@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# Local QA evidence and scratch logs (not part of the product)
+/qa-evidence/
+/qa-bili/
+*.log
+tools/*.log
+
+# User data: cookies, accounts, preferences. Never commit these.
+/token.json
+/accounts.json
+/settings.json
+/settings.json.*
+/token.json.*
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# One-off backups made during development
+*.bak
+*.mojibake.bak
+*.corrupt.bak
+
+# Build-gate state
+/target/.build-gate*
+
+# Stray QA logs at the repo root and unrelated local projects
+/*.txt
+/site/

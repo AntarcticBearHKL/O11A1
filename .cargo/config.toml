@@ -1,0 +1,15 @@
+# Build settings for every crate in this workspace.
+
+# Linker: MSVC's link.exe is slow at writing the debug PDB of Slint-generated
+# code; lld-link (shipped with Visual Studio, x64 host tools) does the same job
+# noticeably faster. If VS is upgraded to another major version, update this
+# path (or put its bin directory on PATH and use `linker = "lld-link.exe"`).
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\Llvm\\x64\\bin\\lld-link.exe"
+
+# Several projects are often built at the same time on a 6-core / 12-thread
+# machine. Each cargo would otherwise take all 12 jobs and the builds would
+# fight for the same cores. 4 keeps 2-3 parallel projects at full machine load;
+# pass `-j 8` (or `-j 6`) on the command line when building only one project.
+[build]
+jobs = 4

@@ -1,0 +1,60 @@
+[package]
+name = "o11a1"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "O11A1 — a Rust + Slint Bilibili desktop client"
+
+[dependencies]
+slint = { version = "1", features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "brotli", "http2", "rustls-tls"] }
+flate2 = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+md-5 = "0.10"
+percent-encoding = "2"
+futures = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+# Tray icon, global hotkey, balloon notifications, autostart. Uses the lightweight
+# windows-sys rather than the full `windows` crate by design.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+slint-build = "1"
+
+# Compile speed first: the dev profile exists for the edit/verify loop, not for
+# shipping. This crate is unoptimized -- it is what gets rebuilt on every edit --
+# while dependencies stay optimized (2), because they are compiled once and own
+# the runtime-heavy code (Slint renderer, reqwest/rustls, image codecs, ...).
+# `debug = 1` keeps line numbers and backtraces but drops the local-variable
+# info that made PDBs and incremental sessions multi-GB; incremental is on for
+# this crate only.
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+
+# Dependencies: optimized once, no incremental state (they never change).
+[profile.dev.package."*"]
+opt-level = 2
+debug = 1
+incremental = false
