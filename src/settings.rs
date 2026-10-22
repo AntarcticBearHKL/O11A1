@@ -156,6 +156,10 @@ pub struct Settings {
     /// 2 = 随机（播完随机跳一条未播过的）。见 [`normalise_play_mode`]。
     #[serde(default = "default_play_mode")]
     pub play_mode: u32,
+    /// 帧插值模式：0 = 关闭, 1 = 帧混合（blend）。2 预留给将来的 RIFE；
+    /// 未知值在加载时归一为 0。见 [`normalise_interp_mode`]。
+    #[serde(default)]
+    pub interp_mode: u8,
 }
 
 /// Number of remappable player actions.
@@ -182,6 +186,9 @@ pub const SEEK_POINTS_MAX: u32 = 20;
 pub const PLAYLIST_MAX: usize = 200;
 /// 循环模式：0 = 手动, 1 = 自动, 2 = 随机.
 pub const PLAY_MODES: [u32; 3] = [0, 1, 2];
+/// 帧插值模式：0 = 关闭, 1 = 帧混合（blend）. 将来的 `2 = rife` 加进这个
+/// 列表即可，加载端无需改动。
+pub const INTERP_MODES: [u8; 3] = [0, 1, 2];
 
 /// Default mapping, one candidate index per action:
 /// 播放/暂停, 快退, 快进, 音量+, 音量-, 静音, 全屏, 退出全屏, 弹幕, 点赞, 截图.
@@ -200,7 +207,6 @@ fn normalize_player_keys(mut keys: Vec<u32>) -> Vec<u32> {
     }
     keys
 }
-
 
 fn default_opacity() -> u32 {
     100
@@ -289,6 +295,20 @@ pub fn normalise_play_mode(value: u32) -> u32 {
     }
 }
 
+/// Normalise the 帧插值 mode.
+///
+/// Only the modes this build implements ([`INTERP_MODES`]) are accepted; a
+/// hand-edited or newer `settings.json` value (including a future `2 = rife`
+/// written by a later build) falls back to off. Off is always safe: it costs
+/// one atomic load per presented source frame and changes nothing else.
+pub fn normalise_interp_mode(value: u8) -> u8 {
+    if INTERP_MODES.contains(&value) {
+        value
+    } else {
+        0
+    }
+}
+
 /// Normalise a restored 播放列表 together with its current index.
 ///
 /// The queue arrives from JSON and may be arbitrarily corrupt:
@@ -315,10 +335,8 @@ pub fn normalise_playlist_state(
         }
         kept.push((index, entry));
     }
-    let mut current = current.and_then(|wanted| {
-        kept.iter()
-            .position(|(index, _)| *index == wanted)
-    });
+    let mut current =
+        current.and_then(|wanted| kept.iter().position(|(index, _)| *index == wanted));
     if kept.len() > PLAYLIST_MAX {
         let dropped = kept.len() - PLAYLIST_MAX;
         kept.drain(0..dropped);
@@ -459,6 +477,7 @@ impl Default for Settings {
             playlist: Vec::new(),
             playlist_current: None,
             play_mode: default_play_mode(),
+            interp_mode: 0,
         }
     }
 }
@@ -524,6 +543,7 @@ pub fn load() -> Settings {
         playlist,
         playlist_current,
         play_mode: normalise_play_mode(settings.play_mode),
+        interp_mode: normalise_interp_mode(settings.interp_mode),
     };
     if loaded.theme != stored_theme {
         let _ = save(&loaded);
@@ -679,11 +699,10 @@ mod tests {
         for value in [SEEK_POINTS_MAX + 1, 21, 99, u32::MAX] {
             assert_eq!(normalise_seek_points(value), default_seek_points());
         }
-        let settings =
-            match serde_json::from_str::<Settings>(r#"{ "seek_points": 99 }"#) {
-                Ok(settings) => settings,
-                Err(_) => Settings::default(),
-            };
+        let settings = match serde_json::from_str::<Settings>(r#"{ "seek_points": 99 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
         assert_eq!(
             normalise_seek_points(settings.seek_points),
             default_seek_points()
@@ -707,10 +726,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&settings)?;
         let decoded = serde_json::from_str::<Settings>(&encoded)?;
-        assert_eq!(
-            normalise_seek_points(decoded.seek_points),
-            SEEK_POINTS_MAX
-        );
+        assert_eq!(normalise_seek_points(decoded.seek_points), SEEK_POINTS_MAX);
         Ok(())
     }
 
@@ -765,8 +781,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&settings)?;
         let decoded = serde_json::from_str::<Settings>(&encoded)?;
-        let (items, current) =
-            normalise_playlist_state(decoded.playlist, decoded.playlist_current);
+        let (items, current) = normalise_playlist_state(decoded.playlist, decoded.playlist_current);
         assert_eq!(items, vec![queued("BV1"), queued("BV2")]);
         assert_eq!(current, Some(1));
         assert_eq!(normalise_play_mode(decoded.play_mode), 2);
@@ -776,16 +791,14 @@ mod tests {
     #[test]
     fn playlist_drops_empty_and_duplicate_bvids() {
         let (items, current) = normalise_playlist_state(
-            vec![
-                queued("BV1"),
-                queued(""),
-                queued("BV1"),
-                queued("BV2"),
-            ],
+            vec![queued("BV1"), queued(""), queued("BV1"), queued("BV2")],
             Some(3),
         );
         assert_eq!(
-            items.iter().map(|entry| entry.bvid.as_str()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|entry| entry.bvid.as_str())
+                .collect::<Vec<_>>(),
             vec!["BV1", "BV2"]
         );
         assert_eq!(current, Some(1), "BV2 moved from slot 3 to slot 1");
@@ -796,8 +809,7 @@ mod tests {
         let all: Vec<QueueEntry> = (0..PLAYLIST_MAX + 5)
             .map(|index| queued(&format!("BV{index}")))
             .collect();
-        let (items, current) =
-            normalise_playlist_state(all.clone(), Some(PLAYLIST_MAX + 2));
+        let (items, current) = normalise_playlist_state(all.clone(), Some(PLAYLIST_MAX + 2));
         let newest = format!("BV{}", PLAYLIST_MAX + 4);
         assert_eq!(items.len(), PLAYLIST_MAX);
         assert_eq!(items.first().map(|entry| entry.bvid.as_str()), Some("BV5"));
@@ -812,8 +824,7 @@ mod tests {
 
     #[test]
     fn playlist_current_out_of_range_becomes_none() {
-        let (items, current) =
-            normalise_playlist_state(vec![queued("BV1")], Some(4));
+        let (items, current) = normalise_playlist_state(vec![queued("BV1")], Some(4));
         assert_eq!(items.len(), 1);
         assert_eq!(current, None);
         let (_, current) = normalise_playlist_state(vec![queued("BV1")], Some(0));
@@ -839,5 +850,45 @@ mod tests {
         assert!(items.is_empty());
         assert_eq!(current, None);
         assert_eq!(normalise_play_mode(settings.play_mode), default_play_mode());
+    }
+
+    #[test]
+    fn interp_mode_defaults_to_off() {
+        assert_eq!(Settings::default().interp_mode, 0);
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.interp_mode, 0);
+    }
+
+    #[test]
+    fn interp_mode_keeps_the_implemented_modes() {
+        for value in INTERP_MODES {
+            assert_eq!(normalise_interp_mode(value), value);
+        }
+        assert_eq!(normalise_interp_mode(1), 1);
+        assert_eq!(normalise_interp_mode(2), 2);
+    }
+
+    #[test]
+    fn interp_mode_rejects_corrupt_and_future_values() {
+        // 0/1/2 are implemented (off / blend / RIFE); anything above is not.
+        for value in [3u8, 9, 99, u8::MAX] {
+            assert_eq!(normalise_interp_mode(value), 0);
+            assert!(!INTERP_MODES.contains(&value));
+        }
+    }
+
+    #[test]
+    fn interp_mode_round_trips_through_json() -> Result<()> {
+        let settings = Settings {
+            interp_mode: 1,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert_eq!(normalise_interp_mode(decoded.interp_mode), 1);
+        Ok(())
     }
 }

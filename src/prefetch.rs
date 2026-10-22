@@ -74,6 +74,10 @@ pub const DEFAULT_POINT_BYTES: u64 = 4 << 20;
 pub const MAX_POINT_CACHE_BYTES: u64 = 80 << 20;
 /// Most seek points that can be warmed at once.
 pub const MAX_WARM_POINTS: usize = 20;
+/// Upper bound on [`PrefetchStats::downloaded`] entries. Past this, the ranges
+/// across the smallest gaps are merged, so the UI never receives a fragmented
+/// list (and a 128 MiB window of 256 KiB chunks still costs one small vector).
+pub const MAX_DOWNLOADED_RANGES: usize = 64;
 
 const MIN_READ_AHEAD_BYTES: u64 = 8 << 20;
 const MAX_READ_AHEAD_BYTES: u64 = 128 << 20;
@@ -183,11 +187,42 @@ impl PrefetchConfig {
     }
 }
 
+/// What one read-ahead worker is doing right now.
+///
+/// `start`/`end` describe the upstream byte range it holds (or held, when it is
+/// between chunks); `bytes` is what that worker itself pulled since the proxy
+/// started. A worker that is between chunks keeps its last range and reports
+/// `busy: false`, so the panel can show "4 connections, 2 fetching" instead of
+/// guessing from the aggregate rate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerStat {
+    /// 0-based index of the configured connection, stable for the proxy's life.
+    pub id: u32,
+    /// Label of the mirror host this worker is fetching from (`""` before its
+    /// first claim).
+    pub host: String,
+    /// Absolute byte offset of the range it is fetching now.
+    pub start: u64,
+    /// Exclusive end of that range (`start + chunk`, clamped to the file
+    /// length when the total is already known at claim time).
+    pub end: u64,
+    /// `false` while the worker waits for window space (or after it stopped).
+    pub busy: bool,
+    /// Bytes this worker has fetched since the proxy started.
+    pub bytes: u64,
+}
+
 /// Byte accounting for the profiler panel.
 ///
 /// [`PrefetchStats::bytes_fetched`] counts bytes *taken from upstream*, not
 /// bytes handed to ffmpeg; the two match within one chunk because the engine
 /// fetches whole chunks and serves them in order.
+///
+/// [`PrefetchStats::workers`], [`PrefetchStats::downloaded`] and
+/// [`PrefetchStats::point_cache`] are the per-connection / per-byte view the
+/// network panel draws (live workers, progress heatmap, warm points). They are
+/// rebuilt under the state lock on every publish and cloned as small vectors,
+/// so a UI frame never waits on the fetch path.
 #[derive(Clone, Debug, Default)]
 pub struct PrefetchStats {
     pub bytes_fetched: u64,
@@ -215,6 +250,21 @@ pub struct PrefetchStats {
     /// Bytes currently held by the point cache (bounded by
     /// [`MAX_POINT_CACHE_BYTES`]).
     pub point_cache_bytes: u64,
+    /// One entry per configured connection, in id order. The entry exists even
+    /// before the worker's first claim (empty host, zero range).
+    pub workers: Vec<WorkerStat>,
+    /// Merged, sorted, non-overlapping `[start, end)` byte ranges already held:
+    /// the union of the read-ahead window and the point cache. Capped at
+    /// [`MAX_DOWNLOADED_RANGES`] entries, merging the smallest gaps first, so
+    /// the UI always receives a compact list.
+    pub downloaded: Vec<(u64, u64)>,
+    /// Same value as [`PrefetchStats::bytes_total`], under the name the panel
+    /// uses for the heatmap denominator.
+    pub total_bytes: Option<u64>,
+    /// Workers with `busy == true` at snapshot time.
+    pub active_workers: u32,
+    /// `[start, end)` ranges currently held by the warm point cache.
+    pub point_cache: Vec<(u64, u64)>,
 }
 
 /// Handle to a running proxy. Dropping it shuts the server down.
@@ -362,6 +412,9 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
             warm_bytes: 0,
             point_hits: 0,
             point_served: 0,
+            workers: (0..config.connections)
+                .map(|_| WorkerSlot::default())
+                .collect(),
         }),
         stats: stats.clone(),
         serving: AtomicBool::new(false),
@@ -808,6 +861,71 @@ fn buffered_bytes(chunks: &BTreeMap<u64, Vec<u8>>) -> u64 {
     chunks.values().map(|data| data.len() as u64).sum()
 }
 
+/// Merge arbitrary `[start, end)` ranges into a sorted, coalesced list of at
+/// most `max_ranges` entries.
+///
+/// Adjacent (`start == previous end`) and overlapping ranges are one range;
+/// empty and inverted ranges are dropped. When the result still has more than
+/// `max_ranges` entries, the pair across the **smallest gap** is merged first
+/// and that repeats, so the compact list loses the least information: a list of
+/// 512 aligned 256 KiB chunks collapses to one entry, and a fragmented window
+/// keeps its largest holes visible instead of dropping ranges wholesale. Equal
+/// gaps are bridged left to right, so the result is deterministic.
+fn merge_ranges(mut ranges: Vec<(u64, u64)>, max_ranges: usize) -> Vec<(u64, u64)> {
+    ranges.retain(|(start, end)| end > start);
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    let cap = max_ranges.max(1);
+    while merged.len() > cap {
+        let mut best = 1usize;
+        let mut best_gap = u64::MAX;
+        for index in 1..merged.len() {
+            let gap = merged[index].0.saturating_sub(merged[index - 1].1);
+            if gap < best_gap {
+                best_gap = gap;
+                best = index;
+            }
+        }
+        let end = merged[best].1;
+        if end > merged[best - 1].1 {
+            merged[best - 1].1 = end;
+        }
+        merged.remove(best);
+    }
+    merged
+}
+
+/// The `[start, end)` ranges of the point cache, in offset order.
+fn point_ranges(points: &PointCache) -> Vec<(u64, u64)> {
+    points
+        .entries
+        .iter()
+        .filter(|(_, data)| !data.is_empty())
+        .map(|(start, data)| (*start, start.saturating_add(data.len() as u64)))
+        .collect()
+}
+
+/// `3.2 MB/s` for the QA stats line; counted bytes, so no `≈`.
+fn format_rate(bytes_per_sec: u64) -> String {
+    if bytes_per_sec >= 1_000_000 {
+        format!("{:.1}MB/s", bytes_per_sec as f64 / 1_000_000.0)
+    } else if bytes_per_sec >= 1_000 {
+        format!("{:.0}KB/s", bytes_per_sec as f64 / 1_000.0)
+    } else {
+        format!("{bytes_per_sec}B/s")
+    }
+}
+
 /// The `count` offsets warmed for seek-ahead, `i / count` of the total size
 /// for `i = 0 .. count`.
 ///
@@ -970,6 +1088,17 @@ struct Host {
     bytes: u64,
 }
 
+/// Live state of one read-ahead worker, owned by the state lock so a snapshot
+/// sees the exact range each connection holds.
+#[derive(Clone, Debug, Default)]
+struct WorkerSlot {
+    host: String,
+    start: u64,
+    end: u64,
+    busy: bool,
+    bytes: u64,
+}
+
 struct State {
     /// First byte of the current chunk alignment (reset on seek).
     base: u64,
@@ -1007,6 +1136,8 @@ struct State {
     /// Requests served from the point cache, and bytes those served.
     point_hits: u64,
     point_served: u64,
+    /// One slot per configured connection (`workers.len() == connections`).
+    workers: Vec<WorkerSlot>,
 }
 
 struct Engine {
@@ -1033,18 +1164,52 @@ impl Engine {
             stats.bytes_fetched = state.bytes_fetched;
             stats.bytes_per_sec = rate;
             stats.bytes_total = state.total;
+            stats.total_bytes = state.total;
             stats.read_ahead_bytes = state.read_ahead;
-            stats.hosts = state
-                .hosts
-                .iter()
-                .map(|host| (host.label.clone(), host.bytes))
-                .collect();
+            stats.hosts.clear();
+            stats.hosts.extend(
+                state
+                    .hosts
+                    .iter()
+                    .map(|host| (host.label.clone(), host.bytes)),
+            );
             stats.failed_ranges = state.failed_ranges;
             stats.warm_points_done = state.warm_points_done;
             stats.warm_points_total = state.warm_points_total;
             stats.point_hits = state.point_hits;
             stats.point_bytes = state.point_served;
             stats.point_cache_bytes = state.points.bytes;
+            // Per-connection view: the exact range and host each worker holds
+            // right now (a waiting worker keeps its last range, `busy: false`).
+            stats.workers.clear();
+            stats.workers.extend(
+                state
+                    .workers
+                    .iter()
+                    .enumerate()
+                    .map(|(id, slot)| WorkerStat {
+                        id: id as u32,
+                        host: slot.host.clone(),
+                        start: slot.start,
+                        end: slot.end,
+                        busy: slot.busy,
+                        bytes: slot.bytes,
+                    }),
+            );
+            stats.active_workers = state.workers.iter().filter(|slot| slot.busy).count() as u32;
+            // Heatmap view: everything held now, as one compact range list.
+            // The chunks are already offset-ordered; the point cache is added
+            // and the whole list is coalesced/capped by `merge_ranges`.
+            let mut ranges: Vec<(u64, u64)> =
+                Vec::with_capacity(state.chunks.len() + state.points.entries.len());
+            ranges.extend(state.chunks.iter().filter_map(|(start, data)| {
+                let len = data.len() as u64;
+                (len > 0).then_some((*start, start.saturating_add(len)))
+            }));
+            let points = point_ranges(&state.points);
+            ranges.extend(points.iter().copied());
+            stats.downloaded = merge_ranges(ranges, MAX_DOWNLOADED_RANGES);
+            stats.point_cache = points;
         }
     }
 
@@ -1169,16 +1334,22 @@ impl Engine {
 
     /// Store one network read at its absolute offset. Bytes become servable
     /// immediately, so the first response does not wait for a whole chunk.
+    ///
+    /// Returns `false` when the read belongs to a superseded generation (a seek
+    /// moved the window) or the proxy is shutting down: the bytes are dropped
+    /// and the caller stops reading this response instead of draining a body
+    /// nobody can use.
     fn push_bytes(
         &self,
         generation: u64,
         offset: u64,
         data: &[u8],
         host: usize,
+        worker: usize,
         shutdown: &AtomicBool,
-    ) {
+    ) -> bool {
         if data.is_empty() {
-            return;
+            return true;
         }
         let now = Instant::now();
         let mut state = match self.state.lock() {
@@ -1186,7 +1357,7 @@ impl Engine {
             Err(poisoned) => poisoned.into_inner(),
         };
         if generation != state.generation || shutdown.load(Ordering::SeqCst) {
-            return;
+            return false;
         }
         let len = data.len() as u64;
         state.chunks.insert(offset, data.to_vec());
@@ -1195,8 +1366,12 @@ impl Engine {
         if let Some(host) = state.hosts.get_mut(host) {
             host.bytes += len;
         }
+        if let Some(slot) = state.workers.get_mut(worker) {
+            slot.bytes = slot.bytes.saturating_add(len);
+        }
         state.samples.push_back((now, len));
         self.publish(&mut state, now);
+        true
     }
 
     /// Store the total length / content type learned from a real range
@@ -1563,12 +1738,17 @@ fn pick_host(state: &mut State, exclude: &[usize]) -> Option<usize> {
 }
 
 /// Reserve the next chunk of the read-ahead window for one worker.
-fn claim(engine: &Engine, shutdown: &AtomicBool) -> Claim {
+///
+/// `worker_id` names the slot this connection owns; the slot is updated under
+/// the same lock that hands out the range, so a snapshot can never see a
+/// claimed range with no worker behind it (or the reverse).
+fn claim(engine: &Engine, shutdown: &AtomicBool, worker_id: usize) -> Claim {
     let mut state = match engine.state.lock() {
         Ok(state) => state,
         Err(poisoned) => poisoned.into_inner(),
     };
     if shutdown.load(Ordering::SeqCst) || state.fatal.is_some() {
+        mark_worker_idle(&mut state, worker_id);
         return Claim::Stop;
     }
     // No probe gate: the first claims happen as soon as the proxy is bound, so
@@ -1585,10 +1765,14 @@ fn claim(engine: &Engine, shutdown: &AtomicBool) -> Claim {
         &state.dead,
         state.generation,
     ) else {
+        // Window full (or the file ended): the worker keeps its last range but
+        // stops counting as active.
+        mark_worker_idle(&mut state, worker_id);
         return Claim::Wait;
     };
     let Some(host) = pick_host(&mut state, &[]) else {
         state.fatal = Some("没有可用的上游主机".to_string());
+        mark_worker_idle(&mut state, worker_id);
         engine.publish(&mut state, Instant::now());
         return Claim::Stop;
     };
@@ -1600,9 +1784,15 @@ fn claim(engine: &Engine, shutdown: &AtomicBool) -> Claim {
         });
     let label = state.hosts[host].label.clone();
     state.inflight.insert((generation, start));
+    if let Some(slot) = state.workers.get_mut(worker_id) {
+        slot.host = label.clone();
+        slot.start = start;
+        slot.end = end;
+        slot.busy = true;
+    }
     drop(state);
     crate::debug_log(&format!(
-        "prefetch chunk claim after_ms={} gen={generation} start={start} end={end} host={label}",
+        "prefetch chunk claim after_ms={} gen={generation} worker={worker_id} start={start} end={end} host={label}",
         engine.started.elapsed().as_millis()
     ));
     Claim::Fetch {
@@ -1613,12 +1803,19 @@ fn claim(engine: &Engine, shutdown: &AtomicBool) -> Claim {
     }
 }
 
-async fn worker(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
+/// Mark a worker as waiting for window space, keeping its last range visible.
+fn mark_worker_idle(state: &mut State, worker_id: usize) {
+    if let Some(slot) = state.workers.get_mut(worker_id) {
+        slot.busy = false;
+    }
+}
+
+async fn worker(worker_id: usize, engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        match claim(&engine, &shutdown) {
+        match claim(&engine, &shutdown, worker_id) {
             Claim::Stop => break,
             Claim::Wait => {
                 tokio::time::sleep(WAIT_POLL).await;
@@ -1645,6 +1842,7 @@ async fn worker(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
                         cursor,
                         end,
                         current.0,
+                        worker_id,
                         &shutdown,
                     )
                     .await
@@ -1729,6 +1927,9 @@ async fn worker(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
                 }
             }
         }
+    }
+    if let Ok(mut state) = engine.state.lock() {
+        mark_worker_idle(&mut state, worker_id);
     }
 }
 
@@ -1977,6 +2178,7 @@ async fn fetch_stream(
     start: u64,
     end: u64,
     host: usize,
+    worker: usize,
     shutdown: &AtomicBool,
 ) -> std::result::Result<u64, (u64, bool, String)> {
     let expected = end.saturating_sub(start);
@@ -2031,7 +2233,13 @@ async fn fetch_stream(
         if take == 0 {
             break;
         }
-        engine.push_bytes(generation, offset, &chunk[..take], host, shutdown);
+        // A seek bumps the generation: stop reading this response at once
+        // instead of draining bytes that can no longer be served. The worker
+        // then claims a range for the new window, so `WorkerStat` never shows
+        // it busy with work that has been discarded.
+        if !engine.push_bytes(generation, offset, &chunk[..take], host, worker, shutdown) {
+            return Ok(received);
+        }
         offset += take as u64;
         received += take as u64;
     }
@@ -2055,13 +2263,18 @@ async fn run_server(
         }
     };
     let mut workers = JoinSet::new();
-    for _ in 0..engine.config.connections {
-        workers.spawn(worker(engine.clone(), shutdown.clone()));
+    for id in 0..engine.config.connections {
+        workers.spawn(worker(id, engine.clone(), shutdown.clone()));
     }
     // The warm task shares the JoinSet, so the usual shutdown path (abort_all)
     // and dropping the handle both cancel it.
     if engine.config.warm_points > 0 {
         workers.spawn(warm_loop(engine.clone(), shutdown.clone()));
+    }
+    // `BILI_PREFETCH_STATS_TEST=1`: one live per-second line describing the
+    // workers and the downloaded ranges (QA only; same JoinSet, same shutdown).
+    if stats_probe_enabled() {
+        workers.spawn(stats_probe(engine.clone(), shutdown.clone()));
     }
     let mut handlers: JoinSet<()> = JoinSet::new();
 
@@ -2097,6 +2310,128 @@ async fn run_server(
     .await;
     drop(listener);
     crate::debug_log("prefetch server stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Live stats probe (`BILI_PREFETCH_STATS_TEST=1`)
+// ---------------------------------------------------------------------------
+
+/// `BILI_PREFETCH_STATS_TEST=1` turns on the once-per-second worker/range line.
+fn stats_probe_enabled() -> bool {
+    std::env::var("BILI_PREFETCH_STATS_TEST")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// `12.6MiB` / `640.0KiB` / `0B` for the QA lines.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1}MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1}KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0}B")
+    }
+}
+
+/// Bytes covered by a merged range list.
+fn ranges_bytes(ranges: &[(u64, u64)]) -> u64 {
+    ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum()
+}
+
+/// Number of adjacent pairs that overlap (always 0 for `merge_ranges` output;
+/// the probe asserts the published list really is coalesced).
+fn range_overlaps(ranges: &[(u64, u64)]) -> usize {
+    ranges
+        .windows(2)
+        .filter(|pair| pair[0].1 > pair[1].0)
+        .count()
+}
+
+/// Read the same snapshot the panel reads, once a second, and log:
+///
+/// ```text
+/// prefetch workers n=4 active=4 ranges=[h1 0-4194304 …] downloaded=3/12.6MiB/25.9% total=48577821 speed=3.2MB/s point_cache=0/0B
+/// prefetch stats qa tick=1 busy_ranges=4/4 overlaps=0 ranges=3 covered=12.6MiB delta=+12.6MiB point_ranges=0 point_bytes=0
+/// ```
+///
+/// The first line is the panel's data; the second proves the invariants: the
+/// busy workers hold distinct ranges, the merged list never overlaps and grows
+/// as chunks land, and the point cache shows up once warm points are stored.
+async fn stats_probe(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
+    let mut tick = 0u64;
+    let mut previous_covered = 0u64;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        tick = tick.saturating_add(1);
+        let stats = engine.snapshot();
+        let ranges = stats
+            .workers
+            .iter()
+            .map(|worker| {
+                let host = if worker.host.is_empty() {
+                    "-"
+                } else {
+                    worker.host.as_str()
+                };
+                format!("{host} {}-{}", worker.start, worker.end)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let covered = ranges_bytes(&stats.downloaded);
+        let percent = match stats.total_bytes {
+            Some(total) if total > 0 => covered as f64 * 100.0 / total as f64,
+            _ => 0.0,
+        };
+        let total = stats
+            .total_bytes
+            .map_or_else(|| "-".to_string(), |total| total.to_string());
+        crate::debug_log(&format!(
+            "prefetch workers n={} active={} ranges=[{ranges}] downloaded={}/{}/{:.1}% total={total} speed={} point_cache={}/{}",
+            stats.workers.len(),
+            stats.active_workers,
+            stats.downloaded.len(),
+            format_bytes(covered),
+            percent,
+            format_rate(stats.bytes_per_sec),
+            stats.point_cache.len(),
+            format_bytes(stats.point_cache_bytes)
+        ));
+        let busy: Vec<(u64, u64)> = stats
+            .workers
+            .iter()
+            .filter(|worker| worker.busy)
+            .map(|worker| (worker.start, worker.end))
+            .collect();
+        let mut distinct = busy.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let delta = covered as i64 - previous_covered as i64;
+        crate::debug_log(&format!(
+            "prefetch stats qa tick={tick} busy_ranges={}/{} overlaps={} ranges={} covered={} delta={delta:+} point_ranges={} point_bytes={} active={}",
+            distinct.len(),
+            busy.len(),
+            range_overlaps(&stats.downloaded),
+            stats.downloaded.len(),
+            format_bytes(covered),
+            stats.point_cache.len(),
+            format_bytes(stats.point_cache_bytes),
+            stats.active_workers
+        ));
+        previous_covered = covered;
+    }
 }
 
 struct Request {
@@ -2954,6 +3289,13 @@ pub fn qa_verify(
             .status()
             .as_u16();
 
+        // Playback resumes at the start and then pauses: the read-ahead window
+        // fills to its limit (all workers idle, `active_workers == 0`) while the
+        // warm task keeps landing seek points. This is the state the panel and
+        // the `BILI_PREFETCH_STATS_TEST` probe must describe.
+        let resume = qa_read(&client, &local, "bytes=0-", 2 << 20, Some(&handle)).await?;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
         let stats = handle.snapshot();
         let proxy_ms: u128 = rounds.iter().map(|(proxy, _)| proxy.ms).sum();
         let direct_ms: u128 = rounds.iter().map(|(_, direct)| direct.ms).sum();
@@ -3032,6 +3374,35 @@ pub fn qa_verify(
             stats.point_bytes,
             stats.point_cache_bytes,
             stats.hosts
+        ));
+        report.push_str(&format!(
+            "workers n={} active={} ranges=[{}]\n",
+            stats.workers.len(),
+            stats.active_workers,
+            stats
+                .workers
+                .iter()
+                .map(|worker| format!(
+                    "{} {} {}-{}{}",
+                    worker.id,
+                    worker.host,
+                    worker.start,
+                    worker.end,
+                    if worker.busy { "" } else { " idle" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        report.push_str(&format!(
+            "downloaded ranges={} bytes={} point_ranges={} point_bytes={}\n",
+            stats.downloaded.len(),
+            ranges_bytes(&stats.downloaded),
+            stats.point_cache.len(),
+            ranges_bytes(&stats.point_cache)
+        ));
+        report.push_str(&format!(
+            "resume bytes={} content_range={} window={} active={}\n",
+            resume.bytes, resume.content_range, stats.read_ahead_bytes, stats.active_workers
         ));
         report.push_str(&format!(
             "peak_bytes_per_sec={} peak_read_ahead={}\n",
@@ -3310,6 +3681,156 @@ mod tests {
             next_chunk_offset(4, 6, 4, 32, Some(100), &partial, &no_inflight, &no_dead, 0),
             Some(8)
         );
+    }
+
+    #[test]
+    fn merge_ranges_coalesces_adjacent_and_overlapping() {
+        // Nothing to merge.
+        assert!(merge_ranges(Vec::new(), MAX_DOWNLOADED_RANGES).is_empty());
+        // Empty and inverted ranges carry no bytes and are dropped.
+        assert!(merge_ranges(vec![(10, 10), (20, 19)], MAX_DOWNLOADED_RANGES).is_empty());
+        // Adjacent chunks (the normal window shape) are one range.
+        assert_eq!(
+            merge_ranges(vec![(0, 4), (4, 8), (8, 12)], MAX_DOWNLOADED_RANGES),
+            vec![(0, 12)]
+        );
+        // Overlap extends the end, a contained range does not.
+        assert_eq!(
+            merge_ranges(
+                vec![(0, 10), (5, 12), (20, 30), (22, 25)],
+                MAX_DOWNLOADED_RANGES
+            ),
+            vec![(0, 12), (20, 30)]
+        );
+        assert_eq!(
+            merge_ranges(vec![(0, 100), (10, 20)], MAX_DOWNLOADED_RANGES),
+            vec![(0, 100)]
+        );
+        // Input order never matters: the result is always sorted.
+        assert_eq!(
+            merge_ranges(vec![(20, 30), (0, 4), (4, 20)], MAX_DOWNLOADED_RANGES),
+            vec![(0, 30)]
+        );
+        // A gap of exactly one byte stays a gap (ranges are half-open).
+        assert_eq!(
+            merge_ranges(vec![(0, 10), (11, 20)], MAX_DOWNLOADED_RANGES),
+            vec![(0, 10), (11, 20)]
+        );
+    }
+
+    #[test]
+    fn merge_ranges_caps_by_merging_the_smallest_gap_first() {
+        // The small gap (10..20) is bridged; the large hole (30..100) survives.
+        assert_eq!(
+            merge_ranges(vec![(0, 10), (20, 30), (100, 110)], 2),
+            vec![(0, 30), (100, 110)]
+        );
+        // Ties are resolved left to right, so the tail keeps its detail.
+        let merged = merge_ranges(
+            (0..8u64).map(|index| (index * 20, index * 20 + 10)).collect(),
+            3,
+        );
+        assert_eq!(merged.len(), 3);
+        assert!(merged.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+        assert_eq!(merged.first().copied(), Some((0, 110)));
+        assert_eq!(merged.last().copied(), Some((140, 150)));
+        // The cap always holds, down to a single range. Every gap is equal
+        // here, so the leftmost pair is bridged first and the tail survives.
+        let many: Vec<(u64, u64)> = (0..500u64).map(|index| (index * 10, index * 10 + 1)).collect();
+        let merged = merge_ranges(many.clone(), MAX_DOWNLOADED_RANGES);
+        assert_eq!(merged.len(), MAX_DOWNLOADED_RANGES);
+        assert_eq!(merged.first().map(|range| range.0), Some(0));
+        assert_eq!(merged.last().copied(), Some((4990, 4991)));
+        assert!(merged.windows(2).all(|pair| pair[0].1 < pair[1].0));
+        let single = merge_ranges(many, 1);
+        assert_eq!(single, vec![(0, 4991)]);
+    }
+
+    #[test]
+    fn merge_ranges_keeps_a_full_window_as_one_entry() {
+        // Worst-case fragmentation of a 128 MiB window at 256 KiB chunks: 512
+        // entries in, one contiguous entry out (well under the 64 cap).
+        let chunk = 256 << 10;
+        let ranges: Vec<(u64, u64)> = (0..512)
+            .map(|index| (index * chunk, (index + 1) * chunk))
+            .collect();
+        assert_eq!(merge_ranges(ranges, MAX_DOWNLOADED_RANGES), vec![(0, 512 * chunk)]);
+    }
+
+    #[test]
+    fn published_downloaded_is_the_window_plus_point_cache() {
+        let engine = test_engine();
+        if let Ok(mut state) = engine.state.lock() {
+            state.total = Some(1000);
+            // Two adjacent window chunks: one merged range.
+            state.chunks.insert(0, vec![0u8; 100]);
+            state.chunks.insert(100, vec![0u8; 50]);
+            // A warm point elsewhere: its own range.
+            state
+                .points
+                .insert(400, vec![7u8; 10], 10, MAX_POINT_CACHE_BYTES);
+            engine.publish(&mut state, Instant::now());
+        }
+        let stats = engine.snapshot();
+        assert_eq!(stats.downloaded, vec![(0, 150), (400, 410)]);
+        assert_eq!(stats.point_cache, vec![(400, 410)]);
+        assert_eq!(stats.point_cache_bytes, 10);
+        assert_eq!(stats.total_bytes, Some(1000));
+        assert_eq!(stats.bytes_total, Some(1000));
+        assert_eq!(ranges_bytes(&stats.downloaded), 160);
+        assert_eq!(range_overlaps(&stats.downloaded), 0);
+    }
+
+    #[test]
+    fn claim_publishes_the_worker_range_and_idles_it() {
+        let mut engine = test_engine();
+        // A tiny window so "full" is reachable without allocating megabytes:
+        // 8 bytes of read-ahead, 4-byte chunks, 2 chunks.
+        engine.config.read_ahead_bytes = 8;
+        engine.config.chunk_bytes = 4;
+        let shutdown = AtomicBool::new(false);
+
+        // First claim: a real range from the configured host.
+        let first = claim(&engine, &shutdown, 0);
+        assert!(matches!(first, Claim::Fetch { start: 0, end: 4, .. }));
+        let stats = engine.snapshot();
+        assert_eq!(stats.workers.len(), 1);
+        assert_eq!(stats.active_workers, 1);
+        assert_eq!(stats.workers[0].id, 0);
+        assert_eq!(stats.workers[0].host, "cdn.example.com");
+        assert!(stats.workers[0].busy);
+        assert_eq!(stats.workers[0].start, 0);
+        assert_eq!(stats.workers[0].end, 4);
+        assert_eq!(stats.workers[0].bytes, 0);
+
+        // One more chunk fills the window; the next claim waits and the worker
+        // reports idle while keeping the last range it held.
+        if let Ok(mut state) = engine.state.lock() {
+            state.total = Some(8);
+            state.chunks.insert(0, vec![0u8; 4]);
+            state.chunks.insert(4, vec![0u8; 4]);
+            state.read_ahead = 8;
+        }
+        let waiting = claim(&engine, &shutdown, 0);
+        assert!(matches!(waiting, Claim::Wait));
+        let stats = engine.snapshot();
+        assert_eq!(stats.active_workers, 0);
+        assert!(!stats.workers[0].busy);
+        assert_eq!(stats.workers[0].start, 0);
+        assert_eq!(stats.workers[0].end, 4);
+    }
+
+    #[test]
+    fn worker_bytes_are_counted_per_connection() {
+        let engine = test_engine();
+        let shutdown = AtomicBool::new(false);
+        engine.push_bytes(0, 0, &[1u8; 32], 0, 0, &shutdown);
+        engine.push_bytes(0, 32, &[2u8; 8], 0, 0, &shutdown);
+        let stats = engine.snapshot();
+        assert_eq!(stats.workers[0].bytes, 40);
+        assert_eq!(stats.bytes_fetched, 40);
+        assert_eq!(stats.hosts, vec![("cdn.example.com".to_string(), 40)]);
+        assert_eq!(stats.downloaded, vec![(0, 40)]);
     }
 
     #[test]
@@ -3657,6 +4178,7 @@ mod tests {
                 warm_bytes: 0,
                 point_hits: 0,
                 point_served: 0,
+                workers: vec![WorkerSlot::default()],
             }),
             stats: Arc::new(Mutex::new(PrefetchStats::default())),
             serving: AtomicBool::new(false),

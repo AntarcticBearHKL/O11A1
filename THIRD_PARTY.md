@@ -28,3 +28,12 @@ Dependencies are declared in `Cargo.toml`; their licences are recorded in
 `ffmpeg.exe` / `ffplay.exe` are not distributed with this repository. They are
 invoked at runtime and are licensed separately (LGPL/GPL depending on the
 build).
+
+## Frame interpolation (optional component)
+
+- **RIFE** (Real-time Intermediate Flow Estimation) ！ algorithm by hzwer, MIT.
+- **ncnn** ！ Tencent, BSD-3-Clause.
+- **rife-ncnn-vulkan** model files (`rife-v4.6`) ！ nihui, MIT.
+- `assets/rife/rife-helper.exe` is a small persistent helper built from the above;
+  it ships with the release bundle (not required to build or run the app ！ without
+  it the RIFE smoothing mode simply reports unavailable and the blend mode is used).

@@ -331,6 +331,10 @@ export global AppTheme {
     out property <color> player-menu-hover: #34343e;
     out property <color> player-menu-border: #3a3a44cc;
     out property <color> player-track: #3a3a44;
+    // Scrubber progress fill: a calm green, distinct from the accent blue so
+    // "played" reads at a glance without turning the strip into a warning. The
+    // player chrome is dark in both schemes, so this token is theme-invariant.
+    out property <color> player-progress: #35a06b;
     out property <color> player-text: #e0e0e6;
     out property <color> player-text-bright: #f0f0f2;
     out property <color> player-time: #e6e6ea;
@@ -497,6 +501,16 @@ export struct AudioEntry {
     index: int,
     label: string,
     vip: bool,
+}
+
+// 网络分析: one prefetch connection, formatted by Rust. `range` reads
+// `12.0–16.0 MB` (the byte window this worker claims), `bytes` its running
+// total, `busy` whether it is fetching right now (green dot) or waiting.
+export struct NetWorker {
+    host: string,
+    range: string,
+    bytes: string,
+    busy: bool,
 }
 
 export struct FavFolderRow {
@@ -1315,15 +1329,106 @@ component PillIcon inherits Rectangle {
     }
 }
 
+// 药丸平滑: the frame-interpolation cell. It reuses PillIcon's chip language
+// (38x38 plate, 10px radius, same hover wash) but is its own component because
+// it carries STATE in a badge, not an on/off highlight:
+//
+//   level 0 关闭   - a dim 4px dot
+//   level 1 混合   - the same dot in `accent` at 60 %
+//   level 2 RIFE   - solid accent dot plus a 3px spark
+//
+// The glyph is three nested right chevrons (frames advancing), drawn as one
+// stroked Path - deliberately unlike the danmaku dashes, the 网络 bars or the
+// play triangle, none of which has a chevron.
+component InterpIcon inherits Rectangle {
+    in property <int> level: 0;
+    in property <bool> interactive: true;
+    out property <bool> hot: area.has-hover;
+    callback clicked();
+
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    background: area.has-hover ? AppTheme.player-btn-hover : AppTheme.player-btn;
+    animate background { duration: 120ms; easing: ease-out; }
+
+    Path {
+        x: (parent.width - 16px) / 2;
+        y: (parent.height - 16px) / 2;
+        width: 16px;
+        height: 16px;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        commands: "M 1.8 3.4 L 6.2 8 L 1.8 12.6 M 5.8 3.4 L 10.2 8 L 5.8 12.6 M 9.8 3.4 L 14.2 8 L 9.8 12.6";
+        fill: #00000000;
+        stroke: AppTheme.player-text;
+        stroke-width: 1.4px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+    }
+
+    // State dot, top-right of the chip: dim while off, accent at 60 % for the
+    // blend mode, solid for RIFE.
+    Rectangle {
+        x: 26.5px;
+        y: 6.5px;
+        width: 4px;
+        height: 4px;
+        border-radius: 2px;
+        background: root.level == 0 ? AppTheme.player-text-dim : AppTheme.accent;
+        opacity: root.level == 1 ? 0.6 : 1;
+        animate opacity { duration: 160ms; easing: ease-out; }
+        animate background { duration: 160ms; easing: ease-out; }
+    }
+
+    // RIFE spark: a 3px four-ray glint up-right of the dot (a stroked plus,
+    // crisper at 16px than a filled star). Drawn only for level 2, so the
+    // three states differ in shape, not just in tint.
+    if root.level == 2 : Path {
+        x: 32.5px;
+        y: 4.5px;
+        width: 3px;
+        height: 3px;
+        viewbox-width: 3;
+        viewbox-height: 3;
+        commands: "M 1.5 0 L 1.5 3 M 0 1.5 L 3 1.5";
+        fill: #00000000;
+        stroke: AppTheme.accent;
+        stroke-width: 0.9px;
+        stroke-line-cap: round;
+    }
+
+    area := TouchArea {
+        x: -1px;
+        y: -1px;
+        width: parent.width + 2px;
+        height: parent.height + 2px;
+        enabled: root.interactive;
+        clicked => { root.clicked(); }
+        // A wheel over a pill button is not the pill's background.
+        scroll-event(event) => { EventResult.accept }
+    }
+}
+
 // 网络分析: one stat row - label left, value right in a fixed column, so every
 // number lines up like an instrument readout (no mono font needed: the bundle
-// only ships Noto Sans SC).
+// only ships Noto Sans SC). `clickable` turns the row into a control: a hover
+// wash, a pointer cursor and a small chevron after the value (the 平滑 模式 row
+// is the one such row - it cycles the mode). The chevron takes 11px out of the
+// value column on that row only, so every other value stays flush right.
 component NetStat inherits Rectangle {
     in property <string> label: "";
     in property <string> value: "";
     in property <bool> strong: false;
+    in property <bool> clickable: false;
+    callback clicked();
 
     height: 24px;
+    border-radius: 4px;
+    background: root.clickable && area.has-hover
+        ? AppTheme.player-menu-hover
+        : #00000000;
+    animate background { duration: 120ms; easing: ease-out; }
 
     Text {
         x: 0;
@@ -1338,7 +1443,7 @@ component NetStat inherits Rectangle {
 
     Text {
         x: 104px;
-        width: max(0px, parent.width - 104px);
+        width: max(0px, parent.width - 104px - (root.clickable ? 11px : 0px));
         height: 100%;
         text: root.value;
         color: root.strong ? AppTheme.player-fg-strong : AppTheme.player-text;
@@ -1347,17 +1452,136 @@ component NetStat inherits Rectangle {
         vertical-alignment: center;
         overflow: elide;
     }
+
+    // The row's affordance: a 6x10 right chevron at the far right, in the same
+    // stroke language as PanelRow. It brightens with the row's hover.
+    if root.clickable : Path {
+        x: parent.width - 7px;
+        y: (parent.height - 10px) / 2;
+        width: 6px;
+        height: 10px;
+        viewbox-width: 6;
+        viewbox-height: 10;
+        commands: "M 1.4 1.5 L 4.6 5 L 1.4 8.5";
+        fill: #00000000;
+        stroke: area.has-hover ? AppTheme.player-fg-strong : AppTheme.player-text-dim;
+        stroke-width: 1.4px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        animate stroke { duration: 120ms; easing: ease-out; }
+    }
+
+    area := TouchArea {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        enabled: root.clickable;
+        mouse-cursor: root.clickable ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 网络分析: one prefetch connection - busy dot, host left, claimed range
+// centred, running byte total right. The three columns are fixed fractions of
+// the row, so the rows read as one aligned table.
+component NetWorkerRow inherits Rectangle {
+    in property <string> host: "";
+    in property <string> range: "";
+    in property <string> bytes: "";
+    in property <bool> busy: false;
+
+    height: 18px;
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - 5px) / 2;
+        width: 5px;
+        height: 5px;
+        border-radius: 2.5px;
+        background: root.busy ? AppTheme.player-progress : AppTheme.player-track;
+    }
+
+    Text {
+        x: 11px;
+        width: max(0px, parent.width * 0.42 - 11px);
+        height: 100%;
+        text: root.host;
+        color: root.busy ? AppTheme.player-text : AppTheme.player-text-dim;
+        font-size: 10.5px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    Text {
+        x: parent.width * 0.42;
+        width: max(0px, parent.width * 0.34);
+        height: 100%;
+        text: root.range;
+        color: AppTheme.player-text-dim;
+        font-size: 10.5px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    Text {
+        x: parent.width * 0.76;
+        width: max(0px, parent.width * 0.24);
+        height: 100%;
+        text: root.bytes;
+        color: AppTheme.player-text;
+        font-size: 10.5px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+// 网络分析: one entry of the 下载分布 legend - a 5px chip in the state's own
+// colour (same tint/alpha as the strip cell) and its name.
+component NetLegend inherits Rectangle {
+    in property <string> label: "";
+    in property <color> tint: AppTheme.player-track;
+    in property <float> alpha: 1;
+
+    horizontal-stretch: 1;
+    height: 16px;
+    background: #00000000;
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - 5px) / 2;
+        width: 5px;
+        height: 5px;
+        border-radius: 1.5px;
+        background: root.tint;
+        opacity: root.alpha;
+    }
+
+    Text {
+        x: 9px;
+        width: max(0px, parent.width - 9px);
+        height: 100%;
+        text: root.label;
+        color: AppTheme.player-text-dim;
+        font-size: 9.5px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 提示条 (toast). 16px drawn mark on the left (never a glyph), one 13px line,
-// and a 3px progress hairline along the bottom edge. The surface is the same
-// `player-menu` plate + hairline family as the popovers, so a toast reads as
-// chrome rather than as a notification from another app.
+// 提示条 (toast). A 36px pill: a 16px drawn mark (never a glyph) inside a 24px
+// tinted circle on the left, one 13px line, and a 3px progress hairline along
+// the bottom edge. The surface is the same `player-menu` plate + hairline
+// family as the popovers, so a toast reads as chrome rather than as a
+// notification from another app.
 //
-// Entrance: 180ms, translate-y 8px -> 0 + fade in. Exit: 200ms, the reverse
-// (the stack keeps a fixed 3 slots, so losing a toast is a state change on a
-// live node and can animate - a model removal would destroy the node instead).
+// Entrance: 180ms, translate-y -8px -> 0 (slides DOWN into place) + fade in.
+// Exit: 200ms, the reverse. The stack keeps a fixed 3 slots, so losing a toast
+// is a state change on a live node and can animate - a model removal would
+// destroy the node instead.
 // ---------------------------------------------------------------------------
 component ToastIcon inherits Rectangle {
     // 0 info · 1 success · 2 error
@@ -1430,23 +1654,27 @@ component ToastView inherits Rectangle {
     in property <int> kind: 0;
     in property <float> progress: 1.0;
     in property <bool> shown: false;
-    // Slot top inside the stack; the stack owns the 3-slot geometry.
+    // Slot top inside the stack; the stack owns the 3-slot geometry. Slot 0 is
+    // the newest, so a new toast pushes the older ones DOWN.
     in property <length> slot_y: 0px;
-    // Entrance offset: the state below eases it from 8px to 0 on entry and
-    // back on the way out.
-    property <length> rise: 8px;
+    // Entrance offset: the state below eases it from -8px to 0 on entry and
+    // back on the way out (slide down + fade in).
+    property <length> rise: -8px;
 
     x: 0;
     y: self.slot_y + self.rise;
     width: 100%;
-    height: 38px;
-    border-radius: 10px;
+    height: 36px;
+    border-radius: 18px;
     background: AppTheme.player-menu;
     border-width: 1px;
     border-color: AppTheme.player-menu-border;
     drop-shadow-color: AppTheme.player-shadow;
     drop-shadow-blur: 12px;
     drop-shadow-offset-y: 3px;
+    // 180ms in, 200ms out. The same animation carries a slot push-down when a
+    // newer toast arrives above an older one.
+    animate y { duration: root.shown ? 180ms : 200ms; easing: ease-out; }
 
     // Info uses the accent, success a lifted `player-on` (the raw green is too
     // dark on `player-menu`), error the theme danger.
@@ -1470,21 +1698,31 @@ component ToastView inherits Rectangle {
         }
         hidden when !root.shown: {
             opacity: 0;
-            rise: 8px;
+            rise: -8px;
         }
     ]
 
-    ToastIcon {
-        x: 12px;
-        y: 11px;
-        kind: root.kind;
-        tint: root.tint;
+    // 24px tinted circle carrying the 16px mark.
+    Rectangle {
+        x: 8px;
+        y: 6px;
+        width: 24px;
+        height: 24px;
+        border-radius: 12px;
+        background: root.tint.transparentize(0.82);
+
+        ToastIcon {
+            x: 4px;
+            y: 4px;
+            kind: root.kind;
+            tint: root.tint;
+        }
     }
 
     Text {
-        x: 36px;
+        x: 40px;
         y: 0;
-        width: max(0px, parent.width - 48px);
+        width: max(0px, parent.width - 52px);
         height: parent.height;
         text: root.message;
         color: AppTheme.player-text;
@@ -2417,6 +2655,12 @@ export component PlayerWindow inherits Window {
     in-out property <float> volume: 100;
     in property <bool> muted: false;
     in property <string> volume_text: "100";
+    // ---- wheel volume feedback (transient, drawn, no numbers) ----
+    // A wheel step shows the capsule for 900ms after the LAST step: a 60ms
+    // countdown is reset to 15 ticks by every step, so a spin keeps it up and
+    // it fades 900ms after the wheel stops.
+    property <bool> wheel_hud_on: false;
+    property <int> wheel_hud_ticks: 0;
 
     // ---- speed ----
     in-out property <float> speed_milli: 1000;
@@ -2534,8 +2778,7 @@ export component PlayerWindow inherits Window {
 
     // ---- 网络分析 (live profiler, published from Rust) ----
     // Every value is a pre-formatted string so the panel never has to guess a
-    // unit; `net_buffer_ratio` (0..1) drives the fill bar and `net_history`
-    // (0..1 samples, newest last) drives the sparkline strip.
+    // unit; `net_buffer_ratio` (0..1) drives the buffer fill bar.
     in property <string> net_fps_presented: "";
     in property <string> net_fps_decoded: "";
     in property <string> net_first_frame: "";
@@ -2550,7 +2793,49 @@ export component PlayerWindow inherits Window {
     // throughput / read-ahead, one pre-formatted line. Declared for the Rust
     // setter; shown as the last 缓冲 row below.
     in property <string> buffer_detail: "";
-    in property <[float]> net_history: [];
+    // Per-connection rows for 线程 (Rust trims the list to 8).
+    in property <[NetWorker]> net_workers: [];
+    // 下载分布: 120 equal slices over the whole file. 0 missing, 1 downloaded,
+    // 2 warm point cache, 3 fetching now. Rust patches the rows in place
+    // (`set_row_data`) so the strip repaints without rebuilding.
+    in property <[int]> net_map: [];
+    // "4 / 4 线程 · 7.2 MB/s" - busy workers over configured ones.
+    in property <string> net_active_text: "";
+    // "已下载 48.0 MB / 455.9 MB (10.5%)".
+    in property <string> net_total_text: "";
+    // Live bar fill: the metered rate over the max of the last 5 s (0..1).
+    in property <float> net_rate_ratio: 0;
+    // 1 s pulse for the active slices in the strip (see the strip's opacity).
+    property <float> net_pulse: 0;
+    // The 网络分析 body is the visible tab: gates its pulse timer so a closed
+    // panel repaints nothing.
+    property <bool> net_panel_open: root.right_panel != 0 && root.right_tab == 2;
+
+    // ---- 平滑 (frame interpolation, published from Rust) ----
+    // One mode, three published strings: the short name for the 模式 row and
+    // the pill badge ("关闭" / "帧混合" / "RIFE"), the generator readout for
+    // 生成, and the optional GPU line ("" hides the row). The UI never formats
+    // a number itself, and it never invents a mode: `interp_level` is DERIVED
+    // from `interp_mode_text` so the badge can never disagree with the row.
+    // `interp_cycle()` advances 0 -> 1 -> 2 -> 0 in Rust and persists it; both
+    // the pill cell and the panel row are entry points to the same call.
+    in property <string> interp_mode_text: "关闭";
+    in property <string> interp_stats_text: "—";
+    in property <string> interp_gpu_text: "";
+    callback interp_cycle();
+
+    // 0 关闭 · 1 帧混合 · 2 RIFE. "关闭" is the documented default; anything
+    // else that is not RIFE reads as the blend mode, so an unknown future
+    // label still shows a live (accent) badge instead of a false 关闭.
+    property <int> interp_level: root.interp_mode_text == "关闭"
+        || root.interp_mode_text == ""
+        ? 0
+        : (root.interp_mode_text.starts-with("RIFE") ? 2 : 1);
+    // The pill tooltip: same three states, one line each, always naming the
+    // mode (never just "平滑").
+    property <string> interp_tip: root.interp_level == 0
+        ? "平滑：关闭"
+        : (root.interp_level == 2 ? "平滑：RIFE（720p 以下）" : "平滑：帧混合（低延迟）");
 
     // ---- 二级 panel ----
     // `fit_menu_open` / `brightness_menu_open` / `sleep_menu_open` are also
@@ -2573,12 +2858,28 @@ export component PlayerWindow inherits Window {
     property <bool> history_expanded: false;
 
     // ---- interaction state ----
+    // A seek-bar drag only PREVIEWS: `drag_ms` drives the fill, the knob and
+    // the time readout while the pointer is down, and the single `seek()` is
+    // issued on release (a seek restarts the decoder, so one per gesture).
     property <bool> dragging: false;
     property <float> drag_ms: 0;
     property <float> shown_ms: root.dragging ? root.drag_ms : root.position_ms;
-    // Position of the last seek() issued while dragging, so the throttle below
-    // never re-seeks a value that was already sent.
-    property <float> seek_sent_ms: -1;
+
+    // ---- idle auto-hide veto (read by Rust) ----
+    // Rust owns the idle timeout and writes `pointer_inside`; it reads this flag
+    // only to know when NOT to time the chrome out. `chrome_shown` stays exactly
+    // `pointer_inside` - the hold never forces the chrome up, it only keeps it up
+    // while the user is demonstrably interacting.
+    //
+    // True while: a floating popover is open (音量 / 弹幕 / 画质), a seek bar or
+    // 缩放进度条 drag is in flight, or the pointer is over the right panel (the
+    // panel has its own close button, so keeping the pill up there is fine).
+    // The player has no playlist panel and the toast stack has no hover target
+    // (plain Rectangles), so neither contributes a condition here.
+    in-out property <bool> chrome_hold: root.quality_expanded
+        || pill.vol_open || pill.dm_open
+        || root.dragging || root.scrub_dragging
+        || right_strip_area.has-hover;
 
     // ---- pointer-driven chrome ----
     // ONE source of truth: `pointer_inside`, written by Rust from the real
@@ -2634,9 +2935,20 @@ export component PlayerWindow inherits Window {
     in-out property <int> scrub_cell_2: 0;
     in-out property <int> scrub_cell_3: 0;
     in-out property <int> scrub_cell_4: 0;
+    // Still published by Rust for the level's window; the strip no longer
+    // paints it - the cells are a progress fill now, not a density heat map.
     in property <[float]> scrub_heat: [];
+    // Drag = preview only (the strip's fill and line follow the pointer 1:1);
+    // the single `seek()` is issued on release. `scrub_settle_ms` holds the
+    // released target on screen until the new position lands, so the line never
+    // snaps back to the old playhead for a frame.
     property <bool> scrub_dragging: false;
     property <float> scrub_drag_ms: 0;
+    property <bool> scrub_settling: false;
+    property <float> scrub_settle_ms: 0;
+    property <float> scrub_preview_ms: root.scrub_dragging
+        ? root.scrub_drag_ms
+        : (root.scrub_settling ? root.scrub_settle_ms : root.shown_ms);
     // The 设置 body's content height. A ScrollView whose content is a layout is
     // bottom-aligned as soon as that content is taller than the viewport (it
     // starts at the maximum scroll, which hid 播放/画质 on a 540px window), so
@@ -2652,6 +2964,20 @@ export component PlayerWindow inherits Window {
         + (root.brightness_menu_open ? 38px : 0px)
         + (root.sleep_menu_open ? (6 * 32px + 26px) : 0px)
         + (root.history_expanded ? (root.history_dates.length * 30px + 28px) : 0px);
+    // The 网络分析 body's content height, same ScrollView contract as
+    // `settings_h`. Keep the sum in step with the rows below:
+    //   pad 14 | 实时速度 32+34+12+4 | 线程 32+22+18n | 下载分布 32+10+18+16+6
+    //   | 平滑 32+24n | 帧率 32+4*24 | 缓冲 32+5*24+18 (+24 明细)
+    property <length> net_h: 14px
+        + 82px
+        + (54px + root.net_workers.length * 18px + (root.net_workers.length == 0 ? 18px : 0px))
+        + 82px
+        + 128px
+        + (root.interp_gpu_text != "" ? 104px : 80px)
+        + (170px + (root.buffer_detail != "" ? 24px : 0px));
+    // 1 s pulse on the strip's active slices: half a second up, half a second
+    // down, so a fetching worker reads as "live" against the static cells.
+    animate net_pulse { duration: 500ms; easing: ease-in-out; }
 
     // ---- panel toggles ----
     // One home for the "close whatever is there / open the new one" rule, so
@@ -2877,22 +3203,12 @@ export component PlayerWindow inherits Window {
         triggered => { root.danmaku_tick(); }
     }
 
-    // ---- 进度条 drag: live, throttled seeking + a termination guard ----
-    // Every seek restarts the decoder (~1s), so seeking on every pointer move
-    // would thrash the pipeline. One seek per 180ms keeps the picture within a
-    // couple of frames of the pointer while the drag itself stays frame-exact
-    // (`shown_ms` drives the fill, the knob and the time readout).
-    Timer {
-        interval: 180ms;
-        running: root.dragging;
-        triggered => {
-            if (root.dragging && root.drag_ms != root.seek_sent_ms) {
-                root.seek_sent_ms = root.drag_ms;
-                root.seek(root.drag_ms);
-            }
-        }
-    }
-
+    // ---- 进度条 drag: preview only, one seek on release ----
+    // Every seek restarts the decoder (~1s), so the drag itself is a pure
+    // preview: `shown_ms` follows the pointer frame-exactly (fill, knob, time
+    // readout) and the single `seek()` goes out on the Up event. There is no
+    // live-seek timer any more.
+    //
     // A release outside the window never reaches `progress_area`, so the drag
     // is finished here (and applied) as soon as the area is no longer pressed.
     // This is what keeps `dragging` from sticking.
@@ -2902,21 +3218,55 @@ export component PlayerWindow inherits Window {
         triggered => {
             if (root.dragging && !progress_area.pressed) {
                 root.dragging = false;
-                root.seek_sent_ms = root.drag_ms;
                 root.seek(root.drag_ms);
+            }
+        }
+    }
+
+    // After a scrub release the strip keeps the released target on screen until
+    // the new position actually lands, so the green fill and the line never snap
+    // back to the old playhead for a frame. The 900ms timer is the fallback for
+    // a seek that never reports back.
+    changed position_ms => {
+        if (root.scrub_settling && abs(root.position_ms - root.scrub_settle_ms) < 1500) {
+            root.scrub_settling = false;
+        }
+    }
+
+    Timer {
+        interval: 900ms;
+        running: root.scrub_settling;
+        triggered => { root.scrub_settling = false; }
+    }
+
+    // Wheel volume HUD: 60ms ticks, reset to 15 (900ms) by every wheel step.
+    Timer {
+        interval: 60ms;
+        running: root.wheel_hud_on;
+        triggered => {
+            root.wheel_hud_ticks = max(0, root.wheel_hud_ticks - 1);
+            if (root.wheel_hud_ticks <= 0) {
+                root.wheel_hud_on = false;
             }
         }
     }
 
     // The chrome going away (pointer left the window) takes any hover-driven
     // popover with it, so it cannot come back stale on the next pointer entry.
+    // The 画质 menu is a chrome child too: it closes with the same edge, so a
+    // panel reopened later never shows a menu left over from the last session.
     Timer {
         interval: 150ms;
-        running: !root.chrome_shown && (pill.vol_open || pill.dm_open);
+        running: !root.chrome_shown && (pill.vol_open || pill.dm_open || root.quality_expanded);
         triggered => {
             if (!root.chrome_shown) {
                 pill.vol_open = false;
                 pill.dm_open = false;
+                root.quality_expanded = false;
+                // The zoom strip morphed out of the pill is chrome as well.
+                if (root.scrub_level != 0) {
+                    root.scrub-close();
+                }
             }
         }
     }
@@ -2961,11 +3311,12 @@ export component PlayerWindow inherits Window {
     // ~80% of the player surface (clamped 720..1100px), and the cells stretch
     // with it, 1px gap, 8px inner padding on both sides.
     //
-    // Current position: `scrub_frac` maps the playhead into the CURRENT window
-    // (base..base+span, 0..1). The strip draws a 2px accent line at
-    // `8 + frac * (bar - 16)` with a 6px cap, so it always sits over the exact
-    // cell the seek would land on.
-    property <float> scrub_frac: clamp((root.shown_ms - root.scrub_base_ms) / max(1, root.scrub_span_ms), 0, 1);
+    // Current position: `scrub_frac` maps the preview playhead into the
+    // CURRENT window (base..base+span, 0..1). While a drag is in flight the
+    // preview IS the pointer, so the green fill and the 2px line follow it 1:1;
+    // otherwise they sit on the real playback position (or the released target
+    // until it lands). The line is never drawn under a hovering pointer.
+    property <float> scrub_frac: clamp((root.scrub_preview_ms - root.scrub_base_ms) / max(1, root.scrub_span_ms), 0, 1);
 
     // 20^(level-1): level 1 = the whole video, 2 = 1/20, 3 = 1/400, ...
     pure function scrub-divisor(level: int) -> float {
@@ -3062,15 +3413,6 @@ export component PlayerWindow inherits Window {
         return clamp(floor((x - 8px) / max(1px, cell_w + 1px)), 0, 19);
     }
 
-    // Heat of cell i: 0..1, uniform 0.15 when Rust has not published a full
-    // 20-element model yet.
-    function scrub-heat-at(i: int) -> float {
-        if (i >= root.scrub_heat.length) {
-            return 0.15;
-        }
-        return clamp(root.scrub_heat[i], 0, 1);
-    }
-
     // The strip's top-left label: the window in mm:ss.
     pure function two-digit(v: float) -> string {
         return v < 9.5 ? "0" + max(0, v).to-fixed(0) : v.to-fixed(0);
@@ -3089,7 +3431,7 @@ export component PlayerWindow inherits Window {
     // resolution, e.g. `1/20` on the whole video and `1/20 · 2/400` one level
     // in. Cells are 1-based, so the label always reads "cell N of M".
     pure function scrub-play-cell(cells: float) -> string {
-        let frac = clamp(root.shown_ms / max(1, root.duration_ms), 0, 1);
+        let frac = clamp(root.scrub_preview_ms / max(1, root.duration_ms), 0, 1);
         return (min(floor(frac * cells), cells - 1) + 1).to-fixed(0);
     }
 
@@ -3120,10 +3462,14 @@ export component PlayerWindow inherits Window {
     function wheel-volume(up: bool) {
         if (up && root.muted) {
             root.toggle_mute();
+            root.wheel_hud_ticks = 15;
+            root.wheel_hud_on = true;
             return;
         }
         root.volume = clamp(root.volume + (up ? 2 : -2), 0, 100);
         root.volume_changed(root.volume);
+        root.wheel_hud_ticks = 15;
+        root.wheel_hud_on = true;
     }
 
     pure function speed-label(milli: float) -> string {
@@ -3735,10 +4081,11 @@ export component PlayerWindow inherits Window {
 
         // ===================== 浮动药丸 (92px: top band = seek, bottom = controls)
         // =====================
-        // Bigger transport, as asked: 408px wide, 92px tall, still centred over
-        // the picture and hugging its content. Seven cells now - the 全屏 cell
-        // is gone (double-click on the picture toggles fullscreen), so the pill
-        // dropped one cell and stays centred. The vertical split stays literal
+        // Bigger transport, as asked: 452px wide, 92px tall, still centred over
+        // the picture and hugging its content. Eight cells now - the 全屏 cell
+        // is gone (double-click on the picture toggles fullscreen) and 平滑
+        // joined between 网络 and 设置, so the pill grew by one cell (44px)
+        // from its 408px seven-cell size. The vertical split stays literal
         // - a 3px seek track in the top band, the 38px control row below it -
         // so the pill reads as a transport, not a band.
         //
@@ -3746,8 +4093,8 @@ export component PlayerWindow inherits Window {
         //   vertical   12 (top pad) | 16 (seek) | 12 (gap) | 40 (controls) | 12
         //   horizontal 14 (outer gutter) | cell | gaps | 14
         //   cells: play 38, time 104 (12.5px readout), volume 38, danmaku 38,
-        //          comments 38, network 38, settings 38
-        //   x: 0 | 50 | 166 | 210 | 254 | 298 | 342, content width 380
+        //          comments 38, network 38, smooth 38, settings 38
+        //   x: 0 | 50 | 166 | 210 | 254 | 298 | 342 | 386, content width 424
         // Every control keeps a 40px hit target around its 38px chip.
         // The bar slides down out of view when the chrome hides and fades with
         // it; every interactive element is gated on `chrome_shown` (disabled
@@ -3771,7 +4118,7 @@ export component PlayerWindow inherits Window {
             // stay legible on a narrow window and do not sprawl on a 4K one.
             width: max(0px, min(parent.width - 24px, root.scrub_level > 0
                 ? clamp(parent.width * 0.8, 720px, 1100px)
-                : 408px));
+                : 452px));
             height: root.scrub_level > 0 ? 72px : 92px;
             border-radius: root.scrub_level > 0 ? 12px : 14px;
             background: AppTheme.bar-fill;
@@ -3793,27 +4140,14 @@ export component PlayerWindow inherits Window {
             property <length> scrub_cells_w: max(0px, self.width - 16px);
             property <length> scrub_cell_w: max(1px, (self.scrub_cells_w - 19px) / 20);
 
-            // ---- current-position line ----
-            // Idle: the 2px line sits at the playback fraction of the CURRENT
-            // window. While the pointer is on the strip (or a drag is in
-            // flight): the line sits exactly under the pointer, clamped to the
-            // cells' 8px..width-8 range. Releasing eases back to playback over
-            // 120ms; tracking has NO duration, so the line never lags the
-            // pointer by a frame.
-            property <length> scrub_head_playback: 8px + self.scrub_cells_w * root.scrub_frac;
-            property <length> scrub_head_pointer: clamp(scrub_area.mouse-x, 8px, 8px + self.scrub_cells_w);
-            property <bool> scrub_tracking: root.chrome_shown && root.scrub_level > 0
-                && (scrub_area.has-hover || root.scrub_dragging);
-            property <length> scrub_head_x: scrub_tracking
-                ? self.scrub_head_pointer
-                : self.scrub_head_playback;
-            animate scrub_head_x {
-                duration: scrub_tracking ? 0ms : 120ms;
-                easing: ease-out;
-            }
-            // Time under the pointer, from the same mapping the strip's seek
-            // uses (`scrub-ms-at`): base + (x - 8) / (width - 16) * span.
-            property <float> scrub_pointer_ms: root.scrub-ms-at(self.scrub_head_pointer, self.width);
+            // ---- current-position line + progress fill ----
+            // ONE position drives both the green fill and the 2px line: the
+            // current playback fraction of the CURRENT window. While a drag is
+            // in flight `scrub_frac` follows the pointer 1:1 (no lag, no
+            // animation); on release the line holds the released target until
+            // the seek lands. Hovering the strip moves nothing - the indicator
+            // is never drawn under a pointer that has not pressed.
+            property <length> scrub_head_x: 8px + self.scrub_cells_w * root.scrub_frac;
 
             property <bool> vol_open: false;
             property <int> vol_miss: 0;
@@ -3889,7 +4223,10 @@ export component PlayerWindow inherits Window {
                 }
 
                 // 20 cells: they stretch with the bar (cells ~44px wide on a
-                // 900px window), 34px tall, 1px gap, 8px inner padding.
+                // 900px window), 34px tall, 1px gap, 8px inner padding. Each
+                // cell is the dark track with a green PROGRESS slice clipped
+                // inside it: the strip reads as one continuous progress fill
+                // that keeps the cell structure and its 1px gaps.
                 cell_row := Rectangle {
                     x: 8px;
                     y: 30px;
@@ -3903,24 +4240,35 @@ export component PlayerWindow inherits Window {
                         width: pill.scrub_cell_w;
                         height: parent.height;
                         border-radius: 3px;
-                        // player-track -> accent by the cell's density; the
-                        // missing-model fallback is a uniform 0.15.
-                        background: AppTheme.player-track.mix(AppTheme.accent, 1 - root.scrub-heat-at(i));
+                        background: AppTheme.player-track;
                         opacity: root.scrub_level > 0 ? 1 : 0;
                         animate opacity { duration: 120ms; delay: 40ms * i; easing: ease-out; }
+
+                        // Progress inside this cell: its own width, clamped to
+                        // the cell, so the fill clips at every 1px gap and never
+                        // bleeds into the next cell.
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: clamp(pill.scrub_cells_w * root.scrub_frac
+                                - i * (pill.scrub_cell_w + 1px), 0px, pill.scrub_cell_w);
+                            height: 100%;
+                            border-radius: 3px;
+                            background: AppTheme.player-progress;
+                        }
                     }
                 }
 
-                // Playhead: a 2px accent line across the cell row at the exact
-                // fraction of the current window, with a 6px cap on top and a
-                // light outline behind it so it reads on an accent-bright cell.
+                // Playhead: a 2px white line across the cell row at the current
+                // progress, with a 6px cap on top and a dark halo behind it so
+                // it reads on both the green fill and the dark track.
                 if root.scrub_level > 0 : Rectangle {
                     x: pill.scrub_head_x - 3px;
                     y: cell_row.y - 5px;
                     width: 6px;
                     height: cell_row.height + 10px;
                     border-radius: 3px;
-                    background: AppTheme.player-fg-strong.transparentize(0.72);
+                    background: AppTheme.player-shadow;
                 }
 
                 if root.scrub_level > 0 : Rectangle {
@@ -3929,7 +4277,7 @@ export component PlayerWindow inherits Window {
                     width: 2px;
                     height: cell_row.height + 8px;
                     border-radius: 1px;
-                    background: AppTheme.accent;
+                    background: AppTheme.player-fg-strong;
                 }
 
                 // 6px cap on the line's top end.
@@ -3939,17 +4287,16 @@ export component PlayerWindow inherits Window {
                     width: 6px;
                     height: 4px;
                     border-radius: 2px;
-                    background: AppTheme.accent;
+                    background: AppTheme.player-fg-strong;
                 }
 
-                // Pointer readout: the time under the line, floating just above
-                // the pill. Shown only while the pointer is on the strip (or a
-                // drag is in flight); the window label at the top-left keeps
-                // showing the range, so both are readable at once. The chip is
-                // clamped to the pill's own 8px gutters, so it never leaves the
-                // strip at either edge and never jumps by a character.
-                if pill.scrub_tracking : Rectangle {
-                    x: clamp(pill.scrub_head_pointer - self.width / 2, 8px,
+                // Drag readout: the preview time, floating just above the pill.
+                // Shown only while the pointer is DOWN (the fill and the line
+                // follow it); the window label at the top-left keeps showing the
+                // range, so both are readable at once. The chip is clamped to
+                // the pill's own 8px gutters, so it never leaves the strip.
+                if root.scrub_dragging : Rectangle {
+                    x: clamp(pill.scrub_head_x - self.width / 2, 8px,
                         max(8px, parent.width - 8px - self.width));
                     y: -28px;
                     width: pointer_label.preferred-width + 14px;
@@ -3966,7 +4313,7 @@ export component PlayerWindow inherits Window {
                         x: 7px;
                         width: max(0px, parent.width - 14px);
                         height: 100%;
-                        text: root.clock(pill.scrub_pointer_ms);
+                        text: root.clock(root.scrub_preview_ms);
                         color: AppTheme.player-fg-strong;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -3975,9 +4322,12 @@ export component PlayerWindow inherits Window {
                 }
 
                 // The whole strip is the seek surface: press anywhere and drag
-                // horizontally for a continuous absolute seek. Right-click steps
-                // one level out (level 1 -> back to the toolbar); double-click
-                // a cell dives one level in on that cell's slice.
+                // horizontally for a continuous absolute seek PREVIEW. The fill,
+                // the line and the time chip follow the pointer 1:1 while the
+                // button is down; the single `seek()` is issued on release.
+                // Right-click steps one level out (level 1 -> back to the
+                // toolbar); double-click a cell dives one level in on that
+                // cell's slice.
                 scrub_area := TouchArea {
                     x: 0;
                     y: 0;
@@ -3997,24 +4347,28 @@ export component PlayerWindow inherits Window {
                             return EventResult.reject;
                         }
                         if (event.kind == PointerEventKind.down) {
+                            root.scrub_settling = false;
                             root.scrub_dragging = true;
                             root.scrub_drag_ms = root.scrub-ms-at(self.mouse-x, self.width);
-                            root.seek(root.scrub_drag_ms);
                             EventResult.accept
                         } else if (event.kind == PointerEventKind.move) {
                             if (root.scrub_dragging) {
                                 root.scrub_drag_ms = root.scrub-ms-at(self.mouse-x, self.width);
-                                root.seek(root.scrub_drag_ms);
                             }
                             EventResult.accept
                         } else if (event.kind == PointerEventKind.up) {
                             if (root.scrub_dragging) {
                                 root.scrub_drag_ms = root.scrub-ms-at(self.mouse-x, self.width);
-                                root.seek(root.scrub_drag_ms);
                                 root.scrub_dragging = false;
+                                // Hold the released target on the strip until
+                                // the new position lands.
+                                root.scrub_settle_ms = root.scrub_drag_ms;
+                                root.scrub_settling = true;
+                                root.seek(root.scrub_drag_ms);
                             }
                             EventResult.accept
                         } else {
+                            // Cancel (pointer lost): drop the preview, no seek.
                             root.scrub_dragging = false;
                             EventResult.accept
                         }
@@ -4114,7 +4468,6 @@ export component PlayerWindow inherits Window {
                             // band around it: mouse-x is relative to this area,
                             // and `track.x` is its inset inside it.
                             root.drag_ms = root.ms-at(self.mouse-x - track.x, track.width);
-                            root.seek_sent_ms = -1;
                             EventResult.accept
                         } else if (event.kind == PointerEventKind.move) {
                             if (root.dragging) {
@@ -4123,8 +4476,8 @@ export component PlayerWindow inherits Window {
                             EventResult.accept
                         } else if (event.kind == PointerEventKind.up) {
                             if (root.dragging) {
+                                root.drag_ms = root.ms-at(self.mouse-x - track.x, track.width);
                                 root.dragging = false;
-                                root.seek_sent_ms = root.drag_ms;
                                 root.seek(root.drag_ms);
                             }
                             EventResult.accept
@@ -4134,7 +4487,6 @@ export component PlayerWindow inherits Window {
                             // last position the pointer showed.
                             if (root.dragging) {
                                 root.dragging = false;
-                                root.seek_sent_ms = root.drag_ms;
                                 root.seek(root.drag_ms);
                             }
                             EventResult.accept
@@ -4275,9 +4627,22 @@ export component PlayerWindow inherits Window {
                     clicked => { root.set-right(2); }
                 }
 
+                // 平滑: frame interpolation. Click cycles 关闭 -> 帧混合 -> RIFE
+                // in Rust (which persists the choice); the badge carries the
+                // current mode, the tooltip above the pill spells it out.
+                interp_icon := InterpIcon {
+                    x: 342px;
+                    y: 1px;
+                    width: 38px;
+                    height: 38px;
+                    level: root.interp_level;
+                    interactive: root.chrome_shown && root.scrub_level == 0;
+                    clicked => { root.interp_cycle(); }
+                }
+
                 // 设置 (right panel, 设置 tab)
                 PillIcon {
-                    x: 342px;
+                    x: 386px;
                     y: 1px;
                     width: 38px;
                     height: 38px;
@@ -4292,6 +4657,43 @@ export component PlayerWindow inherits Window {
                 // removed). It stays reachable by DOUBLE-CLICKING the picture:
                 // see `video_area.double-clicked => root.toggle_fullscreen()`.
                 // The keyboard shortcut (F8 / Esc to leave) is unchanged.
+            }
+
+            // ---- 平滑 tooltip (one line, above the pill) ----
+            // Raised only while the 平滑 cell itself is hovered. It is a
+            // Rectangle, not a TouchArea: it can never steal the pointer (and
+            // so the hover) from the cell that shows it. Its x is centred on
+            // that cell and clamped to the pill's own 6px margin; y -30px sits
+            // clear of the 16px seek band. The plate is the popovers' own
+            // surface (menu fill, 1px hairline, soft shadow).
+            interp_tip_plate := Rectangle {
+                property <bool> shown: interp_icon.hot
+                    && root.chrome_shown && root.scrub_level == 0;
+                visible: self.shown;
+                width: interp_tip_label.preferred-width + 16px;
+                height: 22px;
+                x: clamp(controls_row.x + interp_icon.x + interp_icon.width / 2
+                    - self.width / 2, 6px,
+                    max(6px, pill.width - 6px - self.width));
+                y: -30px;
+                border-radius: 6px;
+                background: AppTheme.player-menu;
+                border-width: 1px;
+                border-color: AppTheme.player-menu-border;
+                drop-shadow-color: AppTheme.player-shadow;
+                drop-shadow-blur: 10px;
+                drop-shadow-offset-y: 3px;
+
+                interp_tip_label := Text {
+                    x: 8px;
+                    width: max(0px, parent.width - 16px);
+                    height: 100%;
+                    text: root.interp_tip;
+                    color: AppTheme.player-text;
+                    font-size: 10.5px;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
             }
 
             // ---- 音量 popover (above the button) ----
@@ -4809,25 +5211,85 @@ export component PlayerWindow inherits Window {
             }
         }
 
+        // ===================== 滚轮音量 HUD =====================
+        // A 24 x 140 capsule near the video's right edge (16px in, vertically
+        // centred): `player-menu` + hairline + the floating-chrome shadow, a
+        // 6px track filled from the BOTTOM to the current level, and a 16px
+        // drawn speaker at the bottom. No text and no numbers - the position of
+        // the fill is the reading. It is painted from plain Rectangles/Paths
+        // with no TouchArea at all, so it is pointer-transparent and can never
+        // steal a click or the wheel.
+        Rectangle {
+            x: parent.width - 40px;
+            y: (parent.height - 140px) / 2;
+            width: 24px;
+            height: 140px;
+            border-radius: 12px;
+            background: AppTheme.player-menu;
+            border-width: 1px;
+            border-color: AppTheme.player-menu-border;
+            drop-shadow-color: AppTheme.player-shadow;
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 4px;
+            opacity: root.wheel_hud_on ? 1 : 0;
+            animate opacity {
+                duration: root.wheel_hud_on ? 140ms : 240ms;
+                easing: ease-out;
+            }
+
+            hud_track := Rectangle {
+                x: (parent.width - 6px) / 2;
+                y: 10px;
+                width: 6px;
+                height: 100px;
+                border-radius: 3px;
+                background: AppTheme.player-track;
+            }
+
+            // Fill grows from the BOTTOM edge to the volume level.
+            Rectangle {
+                x: hud_track.x;
+                width: hud_track.width;
+                height: hud_track.height * clamp(root.volume, 0, 100) / 100;
+                y: hud_track.y + hud_track.height - self.height;
+                border-radius: 3px;
+                background: root.muted ? AppTheme.player-muted-fill : AppTheme.accent;
+            }
+
+            Path {
+                x: (parent.width - 16px) / 2;
+                y: 118px;
+                width: 16px;
+                height: 12px;
+                viewbox-width: 16;
+                viewbox-height: 12;
+                commands: root.muted
+                    ? "M 1.4 4.2 L 4.2 4.2 L 7.4 1.2 L 7.4 10.8 L 4.2 7.8 L 1.4 7.8 Z M 10.2 3.4 L 14.2 8.6 M 14.2 3.4 L 10.2 8.6"
+                    : "M 1.4 4.2 L 4.2 4.2 L 7.4 1.2 L 7.4 10.8 L 4.2 7.8 L 1.4 7.8 Z M 9.6 3.9 C 10.9 4.9 10.9 7.1 9.6 8.1 M 11.9 1.9 C 14.4 3.8 14.4 8.2 11.9 10.1";
+                fill: #00000000;
+                stroke: AppTheme.player-text-soft;
+                stroke-width: 1.3px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+        }
+
         // ===================== 提示条 (toast stack) =====================
-        // Bottom-centre of the video, above the pill. Three fixed slots (38px
-        // each with an 8px gap = 130px), newest at the BOTTOM: a new message
-        // enters there and the older ones rise. Fixed slots are what makes the
-        // 200ms exit animatable - a model removal would destroy the node.
-        // The buffering plate owns the picture while it is up, so the stack
-        // fades out instead of overlapping it; the pill is never covered (the
-        // stack's bottom edge sits 12px above `pill_y`).
+        // Top-centre of the video area, 12px under the 44px title strip, so the
+        // stack never covers the pill, its popovers or the buffering plate.
+        // Three fixed slots (36px each with an 8px gap = 124px), newest on TOP:
+        // a new message enters at slot 0 and pushes the older ones down. Fixed
+        // slots are what makes the 200ms exit animatable - a model removal
+        // would destroy the node.
         toast_stack := Rectangle {
-            x: (parent.width - 330px) / 2;
-            y: max(0px, root.pill_y - 142px);
-            width: 330px;
-            height: 130px;
+            x: (parent.width - self.width) / 2;
+            y: 56px;
+            width: min(420px, max(0px, parent.width - 32px));
+            height: 124px;
             background: #00000000;
-            opacity: root.buffering ? 0 : 1;
-            animate opacity { duration: 160ms; easing: ease-out; }
 
             ToastView {
-                slot_y: 92px;
+                slot_y: 0px;
                 shown: root.toasts.length > 0;
                 message: root.toast-text(0);
                 kind: root.toast-kind(0);
@@ -4835,7 +5297,7 @@ export component PlayerWindow inherits Window {
             }
 
             ToastView {
-                slot_y: 46px;
+                slot_y: 44px;
                 shown: root.toasts.length > 1;
                 message: root.toast-text(1);
                 kind: root.toast-kind(1);
@@ -4843,7 +5305,7 @@ export component PlayerWindow inherits Window {
             }
 
             ToastView {
-                slot_y: 0px;
+                slot_y: 88px;
                 shown: root.toasts.length > 2;
                 message: root.toast-text(2);
                 kind: root.toast-kind(2);
@@ -5620,112 +6082,228 @@ export component PlayerWindow inherits Window {
                 }
 
                 // ================= 2 网络分析 =================
-                // A diagnostic instrument, not a debug dump: three sections with
-                // the panel's own heading style, value rows right-aligned in one
-                // column so the numbers line up, a buffer fill bar and a sparkline
-                // strip built from `net_history`. Every value is a string Rust
-                // publishes; an empty one reads "-" instead of a gap.
+                // A diagnostic instrument, not a debug dump. Top to bottom:
+                //   实时速度   metered throughput as one big number + a 3px bar
+                //              scaled to the max of the last 5 s
+                //   线程       busy / configured + the per-connection rows
+                //   下载分布   the whole file in 120 slices (missing / held /
+                //              warm point cache / fetching) with the playhead
+                //   平滑       the interpolation mode (click to cycle), the
+                //              generator readout and an optional GPU line
+                //   帧率/缓冲  the decoder's own numbers
+                // Every value is a string Rust publishes; an empty one reads "-".
                 if root.right_tab == 2 : Rectangle {
                     vertical-stretch: 1;
                     background: #00000000;
 
-                    VerticalLayout {
-                        padding-left: 12px;
-                        padding-right: 12px;
-                        padding-top: 2px;
-                        padding-bottom: 12px;
-                        spacing: 0px;
+                    // 1 s pulse for the active cells: `net_pulse` animates 0 -> 1
+                    // -> 0, and the strip's active slices fade with it.
+                    Timer {
+                        interval: 1000ms;
+                        running: root.net_panel_open;
+                        triggered => { root.net_pulse = root.net_pulse == 0 ? 1 : 0; }
+                    }
 
-                        PanelSection { text: "帧率"; }
-                        NetStat { label: "呈现"; value: root.or-dash(root.net_fps_presented); strong: true; }
-                        NetStat { label: "解码"; value: root.or-dash(root.net_fps_decoded); }
-                        NetStat { label: "首帧耗时"; value: root.or-dash(root.net_first_frame); }
-                        NetStat { label: "编码"; value: root.or-dash(root.net_codec); }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        content-height: root.net_h;
 
-                        PanelSection { text: "缓冲"; }
-                        NetStat { label: "缓冲"; value: root.or-dash(root.net_buffer); }
-                        NetStat { label: "估算码率"; value: root.or-dash(root.net_bitrate); }
-                        NetStat { label: "网络速率"; value: root.or-dash(root.net_rate); }
-                        NetStat { label: "进度"; value: root.or-dash(root.net_progress); }
-                        NetStat { label: "卡顿"; value: root.or-dash(root.net_stalls); }
-                        if root.buffer_detail != "" : NetStat { label: "缓冲明细"; value: root.buffer_detail; }
+                        VerticalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 2px;
+                            padding-bottom: 12px;
+                            spacing: 0px;
 
-                        // buffer fill: 6px well, accent fill, 0..1 from Rust
-                        Rectangle {
-                            height: 18px;
-                            background: #00000000;
+                            // ---- 1 实时速度 ----
+                            PanelSection { text: "实时速度"; }
 
+                            Text {
+                                height: 34px;
+                                text: root.or-dash(root.net_rate);
+                                color: AppTheme.player-fg-strong;
+                                font-size: 24px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            // live bar: 3px well, accent fill, 0..1 of the 5 s max
                             Rectangle {
-                                x: 0;
-                                y: 6px;
-                                width: 100%;
-                                height: 6px;
-                                border-radius: 3px;
-                                background: AppTheme.player-track;
+                                height: 12px;
+                                background: #00000000;
+
+                                Rectangle {
+                                    y: 4px;
+                                    width: 100%;
+                                    height: 3px;
+                                    border-radius: 1.5px;
+                                    background: AppTheme.player-track;
+                                }
+
+                                Rectangle {
+                                    y: 4px;
+                                    width: parent.width * clamp(root.net_rate_ratio, 0, 1);
+                                    height: 3px;
+                                    border-radius: 1.5px;
+                                    background: AppTheme.accent;
+                                    animate width { duration: 200ms; easing: ease-out; }
+                                }
                             }
 
-                            Rectangle {
-                                x: 0;
-                                y: 6px;
-                                width: parent.width * clamp(root.net_buffer_ratio, 0, 1);
-                                height: 6px;
-                                border-radius: 3px;
-                                background: AppTheme.accent;
-                                animate width { duration: 200ms; easing: ease-out; }
-                            }
-                        }
+                            Rectangle { height: 4px; background: #00000000; }
 
-                        PanelSection { text: "最近采样"; }
+                            // ---- 2 线程 ----
+                            PanelSection { text: "线程"; }
 
-                        // Sparkline: one thin bar per sample, newest last. Plain
-                        // Rectangles in a repeater - no custom paths, no images.
-                        Rectangle {
-                            height: 64px;
-                            border-radius: 6px;
-                            background: AppTheme.player-btn;
-                            clip: true;
-
-                            // baseline
-                            Rectangle {
-                                x: 6px;
-                                y: parent.height - 6px;
-                                width: max(0px, parent.width - 12px);
-                                height: 1px;
-                                background: AppTheme.player-track;
+                            Text {
+                                height: 22px;
+                                text: root.or-dash(root.net_active_text);
+                                color: AppTheme.player-text;
+                                font-size: 11.5px;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
 
-                            for s[i] in root.net_history : Rectangle {
-                                x: 6px + i * ((parent.width - 12px) / max(1, root.net_history.length));
-                                width: max(1px, (parent.width - 12px) / max(1, root.net_history.length) - 1px);
-                                y: parent.height - 6px - clamp(s, 0, 1) * (parent.height - 14px);
-                                height: max(1px, clamp(s, 0, 1) * (parent.height - 14px));
-                                background: AppTheme.accent;
-                                opacity: 0.35 + 0.65 * clamp(s, 0, 1);
-                            }
-
-                            if root.net_history.length == 0 : Text {
-                                width: 100%;
-                                height: 100%;
-                                text: "等待采样";
+                            if root.net_workers.length == 0 : Text {
+                                height: 18px;
+                                text: "等待连接";
                                 color: AppTheme.player-text-dim;
-                                font-size: 11px;
-                                horizontal-alignment: center;
+                                font-size: 10.5px;
                                 vertical-alignment: center;
                             }
-                        }
 
-                        Rectangle {
-                            height: 6px;
-                            background: #00000000;
-                        }
+                            for w in root.net_workers : NetWorkerRow {
+                                host: w.host;
+                                range: w.range;
+                                bytes: w.bytes;
+                                busy: w.busy;
+                            }
 
-                        Text {
-                            text: "每秒一次 · 越靠右越新";
-                            color: AppTheme.player-text-dim;
-                            font-size: 10px;
-                        }
+                            // ---- 3 下载分布 ----
+                            PanelSection { text: "下载分布"; }
 
-                        Rectangle { vertical-stretch: 1; background: #00000000; }
+                            Rectangle {
+                                height: 10px;
+                                background: #00000000;
+
+                                // 120 slices, 1px gaps, 2px radius: 0 missing
+                                // (track), 1 held (green 55%), 2 warm point
+                                // cache (green 80%), 3 fetching (accent, pulsing)
+                                for s[i] in root.net_map : Rectangle {
+                                    x: i * (parent.width / max(1, root.net_map.length));
+                                    width: max(1px, parent.width / max(1, root.net_map.length) - 1px);
+                                    y: 2px;
+                                    height: 6px;
+                                    border-radius: 2px;
+                                    background: s == 3
+                                        ? AppTheme.accent
+                                        : (s >= 1 ? AppTheme.player-progress : AppTheme.player-track);
+                                    opacity: s == 3
+                                        ? 0.55 + 0.45 * root.net_pulse
+                                        : (s == 2 ? 0.8 : (s == 1 ? 0.55 : 1));
+                                }
+
+                                // 播放位置: a 2px white playhead over the strip.
+                                // `shown_ms` follows the seek drag, so the marker
+                                // previews the target before the seek lands.
+                                if root.duration_ms > 0.0 : Rectangle {
+                                    x: min(
+                                        max(0px, parent.width - 2px),
+                                        parent.width * clamp(root.shown_ms / root.duration_ms, 0, 1)
+                                    );
+                                    y: 2px;
+                                    width: 2px;
+                                    height: 6px;
+                                    border-radius: 1px;
+                                    background: AppTheme.player-fg-strong;
+                                }
+                            }
+
+                            Text {
+                                height: 18px;
+                                text: root.or-dash(root.net_total_text);
+                                color: AppTheme.player-text;
+                                font-size: 10.5px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                NetLegend { label: "未下载"; tint: AppTheme.player-track; }
+                                NetLegend { label: "已下载"; tint: AppTheme.player-progress; alpha: 0.55; }
+                                NetLegend { label: "预热点"; tint: AppTheme.player-progress; alpha: 0.8; }
+                                NetLegend {
+                                    label: "下载中";
+                                    tint: AppTheme.accent;
+                                    alpha: 0.55 + 0.45 * root.net_pulse;
+                                }
+                            }
+
+                            Rectangle { height: 6px; background: #00000000; }
+
+                            // ---- 4 平滑 ----
+                            // Frame interpolation. 模式 is the panel's second
+                            // entry point to the same cycle the pill cell
+                            // fires; 生成 is Rust's generator readout and GPU
+                            // only appears when Rust publishes a GPU line.
+                            // Three 24px rows, the label column at 104px - the
+                            // exact NetStat geometry of 帧率 / 缓冲 below.
+                            PanelSection { text: "平滑"; }
+                            NetStat {
+                                label: "模式";
+                                value: root.interp_mode_text;
+                                clickable: true;
+                                clicked => { root.interp_cycle(); }
+                            }
+                            NetStat { label: "生成"; value: root.interp_stats_text; }
+                            if root.interp_gpu_text != "" : NetStat {
+                                label: "GPU";
+                                value: root.interp_gpu_text;
+                            }
+
+                            // ---- 5 帧率 ----
+                            PanelSection { text: "帧率"; }
+                            NetStat { label: "呈现"; value: root.or-dash(root.net_fps_presented); strong: true; }
+                            NetStat { label: "解码"; value: root.or-dash(root.net_fps_decoded); }
+                            NetStat { label: "首帧耗时"; value: root.or-dash(root.net_first_frame); }
+                            NetStat { label: "编码"; value: root.or-dash(root.net_codec); }
+
+                            // ---- 6 缓冲 ----
+                            PanelSection { text: "缓冲"; }
+                            NetStat { label: "缓冲"; value: root.or-dash(root.net_buffer); }
+                            NetStat { label: "估算码率"; value: root.or-dash(root.net_bitrate); }
+                            NetStat { label: "网络速率"; value: root.or-dash(root.net_rate); }
+                            NetStat { label: "进度"; value: root.or-dash(root.net_progress); }
+                            NetStat { label: "卡顿"; value: root.or-dash(root.net_stalls); }
+                            if root.buffer_detail != "" : NetStat { label: "缓冲明细"; value: root.buffer_detail; }
+
+                            // buffer fill: 6px well, accent fill, 0..1 from Rust
+                            Rectangle {
+                                height: 18px;
+                                background: #00000000;
+
+                                Rectangle {
+                                    x: 0;
+                                    y: 6px;
+                                    width: 100%;
+                                    height: 6px;
+                                    border-radius: 3px;
+                                    background: AppTheme.player-track;
+                                }
+
+                                Rectangle {
+                                    x: 0;
+                                    y: 6px;
+                                    width: parent.width * clamp(root.net_buffer_ratio, 0, 1);
+                                    height: 6px;
+                                    border-radius: 3px;
+                                    background: AppTheme.accent;
+                                    animate width { duration: 200ms; easing: ease-out; }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -6531,6 +7109,10 @@ component SkeletonBand inherits Rectangle {
     width: 100%;
     height: 100%;
     clip: true;
+    // A scrolling list turns the per-band sweep animation OFF (0ms): the band
+    // still follows the shared phase, but nothing animates per card while the
+    // feed moves.
+    in property <bool> quiet: false;
     property <length> band-width: max(72px, self.width * 0.5);
 
     Rectangle {
@@ -6538,7 +7120,7 @@ component SkeletonBand inherits Rectangle {
         height: parent.height;
         background: @linear-gradient(90deg, #00000000 0%, AppTheme.shimmer 50%, #00000000 100%);
         x: AppTheme.skeleton_phase * (parent.width + self.width) - self.width;
-        animate x { duration: 90ms; easing: linear; }
+        animate x { duration: root.quiet ? 0ms : 90ms; easing: linear; }
     }
 }
 
@@ -6645,8 +7227,26 @@ component VideoCardView inherits Rectangle {
     // forwarded from the grid it lives in. `glass_valid` is false while the
     // blur slider sits at 0 and before the first snapshot arrives; the tint
     // below is then the only layer, which is the old look.
+    //
+    // `glass_live` is the scroll gate: the home feed sets it false while the
+    // list is moving, so a scrolling card paints its flat tint and skips the
+    // backdrop slice (the per-card image placement is the per-frame cost at
+    // 120 fps). The node stays alive and comes back 120ms after the scroll
+    // stops - no image is re-created, and the glass is never lost.
+    //
+    // `quiet` is the same gate for motion: while the feed scrolls the hover
+    // washes and the skeleton sweep stop animating, so a moving list runs no
+    // per-card animation at all.
     in property <image> glass_source;
     in property <bool> glass_valid: false;
+    in property <bool> glass_live: true;
+    in property <bool> quiet: false;
+    // Refresh feedback, driven by ONE window clock (see AppWindow): a card
+    // fades 0.55 -> 1 and lifts 6px into place, staggered 18ms per slot, only
+    // for the first 12 slots of the visible page. `refresh_ms` is that clock.
+    in property <bool> refresh_run: false;
+    in property <int> refresh_ms: 0;
+    in property <int> refresh_slot: 999;
     in property <length> glass_x: 0px;
     in property <length> glass_y: 0px;
     in property <length> glass_w: 0px;
@@ -6656,12 +7256,6 @@ component VideoCardView inherits Rectangle {
     callback play();
     callback owner-activate();
     callback remove-clicked();
-    // The full-title tooltip is drawn by the window (above every page, so no
-    // list viewport clips it); the card only reports its own window rect and
-    // title on hover, and the same rect when the pointer leaves so a late hide
-    // from a card the pointer already left cannot clear the next card's tip.
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
     // Card pointer semantics: 0 = left (replace), 1 = right (new window),
     // 2 = ctrl+left (enqueue). Slint 1.18 pointer events carry
     // `modifiers`, so the Control state comes from the press itself rather
@@ -6677,12 +7271,15 @@ component VideoCardView inherits Rectangle {
     property <length> avatar-size: min(76px, card-width - 32px);
     // One hover truth for the card surface, the queue mark and the remove
     // button: whichever hit area owns the pointer, the card stays lifted and
-    // the mark stays revealed (no flicker while moving onto the mark).
-    property <bool> card-hover: card_area.has-hover || queue_hit.has-hover;
+    // the mark stays revealed (no flicker while moving onto the mark). While
+    // the feed scrolls (`quiet`) hover is suppressed outright: rows move under
+    // a stationary pointer, so any hover-driven wash would animate per frame.
+    property <bool> card-hover: (card_area.has-hover || queue_hit.has-hover) && !root.quiet;
 
     // ---- meta line: title 18 / gap 6 / meta 20 / bottom 8 = 60px body ----
-    // The title is exactly one line now (the full copy lives in the hover
-    // tooltip), which frees 12px of every card; grids use `cover-h + 60px`.
+    // The title is exactly one line and ellipsizes; there is no full-title
+    // hover surface any more. That frees 12px of every card, so grids use
+    // `cover-h + 60px`.
     property <length> title-y: cover-h + 8px;
     property <length> meta-y: cover-h + 32px;
 
@@ -6723,34 +7320,28 @@ component VideoCardView inherits Rectangle {
     // The chip hugs its label: 11px text + 3px a side, radius 6, one 16px row.
     property <length> chip-w: fresh_label.preferred-width + 6px;
     property <length> chip-x: card-width - 9px - (show-fresh ? chip-w : 0px);
-    property <length> dot-x: chip-x - (show-fresh ? 6px : 0px) - (show-dot ? 8px : 0px);
+    property <length> dot-x: chip-x - (show-fresh ? 6px : 0px) - (show-dot ? 12px : 0px);
     // The owner name yields to the right-hand marks, then elides.
     property <length> name-max-w: max(0px, dot-x - 9px - ((show-dot || show-fresh) ? 8px : 0px));
     property <bool> name-shown: show-owner && owner != "";
-    property <bool> dot-hover: dot_hit.has-hover;
+    property <bool> dot-hover: dot_hit.has-hover && !root.quiet;
+    // Hover on the UP name: a wash under the name. Suppressed while scrolling
+    // for the same reason as `card-hover`.
+    property <bool> owner-hover: owner_hit.has-hover && !root.quiet;
 
-    // The one-line title can ellipsize; hovering the card reports the full copy
-    // to the window's floating tooltip (see AppWindow). A hide carries the rect
-    // so a late hide from a card the pointer already left cannot clear the next
-    // card's tooltip.
-    changed card-hover => {
-        if (root.card-hover) {
-            if (root.title != "") {
-                root.tip_show(
-                    root.absolute-position.x,
-                    root.absolute-position.y,
-                    root.width,
-                    root.height,
-                    root.title
-                );
-            }
-        } else {
-            root.tip_hide(root.absolute-position.x, root.absolute-position.y);
-        }
-    }
+    // Refresh settle: delay = slot * 18ms (12 slots max), then a 160ms
+    // ease-out fade/lift driven by the window clock. No timer here.
+    property <bool> refresh_active: root.refresh_run && root.refresh_slot < 12;
+    property <float> refresh_p: clamp((root.refresh_ms * 1.0 - root.refresh_slot * 18.0) / 160.0, 0, 1);
+    property <float> refresh_ease: 1 - (1 - root.refresh_p) * (1 - root.refresh_p);
+    property <length> refresh_lift: root.refresh_active ? (1 - root.refresh_ease) * 6px : 0px;
 
     width: card-width;
     height: cover-h + 60px;
+    // Refresh settle (see the inputs above): a paint offset inside the fixed
+    // slot, so the grid never re-lays out and the scroll position never moves.
+    y: root.refresh_lift;
+    opacity: root.refresh_active ? 0.55 + 0.45 * root.refresh_ease : 1;
     // The card surface is layered: [blurred backdrop] under [card tint]. The
     // root stays transparent so the glass layer can sit beneath the tint; the
     // tint keeps the cover and text readable over the glass. No root clip: the
@@ -6780,6 +7371,10 @@ component VideoCardView inherits Rectangle {
             height: root.glass_h;
             source: root.glass_source;
             image-fit: fill;
+            // Scroll gate: invisible means the renderer never reads its x/y/
+            // source, so a moving list pays no per-card glass cost. The node
+            // itself stays declared, so the glass returns without a re-create.
+            visible: root.glass_live;
         }
     }
 
@@ -6813,7 +7408,9 @@ component VideoCardView inherits Rectangle {
             animate opacity { duration: 220ms; easing: ease-out; }
         }
 
-        if root.thumb.width <= 0 && AppTheme.skeletons_on : SkeletonBand { }
+        if root.thumb.width <= 0 && AppTheme.skeletons_on : SkeletonBand {
+            quiet: root.quiet;
+        }
     }
 
     // A user search hit has a square avatar, not a 16:9 cover: centre it on a
@@ -6844,7 +7441,9 @@ component VideoCardView inherits Rectangle {
                 animate opacity { duration: 220ms; easing: ease-out; }
             }
 
-            if root.thumb.width <= 0 && AppTheme.skeletons_on : SkeletonBand { }
+            if root.thumb.width <= 0 && AppTheme.skeletons_on : SkeletonBand {
+                quiet: root.quiet;
+            }
         }
     }
 
@@ -6969,7 +7568,7 @@ component VideoCardView inherits Rectangle {
         height: 20px;
         border-radius: 4px;
         visible: root.name-shown;
-        background: root.name-shown && root.owner-link && owner_hit.has-hover
+        background: root.name-shown && root.owner-link && root.owner-hover
             ? AppTheme.accent-soft
             : #00000000;
         animate background { duration: 120ms; easing: ease-out; }
@@ -6980,7 +7579,7 @@ component VideoCardView inherits Rectangle {
             width: parent.width - 6px;
             height: 20px;
             text: root.owner;
-            color: root.owner-link && owner_hit.has-hover ? AppTheme.text : AppTheme.text-soft;
+            color: root.owner-link && root.owner-hover ? AppTheme.text : AppTheme.text-soft;
             font-size: 12px;
             vertical-alignment: center;
             overflow: elide;
@@ -7012,11 +7611,13 @@ component VideoCardView inherits Rectangle {
         overflow: elide;
     }
 
-    // Rarity dot: the play count as one 8px rank mark, grey -> gold. The exact
-    // number is the dot's tooltip; its 16px hit swallows the click so it never
-    // opens the card.
+    // Rarity bulb: the play count as one small lit lamp, grey -> gold. Three
+    // concentric layers (12 / 9 / 6px) in the level colour make it glow instead
+    // of reading as a flat dot; the hover lifts the two soft layers slightly.
+    // The exact number is the bulb's tooltip; its 16px hit swallows the click
+    // so it never opens the card.
     dot_hit := TouchArea {
-        x: root.dot-x - 4px;
+        x: root.dot-x - 2px;
         y: root.meta-y;
         width: 16px;
         height: 20px;
@@ -7024,12 +7625,37 @@ component VideoCardView inherits Rectangle {
         clicked => { }
     }
 
+    // Outer glow: 12px at ~18% alpha (brightens to ~26% on card hover).
     Rectangle {
         x: root.dot-x;
-        y: root.meta-y + 6px;
-        width: 8px;
-        height: 8px;
-        border-radius: 4px;
+        y: root.meta-y + 4px;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        visible: root.show-dot;
+        background: AppTheme.rarity-ramp[root.dot-level].transparentize(root.card-hover ? 0.74 : 0.82);
+        animate background { duration: 120ms; easing: ease-out; }
+    }
+
+    // Mid glow: 9px at ~35% alpha.
+    Rectangle {
+        x: root.dot-x + 1.5px;
+        y: root.meta-y + 5.5px;
+        width: 9px;
+        height: 9px;
+        border-radius: 4.5px;
+        visible: root.show-dot;
+        background: AppTheme.rarity-ramp[root.dot-level].transparentize(root.card-hover ? 0.52 : 0.65);
+        animate background { duration: 120ms; easing: ease-out; }
+    }
+
+    // Core: 6px, solid.
+    Rectangle {
+        x: root.dot-x + 3px;
+        y: root.meta-y + 7px;
+        width: 6px;
+        height: 6px;
+        border-radius: 3px;
         visible: root.show-dot;
         background: AppTheme.rarity-ramp[root.dot-level];
     }
@@ -7137,13 +7763,24 @@ component MasonryCardView inherits Rectangle {
 
     callback activate();
 
+    // Refresh settle (see VideoCardView / AppWindow): stagger by COLUMN, so the
+    // three columns ripple left to right. 18ms per column, 160ms ease-out.
+    in property <bool> refresh_run: false;
+    in property <int> refresh_ms: 0;
+    in property <int> refresh_col: 0;
+
     // h/w from the data, clamped so a malformed value cannot collapse or
     // explode a column. 0.5625 (16:9) is the neutral fallback.
     property <length> cover-h: card-width * max(0.45, min(1.6, aspect));
     property <bool> card-hover: card_area.has-hover;
+    property <float> refresh_p: clamp((refresh_ms * 1.0 - refresh_col * 18.0) / 160.0, 0, 1);
+    property <float> refresh_ease: 1 - (1 - refresh_p) * (1 - refresh_p);
 
     width: card-width;
     height: cover-h + 72px;
+    // Paint offset only: the slot keeps its height, so the grid never reflows.
+    y: refresh_run ? (1 - refresh_ease) * 6px : 0px;
+    opacity: refresh_run ? 0.55 + 0.45 * refresh_ease : 1;
     background: #00000000;
     border-radius: 10px;
     clip: true;
@@ -7292,6 +7929,9 @@ component FavMasonry inherits Rectangle {
     in property <length> glass_y: 0px;
     in property <length> glass_w: 0px;
     in property <length> glass_h: 0px;
+    // Refresh feedback clock (see AppWindow): stagger by column.
+    in property <bool> refresh_run: false;
+    in property <int> refresh_ms: 0;
 
     callback open(string);
 
@@ -7355,6 +7995,9 @@ component FavMasonry inherits Rectangle {
                 title: card.title;
                 owner: card.owner;
                 duration: card.duration;
+                refresh_run: root.refresh_run;
+                refresh_ms: root.refresh_ms;
+                refresh_col: 0;
                 glass_source: root.glass_source;
                 glass_valid: root.glass_valid;
                 glass_x: root.glass_x;
@@ -7398,6 +8041,9 @@ component FavMasonry inherits Rectangle {
                 title: card.title;
                 owner: card.owner;
                 duration: card.duration;
+                refresh_run: root.refresh_run;
+                refresh_ms: root.refresh_ms;
+                refresh_col: 1;
                 glass_source: root.glass_source;
                 glass_valid: root.glass_valid;
                 glass_x: root.glass_x;
@@ -7442,6 +8088,9 @@ component FavMasonry inherits Rectangle {
                 title: card.title;
                 owner: card.owner;
                 duration: card.duration;
+                refresh_run: root.refresh_run;
+                refresh_ms: root.refresh_ms;
+                refresh_col: 2;
                 glass_source: root.glass_source;
                 glass_valid: root.glass_valid;
                 glass_x: root.glass_x;
@@ -7451,6 +8100,24 @@ component FavMasonry inherits Rectangle {
                 activate => { root.open(card.bvid); }
             }
         }
+    }
+
+    // 2px accent sweep, once per refresh, left -> right in 320ms. It sits at the
+    // masonry's content top, which the refresh pin holds at the viewport top.
+    // Plain Rectangle: pointer-transparent, so it never blocks input.
+    property <float> sweep_p: clamp(refresh_ms * 1.0 / 320.0, 0, 1);
+    property <float> sweep_fade: sweep_p < 0.82
+        ? 1.0
+        : clamp((1.0 - sweep_p) / 0.18, 0, 1);
+
+    Rectangle {
+        x: -self.width + (root.width + self.width) * root.sweep_p;
+        y: 0;
+        width: max(24px, root.width * 0.3);
+        height: 2px;
+        border-radius: 1px;
+        background: AppTheme.accent;
+        opacity: refresh_run ? 0.9 * root.sweep_fade : 0;
     }
 }
 
@@ -7520,9 +8187,6 @@ component CardGrid inherits VerticalLayout {
     // Queue mark on each section card (see VideoCardView).
     callback queue(int);
     callback queue_only(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
 
     spacing: 12px;
     // Scroll clearance under the floating page bar: the last row of a page
@@ -7569,46 +8233,42 @@ component CardGrid inherits VerticalLayout {
                 card_press(mode) => { root.card_open(idx, mode); }
                 queue => { root.queue(idx); }
                 queue-only => { root.queue_only(idx); }
-                tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-                tip_hide(x, y) => { root.tip_hide(x, y); }
             }
         }
     }
 }
 
-// A ScrollView that can be asked to return to the top with the same 180ms
-// ease-out the feed ListView uses. A counter input (not a bool) so repeated
-// refreshes each fire once. `content-y` is imperative, and Slint's `animate`
-// only applies to bindings, hence the 18ms step (10 frames of an ease-out
-// quad). Used by the 收藏推荐 masonry, whose content is one tall block inside
-// a plain ScrollView rather than a ListView.
+// A ScrollView that is asked to return to the top on every refresh. `<reset>`
+// is a counter (not a bool) so repeated refreshes each fire once. The reset is
+// INSTANT and then re-asserted for two 16ms ticks: 0 is valid at any content
+// height, so a content-height change can never clamp it to a lower row. Used by
+// the 收藏推荐 masonry, whose content is one tall block inside a plain
+// ScrollView rather than a ListView.
 component ResetScroll inherits ScrollView {
     in property <int> reset: 0;
-    property <bool> resetting: false;
-    property <int> reset_ms: 0;
-    property <length> reset_from: 0px;
+    // Refresh feedback clock, owned by AppWindow (see FeedScroller).
+    in property <bool> refresh_run: false;
+    in property <int> refresh_ms: 0;
+    property <bool> pinning: false;
+    property <int> pin_ticks: 0;
 
     changed reset => {
-        root.reset_from = root.content-y;
-        root.reset_ms = 0;
-        root.resetting = root.reset_from < -1px;
-        if (!root.resetting) {
-            root.content-y = 0px;
-        }
+        root.content-y = 0px;
+        root.pin_ticks = 2;
+        root.pinning = true;
     }
 
     Timer {
-        interval: 18ms;
-        running: root.resetting;
+        interval: 16ms;
+        running: root.pinning;
         triggered => {
-            root.reset_ms += 18;
-            let t = clamp(root.reset_ms / 180, 0, 1);
-            let eased = 1 - (1 - t) * (1 - t);
-            root.content-y = root.reset_from * (1 - eased);
-            if (root.reset_ms >= 180) {
+            // Pin the top while the republished content height settles; the
+            // last write is exactly 0.
+            root.content-y = 0px;
+            root.pin_ticks -= 1;
+            if (root.pin_ticks <= 0) {
                 root.content-y = 0px;
-                root.resetting = false;
-                root.reset_ms = 0;
+                root.pinning = false;
             }
         }
     }
@@ -7634,6 +8294,14 @@ component FeedGrid inherits ListView {
     // Frosted glass forwarded to every card (see VideoCardView).
     in property <image> glass_source;
     in property <bool> glass_valid: false;
+    // False while the list is scrolling: cards paint the flat tint instead of
+    // the per-card backdrop slice and run no per-card animation (see
+    // FeedScroller).
+    in property <bool> glass_live: true;
+    in property <bool> quiet: false;
+    // Refresh settle clock, forwarded to every card (see VideoCardView).
+    in property <bool> refresh_run: false;
+    in property <int> refresh_ms: 0;
     in property <length> glass_x: 0px;
     in property <length> glass_y: 0px;
     in property <length> glass_w: 0px;
@@ -7647,9 +8315,13 @@ component FeedGrid inherits ListView {
     // Queue mark on each home-feed card (see VideoCardView).
     callback queue(int);
     callback queue_only(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
+    // A REAL user scroll (wheel / drag / kinetic), forwarded from the
+    // Flickable's `flicked`; our own `content-y` writes never raise it.
+    callback user_scrolled();
+
+    // The inherited ScrollView callback is aliased to the Flickable's
+    // `flicked`; handling it here is what lets the refresh pin yield to input.
+    scrolled => { root.user_scrolled(); }
 
     in property <int> cols: 2;
     in property <int> page-offset: 0;
@@ -7657,11 +8329,10 @@ component FeedGrid inherits ListView {
     in property <length> available-width: 400px;
     // Window clock for the freshness chips (0 = hide them).
     in property <int> now_ts: 0;
-    // Bumped by the window when a refresh starts: the list eases back to the
-    // top over 180ms. A counter (not a bool) so two refreshes in a row both
-    // fire, and a reset while the model is unchanged still lands. The stepping
-    // itself lives in AppWindow: a ListView may only have one `for` child, so
-    // no Timer can live here.
+    // Bumped by the window when a refresh starts. A counter (not a bool) so two
+    // refreshes in a row both fire, and a reset while the model is unchanged
+    // still lands. The pin itself lives in FeedScroller: a ListView may only
+    // have one `for` child, so no Timer can live here.
     in property <int> scroll_reset: 0;
     property <length> gap: 12px;
     property <length> card-w: max(120px, (available-width - gap * (cols - 1)) / cols);
@@ -7697,6 +8368,11 @@ component FeedGrid inherits ListView {
                 card-width: root.card-w;
                 glass_source: root.glass_source;
                 glass_valid: root.glass_valid;
+                glass_live: root.glass_live;
+                quiet: root.quiet;
+                refresh_run: root.refresh_run;
+                refresh_ms: root.refresh_ms;
+                refresh_slot: idx - root.page-offset;
                 glass_x: root.glass_x;
                 glass_y: root.glass_y;
                 glass_w: root.glass_w;
@@ -7716,8 +8392,6 @@ component FeedGrid inherits ListView {
                 owner-activate => { root.owner(idx); }
                 queue => { root.queue(idx); }
                 queue-only => { root.queue_only(idx); }
-                tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-                tip_hide(x, y) => { root.tip_hide(x, y); }
             }
         }
     }
@@ -7725,8 +8399,10 @@ component FeedGrid inherits ListView {
 
 // FeedGrid inside a thin shell. A ListView may only have a single `for` as
 // children, so the refresh scroll-to-top cannot live inside it: this wrapper
-// owns the 180ms ease-out (18ms steps, ease-out quad) from wherever the user
-// was back to the first row. Everything else is a straight forward.
+// owns the reset (an instant pin of `content-y` to 0, held for ~960ms because
+// the ListView's virtualised layout re-anchors the list when the model lands),
+// the scroll gate and the refresh settle. Everything else is a straight
+// forward.
 component FeedScroller inherits Rectangle {
     in property <[FeedRow]> items;
     in property <image> glass_source;
@@ -7743,6 +8419,9 @@ component FeedScroller inherits Rectangle {
     in property <int> now_ts: 0;
     // Bumped on every refresh start (see AppWindow's `feed_scroll_reset`).
     in property <int> scroll_reset: 0;
+    // Refresh feedback clock, owned by AppWindow (one timer for the window).
+    in property <bool> refresh_run: false;
+    in property <int> refresh_ms: 0;
 
     callback activate(int);
     callback card_open(int, int);
@@ -7750,9 +8429,6 @@ component FeedScroller inherits Rectangle {
     callback owner(int);
     callback queue(int);
     callback queue_only(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
 
     background: #00000000;
 
@@ -7761,6 +8437,10 @@ component FeedScroller inherits Rectangle {
         height: 100%;
         glass_source: root.glass_source;
         glass_valid: root.glass_valid;
+        glass_live: !(root.scroll_busy || root.refresh_run);
+        quiet: root.scroll_busy || root.refresh_run;
+        refresh_run: root.refresh_run;
+        refresh_ms: root.refresh_ms;
         glass_x: root.glass_x;
         glass_y: root.glass_y;
         glass_w: root.glass_w;
@@ -7777,38 +8457,105 @@ component FeedScroller inherits Rectangle {
         owner(idx) => { root.owner(idx); }
         queue(idx) => { root.queue(idx); }
         queue_only(idx) => { root.queue_only(idx); }
-        tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-        tip_hide(x, y) => { root.tip_hide(x, y); }
+        user_scrolled => { root.pinning = false; }
+    }
+
+    // ---- scroll gate: flat tint while the feed moves (120 fps home) ----
+    // The per-card glass slice is the expensive part of a moving feed: every
+    // card re-places the window-sized backdrop at its own offset each frame.
+    // While `content-y` changes the cards paint their flat tint instead, and
+    // the 3-tick (120ms) countdown restores the glass after the scroll stops.
+    //
+    // `changed` only takes a plain identifier, so the list offset is aliased
+    // into this component's scope first. The timer runs only during a scroll
+    // (plus the 120ms tail): an idle feed has no timer and no animation, and
+    // nothing here is per card.
+    property <length> scroll_y <=> feed_grid.content-y;
+    property <bool> scroll_busy: false;
+    property <int> scroll_ticks: 0;
+
+    changed scroll_y => {
+        root.scroll_busy = true;
+        root.scroll_ticks = 3;
+    }
+
+    Timer {
+        interval: 40ms;
+        running: root.scroll_busy;
+        triggered => {
+            root.scroll_ticks -= 1;
+            if (root.scroll_ticks <= 0) {
+                root.scroll_busy = false;
+            }
+        }
     }
 
     property <bool> resetting: false;
     property <int> reset_ms: 0;
     property <length> reset_from: 0px;
 
+    // ---- refresh reset: the FIRST row, exactly ----
+    // The ListView does not treat `content-y` as a plain offset: its virtualised
+    // layout pass RE-ANCHORS the list to the row it had at `state.offset` every
+    // time the model or geometry changes (i-slint-core's
+    // `update_visible_instances`). A single write of 0 - or the old 180ms
+    // animation - is therefore overwritten by that anchor, which is why a
+    // refresh used to settle around the third row.
+    //
+    // So the reset PINS the top: it writes 0 immediately, then re-asserts 0
+    // every 16ms for ~960ms, extended by every model republish (the `items`
+    // change), which is exactly the window in which the layout can re-anchor.
+    // A real user scroll cancels it instantly: `scrolled` (the Flickable's
+    // `flicked`) only fires for wheel/drag/animation, never for our writes, so
+    // input is never blocked. The last write is always exactly 0.
+    property <bool> pinning: false;
+    property <int> pin_hold: 0;
+
+    function pin-top() {
+        feed_grid.content-y = 0px;
+    }
+
     changed scroll_reset => {
-        root.reset_from = feed_grid.content-y;
-        root.reset_ms = 0;
-        // Already at the top: nothing to animate, just make sure it is exact.
-        root.resetting = root.reset_from < -1px;
-        if (!root.resetting) {
-            feed_grid.content-y = 0px;
+        root.pin_hold = 60;
+        root.pinning = true;
+        root.pin-top();
+    }
+
+    changed items => {
+        if (root.pinning) {
+            root.pin_hold = 60;
         }
     }
 
     Timer {
-        interval: 18ms;
-        running: root.resetting;
+        interval: 16ms;
+        running: root.pinning;
         triggered => {
-            root.reset_ms += 18;
-            let t = clamp(root.reset_ms / 180, 0, 1);
-            let eased = 1 - (1 - t) * (1 - t);
-            feed_grid.content-y = root.reset_from * (1 - eased);
-            if (root.reset_ms >= 180) {
-                feed_grid.content-y = 0px;
-                root.resetting = false;
-                root.reset_ms = 0;
+            root.pin-top();
+            root.pin_hold -= 1;
+            if (root.pin_hold <= 0) {
+                root.pin-top();
+                root.pinning = false;
             }
         }
+    }
+
+    // ---- refresh feedback: 2px accent band, left -> right, once ----
+    // Clock from AppWindow (`refresh_ms`), 320ms travel, fading over the last
+    // 18%. Pointer-transparent: no TouchArea, so input is never blocked.
+    property <float> sweep_p: clamp(root.refresh_ms * 1.0 / 320.0, 0, 1);
+    property <float> sweep_fade: root.sweep_p < 0.82
+        ? 1.0
+        : clamp((1.0 - root.sweep_p) / 0.18, 0, 1);
+
+    Rectangle {
+        x: -self.width + (root.width + self.width) * root.sweep_p;
+        y: 0;
+        width: max(24px, root.width * 0.3);
+        height: 2px;
+        border-radius: 1px;
+        background: AppTheme.accent;
+        opacity: root.refresh_run ? 0.9 * root.sweep_fade : 0;
     }
 }
 
@@ -7830,9 +8577,6 @@ component SearchGrid inherits VerticalLayout {
     // grid keeps one shape and a later wiring change only flips the flag.
     callback queue(int);
     callback queue_only(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
 
     spacing: 12px;
     // Scroll clearance under the floating page bar: the last row of a page
@@ -7879,8 +8623,6 @@ component SearchGrid inherits VerticalLayout {
                 badge: items[idx].badge;
                 activate => { root.activate(idx); }
                 card_press(mode) => { root.card_open(idx, mode); }
-                tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-                tip_hide(x, y) => { root.tip_hide(x, y); }
             }
         }
     }
@@ -7903,9 +8645,6 @@ component FolderGrid inherits VerticalLayout {
     // grid keeps one shape and a later wiring change only flips the flag.
     callback queue(int);
     callback queue_only(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
 
     spacing: 12px;
     // Scroll clearance under the floating page bar: the last row of a page
@@ -7953,8 +8692,6 @@ component FolderGrid inherits VerticalLayout {
                 card_press(mode) => { root.card_open(idx, mode); }
                 queue => { root.queue(idx); }
                 queue-only => { root.queue_only(idx); }
-                tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-                tip_hide(x, y) => { root.tip_hide(x, y); }
             }
         }
     }
@@ -7978,9 +8715,6 @@ component HistoryGrid inherits VerticalLayout {
     // grid keeps one shape and a later wiring change only flips the flag.
     callback queue(int);
     callback queue_only(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
 
     spacing: 12px;
     // Scroll clearance under the floating page bar: the last row of a page
@@ -8029,8 +8763,6 @@ component HistoryGrid inherits VerticalLayout {
                 activate => { root.activate(idx); }
                 card_press(mode) => { root.card_open(idx, mode); }
                 remove-clicked => { root.remove(idx); }
-                tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-                tip_hide(x, y) => { root.tip_hide(x, y); }
             }
         }
     }
@@ -8054,9 +8786,6 @@ component ToViewGrid inherits VerticalLayout {
     // grid keeps one shape and a later wiring change only flips the flag.
     callback queue(int);
     callback queue_only(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
 
     spacing: 12px;
     // Scroll clearance under the floating page bar: the last row of a page
@@ -8105,8 +8834,6 @@ component ToViewGrid inherits VerticalLayout {
                 activate => { root.activate(idx); }
                 card_press(mode) => { root.card_open(idx, mode); }
                 remove-clicked => { root.remove(idx); }
-                tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-                tip_hide(x, y) => { root.tip_hide(x, y); }
             }
         }
     }
@@ -8141,9 +8868,6 @@ component UpGrid inherits VerticalLayout {
     in property <string> owner-name: "";
     // A card click opens the video behind this index (`up_open_video`).
     callback card_open(int);
-    // Full-title tooltip for the window overlay (see VideoCardView).
-    callback tip_show(length, length, length, length, string);
-    callback tip_hide(length, length);
 
     spacing: 12px;
     padding-bottom: AppTheme.bar-clearance;
@@ -8223,8 +8947,6 @@ component UpGrid inherits VerticalLayout {
                 pub-ts: root.items[idx].pub_ts;
                 now-ts: root.now_ts;
                 card_press(mode) => { root.card_open(idx); }
-                tip_show(x, y, w, h, text) => { root.tip_show(x, y, w, h, text); }
-                tip_hide(x, y) => { root.tip_hide(x, y); }
             }
         }
     }
@@ -10347,9 +11069,41 @@ export component AppWindow inherits Window {
     // second refresh while the list is already at the top still fires.
     property <int> feed_scroll_reset: 0;
 
+    // ---- refresh feedback (one clock for the whole window) ----
+    // A preload-ring refresh repaints almost instantly, so the rising edge also
+    // runs a deliberate 432ms "settle": the visible cards fade/lift in an 18ms
+    // stagger (capped at 12) and a 2px accent band sweeps left -> right once in
+    // 320ms. One 16ms timer drives every card; there is no per-card timer.
+    property <bool> refresh_run: false;
+    property <int> refresh_ms: 0;
+
     changed list_refreshing => {
         if (root.list_refreshing) {
-            root.feed_scroll_reset += 1;
+            root.start-refresh();
+        }
+    }
+
+    // ONE refresh entry point. The 刷新 button calls this directly, before the
+    // new model lands; `list_refreshing` calls it too for the network path.
+    // The preload-ring path republishes the feed WITHOUT a false->true edge on
+    // `list_refreshing` (it only publishes the final false), so the click is the
+    // only rising edge that path has - which is also why the list never reset
+    // and the repaint was invisible. Running both sources is idempotent: the
+    // pin and the clock simply restart in the same event.
+    function start-refresh() {
+        root.feed_scroll_reset += 1;
+        root.refresh_ms = 0;
+        root.refresh_run = true;
+    }
+
+    Timer {
+        interval: 16ms;
+        running: root.refresh_run;
+        triggered => {
+            root.refresh_ms += 16;
+            if (root.refresh_ms >= 432) {
+                root.refresh_run = false;
+            }
         }
     }
 
@@ -10795,39 +11549,6 @@ export component AppWindow inherits Window {
                 || root.view_mode == 9 || root.view_mode == 10 || root.view_mode == 13
                 || root.view_mode == 14 || root.view_mode == 18);
     }
-
-    // ---- card title tooltip (one window-level surface, painted last) ----
-    // Cards report their own window rect on hover (see VideoCardView). Keeping
-    // the state here lets the tooltip live above every page, list viewport and
-    // the floating bar, and a hide only clears the tip of the card it came from
-    // (the rect is compared), so moving between two cards never blanks the
-    // second one's tooltip.
-    property <bool> card_tip_on: false;
-    property <length> card_tip_x: 0px;
-    property <length> card_tip_y: 0px;
-    property <length> card_tip_w: 0px;
-    property <length> card_tip_h: 0px;
-    property <string> card_tip_text: "";
-
-    function card_tip_show(x: length, y: length, w: length, h: length, text: string) {
-        root.card_tip_x = x;
-        root.card_tip_y = y;
-        root.card_tip_w = w;
-        root.card_tip_h = h;
-        root.card_tip_text = text;
-        root.card_tip_on = true;
-    }
-
-    function card_tip_hide(x: length, y: length) {
-        if (root.card_tip_x == x && root.card_tip_y == y) {
-            root.card_tip_on = false;
-        }
-    }
-
-    // A page or route change can unmount the hovered card without ever sending
-    // a hide (the grid is replaced in the same frame); drop the tip with it.
-    changed up_page_open => { root.card_tip_on = false; }
-    changed view_mode => { root.card_tip_on = false; }
 
     // The two first-level menus report through the NEW contract callback AND
     // the matching legacy one, so the section/library still opens before the
@@ -11416,8 +12137,11 @@ export component AppWindow inherits Window {
                     items: root.feed_items;
                     cols: root.video-cols;
                     available-width: root.grid-avail;
-                    // Refresh starts -> ease back to the first row.
+                    // Refresh starts -> the list lands on the first row and the
+                    // cards settle in; one window clock drives both.
                     scroll_reset: root.feed_scroll_reset;
+                    refresh_run: root.refresh_run;
+                    refresh_ms: root.refresh_ms;
                     // One page, sized by the root (Rust moves the offset).
                     page-offset: root.list_offset;
                     page-size: root.list_page_size;
@@ -11430,8 +12154,6 @@ export component AppWindow inherits Window {
                     // A card's UP name opens the UP page; Rust resolves the
                     // index against the feed this card came from.
                     owner(idx) => { root.open_up(idx); }
-                    tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                    tip_hide(x, y) => { root.card_tip_hide(x, y); }
                 }
             }
 
@@ -11462,6 +12184,9 @@ export component AppWindow inherits Window {
                             active: root.fav_tab == 0;
                             clicked => {
                                 root.fav_tab = 0;
+                                // A folder switch is a fresh list: land on the
+                                // top row, exactly like a refresh.
+                                root.feed_scroll_reset += 1;
                                 root.fav_tab_changed(0);
                             }
                             wheel(delta) => {
@@ -11475,6 +12200,7 @@ export component AppWindow inherits Window {
                             active: root.fav_tab == index + 1;
                             clicked => {
                                 root.fav_tab = index + 1;
+                                root.feed_scroll_reset += 1;
                                 root.fav_tab_changed(index + 1);
                             }
                             wheel(delta) => {
@@ -11504,6 +12230,8 @@ export component AppWindow inherits Window {
                 if root.fav_tabs.length > 0 : ResetScroll {
                     vertical-stretch: 1;
                     reset: root.feed_scroll_reset;
+                    refresh_run: root.refresh_run;
+                    refresh_ms: root.refresh_ms;
                     vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                     mouse-drag-pan-enabled: false;
@@ -11514,6 +12242,8 @@ export component AppWindow inherits Window {
                         cols: root.masonry-cols;
                         available-width: root.width - 56px;
                         viewport-width: root.width - 32px;
+                        refresh_run: root.refresh_run;
+                        refresh_ms: root.refresh_ms;
                         glass_source: root.glass_backdrop;
                         glass_valid: root.glass_backdrop_valid;
                         glass_x: root.glass_x;
@@ -11638,8 +12368,6 @@ export component AppWindow inherits Window {
                         people: root.search_tab == 1;
                         activate(idx) => { root.open_search_item(idx); }
                         card_open(idx, mode) => { root.card_open(idx, mode); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12054,8 +12782,6 @@ export component AppWindow inherits Window {
                         page-size: root.list_page_size;
                         activate(idx) => { root.open_folder_item(idx); }
                         card_open(idx, mode) => { root.card_open(idx, mode); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12133,8 +12859,6 @@ export component AppWindow inherits Window {
                         activate(idx) => { root.open_history_item(idx); }
                         card_open(idx, mode) => { root.card_open(idx, mode); }
                         remove(idx) => { root.history_delete(idx); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12212,8 +12936,6 @@ export component AppWindow inherits Window {
                         activate(idx) => { root.open_toview_item(idx); }
                         card_open(idx, mode) => { root.card_open(idx, mode); }
                         remove(idx) => { root.toview_remove(idx); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12323,8 +13045,6 @@ export component AppWindow inherits Window {
                         card_open(idx, mode) => { root.card_open(idx, mode); }
                         queue(idx) => { root.card_enqueue(idx); }
                         queue_only(idx) => { root.card_enqueue_only(idx); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12406,8 +13126,6 @@ export component AppWindow inherits Window {
                         card_open(idx, mode) => { root.card_open(idx, mode); }
                         queue(idx) => { root.card_enqueue(idx); }
                         queue_only(idx) => { root.card_enqueue_only(idx); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12456,8 +13174,6 @@ export component AppWindow inherits Window {
                         card_open(idx, mode) => { root.card_open(idx, mode); }
                         queue(idx) => { root.card_enqueue(idx); }
                         queue_only(idx) => { root.card_enqueue_only(idx); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12514,8 +13230,6 @@ export component AppWindow inherits Window {
                         card_open(idx, mode) => { root.card_open(idx, mode); }
                         queue(idx) => { root.card_enqueue(idx); }
                         queue_only(idx) => { root.card_enqueue_only(idx); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
             }
@@ -12687,8 +13401,6 @@ export component AppWindow inherits Window {
                         card_open(idx, mode) => { root.card_open(idx, mode); }
                         queue(idx) => { root.card_enqueue(idx); }
                         queue_only(idx) => { root.card_enqueue_only(idx); }
-                        tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                        tip_hide(x, y) => { root.card_tip_hide(x, y); }
                     }
                 }
 
@@ -13628,8 +14340,6 @@ export component AppWindow inherits Window {
                     now_ts: root.now_ts;
                     owner-name: root.up_name;
                     card_open(idx) => { root.up_open_video(idx); }
-                    tip_show(x, y, w, h, text) => { root.card_tip_show(x, y, w, h, text); }
-                    tip_hide(x, y) => { root.card_tip_hide(x, y); }
                 }
             }
         }
@@ -13736,9 +14446,12 @@ export component AppWindow inherits Window {
         }
         library_hover_close => { root.library_menu_open = false; }
         // One refresh button: the new `home_refresh` plus the old list refresh
-        // (Rust re-fetches the section on screen either way).
+        // (Rust re-fetches the section on screen either way). The UI starts the
+        // reset + settle here, not from Rust's indicator: the ring path never
+        // raises `list_refreshing`.
         refresh => {
             root.playlist_open = false;
+            root.start-refresh();
             root.home_refresh();
             root.page_refresh();
         }
@@ -15673,50 +16386,6 @@ export component AppWindow inherits Window {
         }
 
             }
-        }
-    }
-
-    // ===================== CARD TITLE TOOLTIP =====================
-    // The one-line card title can ellipsize, so the full copy lives here: a
-    // floating surface in the bar menus' own materials, above the card, at most
-    // two 12.5px lines, fading in over 200ms. It is declared last, so no page,
-    // list viewport or bar can clip it, and it is pointer-transparent (a plain
-    // Rectangle), so it can never steal the hover that keeps it alive.
-    Rectangle {
-        property <float> a: root.card_tip_on ? 1.0 : 0.0;
-        animate a { duration: 200ms; easing: ease-out; }
-        property <length> tip-h: min(52px, tip_label.preferred-height + 16px);
-
-        visible: self.a > 0.01;
-        opacity: self.a;
-        width: min(320px, max(root.card_tip_w, 180px));
-        x: clamp(root.card_tip_x + root.card_tip_w / 2 - self.width / 2, 8px, root.width - self.width - 8px);
-        // Above the card; flips below only when the first row of the window has
-        // no room above it (never the case under the 50px strip, kept honest).
-        y: root.card_tip_y - self.tip-h - 6px >= 4px
-            ? root.card_tip_y - self.tip-h - 6px
-            : root.card_tip_y + root.card_tip_h + 6px;
-        height: self.tip-h;
-        border-radius: 10px;
-        background: AppTheme.bar-fill;
-        border-width: 1px;
-        border-color: AppTheme.border-popup;
-        drop-shadow-color: #0000002e;
-        drop-shadow-blur: 16px;
-        drop-shadow-offset-y: 4px;
-
-        tip_label := Text {
-            x: 10px;
-            y: 8px;
-            width: parent.width - 20px;
-            height: parent.height - 16px;
-            text: root.card_tip_text;
-            color: AppTheme.text;
-            font-size: 12.5px;
-            wrap: word-wrap;
-            max-lines: 2;
-            overflow: elide;
-            vertical-alignment: center;
         }
     }
 

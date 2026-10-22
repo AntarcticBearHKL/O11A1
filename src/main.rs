@@ -12,6 +12,7 @@ mod bilibili;
 mod danmaku;
 mod download;
 mod glass;
+mod interp;
 mod job;
 mod player;
 #[allow(dead_code)] mod prefetch; // the player wires it in; QA helpers stay unused in a normal build
@@ -2912,6 +2913,16 @@ struct PlayerGlass {
     placed: Cell<Option<(f32, f32, f32, f32)>>,
     /// The refresh timer, owned here so it lives exactly as long as the loop.
     timer: slint::Timer,
+    /// `chrome_shown` (== `pointer_inside`) of the last tick. While false the
+    /// frosted bars are invisible, so the loop pauses: no capture, no blur, no
+    /// placement. A false→true edge queues one immediate capture.
+    chrome: Cell<bool>,
+    /// Scale factor seen on the last tick: a monitor change (which can change
+    /// the DPI) invalidates the captured rect.
+    scale: Cell<f32>,
+    /// Cadence currently in use (1 s, or 3 s after a slow capture), so a change
+    /// is logged once instead of every tick.
+    interval_ms: Cell<Duration>,
 }
 
 impl PlayerGlass {
@@ -2931,6 +2942,12 @@ impl PlayerGlass {
             logged_sigma: Cell::new(-1.0),
             placed: Cell::new(None),
             timer: slint::Timer::default(),
+            // Start "shown": a window that opens with the pointer already inside
+            // must not log a spurious resume, and one that opens with the pointer
+            // outside logs the pause on its first tick.
+            chrome: Cell::new(true),
+            scale: Cell::new(1.0),
+            interval_ms: Cell::new(Duration::from_millis(1000)),
         }
     }
 }
@@ -3074,14 +3091,18 @@ fn start_player_glass(session: &Rc<PlayerSession>) {
     // the player's transparent background would composite as opaque black.
     win::setup_glass(session.window.window(), true);
     let deliver_weak = session.window.as_weak();
-    let worker = glass::GlassWorker::spawn(hwnd, move |frame| {
-        let weak = deliver_weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(player) = weak.upgrade() {
-                player_glass_deliver(&player, frame);
-            }
-        });
-    });
+    let worker = glass::GlassWorker::spawn_with(
+        hwnd,
+        glass::GlassConfig::player(),
+        move |frame| {
+            let weak = deliver_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(player) = weak.upgrade() {
+                    player_glass_deliver(&player, frame);
+                }
+            });
+        },
+    );
     *glass.worker.borrow_mut() = Some(worker);
     crate::debug_log(&format!(
         "player glass worker spawn hwnd={hwnd} win={}",
@@ -3248,11 +3269,173 @@ struct PlayerLoops {
     /// Last `pointer_inside` pushed to the UI: only transitions are written
     /// and logged.
     pointer_inside: Cell<bool>,
+    /// Idle-hide state for this window's chrome (cursor movement + stillness).
+    chrome_idle: Cell<ChromeIdle>,
     /// Last window rect the layout debounce was armed for.
     layout_seen: Cell<Option<(i32, i32, i32, i32)>>,
     /// Last `(physical width, physical height, fullscreen)` published as the
     /// decode-target input. Only transitions are written to the control.
     display_seen: Cell<(u32, u32, bool)>,
+}
+
+/// How long the pointer must be still inside the window before the chrome
+/// hides (classic video-player idle behaviour).
+const CHROME_IDLE_MS: u64 = 2500;
+
+/// Chrome idle-hide state machine for one window.
+///
+/// It is pure (cursor samples in, visibility out) so the real 60 Hz watch and
+/// the `BILI_IDLE_TEST` self-test drive exactly the same logic. No cursor is
+/// moved and no input is synthesized anywhere.
+#[derive(Clone, Copy)]
+struct ChromeIdle {
+    /// Last real cursor position seen (physical px).
+    last_cursor: Option<(i32, i32)>,
+    /// When the cursor last changed, or the window was entered.
+    moved_at: Instant,
+    /// Whether the pointer was inside on the previous sample.
+    was_inside: bool,
+    /// Whether the chrome is currently hidden by this timer.
+    hidden: bool,
+}
+
+impl ChromeIdle {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_cursor: None,
+            moved_at: now,
+            was_inside: false,
+            hidden: false,
+        }
+    }
+
+    fn still_ms(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.moved_at).as_millis() as u64
+    }
+
+    /// Feed one sample and return whether the chrome should be visible.
+    ///
+    /// `held` is true while the left button is down or while the UI holds the
+    /// chrome open (`chrome_hold`): both suppress the idle hide entirely.
+    fn poll(
+        &mut self,
+        cursor: Option<(i32, i32)>,
+        inside: bool,
+        held: bool,
+        now: Instant,
+    ) -> bool {
+        let moved = match (cursor, self.last_cursor) {
+            (Some(next), Some(previous)) => next != previous,
+            // The first sample has no previous position to compare with.
+            (Some(_), None) => true,
+            // A missing sample is not movement; a lost cursor must not pin the
+            // chrome up forever.
+            (None, _) => false,
+        };
+        if let Some(cursor) = cursor {
+            self.last_cursor = Some(cursor);
+        }
+        // Entering the window (including a window moved under a stationary
+        // cursor) is activity, so the chrome comes back. Holding the button (or
+        // the UI's chrome_hold) also keeps the streak fresh, so releasing does
+        // not immediately hide the chrome that was just used.
+        let entered = inside && !self.was_inside;
+        if moved || entered || held {
+            self.moved_at = now;
+        }
+        self.was_inside = inside;
+        self.hidden = inside && !held && self.still_ms(now) >= CHROME_IDLE_MS;
+        inside && !self.hidden
+    }
+
+    /// Forget the current streak, so a hidden/closed window reopens visible.
+    fn reset(&mut self, now: Instant) {
+        self.last_cursor = None;
+        self.moved_at = now;
+        self.was_inside = false;
+        self.hidden = false;
+    }
+}
+
+/// `BILI_IDLE_TEST=1`: drive [`ChromeIdle`] with fake cursor samples and log
+/// the four invariants (continuous movement never hides, 2.5 s of stillness
+/// hides, a held button never hides, `chrome_hold` never hides). Diagnostic
+/// only: nothing here touches the real cursor or any window.
+fn spawn_idle_self_test() {
+    if !std::env::var("BILI_IDLE_TEST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    std::thread::spawn(|| {
+        let base = Instant::now();
+        let mut at_ms = 0u64;
+        let mut idle = ChromeIdle::new(base);
+        let poll = |idle: &mut ChromeIdle,
+                    at_ms: &mut u64,
+                    cursor: Option<(i32, i32)>,
+                    inside: bool,
+                    held: bool| {
+            *at_ms += 16;
+            idle.poll(cursor, inside, held, base + Duration::from_millis(*at_ms))
+        };
+
+        // 1) Continuous movement (1 px every tick) for 3 s: never hides.
+        let mut stayed = true;
+        for step in 0..188 {
+            let visible = poll(&mut idle, &mut at_ms, Some((100 + step % 2, 100)), true, false);
+            stayed &= visible;
+        }
+        crate::debug_log(&format!(
+            "idle-test movement ticks=188 hidden={} still_ms={}",
+            u8::from(!stayed),
+            idle.still_ms(base + Duration::from_millis(at_ms))
+        ));
+
+        // 2) Stillness: visible before the threshold, hidden after it.
+        idle.reset(base + Duration::from_millis(at_ms));
+        let mut before_hide = true;
+        let mut hide_at = 0u64;
+        for _ in 0..250 {
+            let visible = poll(&mut idle, &mut at_ms, Some((100, 100)), true, false);
+            let still = idle.still_ms(base + Duration::from_millis(at_ms));
+            if still < CHROME_IDLE_MS {
+                before_hide &= visible;
+            } else if !visible && hide_at == 0 {
+                hide_at = still;
+            }
+        }
+        crate::debug_log(&format!(
+            "idle-test still visible_before={} hidden={} hide_at_ms={hide_at}",
+            u8::from(before_hide),
+            u8::from(idle.hidden)
+        ));
+
+        // 3) Held button: 3 s of stillness must never hide.
+        idle.reset(base + Duration::from_millis(at_ms));
+        let mut hidden_while_held = false;
+        for _ in 0..188 {
+            let visible = poll(&mut idle, &mut at_ms, Some((100, 100)), true, true);
+            hidden_while_held |= !visible;
+        }
+        crate::debug_log(&format!(
+            "idle-test button held=1 hidden={}",
+            u8::from(hidden_while_held)
+        ));
+
+        // 4) `chrome_hold` (popover / drag): the same hold input, must never hide.
+        idle.reset(base + Duration::from_millis(at_ms));
+        let mut hidden_while_hold = false;
+        for _ in 0..188 {
+            let visible = poll(&mut idle, &mut at_ms, Some((100, 100)), true, true);
+            hidden_while_hold |= !visible;
+        }
+        crate::debug_log(&format!(
+            "idle-test chrome_hold held=1 hidden={}",
+            u8::from(hidden_while_hold)
+        ));
+    });
 }
 
 /// Whether the real cursor is anywhere inside the player window.
@@ -3299,6 +3482,7 @@ fn start_player_loops(
         pointer_timer: slint::Timer::default(),
         layout_timer: slint::Timer::default(),
         pointer_inside: Cell::new(false),
+        chrome_idle: Cell::new(ChromeIdle::new(Instant::now())),
         layout_seen: Cell::new(None),
         display_seen: Cell::new((0, 0, false)),
     });
@@ -3330,11 +3514,37 @@ fn start_player_loops(
                     return;
                 };
                 let inside = player_pointer_inside(&player);
-                if loops.pointer_inside.get() != inside {
-                    loops.pointer_inside.set(inside);
-                    player.set_pointer_inside(inside);
+                // ---- chrome idle hide ------------------------------------
+                // The chrome hides while the pointer is still INSIDE the window
+                // after CHROME_IDLE_MS, the classic player behaviour. A 1 px
+                // move resets the timer and shows it again immediately.
+                //
+                // The UI's `chrome_hold` (popover / seek drag / playlist panel)
+                // keeps the chrome up exactly like a held button.
+                let held = win::left_button_down() || player.get_chrome_hold();
+                let now = Instant::now();
+                let mut idle = loops.chrome_idle.get();
+                let was_hidden = idle.hidden;
+                let visible = idle.poll(win::cursor_px(), inside, held, now);
+                loops.chrome_idle.set(idle);
+                if idle.hidden && !was_hidden {
                     crate::debug_log(&format!(
-                        "pointer inside={inside} tag=player win={}",
+                        "chrome idle hide still_ms={} win={}",
+                        idle.still_ms(now),
+                        loops.id
+                    ));
+                } else if !idle.hidden && was_hidden && inside {
+                    crate::debug_log(&format!(
+                        "chrome idle show still_ms={} win={}",
+                        idle.still_ms(now),
+                        loops.id
+                    ));
+                }
+                if loops.pointer_inside.get() != visible {
+                    loops.pointer_inside.set(visible);
+                    player.set_pointer_inside(visible);
+                    crate::debug_log(&format!(
+                        "pointer inside={visible} tag=player win={}",
                         loops.id
                     ));
                 }
@@ -3395,10 +3605,14 @@ fn stop_player_loops(loops: &Rc<PlayerLoops>) {
     if let Some(player) = loops.window.upgrade() {
         player.set_pointer_inside(false);
     }
+    // A hidden/closed window must reopen with the chrome visible: forget the
+    // stillness streak and the idle latch.
+    loops.chrome_idle.set(ChromeIdle::new(Instant::now()));
+    let was_inside = loops.pointer_inside.replace(false);
     if !was_running {
         return;
     }
-    if loops.pointer_inside.get() {
+    if was_inside {
         crate::debug_log(&format!(
             "pointer inside=0 tag=player-close win={}",
             loops.id
@@ -3410,11 +3624,27 @@ fn stop_player_loops(loops: &Rc<PlayerLoops>) {
 /// One iteration of the player's backdrop refresh loop.
 ///
 /// Mirrors [`glass_step`], but is deliberately NOT gated by `PLAYER_ACTIVE`:
-/// this is the loop that must run WHILE the player is open. Each tick is cheap
-/// when nothing changed - it reads the blur slider, queues a grab at most every
-/// 400ms (or when the radius moved) and re-places the last delivered frame.
+/// this is the loop that must run WHILE the player is open.
+///
+/// Three rules keep it off the machine's back while a video plays:
+///
+/// * **Invisible = paused.** The frosted surfaces are the title strip and the
+///   toolbar pill, and both are gated on `chrome_shown` (== `pointer_inside`).
+///   With the pointer outside the window nothing of this image is on screen, so
+///   there is no capture, no blur and no placement at all.
+/// * **1 s cadence while visible.** The backdrop behind a paused-or-playing
+///   video is static; the old 400 ms timetable made the worker read back the
+///   whole desktop 2.5 times a second for no visible change.
+/// * **Window-rect grabs** (see [`glass::GlassConfig::PLAYER`]): the worker
+///   captures the window plus a small margin instead of the 4K desktop, which
+///   is where most of the 78-170 ms went.
+///
+/// A move or resize invalidates the captured rect, so those paths call
+/// [`player_glass_invalidate`] to queue exactly one fresh capture.
 fn player_glass_step(weak: &Weak<PlayerWindow>, glass: &Rc<PlayerGlass>) {
-    const GLASS_INTERVAL: Duration = Duration::from_millis(400);
+    const GLASS_INTERVAL: Duration = Duration::from_millis(1000);
+    /// A step this slow means the machine is saturated: stretch the cadence.
+    const GLASS_SLOW_MS: u64 = 200;
     let Some(player) = weak.upgrade() else {
         return;
     };
@@ -3422,6 +3652,36 @@ fn player_glass_step(weak: &Weak<PlayerWindow>, glass: &Rc<PlayerGlass>) {
     let blur = theme.get_glass_blur();
     let transparency = theme.get_glass_transparency();
     let now = Instant::now();
+
+    // `chrome_shown` is exactly `pointer_inside` (see ui/app.slint): while it is
+    // false the two frosted bars have opacity 0 and are disabled, i.e. the image
+    // below is not part of what the user sees.
+    let chrome = player.get_pointer_inside();
+    let was_chrome = glass.chrome.replace(chrome);
+    let scale = player.window().scale_factor().max(0.5);
+    let scale_moved = (glass.scale.get() - scale).abs() > 0.01;
+    glass.scale.set(scale);
+    if !chrome {
+        if was_chrome {
+            crate::debug_log("player glass paused reason=chrome-hidden");
+        }
+        // The video panel pump costs no capture and still runs: a panel that is
+        // open while the chrome is timed out keeps its frosted look.
+        player_panel_glass(&player, glass);
+        return;
+    }
+    if !was_chrome {
+        // Chrome just appeared: the bars must not show a stale/garbage backdrop
+        // for a second, so queue one capture immediately.
+        crate::debug_log("player glass resumed reason=chrome-shown");
+        glass.next.set(now);
+        glass.requested_sigma.set(-1.0);
+    }
+    if scale_moved {
+        glass.next.set(now);
+        glass.requested_sigma.set(-1.0);
+        crate::debug_log(&format!("player glass capture due reason=scale scale={scale:.2}"));
+    }
 
     if blur <= 0.5 {
         // Slider at zero, same as the main loop: there is no blur layer, the
@@ -3441,7 +3701,6 @@ fn player_glass_step(weak: &Weak<PlayerWindow>, glass: &Rc<PlayerGlass>) {
         return;
     }
 
-    let scale = player.window().scale_factor().max(0.5);
     // The same mapping as the main loop: slider 0..100 -> Gaussian sigma in
     // physical pixels, so the visual radius is identical at any DPI scale.
     let sigma = blur / 100.0 * glass::SIGMA_MAX * scale;
@@ -3449,9 +3708,30 @@ fn player_glass_step(weak: &Weak<PlayerWindow>, glass: &Rc<PlayerGlass>) {
     // A grab is due, nothing has been requested yet, or the radius moved since
     // the last request: queue one. The worker coalesces them (only the latest
     // survives) and captures/re-blurs only what it actually needs.
+    //
+    // The cadence backs off on a machine that is already busy: a screen readback
+    // measured 25-100 ms when idle but ~0.7-1.1 s while another build saturated
+    // the GPU/CPU, and asking for that once a second would add a full core of
+    // the exact work the user feels as a hitch.
+    let last_step_ms = glass
+        .worker
+        .borrow()
+        .as_ref()
+        .map_or(0, |worker| worker.last_step_ms());
+    let interval = if last_step_ms >= GLASS_SLOW_MS {
+        GLASS_INTERVAL * 3
+    } else {
+        GLASS_INTERVAL
+    };
+    if glass.interval_ms.replace(interval) != interval {
+        crate::debug_log(&format!(
+            "player glass cadence interval_ms={} reason=slow_capture last_ms={last_step_ms}",
+            interval.as_millis()
+        ));
+    }
     let recapture = now >= glass.next.get();
     if recapture {
-        glass.next.set(now + GLASS_INTERVAL);
+        glass.next.set(now + interval);
     }
     let resigma = (sigma - glass.requested_sigma.get()).abs() > 0.25
         || glass.requested_sigma.get() < 0.0;
@@ -3468,6 +3748,21 @@ fn player_glass_step(weak: &Weak<PlayerWindow>, glass: &Rc<PlayerGlass>) {
 
     player_glass_place(&player, glass);
     player_panel_glass(&player, glass);
+}
+
+/// Queue one fresh capture for the next tick (and one only): the player captures
+/// its window rect, so a move or resize makes the cached pixels belong to the
+/// wrong area.
+///
+/// Called from the drag/resize end paths - never per drag frame, where the
+/// existing placement keeps the image glued to the window without a capture.
+fn player_glass_invalidate(player: &PlayerWindow, reason: &str) {
+    let Some(glass) = player_glass_for(player) else {
+        return;
+    };
+    glass.next.set(Instant::now());
+    glass.requested_sigma.set(-1.0);
+    crate::debug_log(&format!("player glass capture due reason={reason}"));
 }
 
 /// Apply one finished player frame on the UI thread.
@@ -4840,6 +5135,10 @@ fn main() -> Result<()> {
 
     // Kill all ffmpeg/ffplay children when this process dies, even abruptly.
     job::init();
+
+    // `BILI_IDLE_TEST=1`: exercise the chrome idle state machine with fake
+    // cursor samples (no synthetic input, no window touched).
+    spawn_idle_self_test();
 
     // 1 ms timer resolution before the first timer starts: the drag flush is
     // 8 ms (120 Hz) and the pacer's frame sleeps depend on the same winmm
@@ -9665,10 +9964,23 @@ const NET_BUFFER_FULL_SCALE_S: f32 = 2.0;
 /// How often the pre-formatted strings are refreshed (the profiler itself
 /// samples at 4 Hz, so faster would only repeat values).
 const NET_PUBLISH_MS: i64 = 250;
-/// One sparkline sample per second - the panel labels it 每秒一次.
-const NET_HISTORY_MS: i64 = 1000;
-/// Samples kept by `net_history` (64 s of history).
-const NET_HISTORY_LEN: usize = 64;
+/// One `prefetch stats` line per second (per-host split; diagnostic only).
+const NET_SPLIT_LOG_MS: i64 = 1000;
+/// `BILI_NET_TRACE=1`: how long the published slice map is logged, so a QA run
+/// can see the live proxy drive the strip (never a seeded model). A millisecond
+/// value (`BILI_NET_TRACE=9000`) selects a longer window.
+const NET_TRACE_MS: i64 = 3000;
+/// Cells in 下载分布: the whole file in 1/120th slices.
+const NET_MAP_SLICES: usize = 120;
+/// Slice states, strongest last: a cell shows the strongest state it contains.
+const NET_MAP_MISSING: i32 = 0;
+const NET_MAP_HELD: i32 = 1;
+const NET_MAP_POINT: i32 = 2;
+const NET_MAP_ACTIVE: i32 = 3;
+/// Connection rows the panel lists (the proxy may run more; Rust trims).
+const NET_WORKER_ROWS: usize = 8;
+/// Samples behind the live bar: 20 x 250 ms = the last 5 s.
+const NET_RATE_WINDOW: usize = 20;
 
 fn codec_name(codecid: u32) -> &'static str {
     match codecid {
@@ -9697,6 +10009,292 @@ fn fmt_socket_rate(bps: u64) -> String {
         format!("{:.0} KB/s", bps as f64 / 1_000.0)
     } else {
         format!("{bps} B/s")
+    }
+}
+
+/// `48.0 MB` / `512 KB` / `0 B`, decimal units: the same base as
+/// [`fmt_socket_rate`], so a claimed range and a rate read off one screen.
+fn fmt_mb(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.0} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// `https://upos-sz-mirrorcos.bilivideo.com:443/` -> the bare host, so the
+/// 线程 rows show what they are talking to instead of a URL prefix.
+fn trim_host(host: &str) -> &str {
+    let trimmed = host.trim();
+    let bare = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let bare = bare.split('/').next().unwrap_or(bare);
+    bare.split(':').next().unwrap_or(bare)
+}
+
+/// 120 equal slices over the whole file, strongest state wins: an active
+/// claim (3) beats a warm point cache range (2), which beats a held range (1).
+/// `None`, or a file whose length is not known yet, is all missing.
+fn net_map_slices(stats: Option<&prefetch::PrefetchStats>) -> Vec<i32> {
+    let mut slices = vec![NET_MAP_MISSING; NET_MAP_SLICES];
+    let Some(stats) = stats else {
+        return slices;
+    };
+    let Some(total) = stats.total_bytes.filter(|total| *total > 0) else {
+        return slices;
+    };
+    let slice = total as f64 / NET_MAP_SLICES as f64;
+    let mut mark = |ranges: &[(u64, u64)], state: i32| {
+        for (start, end) in ranges {
+            if end <= start {
+                continue;
+            }
+            let first = ((*start as f64 / slice).floor() as usize).min(NET_MAP_SLICES - 1);
+            let last = (*end as f64 / slice).ceil() as usize;
+            for index in first..last.clamp(first + 1, NET_MAP_SLICES) {
+                if state > slices[index] {
+                    slices[index] = state;
+                }
+            }
+        }
+    };
+    mark(&stats.downloaded, NET_MAP_HELD);
+    mark(&stats.point_cache, NET_MAP_POINT);
+    let active: Vec<(u64, u64)> = stats
+        .workers
+        .iter()
+        .filter(|worker| worker.busy && worker.end > worker.start)
+        .map(|worker| (worker.start, worker.end))
+        .collect();
+    mark(&active, NET_MAP_ACTIVE);
+    slices
+}
+
+/// `已下载 48.0 MB / 455.9 MB (10.5%)`. The held bytes are the merged ranges
+/// (read-ahead window + point cache), so a point already inside the window is
+/// counted once.
+fn net_total_text(stats: &prefetch::PrefetchStats) -> String {
+    let held: u64 = stats
+        .downloaded
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum();
+    match stats.total_bytes.filter(|total| *total > 0) {
+        Some(total) => format!(
+            "已下载 {} / {} ({:.1}%)",
+            fmt_mb(held),
+            fmt_mb(total),
+            held as f64 * 100.0 / total as f64
+        ),
+        None => format!("已下载 {}", fmt_mb(held)),
+    }
+}
+
+/// 网络分析 state: the two models Rust patches in place plus the 5 s rate
+/// window behind the live bar. One per player window.
+struct NetPanel {
+    /// 线程 rows, at most [`NET_WORKER_ROWS`].
+    workers: Rc<VecModel<NetWorker>>,
+    /// 下载分布, [`NET_MAP_SLICES`] cells.
+    map: Rc<VecModel<i32>>,
+    rate_window: RefCell<VecDeque<u64>>,
+    /// `BILI_NET_TRACE`: log the published slice map for this many ms (`0` =
+    /// off). `1` means the default [`NET_TRACE_MS`].
+    trace_ms: i64,
+}
+
+impl NetPanel {
+    fn new() -> Self {
+        Self {
+            workers: Rc::new(VecModel::from(Vec::<NetWorker>::new())),
+            map: Rc::new(VecModel::from(vec![NET_MAP_MISSING; NET_MAP_SLICES])),
+            rate_window: RefCell::new(VecDeque::with_capacity(NET_RATE_WINDOW)),
+            trace_ms: std::env::var("BILI_NET_TRACE")
+                .ok()
+                .and_then(|value| match value.trim() {
+                    "" => None,
+                    "1" => Some(NET_TRACE_MS),
+                    other => other.parse::<i64>().ok().filter(|ms| *ms > 0),
+                })
+                .unwrap_or(0),
+        }
+    }
+
+    /// Hand the models to the window once; every later frame patches them.
+    fn attach(&self, window: &PlayerWindow) {
+        window.set_net_workers(ModelRc::from(self.workers.clone()));
+        window.set_net_map(ModelRc::from(self.map.clone()));
+    }
+
+    /// `net_rate_ratio`: this sample over the max of the last 5 s, so the bar
+    /// reads full at the session's own peak instead of a fixed scale.
+    fn rate_ratio(&self, rate: u64) -> f32 {
+        let mut window = self.rate_window.borrow_mut();
+        if window.len() >= NET_RATE_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(rate);
+        match window.iter().copied().max().unwrap_or(0) {
+            0 => 0.0,
+            peak => (rate as f32 / peak as f32).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Rebuild the 线程 rows, in place: `set_row_data` per row (a `set_vec`
+    /// would destroy and recreate every row, which flickers on a model that
+    /// changes 4x a second).
+    fn publish_workers(&self, prefetch: Option<&prefetch::PrefetchStats>) {
+        let rows: Vec<NetWorker> = prefetch
+            .map(|stats| {
+                stats
+                    .workers
+                    .iter()
+                    .take(NET_WORKER_ROWS)
+                    .map(|worker| NetWorker {
+                        host: trim_host(&worker.host).to_string().into(),
+                        range: if worker.end > worker.start {
+                            format!("{}–{}", fmt_mb(worker.start), fmt_mb(worker.end)).into()
+                        } else {
+                            "-".into()
+                        },
+                        bytes: fmt_mb(worker.bytes).into(),
+                        busy: worker.busy,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        while self.workers.row_count() > rows.len() {
+            self.workers.remove(self.workers.row_count() - 1);
+        }
+        for (index, row) in rows.into_iter().enumerate() {
+            if index < self.workers.row_count() {
+                self.workers.set_row_data(index, row);
+            } else {
+                self.workers.push(row);
+            }
+        }
+    }
+
+    /// Patch 下载分布 in place and return the per-state counts (for the trace
+    /// log). `set_row_data`, not `set_vec`: the strip must not flicker.
+    fn publish_map(&self, prefetch: Option<&prefetch::PrefetchStats>) -> [u32; 4] {
+        let slices = net_map_slices(prefetch);
+        let mut counts = [0u32; 4];
+        for (index, state) in slices.iter().enumerate() {
+            counts[*state as usize] += 1;
+            if self.map.row_data(index) != Some(*state) {
+                self.map.set_row_data(index, *state);
+            }
+        }
+        counts
+    }
+
+    /// Publish one frame. `net_rate` is metered (no `≈`) while the loopback
+    /// proxy feeds the decoder and the profiler's ESTIMATE otherwise;
+    /// `net_bitrate` is always the track's declared bitrate.
+    fn publish(
+        &self,
+        window: &PlayerWindow,
+        stats: Option<&player::Stats>,
+        prefetch: Option<&prefetch::PrefetchStats>,
+    ) -> [u32; 4] {
+        let counts = self.publish_map(prefetch);
+        self.publish_workers(prefetch);
+        let Some(stats) = stats else {
+            // No track yet: clear everything so every row reads "-".
+            window.set_net_fps_presented(SharedString::default());
+            window.set_net_fps_decoded(SharedString::default());
+            window.set_net_first_frame(SharedString::default());
+            window.set_net_buffer(SharedString::default());
+            window.set_net_rate(SharedString::default());
+            window.set_net_bitrate(SharedString::default());
+            window.set_net_progress(SharedString::default());
+            window.set_net_stalls(SharedString::default());
+            window.set_net_codec(SharedString::default());
+            window.set_net_buffer_ratio(0.0);
+            window.set_net_active_text(SharedString::default());
+            window.set_net_total_text(SharedString::default());
+            window.set_net_rate_ratio(0.0);
+            self.rate_window.borrow_mut().clear();
+            return counts;
+        };
+        window.set_net_fps_presented(format!("{:.1} fps", stats.fps_presented).into());
+        window.set_net_fps_decoded(format!("{:.1} fps", stats.fps_decoded).into());
+        window.set_net_first_frame(
+            match stats.first_frame_ms {
+                Some(ms) => format!("{ms} ms"),
+                None => "-".to_string(),
+            }
+            .into(),
+        );
+        window.set_net_buffer(
+            format!(
+                "{:.2} s ({:+.2})",
+                stats.buffer_s, stats.buffer_delta_per_s
+            )
+            .into(),
+        );
+        window.set_net_rate(
+            match prefetch {
+                Some(metered) => fmt_socket_rate(metered.bytes_per_sec),
+                None => format!("≈ {}", fmt_bps(stats.estimated_bps)),
+            }
+            .into(),
+        );
+        window.set_net_bitrate(fmt_bps(stats.declared_bps).into());
+        window.set_net_progress(
+            format!(
+                "{} / {}",
+                format_mmss(stats.position_ms),
+                format_mmss(stats.duration_ms)
+            )
+            .into(),
+        );
+        window.set_net_stalls(
+            format!("{} 次 · 最长 {} ms", stats.stalls, stats.longest_stall_ms).into(),
+        );
+        window.set_net_codec(
+            if stats.width == 0 || stats.height == 0 {
+                codec_name(stats.codecid).to_string()
+            } else {
+                format!(
+                    "{} · {}×{} · {:.0} fps",
+                    codec_name(stats.codecid),
+                    stats.width,
+                    stats.height,
+                    stats.declared_fps
+                )
+            }
+            .into(),
+        );
+        window.set_net_buffer_ratio((stats.buffer_s / NET_BUFFER_FULL_SCALE_S).clamp(0.0, 1.0));
+        match prefetch {
+            Some(metered) => {
+                window.set_net_active_text(
+                    format!(
+                        "{} / {} 线程 · {}",
+                        metered.active_workers.min(metered.workers.len() as u32),
+                        metered.workers.len(),
+                        fmt_socket_rate(metered.bytes_per_sec)
+                    )
+                    .into(),
+                );
+                window.set_net_total_text(net_total_text(metered).into());
+                window.set_net_rate_ratio(self.rate_ratio(metered.bytes_per_sec));
+            }
+            None => {
+                // No proxy: the worker list and the strip are honestly empty.
+                window.set_net_active_text(SharedString::default());
+                window.set_net_total_text(SharedString::default());
+                window.set_net_rate_ratio(0.0);
+                self.rate_window.borrow_mut().clear();
+            }
+        }
+        counts
     }
 }
 
@@ -9748,84 +10346,6 @@ fn trace_buffer_state(
         window.get_frame().size().width > 0,
         control.paused()
     ));
-}
-
-/// Publish the eleven `net_*` strings. `net_rate` is metered
-/// ([`prefetch::PrefetchStats::bytes_per_sec`], no `≈`) while the loopback
-/// proxy feeds the decoder, and the profiler's ESTIMATE (`≈`) otherwise;
-/// `net_bitrate` is always the track's declared bitrate.
-/// Returns the buffer ratio so the caller can append it to the sparkline.
-fn publish_net_stats(
-    window: &PlayerWindow,
-    stats: Option<&player::Stats>,
-    prefetch: Option<&prefetch::PrefetchStats>,
-) -> f32 {
-    let Some(stats) = stats else {
-        // No track yet: clear everything so the panel reads "-" per row.
-        window.set_net_fps_presented(SharedString::default());
-        window.set_net_fps_decoded(SharedString::default());
-        window.set_net_first_frame(SharedString::default());
-        window.set_net_buffer(SharedString::default());
-        window.set_net_rate(SharedString::default());
-        window.set_net_bitrate(SharedString::default());
-        window.set_net_progress(SharedString::default());
-        window.set_net_stalls(SharedString::default());
-        window.set_net_codec(SharedString::default());
-        window.set_net_buffer_ratio(0.0);
-        return 0.0;
-    };
-    window.set_net_fps_presented(format!("{:.1} fps", stats.fps_presented).into());
-    window.set_net_fps_decoded(format!("{:.1} fps", stats.fps_decoded).into());
-    window.set_net_first_frame(
-        match stats.first_frame_ms {
-            Some(ms) => format!("{ms} ms"),
-            None => "-".to_string(),
-        }
-        .into(),
-    );
-    window.set_net_buffer(
-        format!(
-            "{:.2} s ({:+.2})",
-            stats.buffer_s, stats.buffer_delta_per_s
-        )
-        .into(),
-    );
-    window.set_net_rate(
-        match prefetch {
-            Some(metered) => fmt_socket_rate(metered.bytes_per_sec),
-            None => format!("≈ {}", fmt_bps(stats.estimated_bps)),
-        }
-        .into(),
-    );
-    window.set_net_bitrate(fmt_bps(stats.declared_bps).into());
-    window.set_net_progress(
-        format!(
-            "{} / {}",
-            format_mmss(stats.position_ms),
-            format_mmss(stats.duration_ms)
-        )
-        .into(),
-    );
-    window.set_net_stalls(
-        format!("{} 次 · 最长 {} ms", stats.stalls, stats.longest_stall_ms).into(),
-    );
-    window.set_net_codec(
-        if stats.width == 0 || stats.height == 0 {
-            codec_name(stats.codecid).to_string()
-        } else {
-            format!(
-                "{} · {}×{} · {:.0} fps",
-                codec_name(stats.codecid),
-                stats.width,
-                stats.height,
-                stats.declared_fps
-            )
-        }
-        .into(),
-    );
-    let ratio = (stats.buffer_s / NET_BUFFER_FULL_SCALE_S).clamp(0.0, 1.0);
-    window.set_net_buffer_ratio(ratio);
-    ratio
 }
 
 /// Re-publish the 画质 menu so `current` follows the decoder.
@@ -9881,6 +10401,78 @@ fn auto_stream_for(
         .filter(|spec| spec.qn == qn)
         .max_by_key(|spec| spec.bandwidth)
         .map(stream)
+}
+
+// ---- GPU utilisation for the interpolation row ---------------------------
+//
+// The player's interpolation badge shows `GPU 57%` next to the measured frame
+// cost. `nvidia-smi` takes 100-200 ms per call, so it is sampled every two
+// seconds on its own thread and the tick only reads the cached number. A machine
+// without `nvidia-smi` (or without an NVIDIA GPU) publishes nothing: the UI
+// hides the cell instead of showing a fake 0%.
+
+/// Sample interval for `nvidia-smi`.
+const GPU_SAMPLE_MS: u64 = 2_000;
+/// `nvidia-smi`'s own process is window-less like every other child.
+const GPU_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Cached utilisation + 1 (`0` = not available, so "0%" is a real reading).
+static GPU_UTIL: AtomicU64 = AtomicU64::new(0);
+/// One sampler for the whole process, however many player windows open.
+static GPU_SAMPLER: OnceLock<()> = OnceLock::new();
+
+/// Start the sampler once. Never blocks and never fails loudly.
+fn start_gpu_sampler() {
+    GPU_SAMPLER.get_or_init(|| {
+        std::thread::spawn(|| {
+            use std::os::windows::process::CommandExt;
+            let mut misses = 0u32;
+            loop {
+                let mut command = std::process::Command::new("nvidia-smi");
+                command
+                    .arg("--query-gpu=utilization.gpu")
+                    .arg("--format=csv,noheader,nounits")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .creation_flags(GPU_CREATE_NO_WINDOW);
+                let reading = command.output().ok().and_then(|output| {
+                    if !output.status.success() {
+                        return None;
+                    }
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    text.lines()
+                        .next()
+                        .and_then(|line| line.trim().parse::<u32>().ok())
+                        .map(|percent| percent.min(100))
+                });
+                match reading {
+                    Some(percent) => {
+                        misses = 0;
+                        GPU_UTIL.store(u64::from(percent) + 1, Ordering::Relaxed);
+                    }
+                    None => {
+                        // The tool is either absent or the driver is gone; three
+                        // failed rounds is enough to stop asking for this run.
+                        GPU_UTIL.store(0, Ordering::Relaxed);
+                        misses += 1;
+                        if misses >= 3 {
+                            crate::debug_log("gpu sampler stop reason=nvidia_smi_unavailable");
+                            return;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(GPU_SAMPLE_MS));
+            }
+        });
+    });
+}
+
+/// `GPU 57%`, or `""` while the sampler has no reading.
+fn gpu_utilization_text() -> String {
+    match GPU_UTIL.load(Ordering::Relaxed) {
+        0 => String::new(),
+        raw => format!("GPU {}%", raw - 1),
+    }
 }
 
 /// Build and drive the player window for a resolved video.
@@ -10240,6 +10832,10 @@ fn open_player_inner(
                         player_glass_place(&player, &glass);
                     }
                 }
+                // The player's glass captures its own window rect, so the pixels
+                // gathered where the window used to be are stale now. One fresh
+                // capture for the next tick (the drag itself captured nothing).
+                player_glass_invalidate(&player, "drag-end");
                 // Drag-end persist (task 4): the settled base rect.
                 persist_player_layout(&geom, player.window(), &store, cascade, "drag-end");
             }
@@ -10338,6 +10934,9 @@ fn open_player_inner(
                 // app closes inside the 600ms settle window.
                 resize.update(&player.window());
                 persist_player_layout(&geom, player.window(), &store, cascade, "resize-end");
+                // The captured rect no longer covers the window: one fresh
+                // capture on the next tick.
+                player_glass_invalidate(&player, "resize-end");
             }
             timer.stop();
             resize.end();
@@ -10353,6 +10952,37 @@ fn open_player_inner(
     control.set_hwaccel(prefs.hwaccel);
     control.set_codec_pref(prefs.codec_pref as i64);
     control.set_speed(prefs.player_speed as f64 / 1000.0);
+    // 帧插值: the persisted mode applies to this window from the first frame.
+    // `set_interp_mode` normalises it (0/1/2, anything else = off) and is what
+    // the badge, the pacer and the 60 Hz grid all read.
+    control.set_interp_mode(prefs.interp_mode);
+    start_gpu_sampler();
+    // The three interpolation labels are republished by the tick on change; seed
+    // them now so the row never shows a stale/blank mode for the first frames.
+    player.set_interp_mode_text(control.interp_mode_text().into());
+    player.set_interp_stats_text(control.interp_stats_text().into());
+    player.set_interp_gpu_text(gpu_utilization_text().into());
+    // `interp_cycle()` (the row and the shortcut menu item) advances
+    // 关闭 -> 混合 -> RIFE -> 关闭, applies it to this player and persists it.
+    {
+        let control = control.clone();
+        let window = weak.clone();
+        let store = settings_store.clone();
+        player.on_interp_cycle(move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let next = (control.interp_mode() + 1) % 3;
+            control.set_interp_mode(next);
+            update_settings(&store, |prefs| prefs.interp_mode = next);
+            window.set_interp_mode_text(control.interp_mode_text().into());
+            window.set_interp_stats_text(control.interp_stats_text().into());
+            crate::debug_log(&format!(
+                "interp cycle mode={next} text={} source=ui",
+                control.interp_mode_text()
+            ));
+        });
+    }
     // Everything that belongs to exactly this window. The glass loop is created
     // now (not when the HWND appears) so the seeded image is already in place
     // and its 33ms tick can position it on the first frame. The session is
@@ -10404,19 +11034,22 @@ fn open_player_inner(
     let refresh = Rc::new(Cell::new(true));
     let last_position = Rc::new(Cell::new(u64::MAX));
     let last_danmaku_on = Rc::new(Cell::new(true));
+    // Last RIFE downgrade notice this window has toasted. RIFE is not available
+    // at this frame size / helper missing: the pacer bumps the counter once per
+    // session and the tick shows one explanation instead of a silent fallback.
+    let interp_notice_seen = Rc::new(Cell::new(control.interp_notice()));
     // Last opacity baked into the model rows; a change repaints even while
     // paused (see the skip guard). -1.0 is never a valid opacity.
     let last_opacity = Rc::new(Cell::new(-1.0f32));
     // Gate for the once-a-second `danmaku diff` debug-log line.
     let last_diff_log = Rc::new(Cell::new(0u64));
-    // 网络分析 sparkline: 64 samples, newest last, mutated in place so the
-    // model is never rebuilt.
-    let net_history = Rc::new(VecModel::<f32>::from(Vec::<f32>::new()));
-    player.set_net_history(ModelRc::from(net_history.clone()));
+    // 网络分析: the two models Rust patches in place (线程 rows and the
+    // 120-slice 下载分布 strip) plus the 5 s rate window behind the live bar.
+    let net_panel = Rc::new(NetPanel::new());
+    net_panel.attach(&player);
     let net_last_publish = Rc::new(Cell::new(-NET_PUBLISH_MS));
-    let net_last_history = Rc::new(Cell::new(-NET_HISTORY_MS));
     // Gate for the once-a-second `prefetch stats` line (per-host split).
-    let net_last_split = Rc::new(Cell::new(-NET_HISTORY_MS));
+    let net_last_split = Rc::new(Cell::new(-NET_SPLIT_LOG_MS));
     // `BILI_BUFFER_TRACE=1`: log the first 500 ms of `buffering` / position at
     // 50 ms, so the pre-show buffering state can be proven frame by frame.
     let buffer_trace = Rc::new(
@@ -10480,10 +11113,10 @@ fn open_player_inner(
         let refresh = refresh.clone();
         let last_opacity = last_opacity.clone();
         let last_diff_log = last_diff_log.clone();
+        let interp_notice_seen = interp_notice_seen.clone();
         let panel_geom = panel_geom.clone();
-        let net_history = net_history.clone();
+        let net_panel = net_panel.clone();
         let net_last_publish = net_last_publish.clone();
-        let net_last_history = net_last_history.clone();
         let net_last_split = net_last_split.clone();
         let buffer_trace = buffer_trace.clone();
         let buffer_trace_at = buffer_trace_at.clone();
@@ -10503,6 +11136,29 @@ fn open_player_inner(
             // called before the paused-frame skip guard so a paused player's
             // toasts still expire.
             toast_tick(&window);
+            // 帧插值: mode badge, measured cost and (when an NVIDIA GPU is
+            // present) its utilisation. Written only on change: the tick runs at
+            // ~30 Hz and a Slint property write repaints the row.
+            let interp_mode_text = control.interp_mode_text();
+            if window.get_interp_mode_text().as_str() != interp_mode_text {
+                window.set_interp_mode_text(interp_mode_text.into());
+            }
+            let interp_stats_text = control.interp_stats_text();
+            if window.get_interp_stats_text().as_str() != interp_stats_text {
+                window.set_interp_stats_text(interp_stats_text.into());
+            }
+            let interp_gpu_text = gpu_utilization_text();
+            if window.get_interp_gpu_text().as_str() != interp_gpu_text {
+                window.set_interp_gpu_text(interp_gpu_text.into());
+            }
+            // One toast per downgrade: mode 2 was asked for, blend is delivered
+            // (1080p frame, or the helper/model is missing). The pacer logs the
+            // reason; the user sees it once.
+            let notice = control.interp_notice();
+            if notice != interp_notice_seen.get() {
+                interp_notice_seen.set(notice);
+                toast(&window, control.interp_notice_text(), TOAST_KIND_INFO);
+            }
             // 播放列表: this window is the queue's active player, so report the
             // play/pause state and watch for the end of the track (self-gated
             // to 250ms, like the toast tick).
@@ -10579,21 +11235,28 @@ fn open_player_inner(
             }
             if net_now - net_last_publish.get() >= NET_PUBLISH_MS {
                 net_last_publish.set(net_now);
-                let ratio =
-                    publish_net_stats(&window, stats.as_ref(), prefetch_stats.as_ref());
-                if stats.is_some() && net_now - net_last_history.get() >= NET_HISTORY_MS {
-                    net_last_history.set(net_now);
-                    if net_history.row_count() >= NET_HISTORY_LEN {
-                        let _ = net_history.remove(0);
-                    }
-                    net_history.push(ratio);
-                    // The per-host split has no property of its own; it goes
-                    // to the diagnostic log at the same one-per-second cadence.
-                    if let Some(metered) = prefetch_stats.as_ref() {
-                        if net_now - net_last_split.get() >= NET_HISTORY_MS {
-                            net_last_split.set(net_now);
-                            log_prefetch_split(&bvid_log, metered);
-                        }
+                let counts = net_panel.publish(&window, stats.as_ref(), prefetch_stats.as_ref());
+                // `BILI_NET_TRACE=1`: prove the strip is driven by the live
+                // proxy - the published slice counts, once per publish tick,
+                // for the first 3 s.
+                if net_panel.trace_ms > 0 && net_now <= net_panel.trace_ms {
+                    let (workers, active) = prefetch_stats
+                        .as_ref()
+                        .map(|metered| (metered.workers.len(), metered.active_workers))
+                        .unwrap_or((0, 0));
+                    crate::debug_log(&format!(
+                        "net map t_ms={net_now} slices={} missing={} held={} point={} active={} \
+                         workers={active}/{workers} rate={}",
+                        NET_MAP_SLICES, counts[0], counts[1], counts[2], counts[3],
+                        window.get_net_rate()
+                    ));
+                }
+                // The per-host split has no property of its own; it goes to the
+                // diagnostic log once a second.
+                if let Some(metered) = prefetch_stats.as_ref() {
+                    if net_now - net_last_split.get() >= NET_SPLIT_LOG_MS {
+                        net_last_split.set(net_now);
+                        log_prefetch_split(&bvid_log, metered);
                     }
                 }
             }
@@ -10881,6 +11544,9 @@ fn open_player_inner(
                 window.set_fullscreen(next);
                 window.set_panels_overlay(next);
                 window.set_fullscreen_text(if next { "退出全屏" } else { "全屏" }.into());
+                // Fullscreen changes the window rect: recapture once instead of
+                // waiting for the one-second cadence.
+                player_glass_invalidate(&window, "fullscreen");
                 if !next {
                     // Winit restores the pre-fullscreen rect asynchronously;
                     // grow back by the strips that are open now afterwards.
@@ -12111,8 +12777,84 @@ fn open_player_inner(
                     "seek-test after_ms={after} target_ms={target} delta_ms={}",
                     after as i64 - target as i64
                 ));
+                // End→seek check (no synthetic input): wait for the track to
+                // reach its end, then seek to BILI_SEEK_AGAIN and prove the
+                // decoder restarted and the position advances again.
+                if let Ok(again) = std::env::var("BILI_SEEK_AGAIN") {
+                    let again = again.trim().to_string();
+                    if !again.is_empty() {
+                        let mut ended = false;
+                        // A seek near EOF can take a while on a slow CDN; give
+                        // it up to a minute to reach the real end.
+                        for _ in 0..120 {
+                            if control.track_ended() {
+                                ended = true;
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                        let duration = control.duration_ms();
+                        let target = if let Some(percent) = again.strip_prefix('p') {
+                            let percent = percent.parse::<u64>().unwrap_or(10).clamp(1, 99);
+                            duration.saturating_mul(percent) / 100
+                        } else {
+                            again.parse::<u64>().unwrap_or(10).saturating_mul(1_000)
+                        };
+                        let target = if duration > 0 {
+                            target.min(duration.saturating_sub(1_000))
+                        } else {
+                            target
+                        };
+                        let before = control.playback_position_ms();
+                        crate::debug_log(&format!(
+                            "seek-again spec={again} ended={ended} before_ms={before} target_ms={target} duration_ms={duration}"
+                        ));
+                        control.seek(target);
+                        // A far seek can spend a second or two buffering; wait
+                        // past that so "the position advances" is measured on a
+                        // running picture, not on the held seek target.
+                        std::thread::sleep(Duration::from_millis(4_500));
+                        let after = control.playback_position_ms();
+                        crate::debug_log(&format!(
+                            "seek-again after_ms={after} target_ms={target} advanced_ms={}",
+                            after as i64 - target as i64
+                        ));
+                    }
+                }
             });
         }
+    }
+    // Diagnostic hook (mirrors BILI_RESIZE_TEST): toggle fullscreen on and back
+    // off through the same UI callback the button uses, so the decode target's
+    // window-independence can be read from the backend without synthetic input.
+    // `BILI_FULLSCREEN_TEST=<delay_ms>` (default 8000) is when the first toggle
+    // happens; the second follows 4 s later.
+    if let Ok(value) = std::env::var("BILI_FULLSCREEN_TEST") {
+        let delay = value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .unwrap_or(8_000)
+            .clamp(1_000, 60_000);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let first = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(player) = first.upgrade() {
+                    crate::debug_log(&format!("fullscreen-test toggle=on delay_ms={delay}"));
+                    player.invoke_toggle_fullscreen();
+                }
+            });
+            std::thread::sleep(Duration::from_secs(4));
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(player) = weak.upgrade() {
+                    crate::debug_log("fullscreen-test toggle=off");
+                    player.invoke_toggle_fullscreen();
+                }
+            });
+        });
     }
     // Diagnostic hook (mirrors BILI_AUTOPLAY): open the mini PiP immediately so
     // its frameless frame style can be read back from the backend.
@@ -20536,3 +21278,62 @@ mod up_resolver_tests {
 }
 
 
+
+#[cfg(test)]
+mod chrome_idle_tests {
+    use super::*;
+
+    /// One 16 ms tick, like the real pointer watch.
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn movement_never_hides_the_chrome() {
+        let base = Instant::now();
+        let mut idle = ChromeIdle::new(base);
+        for step in 0u64..400 {
+            let cursor = Some((100 + (step % 2) as i32, 100));
+            assert!(
+                idle.poll(cursor, true, false, at(base, step * 16)),
+                "1 px movement at {} ms must keep the chrome up",
+                step * 16
+            );
+        }
+        assert!(!idle.hidden);
+    }
+
+    #[test]
+    fn stillness_hides_after_the_threshold_and_hold_suppresses_it() {
+        let base = Instant::now();
+        let mut idle = ChromeIdle::new(base);
+        assert!(idle.poll(Some((10, 10)), true, false, at(base, 0)));
+        // Just below the threshold the chrome is still up.
+        assert!(idle.poll(Some((10, 10)), true, false, at(base, 2_400)));
+        assert!(!idle.hidden);
+        // Past it, the chrome hides and stays hidden.
+        assert!(!idle.poll(Some((10, 10)), true, false, at(base, 2_501)));
+        assert!(idle.hidden);
+        assert!(!idle.poll(Some((10, 10)), true, false, at(base, 4_000)));
+        // A held button (or chrome_hold) shows it again immediately.
+        assert!(idle.poll(Some((10, 10)), true, true, at(base, 4_100)));
+        assert!(!idle.hidden);
+        // Releasing with no movement starts a fresh streak.
+        assert!(idle.poll(Some((10, 10)), true, false, at(base, 4_200)));
+    }
+
+    #[test]
+    fn leaving_and_re_entering_resets_the_streak() {
+        let base = Instant::now();
+        let mut idle = ChromeIdle::new(base);
+        assert!(idle.poll(Some((10, 10)), true, false, at(base, 0)));
+        assert!(!idle.poll(Some((10, 10)), true, false, at(base, 3_000)));
+        assert!(idle.hidden);
+        // Left the window: not visible, and the idle latch is cleared.
+        assert!(!idle.poll(Some((900, 900)), false, false, at(base, 3_100)));
+        assert!(!idle.hidden);
+        // Back inside without moving the cursor: entering is activity.
+        assert!(idle.poll(Some((900, 900)), true, false, at(base, 3_200)));
+        assert!(!idle.hidden);
+    }
+}

@@ -91,3 +91,16 @@ The player keys are remappable in Settings ‚Üí Âø´Êç∑ÈîÆ.
 
 See [THIRD_PARTY.md](THIRD_PARTY.md). The UI font is Chill Round Gothic (OFL-1.1),
 bundled under `assets/fonts/` with its licence text.
+
+## Frame smoothing
+
+Settings °˙ ”≈ªØ / the player's ∆Ωª¨ button cycles three modes:
+
+| Mode | What it does | Limits |
+| --- | --- | --- |
+| πÿ±’ | native frame rate | °™ |
+| ªÏ∫œ | blends adjacent frames to the display rate (display-only, no A/V impact) | 1080p capped at 60 fps; 120 fps only at °‹960°¡540 |
+| RIFE | optical-flow interpolation through the bundled helper (real intermediate frames) | **°‹1280°¡720, 30/25 fps sources only**; falls back to ªÏ∫œ above that or if the helper is missing |
+
+RIFE needs `rife-helper.exe` + `assets/rife/model` next to the exe (both are in the
+release bundle). Measured on an RTX 4060 Ti: 16®C18 ms per 720p pair (°÷58 pairs/s).

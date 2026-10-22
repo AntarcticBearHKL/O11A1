@@ -452,6 +452,11 @@ pub struct Glass {
     shot_h: i32,
     /// Sigma the cached pixels were last blurred at; negative = never.
     rendered_sigma: f32,
+    /// Capture the window rect plus this margin instead of the whole desktop
+    /// (`0` = desktop grab).
+    margin: i32,
+    /// Smallest blur downscale factor (see [`GlassConfig`]).
+    min_downscale: usize,
     /// Optional `BILI_GLASS_FAILTEST` countdown, owned by the worker so a
     /// rebuild never re-arms it.
     inject: Option<Arc<Injector>>,
@@ -470,8 +475,19 @@ impl Glass {
             shot_w: 0,
             shot_h: 0,
             rendered_sigma: -1.0,
+            margin: 0,
+            min_downscale: 1,
             inject: None,
         }
+    }
+
+    /// Apply the capture/blur profile (window-rect capture, blur floor).
+    fn set_config(&mut self, config: GlassConfig) {
+        self.margin = config.window_margin.max(0);
+        self.min_downscale = config.min_downscale.clamp(1, 8);
+        // A different capture rect invalidates the cached grab.
+        self.have_shot = false;
+        self.rendered_sigma = -1.0;
     }
 
     /// Hand the fail-test countdown to a freshly built engine.
@@ -562,7 +578,8 @@ impl Glass {
         Some(unsafe { std::slice::from_raw_parts(self.bits as *const u8, len) })
     }
 
-    /// Grab the whole virtual desktop.
+    /// Grab the capture rect: the whole virtual desktop, or (player) just the
+    /// window plus `margin` around it.
     ///
     /// A hidden or minimised window is a pause (`Fail::Hidden`/`Fail::Iconic`):
     /// there is nothing to show and GDI would grab a desktop the window is not
@@ -579,10 +596,30 @@ impl Glass {
             if matches!(injection, Some(Injection::Fail)) {
                 return Err(Fail::Injected);
             }
-            let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-            let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if vw < 2 || vh < 2 {
+                return Err(Fail::NoArea);
+            }
+            // Player profile: the window rect plus a margin, clamped to the
+            // virtual desktop. The placement math is rect-relative, so a
+            // smaller grab needs no other change - and the readback drops from
+            // the whole desktop (11-18 MB at 4K) to a few hundred KB typically.
+            let (x, y, w, h) = if self.margin > 0 {
+                let mut r = Rect::default();
+                if GetWindowRect(self.hwnd, &mut r) == 0 {
+                    return Err(Fail::NoArea);
+                }
+                let left = (r.left - self.margin).max(vx);
+                let top = (r.top - self.margin).max(vy);
+                let right = (r.right + self.margin).min(vx + vw);
+                let bottom = (r.bottom + self.margin).min(vy + vh);
+                (left, top, right - left, bottom - top)
+            } else {
+                (vx, vy, vw, vh)
+            };
             if w < 2 || h < 2 {
                 return Err(Fail::NoArea);
             }
@@ -684,12 +721,15 @@ impl Glass {
         let h = self.dib_h as usize;
         // Blur scale: enough downscale that even the strongest radius stays
         // a small number of pixels wide here, no more (the renderer's
-        // linear upscale hides the rest of the sampling).
+        // linear upscale hides the rest of the sampling). The player's profile
+        // floors it at 2, so a blurred backdrop never pays a full-resolution
+        // pass: at 1/2 per axis the box passes touch a quarter of the pixels.
         let factor = if sigma < 3.0 {
             1
         } else {
             ((sigma / 8.0).round() as usize).clamp(1, 4)
-        };
+        }
+        .max(self.min_downscale);
         let (mut rgb, bw, bh) = downscale(src, w, h, factor);
         // Three box passes per axis approximate a Gaussian whose sigma is
         // close to the box radius; below sigma 1 the blur is skipped so the
@@ -815,6 +855,45 @@ impl Drop for AffinityGuard {
     }
 }
 
+/// What a glass worker captures and how hard it blurs.
+///
+/// The main window's glass covers the whole window, so it still wants the
+/// desktop grab (a move keeps the pixels valid, which is what makes its drag
+/// path free). A player window only shows two thin bars: capturing the whole
+/// 4K desktop there costs an 18 MB GPU→CPU readback four times a second for
+/// pixels nobody sees, so it captures just the window rect and blurs a
+/// downscaled copy of it.
+#[derive(Clone, Copy, Debug)]
+pub struct GlassConfig {
+    /// Physical pixels of margin around the window rect, or `0` to grab the
+    /// whole virtual desktop.
+    pub window_margin: i32,
+    /// Smallest blur downscale factor (2 = quarter-resolution copy).
+    pub min_downscale: usize,
+}
+
+impl GlassConfig {
+    /// Whole virtual desktop, full-resolution blur: the main window.
+    pub const DESKTOP: GlassConfig = GlassConfig {
+        window_margin: 0,
+        min_downscale: 1,
+    };
+    /// Window rect + margin, blur at 1/2 per axis (1/4 of the pixels).
+    pub const PLAYER: GlassConfig = GlassConfig {
+        window_margin: 96,
+        min_downscale: 2,
+    };
+
+    /// The player's profile, with a QA switch: `BILI_GLASS_RECT=0` falls back to
+    /// the desktop grab (used to A/B the capture cost on this machine).
+    pub fn player() -> GlassConfig {
+        match std::env::var("BILI_GLASS_RECT").as_deref() {
+            Ok("0") => GlassConfig::DESKTOP,
+            _ => GlassConfig::PLAYER,
+        }
+    }
+}
+
 /// One request from the UI thread to the glass worker.
 pub enum GlassRequest {
     /// Capture (when `recapture`) and/or re-blur the cached grab at `sigma`.
@@ -899,6 +978,10 @@ pub struct GlassWorker {
     tx: mpsc::Sender<GlassRequest>,
     join: Option<JoinHandle<()>>,
     health: Arc<Health>,
+    /// Duration of the last served step, in ms. A machine already saturated by
+    /// another build can turn a capture into a ~1 s stall; the caller uses this
+    /// to stretch its cadence instead of asking for more of the same.
+    last_step_ms: Arc<AtomicU64>,
 }
 
 /// One queued grab, after coalescing.
@@ -928,17 +1011,30 @@ impl GlassWorker {
     /// captures fail (see the module docs), so the callback can fire without a
     /// new capture having happened.
     pub fn spawn(hwnd: isize, deliver: impl Fn(GlassFrame) + Send + 'static) -> GlassWorker {
+        Self::spawn_with(hwnd, GlassConfig::DESKTOP, deliver)
+    }
+
+    /// Spawn the worker with an explicit capture/blur profile (see
+    /// [`GlassConfig`]): the player passes [`GlassConfig::PLAYER`].
+    pub fn spawn_with(
+        hwnd: isize,
+        config: GlassConfig,
+        deliver: impl Fn(GlassFrame) + Send + 'static,
+    ) -> GlassWorker {
         let (tx, rx) = mpsc::channel();
         let health = Arc::new(Health::new());
         let worker_health = health.clone();
+        let last_step_ms = Arc::new(AtomicU64::new(0));
+        let worker_cost = last_step_ms.clone();
         match std::thread::Builder::new()
             .name("glass".to_string())
-            .spawn(move || worker_loop(hwnd, rx, deliver, worker_health))
+            .spawn(move || worker_loop(hwnd, config, rx, deliver, worker_health, worker_cost))
         {
             Ok(join) => GlassWorker {
                 tx,
                 join: Some(join),
                 health,
+                last_step_ms,
             },
             Err(err) => {
                 // No worker: requests fail silently and no frame is ever
@@ -949,6 +1045,7 @@ impl GlassWorker {
                     tx,
                     join: None,
                     health,
+                    last_step_ms,
                 }
             }
         }
@@ -958,6 +1055,15 @@ impl GlassWorker {
     /// unbounded and a gone worker just drops it.
     pub fn request(&self, request: GlassRequest) {
         let _ = self.tx.send(request);
+    }
+
+    /// Wall time of the last served step in ms (`0` before the first one).
+    ///
+    /// A loaded machine can stretch a screen readback to hundreds of
+    /// milliseconds; a caller that sees this go up should slow its cadence
+    /// rather than queue the same work again.
+    pub fn last_step_ms(&self) -> u64 {
+        self.last_step_ms.load(Ordering::Relaxed)
     }
 
     /// Whether the worker thread is alive and its last capture did not fail.
@@ -1013,15 +1119,17 @@ impl Drop for GlassWorker {
 /// frames ever again.
 fn worker_loop(
     hwnd: isize,
+    config: GlassConfig,
     rx: mpsc::Receiver<GlassRequest>,
     deliver: impl Fn(GlassFrame),
     health: Arc<Health>,
+    last_step_ms: Arc<AtomicU64>,
 ) {
     let inject = Injector::from_env();
     if inject.total > 0 {
         crate::debug_log(&format!("glass failtest enabled n={}", inject.total));
     }
-    let mut worker = Worker::new(hwnd, &inject, &health);
+    let mut worker = Worker::new(hwnd, &inject, &health, config, last_step_ms.clone());
     let mut panics: u32 = 0;
     loop {
         let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1034,7 +1142,7 @@ fn worker_loop(
         crate::debug_log(&format!("glass worker panic: respawn n={panics}"));
         // Never turn a deterministic panic into a hot loop.
         std::thread::sleep(Duration::from_millis(RETRY_MIN_MS));
-        worker = Worker::new(hwnd, &inject, &health);
+        worker = Worker::new(hwnd, &inject, &health, config, last_step_ms.clone());
     }
     health.alive.store(false, Ordering::Relaxed);
 }
@@ -1074,12 +1182,22 @@ struct Worker {
     paused: Option<(Instant, Fail)>,
     /// Set once the fail-test countdown has been reported as exhausted.
     injected_done: bool,
+    /// Written with the duration of every served step (see
+    /// [`GlassWorker::last_step_ms`]).
+    last_step_ms: Arc<AtomicU64>,
 }
 
 impl Worker {
-    fn new(hwnd: isize, inject: &Arc<Injector>, health: &Arc<Health>) -> Worker {
+    fn new(
+        hwnd: isize,
+        inject: &Arc<Injector>,
+        health: &Arc<Health>,
+        config: GlassConfig,
+        last_step_ms: Arc<AtomicU64>,
+    ) -> Worker {
         let mut engine = Glass::new(hwnd);
         engine.set_injector(inject.clone());
+        engine.set_config(config);
         Worker {
             hwnd,
             engine,
@@ -1097,6 +1215,7 @@ impl Worker {
             retained_at: None,
             paused: None,
             injected_done: false,
+            last_step_ms,
         }
     }
 
@@ -1183,6 +1302,8 @@ impl Worker {
         let started = Instant::now();
         let step = self.engine.frame(job.sigma, job.scale, job.recapture);
         let delivered = step.frame.is_some();
+        self.last_step_ms
+            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
 
         if let Some(frame) = step.frame {
             let (sig, range) = fingerprint(&frame.buffer);
