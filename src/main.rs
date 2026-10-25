@@ -8,14 +8,15 @@
 
 mod accounts;
 mod autostart;
+mod backdrop;
 mod bilibili;
 mod danmaku;
 mod download;
-mod glass;
-mod interp;
+mod fish;
 mod job;
+mod netpool;
 mod player;
-#[allow(dead_code)] mod prefetch; // the player wires it in; QA helpers stay unused in a normal build
+mod prefetch; // the player wires it in; QA helpers stay unused in a normal build
 mod settings;
 mod theme;
 mod tray;
@@ -38,8 +39,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsZoomed, SetWindowPos, SWP_NOACTIVATE,
-    SWP_NOZORDER,
+    EnumWindows, GetWindowRect, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsZoomed,
+    SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
 };
 
 slint::include_modules!();
@@ -86,9 +87,9 @@ const FEED_HOME_WAIT: Duration = Duration::from_secs(6);
 const FEED_START_CURSOR: u64 = 1;
 
 /// Number of player windows currently open (or opening). Main-window background
-/// work — incremental cover fetch/patch, the skeleton shimmer and the
-/// frosted-glass refresh loop — is suspended while it is non-zero so nothing
-/// competes with playback for CPU, the UI thread or DWM.
+/// work — incremental cover fetch/patch and the skeleton shimmer — is suspended
+/// while it is non-zero so nothing competes with playback for CPU, the UI thread
+/// or DWM.
 ///
 /// A counter rather than a flag: several player windows can be open at once, so
 /// closing one must not resume the main window while another still plays.
@@ -114,7 +115,7 @@ fn player_closed() {
 /// The one live session, shared with the player worker threads.
 type SessionSlot = Arc<Mutex<Option<Arc<bilibili::Session>>>>;
 
-/// Region list offered by 分区浏览 and the 排行榜 selector (番剧/直播 excluded).
+/// Region list offered by 分区浏览 (番剧/直播 excluded).
 const REGIONS: &[(&str, i64)] = &[
     ("动画", 1),
     ("国创", 167),
@@ -144,17 +145,12 @@ fn region_labels() -> Vec<SharedString> {
         .collect()
 }
 
-fn rank_region_labels() -> Vec<SharedString> {
-    let mut labels = Vec::with_capacity(REGIONS.len() + 1);
-    labels.push(SharedString::from("全站"));
-    for (name, _) in REGIONS {
-        labels.push(SharedString::from(*name));
-    }
-    labels
-}
-
 /// Append `line` to the file named by `BILI_DEBUG_LOG`, when set. Diagnostic
 /// only: never writes to stdout and is inert unless the env var is present.
+///
+/// One `write_all` per line: the pool, the prefetch workers and the player all
+/// log from different threads, and `writeln!` on a `File` issues several writes
+/// per line, which let two lines interleave in the middle of a word.
 pub(crate) fn debug_log(line: &str) {
     let Ok(path) = std::env::var("BILI_DEBUG_LOG") else {
         return;
@@ -165,7 +161,10 @@ pub(crate) fn debug_log(line: &str) {
         .open(path)
     {
         use std::io::Write;
-        let _ = writeln!(file, "{line}");
+        let mut record = String::with_capacity(line.len() + 1);
+        record.push_str(line);
+        record.push('\n');
+        let _ = file.write_all(record.as_bytes());
     }
 }
 
@@ -241,7 +240,7 @@ fn toast_model_items(queue: &ToastQueue) -> Vec<ToastItem> {
 /// At most [`TOAST_MAX_VISIBLE`] stay up: a fourth drops the oldest. The queue
 /// is republished immediately, so the new toast appears without waiting for the
 /// next tick.
-fn toast(player: &PlayerWindow, text: impl Into<String>, kind: i32) {
+pub(crate) fn toast(player: &PlayerWindow, text: impl Into<String>, kind: i32) {
     let text = text.into();
     let Some(hwnd) = win::hwnd_of(player.window()) else {
         crate::debug_log(&format!("toast skipped no-hwnd text={text}"));
@@ -1000,6 +999,9 @@ struct Playlist {
     last_tick: Cell<Instant>,
     /// xorshift state for shuffle mode (no new dependency).
     rng: Cell<u64>,
+    /// `(current, len)` of the last preload pass: the next-items fetch only
+    /// runs when the queue actually changed.
+    preload_mark: RefCell<Option<(Option<usize>, usize)>>,
 }
 
 thread_local! {
@@ -1058,6 +1060,7 @@ impl Playlist {
             end_handled: Cell::new(true),
             last_tick: Cell::new(Instant::now()),
             rng: Cell::new(seed | 1),
+            preload_mark: RefCell::new(None),
         });
         let len = host.queue.borrow().items.len();
         if len > 0 {
@@ -1161,9 +1164,125 @@ impl Playlist {
         ui.set_now_playing(playing);
         ui.set_now_title(now_title.into());
         ui.set_now_cover(now_cover);
+        self.mark_feed_queued(&ui);
         crate::debug_log(&format!(
             "playlist publish items={len} current={current:?} mode={mode} playing={playing} now={now_bvid}"
         ));
+        self.preload_ahead();
+    }
+
+    /// Refresh the model-born `queued` flag on every home-feed card.
+    ///
+    /// The feed row owns the flag (not the card): a virtualised card that was
+    /// recycled comes back with the check, and a row removed from the queue
+    /// loses it. Only rows whose flag actually changed are written, so an
+    /// enqueue repaints one card, not the list.
+    fn mark_feed_queued(&self, ui: &AppWindow) {
+        let queued: HashSet<String> = self
+            .queue
+            .borrow()
+            .items
+            .iter()
+            .map(|entry| entry.bvid.clone())
+            .collect();
+        let rows = ui.get_feed_items();
+        for index in 0..rows.row_count() {
+            let Some(mut row) = rows.row_data(index) else {
+                continue;
+            };
+            let want = queued.contains(row.bvid.as_str());
+            if row.queued != want {
+                row.queued = want;
+                rows.set_row_data(index, row);
+            }
+        }
+    }
+
+    /// Preload the next playlist entries into their cache files, in order.
+    ///
+    /// `PrefetchHandle::preload_keys` writes exactly the file name the decoder
+    /// opens for that stream, so the next item starts from local bytes instead
+    /// of the network. Runs only when the queue's shape or current index
+    /// changed; the prefetch handle skips keys it already holds.
+    fn preload_ahead(&self) {
+        let (current, len) = {
+            let queue = self.queue.borrow();
+            (queue.current, queue.items.len())
+        };
+        if *self.preload_mark.borrow() == Some((current, len)) {
+            return;
+        }
+        *self.preload_mark.borrow_mut() = Some((current, len));
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let control = state
+            .focused
+            .borrow()
+            .clone()
+            .or_else(|| state.players.borrow().last().cloned())
+            .map(|player| player.control.clone());
+        let Some(control) = control else {
+            return;
+        };
+        let Some(session) = active_session(&self.session) else {
+            return;
+        };
+        let next: Vec<(String, u64)> = {
+            let queue = self.queue.borrow();
+            let start = queue.current.map(|index| index + 1).unwrap_or(0);
+            queue
+                .items
+                .iter()
+                .skip(start)
+                .take(2)
+                .map(|entry| (entry.bvid.clone(), entry.cid))
+                .collect()
+        };
+        if next.is_empty() {
+            return;
+        }
+        let (quality, codec) = match self.settings.lock() {
+            Ok(settings) => (settings.player_quality, i64::from(settings.codec_pref)),
+            Err(poisoned) => {
+                let settings = poisoned.into_inner();
+                (settings.player_quality, i64::from(settings.codec_pref))
+            }
+        };
+        crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
+            let Some(runtime) = bilibili::shared_runtime() else {
+                return;
+            };
+            let mut order: Vec<(String, String)> = Vec::new();
+            for (bvid, cid) in next {
+                let Ok(info) = runtime.block_on(session.playurl(&bvid, cid)) else {
+                    continue;
+                };
+                let qn = if quality != 0 && info.video_tracks.iter().any(|track| track.id == quality)
+                {
+                    quality
+                } else {
+                    info.default_qn
+                };
+                let Some(track) = player::auto_track_for(&info, qn, codec) else {
+                    continue;
+                };
+                if track.url.is_empty() {
+                    continue;
+                }
+                order.push((
+                    format!("{bvid}-{cid}-{}-{}", track.id, track.codecid),
+                    track.url.clone(),
+                ));
+            }
+            if order.is_empty() {
+                return;
+            }
+            crate::debug_log(&format!("playlist preload items={}", order.len()));
+            let _ = slint::invoke_from_event_loop(move || {
+                control.preload_playlist(&order);
+            });
+        }));
     }
 
     /// Write queue + current index + mode to `settings.json`.
@@ -1212,7 +1331,7 @@ impl Playlist {
         let Some(session) = active_session(&self.session) else {
             return;
         };
-        std::thread::spawn(move || {
+        crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
             let Some(runtime) = bilibili::shared_runtime() else {
                 return;
             };
@@ -1228,13 +1347,13 @@ impl Playlist {
                     host.publish();
                 }
             });
-        });
+        }));
     }
 
     /// Queue entry for a card index in the view that is on screen.
     ///
     /// The feed carries cid/aid itself, so it is queued synchronously. The
-    /// discovery cards (分区 / 排行 / 热门 / 必刷 / 用户空间) only carry a bvid;
+    /// discovery cards (分区 / 排行 / 用户空间) only carry a bvid;
     /// those are resolved through the detail API first, then queued.
     fn enqueue_index(&self, index: i32, only: bool) {
         let index = index.max(0) as usize;
@@ -1285,7 +1404,7 @@ impl Playlist {
             return;
         };
         let ui = self.ui.clone();
-        std::thread::spawn(move || {
+        crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
             let Some(runtime) = bilibili::shared_runtime() else {
                 return;
             };
@@ -1314,7 +1433,7 @@ impl Playlist {
                     host.insert_entry(entry, only);
                 }
             });
-        });
+        }));
     }
 
     /// Append one resolved entry, open the panel for a plain enqueue, and
@@ -1345,6 +1464,7 @@ impl Playlist {
         self.spawn_cover(cover);
         self.publish();
         self.persist();
+        self.toast_any("已加入播放列表", TOAST_KIND_SUCCESS);
         // "Nothing is playing" includes a natural stop (mode 0) and a closed
         // player; a merely paused player still owns the screen, so a new card
         // is appended without interrupting it.
@@ -1390,21 +1510,72 @@ impl Playlist {
         self.persist();
     }
 
-    fn remove(&self, index: i32) {
+    /// Remove one row. `via` names the entry point (`row-x`, `window-close`,
+    /// or a test), so the log proves WHICH gesture removed the item.
+    fn remove_via(&self, index: i32, via: &str) -> bool {
         let index = index.max(0) as usize;
         let removed = self.queue.borrow_mut().remove(index);
         let Some(removed) = removed else {
-            crate::debug_log(&format!("playlist remove ignored index={index}"));
-            return;
+            crate::debug_log(&format!(
+                "playlist remove ignored index={index} via={via}"
+            ));
+            return false;
         };
         crate::debug_log(&format!(
-            "playlist remove index={index} bvid={} items={} current={:?}",
+            "playlist remove index={index} bvid={} items={} current={:?} via={via}",
             removed.bvid,
             self.queue.borrow().items.len(),
             self.current()
         ));
         self.publish();
         self.persist();
+        true
+    }
+
+    fn remove(&self, index: i32) {
+        self.remove_via(index, "row-x");
+    }
+
+    /// A player window closed on the user's terms (X / Alt+F4): that video is
+    /// done, so its queue row goes with it. A pause or an end-of-track never
+    /// reaches here; a Replace close is tagged `replace` and is skipped by the
+    /// caller, so auto-advance keeps the played item in the queue.
+    fn remove_bvid_via(&self, bvid: &str, via: &str) -> bool {
+        let index = self
+            .queue
+            .borrow()
+            .items
+            .iter()
+            .position(|entry| entry.bvid == bvid);
+        match index {
+            Some(index) => self.remove_via(index as i32, via),
+            None => {
+                crate::debug_log(&format!(
+                    "playlist remove skipped bvid={bvid} via={via} reason=not-queued"
+                ));
+                false
+            }
+        }
+    }
+
+    /// A short confirmation: the focused player's stack when one is open,
+    /// otherwise the main window's own single toast (the home bar's queue mark
+    /// is used with no player all the time).
+    fn toast_any(&self, text: &str, kind: i32) {
+        if let Some(state) = self.state.upgrade() {
+            let player = focused_session(&state)
+                .or_else(|| player_sessions(&state).last().cloned());
+            if let Some(player) = player {
+                toast(&player.window, text.to_string(), kind);
+                crate::debug_log(&format!("playlist toast text={text} win={}", player.id));
+                return;
+            }
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_toast_text(text.into());
+            ui.set_toast_kind(kind);
+            crate::debug_log(&format!("playlist toast main=1 text={text}"));
+        }
     }
 
     fn clear(&self) {
@@ -1565,7 +1736,7 @@ impl Playlist {
         self.stopped.set(true);
         self.end_handled.set(true);
         self.publish();
-        crate::debug_log("playlist close keep-current=1 playing=0");
+        crate::debug_log("playlist close playing=0");
     }
 
     /// Another open player window gained focus: the bar's now-playing block
@@ -1603,6 +1774,10 @@ impl Playlist {
 /// Runs once per process; the timer lives in a thread-local so dropping the
 /// closure cannot stop it by accident.
 static PLAYLIST_TEST_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// How many `seek requested` lines the player windows have emitted. The seek
+/// drag harness samples it around one gesture: a 2s drag must add exactly 1.
+static SEEK_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static PLAYLIST_TEST_TIMER: RefCell<Option<Rc<slint::Timer>>> = RefCell::new(None);
@@ -1859,9 +2034,14 @@ fn maybe_start_playlist_test(ui: &AppWindow) {
                 }
                 13 => {
                     // The ✕ path (both close paths share `close_player_window`):
-                    // the bar must stop reporting playback and the queue must
-                    // keep its position.
+                    // a user close means "done with this video", so its queue row
+                    // goes with it. Auto-advance uses tag=replace and is skipped,
+                    // which the mode-2 step above already proves (items=3 after
+                    // the shuffle advance).
                     let current = playlist().and_then(|host| host.current());
+                    let items_before = playlist()
+                        .map(|host| host.queue.borrow().items.len())
+                        .unwrap_or(0);
                     let window = playlist()
                         .and_then(|host| host.state.upgrade())
                         .and_then(|state| newest_player(&state));
@@ -1870,10 +2050,13 @@ fn maybe_start_playlist_test(ui: &AppWindow) {
                             crate::debug_log("playlist test step=close-window via=player_closed");
                             player.invoke_player_closed();
                             log_playlist_state("after-close");
+                            let items_after = playlist()
+                                .map(|host| host.queue.borrow().items.len())
+                                .unwrap_or(0);
                             crate::debug_log(&format!(
-                                "playlist test assert close current={current:?} now_playing={} keep-current={}",
+                                "playlist test assert close current_before={current:?} now_playing={} items_before={items_before} items_after={items_after} removed={} keep-current=0 remove-on-close=1",
                                 ui.get_now_playing(),
-                                usize::from(playlist().and_then(|host| host.current()) == current)
+                                items_before.saturating_sub(items_after)
                             ));
                             14
                         }
@@ -2117,7 +2300,7 @@ type CommentsSlot = Arc<Mutex<CommentsState>>;
 /// Shared handles the UI thread keeps for the open player windows.
 ///
 /// Each window owns its playback control, panel geometry, pointer watch and
-/// glass loop; nothing here is shared between two players. `players` holds them
+/// pointer watch; nothing here is shared between two players. `players` holds them
 /// oldest first and is the only strong reference that outlives the open call
 /// (the window's own callbacks use `Weak`), so removing an entry closes exactly
 /// that window.
@@ -2161,16 +2344,13 @@ struct PlayerSession {
     window: PlayerWindow,
     control: Arc<player::PlaybackControl>,
     panel_geom: Rc<RefCell<PanelGeom>>,
-    /// Native handle, cached once known (identity for focus/toast/glass).
+    /// Native handle, cached once known (identity for focus/toast).
     hwnd: Cell<isize>,
     /// A close path already ran for this window (a native WM_CLOSE can race
     /// the ✕); the second one is a no-op.
     closed: Cell<bool>,
     /// This window's 60Hz pointer watch + layout debounce.
     loops: RefCell<Option<Rc<PlayerLoops>>>,
-    /// This window's frosted-glass loop (created at open, worker attached once
-    /// the HWND exists).
-    glass: RefCell<Option<Rc<PlayerGlass>>>,
     /// The decode thread mirrors frames into the mini through this slot; one
     /// per window so a background player never paints another's PiP.
     mini_slot: player::MiniSlot,
@@ -2251,8 +2431,8 @@ fn mini_handle(state: &Rc<PlayerState>) -> Option<MiniPlayerWindow> {
 }
 
 /// Undo the player-active suspension: resume main-window background work (the
-/// incremental cover fetches, the skeleton shimmer and the frosted-glass
-/// refresh loop, all gated on `player_active()`). Shared by both player close
+/// incremental cover fetches and the skeleton shimmer, both gated on
+/// `player_active()`). Shared by both player close
 /// paths; the main window stays suspended while another player is still open.
 fn resume_main_window(_state: &Rc<PlayerState>) {
     player_closed();
@@ -2579,10 +2759,10 @@ fn run_close_test(
 ///
 /// The HWND is only valid after the event loop has created the window, so this
 /// re-queues itself a bounded number of times on the UI thread until
-/// `win::setup_glass` finds a handle, then logs the resulting frame style. The
-/// frosted-glass refresh loop is started separately (`start_glass_loop`), on
-/// the UI thread, and does no work of its own until the handle exists.
-fn schedule_glass(weak: Weak<AppWindow>, dark: bool, tries: u32) {
+/// `win::setup_glass` finds a handle, then logs the resulting frame style.
+/// `win::setup_glass` here is the compositor alpha + DWM chrome (the per-pixel
+/// backdrop is the generated gradient, not a screen capture).
+fn schedule_window_chrome(weak: Weak<AppWindow>, dark: bool, tries: u32) {
     let retry = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = retry.upgrade() else {
@@ -2590,10 +2770,10 @@ fn schedule_glass(weak: Weak<AppWindow>, dark: bool, tries: u32) {
         };
         if win::style_bits(ui.window()).is_none() {
             if tries == 0 {
-                crate::debug_log("glass: no hwnd after retries");
+                crate::debug_log("window chrome: no hwnd after retries");
                 return;
             }
-            schedule_glass(retry.clone(), dark, tries - 1);
+            schedule_window_chrome(retry.clone(), dark, tries - 1);
             return;
         }
         let scale = ui.window().scale_factor();
@@ -2606,559 +2786,573 @@ fn schedule_glass(weak: Weak<AppWindow>, dark: bool, tries: u32) {
         // resize (the login page still uses its own 20px strip inside that
         // range).
         win::set_top_drag_strip((76.0 * scale) as i32);
-        win::log_frame_state(ui.window(), "before-glass");
+        win::log_frame_state(ui.window(), "before-chrome");
         win::install_subclass(ui.window());
+        // Every native move republishes the wallpaper origin (parallax). This is
+        // the only trigger - no polling timer: an idle window does no work.
+        {
+            let move_weak = ui.as_weak();
+            win::set_move_hook(ui.window(), move || {
+                if let Some(ui) = move_weak.upgrade() {
+                    publish_wallpaper(ui.global::<AppTheme>(), ui.window());
+                }
+            });
+        }
+        let (wall_x, wall_y) = publish_wallpaper(ui.global::<AppTheme>(), ui.window());
+        crate::debug_log(&format!(
+            "wallpaper origin win=main stage=chrome x={wall_x:.1} y={wall_y:.1}"
+        ));
         win::setup_glass(ui.window(), dark);
-        win::log_frame_state(ui.window(), "after-glass");
+        win::log_frame_state(ui.window(), "after-chrome");
+        // Pin the landscape size once the layout has settled. On a scaled
+        // display the window can come up at the content's preferred width
+        // instead of the intended logical 1280x800, which shrinks every
+        // horizontal metric (the bar included). The OS still clamps to the
+        // work area.
+        let size = ui.window().size();
+        if size.width < 1200 {
+            let weak = ui.as_weak();
+            slint::Timer::single_shot(Duration::from_millis(600), move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.window()
+                        .set_size(slint::LogicalSize::new(1280.0, 800.0));
+                    crate::debug_log(&format!(
+                        "window size pinned {:?}",
+                        ui.window().size()
+                    ));
+                }
+            });
+        }
     });
 }
 
-/// Shared state of the frosted-glass refresh loop (see [`glass_step`]).
+/// The wallpaper's origin for one window: `-(screen position mod tile)`, in
+/// logical px.
 ///
-/// One per main window: the worker thread that owns the GDI grab engine and
-/// does every capture + blur, the shot origin/size the UI thread keeps from the
-/// last delivered frame (so placement never needs the worker), the next forced
-/// recapture, the sigma last requested and last pushed to the UI (so the debug
-/// log stays one line per state change) and the 33ms timer that drives it.
-/// Created on the UI thread and only ever touched from there - the worker's
-/// replies are re-dispatched onto the UI thread by [`glass_deliver`].
-struct GlassLoop {
-    /// The grab worker; created on the first tick that finds a live HWND.
-    worker: RefCell<Option<glass::GlassWorker>>,
-    /// Grab origin and size (physical desktop px) of the last delivered frame.
-    /// Kept here so `glass_place` can re-place the image with one
-    /// `GetWindowRect` and no worker round-trip.
-    shot: Cell<Option<((i32, i32), i32, i32)>>,
-    /// Earliest next forced recapture; pulled to "now" while the blur is off so
-    /// switching it back on grabs a fresh backdrop immediately instead of
-    /// reusing whatever was cached minutes ago.
-    next: Cell<Instant>,
-    /// Sigma of the last grab request sent to the worker; negative = none yet.
-    /// A change beyond the render threshold queues a re-blur.
-    requested_sigma: Cell<f32>,
-    /// Sigma of the last frame pushed to the UI; negative = none yet.
-    logged_sigma: Cell<f32>,
-    /// Placement (glass_x/y/w/h, logical px) last pushed to the UI, so the
-    /// per-tick re-place can skip the property writes when nothing moved.
-    placed: Cell<Option<(f32, f32, f32, f32)>>,
-    /// The refresh timer, owned here so it lives exactly as long as the loop.
-    timer: slint::Timer,
-}
-
-impl GlassLoop {
-    fn new() -> Self {
-        GlassLoop {
-            worker: RefCell::new(None),
-            shot: Cell::new(None),
-            next: Cell::new(Instant::now()),
-            requested_sigma: Cell::new(-1.0),
-            logged_sigma: Cell::new(-1.0),
-            placed: Cell::new(None),
-            timer: slint::Timer::default(),
-        }
-    }
-}
-
-thread_local! {
-    /// The main window's glass loop, as a weak handle.
-    ///
-    /// A finished frame arrives through `slint::invoke_from_event_loop`, whose
-    /// closure must be `Send` and therefore cannot capture the `Rc<GlassLoop>`
-    /// (all of its state is UI-thread-only). The loop registers itself here
-    /// instead, so the delivery callback can find it again on the thread it
-    /// belongs to. There is exactly one main window and one loop.
-    static GLASS_LOOP: RefCell<std::rc::Weak<GlassLoop>> =
-        RefCell::new(std::rc::Weak::new());
-}
-
-/// The registered glass loop, while one exists.
-fn glass_loop() -> Option<Rc<GlassLoop>> {
-    GLASS_LOOP.with(|slot| slot.borrow().upgrade())
-}
-
-/// Start the backdrop refresh loop on the UI thread.
-///
-/// The 33ms tick itself is cheap; [`glass_step`] decides whether it needs to
-/// queue a grab and/or re-place the image, so this can run at the animation
-/// cadence without work. It is started before the native handle exists - the
-/// loop's first useful tick is the one that finds it and spawns the glass
-/// worker.
-fn start_glass_loop(ui: &AppWindow, state: &Rc<GlassLoop>) {
-    if state.timer.running() {
-        return;
-    }
-    GLASS_LOOP.with(|slot| *slot.borrow_mut() = Rc::downgrade(state));
-    let weak = ui.as_weak();
-    let loop_state = Rc::downgrade(state);
-    state.timer.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(33),
-        move || {
-            if let Some(state) = loop_state.upgrade() {
-                glass_step(&weak, &state);
-            }
-        },
-    );
-    crate::debug_log("glass: refresh loop started");
-}
-
-/// One iteration of the backdrop refresh loop.
-///
-/// Each tick is cheap when nothing changed: it reads the two 设置 sliders from
-/// the theme, queues a grab on the glass worker at most every 400ms (or when
-/// the blur radius moved) and re-places the last delivered frame. Capture and
-/// blur never run here - the worker owns them, coalesces the requests and
-/// delivers finished frames through [`glass_deliver`]. A window move is not a
-/// reason to grab: the grab covers the whole desktop and [`glass_place`] keeps
-/// it registered with the desktop, so it stays correct wherever the window is.
-/// While a player window is open the whole loop is suspended (`PLAYER_ACTIVE`),
-/// like the other main-window background work.
-fn glass_step(weak: &Weak<AppWindow>, state: &Rc<GlassLoop>) {
-    const GLASS_INTERVAL: Duration = Duration::from_millis(400);
-    if player_active() {
-        return;
-    }
-    let Some(ui) = weak.upgrade() else {
-        return;
+/// The tile is pinned to the monitor, not to the window: a window whose
+/// top-left sits at `(x, y)` shows the tile starting at `-x mod tile`. Two
+/// consequences the UI relies on: moving by one full tile reproduces the same
+/// pixels (the tile is seamless), and a small move reveals a different part.
+fn wallpaper_origin(window: &slint::Window, tile: f32) -> (f32, f32) {
+    let tile = f64::from(tile.max(1.0));
+    let Some((x, y, _, _)) = win::window_rect(window) else {
+        return (0.0, 0.0);
     };
-    let theme = ui.global::<AppTheme>();
-    let blur = theme.get_glass_blur();
-    let transparency = theme.get_glass_transparency();
-    let now = Instant::now();
-
-    if blur <= 0.5 {
-        // Slider at zero: there is no blur layer at all. The tint alone sits
-        // over the compositor's transparent window - a sharp, always-live
-        // desktop - and the loop stays idle. `next` is pulled to now so that
-        // turning the blur back on grabs a fresh backdrop immediately rather
-        // than reusing whatever was cached minutes ago.
-        if ui.get_glass_backdrop_valid() {
-            ui.set_glass_backdrop(Image::default());
-            ui.set_glass_backdrop_valid(false);
-            crate::debug_log(&format!(
-                "glass step blur=0 backdrop=off transparency={transparency:.0}"
-            ));
-        }
-        state.next.set(now);
-        return;
-    }
-
-    let Some(hwnd) = win::hwnd_of(ui.window()) else {
-        return;
-    };
-    if state.worker.borrow().is_none() {
-        let weak = weak.clone();
-        let worker = glass::GlassWorker::spawn(hwnd, move |frame| {
-            let weak = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = weak.upgrade() {
-                    glass_deliver(&ui, frame);
-                }
-            });
-        });
-        *state.worker.borrow_mut() = Some(worker);
-    }
-    let scale = ui.window().scale_factor().max(0.5);
-    // Slider 0..100 -> Gaussian sigma in physical pixels; rendering in physical
-    // pixels keeps the visual radius the same at any DPI scale.
-    let sigma = blur / 100.0 * glass::SIGMA_MAX * scale;
-
-    // A grab is due, nothing has been requested yet, or the radius moved since
-    // the last request: queue one. The worker coalesces them (only the latest
-    // survives) and captures/re-blurs only what it actually needs.
-    let recapture = now >= state.next.get();
-    if recapture {
-        state.next.set(now + GLASS_INTERVAL);
-    }
-    let resigma =
-        (sigma - state.requested_sigma.get()).abs() > 0.25 || state.requested_sigma.get() < 0.0;
-    if recapture || resigma {
-        state.requested_sigma.set(sigma);
-        if let Some(worker) = state.worker.borrow().as_ref() {
-            worker.request(glass::GlassRequest::Grab {
-                sigma,
-                scale,
-                recapture,
-            });
-        }
-    }
-
-    glass_place(&ui, state);
+    let scale = f64::from(window.scale_factor().max(0.2));
+    let left = (f64::from(x) / scale).rem_euclid(tile);
+    let top = (f64::from(y) / scale).rem_euclid(tile);
+    (-(left as f32), -(top as f32))
 }
 
-/// Apply one finished frame on the UI thread.
+/// Publish the wallpaper lattice for one window: the tile edge (once per
+/// publish, cheap) and the origin derived from the live screen position.
 ///
-/// Runs from the worker's `slint::invoke_from_event_loop` delivery: the image
-/// (built here from the worker's `Send` pixel buffer - `slint::Image` itself is
-/// not `Send`), the placement that came with it, and the shot origin/size the
-/// drag path re-places from.
-fn glass_deliver(ui: &AppWindow, frame: glass::GlassFrame) {
-    let Some(state) = glass_loop() else {
-        return;
-    };
-    state
-        .shot
-        .set(Some((frame.shot_origin, frame.shot_w, frame.shot_h)));
-    ui.set_glass_backdrop(Image::from_rgba8(frame.buffer));
-    ui.set_glass_backdrop_valid(true);
-    if (frame.sigma - state.logged_sigma.get()).abs() > 0.25 {
-        state.logged_sigma.set(frame.sigma);
-        let theme = ui.global::<AppTheme>();
-        crate::debug_log(&format!(
-            "glass step sigma={:.1} blur={:.0} transparency={:.0}",
-            frame.sigma,
-            theme.get_glass_blur(),
-            theme.get_glass_transparency(),
-        ));
-    }
-    // The placement that came with the image, applied straight away so
-    // `glass_place` below only has to cover plain moves and resizes.
-    glass_apply(ui, &state, frame.placed);
+/// Called at creation, on every theme switch, and from each window's
+/// `WM_MOVE` hook. No timer: an idle window publishes nothing.
+fn publish_wallpaper(theme: AppTheme, window: &slint::Window) -> (f32, f32) {
+    let tile = backdrop::tile_px();
+    let (wall_x, wall_y) = wallpaper_origin(window, tile);
+    theme.set_wallpaper_tile(tile);
+    theme.set_wall_x(wall_x);
+    theme.set_wall_y(wall_y);
+    (wall_x, wall_y)
 }
 
-/// Write a backdrop placement into the window, skipping the writes when it is
-/// unchanged (the loop runs every 33ms, and Slint notifies on every property
-/// write).
-fn glass_apply(ui: &AppWindow, state: &GlassLoop, placed: (f32, f32, f32, f32)) {
-    if state.placed.get() == Some(placed) {
-        return;
-    }
-    state.placed.set(Some(placed));
-    ui.set_glass_x(placed.0);
-    ui.set_glass_y(placed.1);
-    ui.set_glass_w(placed.2);
-    ui.set_glass_h(placed.3);
+/// Paint the generated wallpaper tile into the main window and mark it valid.
+///
+/// Called once at creation and again on every theme/blur switch, before anything
+/// is shown: the first painted frame is already wallpaper + tint.
+fn set_backdrop(ui: &AppWindow, dark: bool) {
+    // The wallpaper IS the diffused image: at blur 0 the coloured balls read as
+    // crisp discs, at the default they melt into a mesh gradient.
+    let blur_start = Instant::now();
+    let wallpaper = backdrop::image(dark);
+    let blurred = backdrop::blurred(dark);
+    ui.set_wallpaper(wallpaper);
+    ui.set_wallpaper_valid(true);
+    // Every GlassPanel in this window paints the SAME pre-blurred copy; the
+    // first call per theme pays for the blur (three separable box passes on the
+    // cached sharp pixels), every later call gets the cached image. Logged so
+    // the one-time cost is visible and the per-frame cost is provably zero.
     crate::debug_log(&format!(
-        "glass place x={:.0} y={:.0} w={:.0} h={:.0}",
-        placed.0, placed.1, placed.2, placed.3
+        "glass blur dark={} ms={:.1} size={}x{} tile={}px",
+        u8::from(dark),
+        blur_start.elapsed().as_secs_f64() * 1000.0,
+        blurred.size().width,
+        blurred.size().height,
+        backdrop::tile_px(),
+    ));
+    ui.global::<AppTheme>().set_glass_blur(blurred);
+    ui.global::<AppTheme>()
+        .set_backdrop_blur(backdrop::blur_px() as i32);
+    let (wall_x, wall_y) = publish_wallpaper(ui.global::<AppTheme>(), ui.window());
+    crate::debug_log(&format!(
+        "wallpaper publish win=main x={wall_x:.1} y={wall_y:.1} tile={:.0}",
+        backdrop::tile_px()
     ));
 }
 
-/// Keep the desktop grab registered with the desktop: place it at the grab
-/// origin minus the current window origin, in logical pixels.
-///
-/// Pure placement — one `GetWindowRect`, four property writes, no capture and
-/// no blur (and no worker round-trip) — so it runs on every [`glass_step`] tick
-/// and, more importantly, in the same pointer event as `WindowDrag::move_to`
-/// (see the drag wiring): the image follows the window immediately instead of
-/// waiting for the next capture, which is what removes the trailing blur during
-/// a drag. Before the first delivered frame there is nothing to place.
-fn glass_place(ui: &AppWindow, state: &GlassLoop) {
-    let Some((shot_origin, shot_w, shot_h)) = state.shot.get() else {
-        return;
-    };
-    // A minimised window reports a -32000 rect; the previous placement is the
-    // one the restore comes back to.
-    let Some(hwnd) = win::hwnd_of(ui.window()) else {
-        return;
-    };
-    if glass::window_iconic(hwnd) {
-        return;
-    }
-    let Some((wx, wy)) = win::window_origin(ui.window()) else {
-        return;
-    };
-    let scale = ui.window().scale_factor().max(0.5);
-    glass_apply(
-        ui,
-        state,
-        glass::place_for(shot_origin, shot_w, shot_h, wx, wy, scale),
-    );
-}
-
-/// Shared state of the PLAYER window's frosted-glass refresh loop (see
-/// [`player_glass_step`]).
-///
-/// A deliberate near-copy of [`GlassLoop`] for the second window. The main loop
-/// is suspended while a player is open (`PLAYER_ACTIVE`), so the player carries
-/// its own worker - a whole-desktop grab with its own `WDA_EXCLUDEFROMCAPTURE`
-/// toggle, see `glass.rs` - driven by its own 33ms timer. Exactly one
-/// `PlayerGlass` lives per open player window; [`stop_player_glass`] drops it on
-/// close, so reopening always starts a fresh worker. All of it is
-/// UI-thread-only, like `GlassLoop`.
-struct PlayerGlass {
-    /// The grab worker, spawned once the player HWND exists.
-    worker: RefCell<Option<glass::GlassWorker>>,
-    /// The player HWND the worker was spawned for: a frame from a superseded
-    /// player's worker is dropped instead of feeding the next player's loop.
-    hwnd: Cell<isize>,
-    /// The control of the window this loop belongs to, weakly so the loop never
-    /// keeps the session alive. Used to release the video-glass sampling.
-    control: std::sync::Weak<player::PlaybackControl>,
-    /// Whether the panels currently sample the VIDEO frame instead of the
-    /// desktop snapshot (fullscreen/overlay with a panel open).
-    video_glass_on: Cell<bool>,
-    /// Last `PlaybackControl::video_glass_generation` baked into `panel_glass`
-    /// (0 = nothing baked for this activation).
-    video_glass_generation: Cell<u64>,
-    /// Last time a video frame was baked: the 10 fps gate.
-    video_glass_at: Cell<Option<Instant>>,
-    /// Frames baked since the last activation, logged when the source flips
-    /// back so a QA run can see the effective rate.
-    video_glass_bakes: Cell<u64>,
-    /// Window rect (logical px) last written to `panel_glass_*` in video mode.
-    video_glass_rect: Cell<Option<(f32, f32, f32, f32)>>,
-    /// Grab origin and size (physical desktop px) of the last delivered frame,
-    /// kept so the per-tick placement needs one `GetWindowRect` and no worker
-    /// round-trip.
-    shot: Cell<Option<((i32, i32), i32, i32)>>,
-    /// Earliest next forced recapture (the same 400ms cadence as the main loop).
-    next: Cell<Instant>,
-    /// Sigma of the last grab request sent to the worker; negative = none yet.
-    requested_sigma: Cell<f32>,
-    /// Sigma of the last frame pushed to the UI; negative = none yet.
-    logged_sigma: Cell<f32>,
-    /// Placement (glass_x/y/w/h, logical px) last pushed to the UI, so the
-    /// per-tick re-place can skip the property writes when nothing moved.
-    placed: Cell<Option<(f32, f32, f32, f32)>>,
-    /// The refresh timer, owned here so it lives exactly as long as the loop.
-    timer: slint::Timer,
-    /// `chrome_shown` (== `pointer_inside`) of the last tick. While false the
-    /// frosted bars are invisible, so the loop pauses: no capture, no blur, no
-    /// placement. A false→true edge queues one immediate capture.
-    chrome: Cell<bool>,
-    /// Scale factor seen on the last tick: a monitor change (which can change
-    /// the DPI) invalidates the captured rect.
-    scale: Cell<f32>,
-    /// Cadence currently in use (1 s, or 3 s after a slow capture), so a change
-    /// is logged once instead of every tick.
-    interval_ms: Cell<Duration>,
-}
-
-impl PlayerGlass {
-    fn new(hwnd: isize, control: std::sync::Weak<player::PlaybackControl>) -> Self {
-        PlayerGlass {
-            worker: RefCell::new(None),
-            hwnd: Cell::new(hwnd),
-            control,
-            video_glass_on: Cell::new(false),
-            video_glass_generation: Cell::new(0),
-            video_glass_at: Cell::new(None),
-            video_glass_rect: Cell::new(None),
-            video_glass_bakes: Cell::new(0),
-            shot: Cell::new(None),
-            next: Cell::new(Instant::now()),
-            requested_sigma: Cell::new(-1.0),
-            logged_sigma: Cell::new(-1.0),
-            placed: Cell::new(None),
-            timer: slint::Timer::default(),
-            // Start "shown": a window that opens with the pointer already inside
-            // must not log a spurious resume, and one that opens with the pointer
-            // outside logs the pause on its first tick.
-            chrome: Cell::new(true),
-            scale: Cell::new(1.0),
-            interval_ms: Cell::new(Duration::from_millis(1000)),
-        }
-    }
-}
-
-thread_local! {
-    /// Every open player window's glass loop, as weak handles.
-    ///
-    /// Same routing problem as `GLASS_LOOP`: the worker's delivery closure must
-    /// be `Send` and cannot capture the `Rc<PlayerGlass>`, so each loop
-    /// registers itself here and delivery finds it again on the UI thread.
-    /// Several players can be open at once, so this is a list keyed by the
-    /// loop's own HWND; [`stop_player_glass`] removes exactly its own entry and
-    /// never touches another window's.
-    static PLAYER_GLASS_LOOPS: RefCell<Vec<std::rc::Weak<PlayerGlass>>> =
-        RefCell::new(Vec::new());
-}
-
-/// The glass loop that belongs to `player`, if it is running.
-fn player_glass_for(player: &PlayerWindow) -> Option<Rc<PlayerGlass>> {
-    let hwnd = win::hwnd_of(player.window())?;
-    PLAYER_GLASS_LOOPS.with(|slot| {
-        slot.borrow()
-            .iter()
-            .filter_map(|weak| weak.upgrade())
-            .find(|glass| glass.hwnd.get() == hwnd)
-    })
-}
-
-/// The main window's last delivered desktop snapshot, written into the player's
-/// glass properties before its first frame.
-///
-/// Returns the grab origin/size so the new loop can re-place that same image for
-/// this window's rect (`player_glass_step` does it on its first tick). `target`
-/// is the physical rect the window will be shown at, so the placement is valid
-/// on the very first painted frame; without it nothing is seeded and the caller
-/// keeps the window hidden instead of showing a transparent surface.
-fn seed_player_backdrop(
-    state: &Rc<PlayerState>,
-    player: &PlayerWindow,
-    target: Option<WinRect>,
-) -> Option<((i32, i32), i32, i32)> {
-    let main = state.main.upgrade()?;
-    if !main.get_glass_backdrop_valid() {
-        crate::debug_log("player glass seed valid=0 reason=main-backdrop-invalid");
-        return None;
-    }
-    let image = main.get_glass_backdrop();
-    if image.size().width == 0 {
-        crate::debug_log("player glass seed valid=0 reason=main-backdrop-empty");
-        return None;
-    }
-    let Some(shot) = glass_loop().and_then(|loop_| loop_.shot.get()) else {
-        crate::debug_log("player glass seed valid=0 reason=no-shot-origin");
-        return None;
-    };
-    let Some(target) = target else {
-        crate::debug_log("player glass seed valid=0 reason=no-layout-target");
-        return None;
-    };
-    let scale = player.window().scale_factor().max(0.5);
-    let placed = glass::place_for(shot.0, shot.1, shot.2, target.x, target.y, scale);
-    player.set_glass_backdrop(image.clone());
-    player.set_glass_backdrop_valid(true);
-    player.set_glass_x(placed.0);
-    player.set_glass_y(placed.1);
-    player.set_glass_w(placed.2);
-    player.set_glass_h(placed.3);
-    // The panels read `panel_glass`; the video pump takes it over later.
-    player_panel_glass_desktop(player);
+/// The same for a player window.
+fn set_player_backdrop(player: &PlayerWindow, dark: bool) {
+    player.set_wallpaper(backdrop::image(dark));
+    player.set_wallpaper_valid(true);
+    player.global::<AppTheme>().set_glass_blur(backdrop::blurred(dark));
+    player
+        .global::<AppTheme>()
+        .set_backdrop_blur(backdrop::blur_px() as i32);
+    let (wall_x, wall_y) = publish_wallpaper(player.global::<AppTheme>(), player.window());
     crate::debug_log(&format!(
-        "player glass seed valid=1 pre_show=1 shot_origin={},{} shot={}x{} place={:.0},{:.0},{:.0}x{:.0}",
-        shot.0 .0, shot.0 .1, shot.1, shot.2, placed.0, placed.1, placed.2, placed.3
+        "wallpaper publish win=player x={wall_x:.1} y={wall_y:.1} tile={:.0}",
+        backdrop::tile_px()
     ));
-    Some(shot)
 }
 
-/// Show a player window that had no backdrop to seed from, after the bounded
-/// fallback delay. The create hook already made it frameless; this only maps it.
-fn schedule_player_show(player: Weak<PlayerWindow>, delay_ms: u64) {
-    slint::Timer::single_shot(Duration::from_millis(delay_ms), move || {
-        let Some(player) = player.upgrade() else {
+/// The same for the mini player.
+fn set_mini_backdrop(mini: &MiniPlayerWindow, dark: bool) {
+    mini.set_wallpaper(backdrop::image(dark));
+    mini.set_wallpaper_valid(true);
+    mini.global::<AppTheme>().set_glass_blur(backdrop::blurred(dark));
+    mini.global::<AppTheme>()
+        .set_backdrop_blur(backdrop::blur_px() as i32);
+    let (wall_x, wall_y) = publish_wallpaper(mini.global::<AppTheme>(), mini.window());
+    crate::debug_log(&format!(
+        "wallpaper publish win=mini x={wall_x:.1} y={wall_y:.1} tile={:.0}",
+        backdrop::tile_px()
+    ));
+}
+
+// The live `PlayerState` for the wallpaper republish, which runs inside an
+// `invoke_from_event_loop` closure: that closure must be `Send` while
+// `Rc<PlayerState>` is not, and the closure does execute on the UI thread, so
+// the ordinary UI-thread handle lives here.
+thread_local! {
+    static WALLPAPER_STATE: RefCell<Option<Rc<PlayerState>>> = const { RefCell::new(None) };
+}
+
+/// Replace the wallpaper / panel image in every live window of the current
+/// theme. UI thread only. `dark` is the theme the pixels were generated for: a
+/// generation that finished after the user switched theme is installed into
+/// that theme's cache but never painted over the other palette.
+fn republish_wallpaper(image: &slint::Image, dark: bool) {
+    WALLPAPER_STATE.with(|slot| {
+        let Some(state) = slot.borrow().clone() else {
             return;
         };
-        let prepared = win::prepare_frameless(player.window());
-        if player.show().is_ok() {
-            if !prepared {
-                win::prepare_frameless(player.window());
-            }
-            crate::debug_log(&format!("player show deferred_after_ms={delay_ms}"));
+        if state.theme_dark.get() != dark {
+            return;
+        }
+        if let Some(ui) = state.main.upgrade() {
+            ui.set_wallpaper(image.clone());
+            ui.global::<AppTheme>().set_glass_blur(image.clone());
+            ui.global::<AppTheme>()
+                .set_backdrop_blur(backdrop::blur_px() as i32);
+        }
+        for session in player_sessions(&state) {
+            session.window.set_wallpaper(image.clone());
+            session
+                .window
+                .global::<AppTheme>()
+                .set_glass_blur(image.clone());
+        }
+        let mini = state.mini.borrow().as_ref().map(|w| w.clone_strong());
+        if let Some(mini) = mini {
+            mini.set_wallpaper(image.clone());
+            mini.global::<AppTheme>().set_glass_blur(image.clone());
         }
     });
 }
 
-/// Create one player window's glass loop, register it for frame delivery and
-/// start its 33ms tick.
-///
-/// The grab worker is attached later ([`start_player_glass`]), once the native
-/// handle exists; until then the tick only re-places the seeded image.
-fn create_player_glass(
-    player: &PlayerWindow,
-    control: &Arc<player::PlaybackControl>,
-    shot: Option<((i32, i32), i32, i32)>,
-) -> Rc<PlayerGlass> {
-    let hwnd = win::hwnd_of(player.window()).unwrap_or(0);
-    let glass = Rc::new(PlayerGlass::new(hwnd, Arc::downgrade(control)));
-    if let Some(shot) = shot {
-        glass.shot.set(Some(shot));
-    }
-    PLAYER_GLASS_LOOPS.with(|loops| loops.borrow_mut().push(Rc::downgrade(&glass)));
-    let weak = player.as_weak();
-    let loop_state = Rc::downgrade(&glass);
-    glass.timer.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(33),
-        move || {
-            if let Some(glass) = loop_state.upgrade() {
-                player_glass_step(&weak, &glass);
-            }
-        },
-    );
-    glass
+/// Live state for the `BILI_F144_TEST` QA chain (all of it UI-thread only).
+struct F144State {
+    base: std::cell::RefCell<Option<Vec<u8>>>,
+    base_wall: std::cell::Cell<(f32, f32)>,
 }
 
-/// Attach a player window's grab worker once its native handle exists.
-///
-/// Called from the frameless retry chain (`retry_subclass`); the loop and its
-/// timer were already created at open. Idempotent per session, torn down by
-/// [`stop_player_glass`].
-fn start_player_glass(session: &Rc<PlayerSession>) {
-    let Some(hwnd) = win::hwnd_of(session.window.window()) else {
-        return;
-    };
-    let Some(glass) = session.glass.borrow().as_ref().cloned() else {
-        return;
-    };
-    if glass.worker.borrow().is_some() {
-        return;
-    }
-    glass.hwnd.set(hwnd);
-    // Compositor alpha + DWM chrome, exactly like the main window: without it
-    // the player's transparent background would composite as opaque black.
-    win::setup_glass(session.window.window(), true);
-    let deliver_weak = session.window.as_weak();
-    let worker = glass::GlassWorker::spawn_with(
-        hwnd,
-        glass::GlassConfig::player(),
-        move |frame| {
-            let weak = deliver_weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(player) = weak.upgrade() {
-                    player_glass_deliver(&player, frame);
-                }
-            });
-        },
-    );
-    *glass.worker.borrow_mut() = Some(worker);
-    crate::debug_log(&format!(
-        "player glass worker spawn hwnd={hwnd} win={}",
-        session.id
-    ));
+/// Set the 背景模糊 slider through the REAL slider path: the property drives the
+/// label/knob, the callback is what Rust debounces and regenerates from.
+fn f144_set_blur(ui: &AppWindow, value: u32) {
+    ui.global::<AppTheme>().set_backdrop_blur(value as i32);
+    ui.invoke_settings_backdrop_blur(value as i32);
 }
 
-/// Stop one player window's frosted-glass loop.
+/// QA chain behind `BILI_F144_TEST=1`.
 ///
-/// Stops the timer here (UI thread, the only place a `slint::Timer` may be
-/// touched) and hands the worker to a throwaway thread: `GlassWorker`'s `Drop`
-/// joins the worker thread, which can be in the middle of a GDI grab + blur, so
-/// joining it on the UI thread would freeze the close for that long. The
-/// delivery closure only uses `slint::invoke_from_event_loop` and compares the
-/// HWND, and this loop is unregistered below, so a late frame is dropped instead
-/// of reaching a closed window. Other windows' loops are untouched. Idempotent.
-fn stop_player_glass(session: &Rc<PlayerSession>) {
-    let Some(glass) = session.glass.borrow_mut().take() else {
-        return;
-    };
-    // Turning the video glass off here means a closed player never leaves the
-    // decode pipeline downscaling frames for a window that is gone.
-    if glass.video_glass_on.replace(false) {
-        if let Some(control) = glass.control.upgrade() {
-            control.set_video_glass_needed(false);
-        }
-        crate::debug_log("panel glass source=desktop reason=close");
-    }
-    glass.timer.stop();
-    PLAYER_GLASS_LOOPS.with(|slot| {
-        let mut loops = slot.borrow_mut();
-        loops.retain(|weak| {
-            weak.upgrade()
-                .map(|current| !Rc::ptr_eq(&current, &glass))
-                .unwrap_or(false)
-        });
-    });
-    // Take the worker out of the loop and drop it off the UI thread. The rest
-    // of `glass` (plain cells) is dropped here, cheaply.
-    let worker = glass.worker.borrow_mut().take();
-    if let Some(worker) = worker {
-        // Timed so the cost the old UI-thread join used to add to every close
-        // stays visible: `close profile ... glass=` no longer includes it.
-        let started = Instant::now();
-        std::thread::spawn(move || {
-            drop(worker);
+/// Drives the REAL properties/callbacks and window APIs only (no synthetic
+/// input): positions the window with `set_position`, opens 设置 through
+/// `open_settings`, moves the slider through `settings_backdrop_blur`, and reads
+/// pixels back with `window_patch`. It proves the four f144 contracts in one run:
+/// the glass shots, the settings page's zero plate alpha, the blur sweep, and
+/// the parallax / 1024 px seam.
+fn f144_step(
+    ui: &AppWindow,
+    step: usize,
+    session_slot: &SessionSlot,
+    store: &Arc<Mutex<settings::Settings>>,
+    state: &Rc<F144State>,
+) -> Option<usize> {
+    // Plain-wallpaper probe: a 64x40 patch in the empty middle of the 70px top
+    // strip (no card, no control, no animation), so a move changes only the
+    // wallpaper underneath it.
+    const PATCH: (i32, i32, i32, i32) = (600, 18, 64, 40);
+    const BASE_X: f32 = 140.0;
+    const BASE_Y: f32 = 90.0;
+    match step {
+        0 => {
+            ui.invoke_back_to_feed();
+            ui.set_settings_tab(1);
+            ui.window()
+                .set_size(slint::LogicalSize::new(1280.0, 800.0));
+            ui.window()
+                .set_position(slint::LogicalPosition::new(BASE_X, BASE_Y));
+            let theme = ui.global::<AppTheme>();
             crate::debug_log(&format!(
-                "player glass: worker joined after_ms={}",
-                started.elapsed().as_millis()
+                "f144 start blur={} transparency={} defaults blur={} transparency={}",
+                theme.get_backdrop_blur(),
+                theme.get_glass_transparency(),
+                settings::default_backdrop_blur(),
+                settings::default_glass_transparency()
             ));
-        });
+        }
+        1 => {
+            let theme = ui.global::<AppTheme>();
+            let scale = ui.window().scale_factor();
+            let (rect_x, rect_y) = win::window_rect(ui.window())
+                .map(|(x, y, _, _)| (x, y))
+                .unwrap_or((0, 0));
+            crate::debug_log(&format!(
+                "f144 wall stage=home win={rect_x},{rect_y} px scale={scale:.2} wall={:.1},{:.1} tile={:.0}",
+                theme.get_wall_x(),
+                theme.get_wall_y(),
+                theme.get_wallpaper_tile()
+            ));
+            if let Some(patch) = window_patch(ui.window(), PATCH.0, PATCH.1, PATCH.2, PATCH.3) {
+                crate::debug_log(&format!(
+                    "f144 sample stage=base wall={:.1},{:.1} rgba=[{}, {}, {}, {}]",
+                    theme.get_wall_x(),
+                    theme.get_wall_y(),
+                    patch[0], patch[1], patch[2], patch[3]
+                ));
+                *state.base.borrow_mut() = Some(patch);
+                state
+                    .base_wall
+                    .set((theme.get_wall_x(), theme.get_wall_y()));
+            } else {
+                crate::debug_log("f144 sample stage=base err=no-pixels");
+            }
+            crate::debug_log(&format!(
+                "f144 capture tag=f144_glass_main ok={}",
+                u8::from(capture_window_png(
+                    &ui.window(),
+                    &qa_capture_path("f144_glass_main")
+                )
+                .is_some())
+            ));
+            ui.invoke_open_settings();
+            ui.set_settings_tab(1);
+        }
+        2 => {
+            let theme = ui.global::<AppTheme>();
+            crate::debug_log(&format!(
+                "f144 settings view={} tab={} page_alpha={:.3} blur={} transparency={}",
+                ui.get_view_mode(),
+                ui.get_settings_tab(),
+                ui.get_settings_page_alpha(),
+                theme.get_backdrop_blur(),
+                theme.get_glass_transparency()
+            ));
+            crate::debug_log(&format!(
+                "f144 capture tag=f144_settings ok={}",
+                u8::from(capture_window_png(
+                    &ui.window(),
+                    &qa_capture_path("f144_settings")
+                )
+                .is_some())
+            ));
+            ui.invoke_back_to_feed();
+            f144_set_blur(ui, 0);
+        }
+        3 => {
+            crate::debug_log(&format!(
+                "f144 blur shot blur={} capture=f144_blur_0",
+                ui.global::<AppTheme>().get_backdrop_blur()
+            ));
+            crate::debug_log(&format!(
+                "f144 capture tag=f144_blur_0 ok={}",
+                u8::from(capture_window_png(
+                    &ui.window(),
+                    &qa_capture_path("f144_blur_0")
+                )
+                .is_some())
+            ));
+            f144_set_blur(ui, 120);
+        }
+        4 => {
+            crate::debug_log(&format!(
+                "f144 blur shot blur={} capture=f144_blur_120",
+                ui.global::<AppTheme>().get_backdrop_blur()
+            ));
+            crate::debug_log(&format!(
+                "f144 capture tag=f144_blur_120 ok={}",
+                u8::from(capture_window_png(
+                    &ui.window(),
+                    &qa_capture_path("f144_blur_120")
+                )
+                .is_some())
+            ));
+            f144_set_blur(ui, 160);
+        }
+        5 => {
+            crate::debug_log(&format!(
+                "f144 blur shot blur={} capture=f144_blur_160",
+                ui.global::<AppTheme>().get_backdrop_blur()
+            ));
+            crate::debug_log(&format!(
+                "f144 capture tag=f144_blur_160 ok={}",
+                u8::from(capture_window_png(
+                    &ui.window(),
+                    &qa_capture_path("f144_blur_160")
+                )
+                .is_some())
+            ));
+            // Back to the default radius for the parallax probes: a softer
+            // gradient makes a 200 px shift less obvious, so use 60 (the
+            // shipped default) but sample a vivid area.
+            f144_set_blur(ui, 60);
+        }
+        6 => {
+            ui.window()
+                .set_position(slint::LogicalPosition::new(BASE_X, BASE_Y));
+        }
+        7 => {
+            let theme = ui.global::<AppTheme>();
+            if let Some(patch) = window_patch(ui.window(), PATCH.0, PATCH.1, PATCH.2, PATCH.3) {
+                *state.base.borrow_mut() = Some(patch);
+                state
+                    .base_wall
+                    .set((theme.get_wall_x(), theme.get_wall_y()));
+                crate::debug_log(&format!(
+                    "f144 parallax base wall={:.1},{:.1}",
+                    theme.get_wall_x(),
+                    theme.get_wall_y()
+                ));
+            } else {
+                crate::debug_log("f144 parallax base err=no-pixels");
+            }
+        }
+        8 => {
+            ui.window()
+                .set_position(slint::LogicalPosition::new(BASE_X + 200.0, BASE_Y + 120.0));
+        }
+        9 => {
+            let theme = ui.global::<AppTheme>();
+            let patch = window_patch(ui.window(), PATCH.0, PATCH.1, PATCH.2, PATCH.3);
+            let diff = match (state.base.borrow().as_ref(), patch.as_ref()) {
+                (Some(base), Some(now)) => patch_diff(base, now),
+                _ => None,
+            };
+            crate::debug_log(&format!(
+                "f144 parallax moved=200,120 wall={:.1},{:.1} delta_wall={:.1},{:.1} max_diff={} mean_diff={:.2} changed={}",
+                theme.get_wall_x(),
+                theme.get_wall_y(),
+                theme.get_wall_x() - state.base_wall.get().0,
+                theme.get_wall_y() - state.base_wall.get().1,
+                diff.map(|d| d.0.to_string()).unwrap_or_else(|| "-".into()),
+                diff.map(|d| d.1).unwrap_or(0.0),
+                u8::from(diff.map(|d| d.0 > 2).unwrap_or(false))
+            ));
+            ui.window()
+                .set_position(slint::LogicalPosition::new(BASE_X + 1024.0, BASE_Y));
+        }
+        10 => {
+            let theme = ui.global::<AppTheme>();
+            let patch = window_patch(ui.window(), PATCH.0, PATCH.1, PATCH.2, PATCH.3);
+            let diff = match (state.base.borrow().as_ref(), patch.as_ref()) {
+                (Some(base), Some(now)) => patch_diff(base, now),
+                _ => None,
+            };
+            crate::debug_log(&format!(
+                "f144 seam moved=1024,0 wall={:.1},{:.1} max_diff={} mean_diff={:.3} match={}",
+                theme.get_wall_x(),
+                theme.get_wall_y(),
+                diff.map(|d| d.0.to_string()).unwrap_or_else(|| "-".into()),
+                diff.map(|d| d.1).unwrap_or(0.0),
+                u8::from(diff.map(|d| d.0 <= 2).unwrap_or(false))
+            ));
+            ui.window()
+                .set_position(slint::LogicalPosition::new(BASE_X, BASE_Y));
+        }
+        11 => {
+            let Some(session) = active_session(session_slot) else {
+                crate::debug_log("f144 player skip reason=no-session");
+                return None;
+            };
+            let Some(player_state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+                crate::debug_log("f144 player skip reason=no-state");
+                return None;
+            };
+            crate::debug_log("f144 player open=1");
+            open_player_for(
+                session_slot,
+                &player_state,
+                store,
+                "BV1xx411c7mD".to_string(),
+                0,
+                "f144 壁纸".to_string(),
+                0,
+            );
+            // Keep `session` alive until the window exists; the state owns it.
+            drop(session);
+        }
+        12 => {
+            let Some(player_state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+                return None;
+            };
+            let sessions = player_sessions(&player_state);
+            let Some(session) = sessions.last() else {
+                crate::debug_log("f144 player skip reason=no-window");
+                return None;
+            };
+            let window = session.window.window();
+            let before = win::window_rect(&window)
+                .map(|(x, y, w, h)| format!("{x},{y} {w}x{h}"))
+                .unwrap_or_else(|| "-".into());
+            // Move by a delta from wherever the player was restored, so the
+            // probe always exercises a real WM_MOVE (even on a rerun where the
+            // saved layout already sits at the previous probe position).
+            let scale = f64::from(window.scale_factor().max(0.2));
+            let (x, y) = win::window_rect(&window)
+                .map(|(x, y, _, _)| (f64::from(x) / scale + 120.0, f64::from(y) / scale + 80.0))
+                .unwrap_or((500.0, 160.0));
+            window.set_position(slint::LogicalPosition::new(x as f32, y as f32));
+            crate::debug_log(&format!(
+                "f144 player move before={before} want={x:.0},{y:.0}"
+            ));
+        }
+        13 => {
+            let Some(player_state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+                return None;
+            };
+            let sessions = player_sessions(&player_state);
+            let Some(session) = sessions.last() else {
+                crate::debug_log("f144 player skip reason=no-window");
+                return None;
+            };
+            let theme = session.window.global::<AppTheme>();
+            crate::debug_log(&format!(
+                "f144 wall stage=player rect={} wall={:.1},{:.1} tile={:.0}",
+                win::window_rect(session.window.window())
+                    .map(|(x, y, w, h)| format!("{x},{y} {w}x{h}"))
+                    .unwrap_or_else(|| "-".into()),
+                theme.get_wall_x(),
+                theme.get_wall_y(),
+                theme.get_wallpaper_tile()
+            ));
+            crate::debug_log(&format!(
+                "f144 capture tag=f144_glass_player ok={}",
+                u8::from(capture_window_png(
+                    session.window.window(),
+                    &qa_capture_path("f144_glass_player")
+                )
+                .is_some())
+            ));
+            request_quit("f144 qa done");
+            return None;
+        }
+        _ => return None,
     }
-    crate::debug_log(&format!(
-        "player glass: loop stopped win={}",
-        session.id
-    ));
+    Some(step + 1)
+}
+
+/// Start the f144 chain once the window is up (`BILI_F144_TEST=1`).
+fn maybe_start_f144_test(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    store: Arc<Mutex<settings::Settings>>,
+) {
+    if !std::env::var("BILI_F144_TEST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10_000));
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let state = Rc::new(F144State {
+                base: std::cell::RefCell::new(None),
+                base_wall: std::cell::Cell::new((0.0, 0.0)),
+            });
+            f144_advance(&ui, 0, &session_slot, &store, &state);
+        });
+    });
+}
+
+/// One link of the f144 chain: run a step, then schedule the next after that
+/// step's settle time. Every callback runs on the UI thread; the state is an
+/// `Rc` because it never leaves this thread.
+fn f144_advance(
+    ui: &AppWindow,
+    step: usize,
+    session_slot: &SessionSlot,
+    store: &Arc<Mutex<settings::Settings>>,
+    state: &Rc<F144State>,
+) {
+    // Settle time after step i: capture + (for slider steps) the 150 ms
+    // debounce and the worker regeneration. Step 11 opens the player window, so
+    // it needs the longest gap (window mapping + first paint); step 12 moves it.
+    const DELAYS_MS: [u64; 13] =
+        [900, 700, 1000, 1000, 1000, 800, 500, 500, 500, 400, 400, 2400, 700];
+    let Some(next) = f144_step(ui, step, session_slot, store, state) else {
+        return;
+    };
+    let delay = DELAYS_MS.get(step).copied().unwrap_or(500);
+    let ui_weak = ui.as_weak();
+    let slot = session_slot.clone();
+    let store = store.clone();
+    let state = state.clone();
+    slint::Timer::single_shot(Duration::from_millis(delay), move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            f144_advance(&ui, next, &slot, &store, &state);
+        }
+    });
+}
+
+
+fn apply_home_test(ui: &AppWindow, spec: &str) {
+    for part in spec.split(',') {
+        match part.trim() {
+            "menu" => {
+                ui.set_menu_hold(true);
+                ui.set_section_menu_open(true);
+            }
+            "library" => {
+                ui.set_menu_hold(true);
+                ui.set_library_menu_open(true);
+            }
+            "search" => ui.set_search_open(true),
+            "fish" => ui.invoke_fish_open(),
+            "favorites" => ui.invoke_nav_favorites(),
+            "settings" => ui.invoke_open_settings(),
+            "account" => ui.set_account_pop(true),
+            "typed" => {
+                ui.set_search_open(true);
+                ui.set_search_text("测".into());
+            }
+            // Press 开始 through the real callback (no key => the engine goes
+            // to NeedsKey without any network).
+            "start" => ui.invoke_fish_start(),
+            "close" => {
+                ui.set_menu_hold(false);
+                ui.set_section_menu_open(false);
+                ui.set_library_menu_open(false);
+                ui.set_search_open(false);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The player chrome's pointer watch cadence: 60 Hz, the same frame cadence as
@@ -3246,9 +3440,6 @@ fn keep_qa_timer(timer: Rc<slint::Timer>) {
     });
 }
 
-/// How long the player window may stay hidden waiting for the own backdrop
-/// worker when the main window had no snapshot to seed from yet.
-const SEED_SHOW_FALLBACK_MS: u64 = 400;
 /// How long a move/resize must settle before the base rect is persisted.
 const LAYOUT_SETTLE: Duration = Duration::from_millis(600);
 
@@ -3621,375 +3812,17 @@ fn stop_player_loops(loops: &Rc<PlayerLoops>) {
     crate::debug_log(&format!("player loops: stopped win={}", loops.id));
 }
 
-/// One iteration of the player's backdrop refresh loop.
-///
-/// Mirrors [`glass_step`], but is deliberately NOT gated by `PLAYER_ACTIVE`:
-/// this is the loop that must run WHILE the player is open.
-///
-/// Three rules keep it off the machine's back while a video plays:
-///
-/// * **Invisible = paused.** The frosted surfaces are the title strip and the
-///   toolbar pill, and both are gated on `chrome_shown` (== `pointer_inside`).
-///   With the pointer outside the window nothing of this image is on screen, so
-///   there is no capture, no blur and no placement at all.
-/// * **1 s cadence while visible.** The backdrop behind a paused-or-playing
-///   video is static; the old 400 ms timetable made the worker read back the
-///   whole desktop 2.5 times a second for no visible change.
-/// * **Window-rect grabs** (see [`glass::GlassConfig::PLAYER`]): the worker
-///   captures the window plus a small margin instead of the 4K desktop, which
-///   is where most of the 78-170 ms went.
-///
-/// A move or resize invalidates the captured rect, so those paths call
-/// [`player_glass_invalidate`] to queue exactly one fresh capture.
-fn player_glass_step(weak: &Weak<PlayerWindow>, glass: &Rc<PlayerGlass>) {
-    const GLASS_INTERVAL: Duration = Duration::from_millis(1000);
-    /// A step this slow means the machine is saturated: stretch the cadence.
-    const GLASS_SLOW_MS: u64 = 200;
-    let Some(player) = weak.upgrade() else {
-        return;
-    };
-    let theme = player.global::<AppTheme>();
-    let blur = theme.get_glass_blur();
-    let transparency = theme.get_glass_transparency();
-    let now = Instant::now();
-
-    // `chrome_shown` is exactly `pointer_inside` (see ui/app.slint): while it is
-    // false the two frosted bars have opacity 0 and are disabled, i.e. the image
-    // below is not part of what the user sees.
-    let chrome = player.get_pointer_inside();
-    let was_chrome = glass.chrome.replace(chrome);
-    let scale = player.window().scale_factor().max(0.5);
-    let scale_moved = (glass.scale.get() - scale).abs() > 0.01;
-    glass.scale.set(scale);
-    if !chrome {
-        if was_chrome {
-            crate::debug_log("player glass paused reason=chrome-hidden");
-        }
-        // The video panel pump costs no capture and still runs: a panel that is
-        // open while the chrome is timed out keeps its frosted look.
-        player_panel_glass(&player, glass);
-        return;
-    }
-    if !was_chrome {
-        // Chrome just appeared: the bars must not show a stale/garbage backdrop
-        // for a second, so queue one capture immediately.
-        crate::debug_log("player glass resumed reason=chrome-shown");
-        glass.next.set(now);
-        glass.requested_sigma.set(-1.0);
-    }
-    if scale_moved {
-        glass.next.set(now);
-        glass.requested_sigma.set(-1.0);
-        crate::debug_log(&format!("player glass capture due reason=scale scale={scale:.2}"));
-    }
-
-    if blur <= 0.5 {
-        // Slider at zero, same as the main loop: there is no blur layer, the
-        // tint alone sits over the compositor's transparent window. `next` is
-        // pulled to now so turning the blur back on grabs a fresh backdrop
-        // immediately instead of reusing whatever was cached.
-        player_panel_glass_release(&player, glass, "blur=0");
-        if player.get_glass_backdrop_valid() {
-            player.set_glass_backdrop(Image::default());
-            player.set_glass_backdrop_valid(false);
-            player_panel_glass_desktop(&player);
-            crate::debug_log(&format!(
-                "player glass step blur=0 backdrop=off transparency={transparency:.0}"
-            ));
-        }
-        glass.next.set(now);
-        return;
-    }
-
-    // The same mapping as the main loop: slider 0..100 -> Gaussian sigma in
-    // physical pixels, so the visual radius is identical at any DPI scale.
-    let sigma = blur / 100.0 * glass::SIGMA_MAX * scale;
-
-    // A grab is due, nothing has been requested yet, or the radius moved since
-    // the last request: queue one. The worker coalesces them (only the latest
-    // survives) and captures/re-blurs only what it actually needs.
-    //
-    // The cadence backs off on a machine that is already busy: a screen readback
-    // measured 25-100 ms when idle but ~0.7-1.1 s while another build saturated
-    // the GPU/CPU, and asking for that once a second would add a full core of
-    // the exact work the user feels as a hitch.
-    let last_step_ms = glass
-        .worker
-        .borrow()
-        .as_ref()
-        .map_or(0, |worker| worker.last_step_ms());
-    let interval = if last_step_ms >= GLASS_SLOW_MS {
-        GLASS_INTERVAL * 3
-    } else {
-        GLASS_INTERVAL
-    };
-    if glass.interval_ms.replace(interval) != interval {
-        crate::debug_log(&format!(
-            "player glass cadence interval_ms={} reason=slow_capture last_ms={last_step_ms}",
-            interval.as_millis()
-        ));
-    }
-    let recapture = now >= glass.next.get();
-    if recapture {
-        glass.next.set(now + interval);
-    }
-    let resigma = (sigma - glass.requested_sigma.get()).abs() > 0.25
-        || glass.requested_sigma.get() < 0.0;
-    if recapture || resigma {
-        glass.requested_sigma.set(sigma);
-        if let Some(worker) = glass.worker.borrow().as_ref() {
-            worker.request(glass::GlassRequest::Grab {
-                sigma,
-                scale,
-                recapture,
-            });
-        }
-    }
-
-    player_glass_place(&player, glass);
-    player_panel_glass(&player, glass);
-}
-
-/// Queue one fresh capture for the next tick (and one only): the player captures
-/// its window rect, so a move or resize makes the cached pixels belong to the
-/// wrong area.
-///
-/// Called from the drag/resize end paths - never per drag frame, where the
-/// existing placement keeps the image glued to the window without a capture.
-fn player_glass_invalidate(player: &PlayerWindow, reason: &str) {
-    let Some(glass) = player_glass_for(player) else {
-        return;
-    };
-    glass.next.set(Instant::now());
-    glass.requested_sigma.set(-1.0);
-    crate::debug_log(&format!("player glass capture due reason={reason}"));
-}
-
-/// Apply one finished player frame on the UI thread.
-///
-/// The counterpart of [`glass_deliver`]: the loop is found by this player's
-/// HWND (several windows can have a loop at once), and a frame whose worker
-/// belongs to a closed window is dropped instead of feeding another one.
-fn player_glass_deliver(player: &PlayerWindow, frame: glass::GlassFrame) {
-    let Some(glass) = player_glass_for(player) else {
-        return;
-    };
-    if win::hwnd_of(player.window()) != Some(glass.hwnd.get()) {
-        return;
-    }
-    glass
-        .shot
-        .set(Some((frame.shot_origin, frame.shot_w, frame.shot_h)));
-    let image = Image::from_rgba8(frame.buffer);
-    player.set_glass_backdrop(image.clone());
-    player.set_glass_backdrop_valid(true);
-    // The panels draw `panel_glass`, which defaults to this image by binding.
-    // Once the video pump has written it the binding is gone, so mirror the
-    // desktop snapshot explicitly whenever the panels fall back to it.
-    if !glass.video_glass_on.get() {
-        player.set_panel_glass(image);
-        player.set_panel_glass_valid(true);
-    }
-    if (frame.sigma - glass.logged_sigma.get()).abs() > 0.25 {
-        glass.logged_sigma.set(frame.sigma);
-        let theme = player.global::<AppTheme>();
-        crate::debug_log(&format!(
-            "player glass step sigma={:.1} blur={:.0} transparency={:.0}",
-            frame.sigma,
-            theme.get_glass_blur(),
-            theme.get_glass_transparency(),
-        ));
-    }
-    player_glass_apply(player, &glass, frame.placed);
-}
-
-/// Write the player backdrop placement, skipping the writes when it is
-/// unchanged (the loop runs every 33ms and Slint notifies on every property
-/// write).
-fn player_glass_apply(player: &PlayerWindow, glass: &PlayerGlass, placed: (f32, f32, f32, f32)) {
-    if glass.placed.get() == Some(placed) {
-        return;
-    }
-    glass.placed.set(Some(placed));
-    player.set_glass_x(placed.0);
-    player.set_glass_y(placed.1);
-    player.set_glass_w(placed.2);
-    player.set_glass_h(placed.3);
-    if !glass.video_glass_on.get() {
-        player_panel_glass_desktop(player);
-    }
+/// Log the panel / fullscreen wiring as the UI sees it (QA,
+/// `BILI_PANEL_GLASS_TEST`).
+fn log_panel_state(player: &PlayerWindow, tag: &str) {
     crate::debug_log(&format!(
-        "player glass place x={:.0} y={:.0} w={:.0} h={:.0}",
-        placed.0, placed.1, placed.2, placed.3
-    ));
-}
-
-/// Keep the player's desktop grab registered with the desktop: the grab origin
-/// minus the current window origin, logical pixels.
-///
-/// Pure placement - one `GetWindowRect`, four property writes, no capture and
-/// no blur - so it runs on every [`player_glass_step`] tick.
-fn player_glass_place(player: &PlayerWindow, glass: &Rc<PlayerGlass>) {
-    let Some((shot_origin, shot_w, shot_h)) = glass.shot.get() else {
-        return;
-    };
-    // A minimised window reports a -32000 rect; the previous placement is the
-    // one the restore comes back to.
-    let Some(hwnd) = win::hwnd_of(player.window()) else {
-        return;
-    };
-    if glass::window_iconic(hwnd) {
-        return;
-    }
-    let Some((wx, wy)) = win::window_origin(player.window()) else {
-        return;
-    };
-    let scale = player.window().scale_factor().max(0.5);
-    player_glass_apply(
-        player,
-        glass,
-        glass::place_for(shot_origin, shot_w, shot_h, wx, wy, scale),
-    );
-}
-
-/// Log the panel-glass wiring as the UI sees it (QA, `BILI_PANEL_GLASS_TEST`).
-fn log_panel_glass(player: &PlayerWindow, tag: &str) {
-    crate::debug_log(&format!(
-        "panel-glass tag={tag} fullscreen={} overlay={} left={} right={} valid={} x={:.0} y={:.0} w={:.0} h={:.0}",
+        "panel-state tag={tag} fullscreen={} overlay={} left={} right={} right_panel_w={:.0}",
         player.get_fullscreen(),
         player.get_panels_overlay(),
         player.get_left_panel(),
         player.get_right_panel(),
-        player.get_panel_glass_valid(),
-        player.get_panel_glass_x(),
-        player.get_panel_glass_y(),
-        player.get_panel_glass_w(),
-        player.get_panel_glass_h()
+        player.get_right_panel_w(),
     ));
-}
-
-/// Write the desktop-snapshot fallback into the panel-glass properties.
-///
-/// This is the source the panels had by binding before the video pump wrote
-/// them: the same image and placement the chrome uses.
-fn player_panel_glass_desktop(player: &PlayerWindow) {
-    player.set_panel_glass(player.get_glass_backdrop());
-    player.set_panel_glass_valid(player.get_glass_backdrop_valid());
-    player.set_panel_glass_x(player.get_glass_x());
-    player.set_panel_glass_y(player.get_glass_y());
-    player.set_panel_glass_w(player.get_glass_w());
-    player.set_panel_glass_h(player.get_glass_h());
-}
-
-/// Stop sampling the video and put the panels back on the desktop snapshot.
-///
-/// Idempotent: only a call that actually turns the video glass off releases
-/// the decode pipeline and logs, so the per-tick call costs one `Cell` read.
-fn player_panel_glass_release(player: &PlayerWindow, glass: &Rc<PlayerGlass>, reason: &str) {
-    if !glass.video_glass_on.replace(false) {
-        return;
-    }
-    if let Some(control) = glass.control.upgrade() {
-        control.set_video_glass_needed(false);
-    }
-    glass.video_glass_generation.set(0);
-    glass.video_glass_at.set(None);
-    glass.video_glass_rect.set(None);
-    player_panel_glass_desktop(player);
-    let bakes = glass.video_glass_bakes.replace(0);
-    crate::debug_log(&format!(
-        "panel glass source=desktop reason={reason} valid={} w={:.0} h={:.0} bakes={bakes}",
-        player.get_panel_glass_valid(),
-        player.get_panel_glass_w(),
-        player.get_panel_glass_h()
-    ));
-}
-
-/// Sample the VIDEO frame into the panel glass while a panel floats over the
-/// picture (fullscreen / `panels_overlay`), and fall back to the desktop
-/// snapshot otherwise.
-///
-/// Runs on the player's 33ms glass tick, so the switch is at worst one tick
-/// behind the panel/`fullscreen` property. The decode side publishes a 96×54
-/// RGBA8 thumbnail at ~10 fps; this bakes a `slint::Image` from it only when
-/// the generation moved and at most every 100ms. With no panel open the
-/// pipeline is released (`set_video_glass_needed(false)`), which makes the
-/// pacer skip the downscale and drops the retained buffer - the cost is then
-/// one relaxed atomic load per decoded frame.
-fn player_panel_glass(player: &PlayerWindow, glass: &Rc<PlayerGlass>) {
-    const VIDEO_GLASS_STEP: Duration = Duration::from_millis(100);
-
-    let overlay = player.get_panels_overlay() || player.get_fullscreen();
-    let panel_open = player.get_right_panel() != 0 || player.get_left_panel() != 0;
-    let control = glass.control.upgrade();
-
-    let Some(control) = control else {
-        player_panel_glass_release(player, glass, "no-control");
-        return;
-    };
-    if !(overlay && panel_open) {
-        player_panel_glass_release(
-            player,
-            glass,
-            if overlay { "no-panel" } else { "windowed" },
-        );
-        return;
-    }
-    if !glass.video_glass_on.replace(true) {
-        control.set_video_glass_needed(true);
-        glass.video_glass_generation.set(0);
-        glass.video_glass_at.set(None);
-        glass.video_glass_rect.set(None);
-        crate::debug_log("panel glass source=video");
-    }
-
-    let generation = control.video_glass_generation();
-    if generation == 0 || generation == glass.video_glass_generation.get() {
-        return;
-    }
-    // Bake at most every 100ms, but only advance the gate when a frame is
-    // actually taken: gating before the generation check aliased with the
-    // pacer's own 10 fps publish and halved the visible rate.
-    let now = Instant::now();
-    if let Some(last) = glass.video_glass_at.get() {
-        if now.duration_since(last) < VIDEO_GLASS_STEP {
-            return;
-        }
-    }
-    glass.video_glass_at.set(Some(now));
-    let Some((rgba, width, height)) = control.video_glass_frame() else {
-        return;
-    };
-    if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
-        return;
-    }
-    glass.video_glass_generation.set(generation);
-    glass.video_glass_bakes.set(glass.video_glass_bakes.get().saturating_add(1));
-    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-    buffer.make_mut_bytes().copy_from_slice(&rgba);
-    player.set_panel_glass(Image::from_rgba8(buffer));
-    player.set_panel_glass_valid(true);
-
-    // The strip clips this image at its own window offset, so the rect is the
-    // whole window (the picture fills it in overlay mode) and every panel sees
-    // the part of the video that is actually behind it.
-    let Some((_, _, window_w, window_h)) = win::window_rect(player.window()) else {
-        return;
-    };
-    let scale = f64::from(player.window().scale_factor().max(0.2));
-    let rect = (
-        0.0,
-        0.0,
-        (f64::from(window_w) / scale) as f32,
-        (f64::from(window_h) / scale) as f32,
-    );
-    if glass.video_glass_rect.get() != Some(rect) {
-        glass.video_glass_rect.set(Some(rect));
-        player.set_panel_glass_x(rect.0);
-        player.set_panel_glass_y(rect.1);
-        player.set_panel_glass_w(rect.2);
-        player.set_panel_glass_h(rect.3);
-    }
 }
 
 /// Retry installing the frameless subclass on the player and mini windows until
@@ -4014,7 +3847,7 @@ fn retry_subclass(state: &Rc<PlayerState>) {
                 return;
             }
             // Every open player, not just the newest: each one installs its own
-            // subclass and attaches its own grab worker once its HWND exists.
+            // subclass once its HWND exists.
             for session in &players {
                 let player = &session.window;
                 if session.hwnd.get() == 0 {
@@ -4023,16 +3856,23 @@ fn retry_subclass(state: &Rc<PlayerState>) {
                     }
                 }
                 if win::install_subclass(player.window()) {
-                    let needs_worker = session
-                        .glass
-                        .borrow()
-                        .as_ref()
-                        .map(|glass| glass.worker.borrow().is_none())
-                        .unwrap_or(false);
-                    if needs_worker {
-                        win::log_frame_state(player.window(), "player");
-                    }
-                    start_player_glass(session);
+                    // Compositor alpha + DWM chrome for this HWND (the backdrop
+                    // itself is painted by Slint, no capture involved).
+                    win::setup_glass(player.window(), state.theme_dark.get());
+                    win::log_frame_state(player.window(), "player");
+                }
+                // Wallpaper parallax on every native move, installed once the
+                // handle exists (the call is idempotent per HWND).
+                {
+                    let move_weak = player.as_weak();
+                    win::set_move_hook(player.window(), move || {
+                        if let Some(player) = move_weak.upgrade() {
+                            publish_wallpaper(
+                                player.global::<AppTheme>(),
+                                player.window(),
+                            );
+                        }
+                    });
                 }
             }
             match &mini {
@@ -4041,6 +3881,12 @@ fn retry_subclass(state: &Rc<PlayerState>) {
                         mini_logged.set(true);
                         win::log_frame_state(mini.window(), "mini");
                     }
+                    let move_weak = mini.as_weak();
+                    win::set_move_hook(mini.window(), move || {
+                        if let Some(mini) = move_weak.upgrade() {
+                            publish_wallpaper(mini.global::<AppTheme>(), mini.window());
+                        }
+                    });
                 }
                 None => mini_logged.set(false),
             }
@@ -4406,6 +4252,118 @@ fn run_drag_rate_test(
     });
 }
 
+/// Diagnostic (`BILI_PLAYER_DRAG_TEST=<ms>`): the same measurement on the
+/// **player** window, started `start_after` into its life so it lands inside
+/// playback.
+///
+/// This is the drag the user reported. Same contract as
+/// [`run_drag_rate_test`]: no synthetic input, no production branch changed -
+/// the drag is started with the `WindowDrag::start` the UI callback calls, and
+/// the harness owns the ticker (the production tick ends a drag the moment
+/// `VK_LBUTTON` reads up, which no test may fake). The log shows the placement
+/// rate; the pacer's own `profiler` and `interp mode` lines cover the same
+/// interval on the same window.
+fn run_player_drag_rate_test(
+    weak: Weak<PlayerWindow>,
+    drag: Rc<win::WindowDrag>,
+    stats: Rc<DragFlushStats>,
+    start_after: Duration,
+    duration: Duration,
+    tries: u32,
+) {
+    let retry_weak = weak.clone();
+    let retry_drag = drag.clone();
+    let retry_stats = stats.clone();
+    slint::Timer::single_shot(start_after, move || {
+        let Some(player) = retry_weak.upgrade() else {
+            return;
+        };
+        if win::style_bits(player.window()).is_none() {
+            if tries > 0 {
+                run_player_drag_rate_test(
+                    retry_weak,
+                    retry_drag,
+                    retry_stats,
+                    Duration::from_millis(500),
+                    duration,
+                    tries - 1,
+                );
+            } else {
+                crate::debug_log("player drag-rate window timeout");
+            }
+            return;
+        }
+        if let Err(reason) = drag.start(player.window()) {
+            crate::debug_log(&format!("player drag-rate start denied reason={reason}"));
+            return;
+        }
+        stats.begin();
+        let ((anchor_x, anchor_y), _) = drag.anchor();
+        crate::debug_log(&format!(
+            "player drag-rate start anchor=({anchor_x},{anchor_y}) duration_ms={} frame_ms={}",
+            duration.as_millis(),
+            DRAG_FRAME.as_millis()
+        ));
+        let feeder = Rc::new(slint::Timer::default());
+        {
+            let feed_drag = drag.clone();
+            let feed_stats = stats.clone();
+            let step = Rc::new(Cell::new(0u32));
+            feeder.start(slint::TimerMode::Repeated, DRAG_FRAME / 2, move || {
+                let n = step.get().wrapping_add(1);
+                step.set(n);
+                // Same 40px oscillation as the main-window harness: the player
+                // returns to where it started instead of walking off screen.
+                let phase = (n / 40) % 2;
+                let offset = (n % 40) as i32;
+                let dx = if phase == 0 { offset } else { 40 - offset };
+                feed_stats.event();
+                feed_drag.move_to_cursor((anchor_x + dx, anchor_y));
+            });
+        }
+        keep_qa_timer(feeder.clone());
+        let flush = Rc::new(slint::Timer::default());
+        {
+            let place_weak = weak.clone();
+            let place_drag = drag.clone();
+            let place_stats = stats.clone();
+            let place_timer = flush.clone();
+            flush.start(slint::TimerMode::Repeated, DRAG_FRAME, move || {
+                let Some(player) = place_weak.upgrade() else {
+                    place_timer.stop();
+                    return;
+                };
+                if !place_drag.is_dragging() {
+                    place_timer.stop();
+                    return;
+                }
+                if place_drag.flush(player.window()) {
+                    place_stats.placement();
+                }
+            });
+        }
+        keep_qa_timer(flush.clone());
+        let stop_weak = weak.clone();
+        let stop_feeder = feeder.clone();
+        let stop_flush = flush.clone();
+        let stop_drag = drag.clone();
+        let stop_stats = stats.clone();
+        slint::Timer::single_shot(duration, move || {
+            stop_feeder.stop();
+            stop_flush.stop();
+            if let Some(player) = stop_weak.upgrade() {
+                // Last pending position, exactly like the end callback does.
+                if stop_drag.flush(player.window()) {
+                    stop_stats.placement();
+                }
+            }
+            stop_stats.finish("player");
+            stop_drag.end();
+            crate::debug_log("player drag-rate done");
+        });
+    });
+}
+
 /// Diagnostic (`BILI_RESIZE_TEST=<ms>`): prove the self-driven resize path does
 /// not block the event loop.
 ///
@@ -4674,8 +4632,8 @@ fn parse_page_test(value: &str) -> (i32, u32) {
 /// `page_next` `count` times `gap` apart, so the no-scroll client paging can be
 /// exercised end to end from the backend without synthetic input. A non-feed
 /// view is first opened through its existing navigation callback (0 feed /
-/// 1 搜索 / 5 历史 / 6 稍后再看 / 8 分区 / 9 排行榜 / 10 热门 / 13 动态 /
-/// 18 入站必刷); `probe` is that section's row store, awaited so the paging
+/// 1 搜索 / 5 历史 / 6 稍后再看 / 8 分区 / 9 排行榜 / 13 动态 /
+/// 18 removed); `probe` is that section's row store, awaited so the paging
 /// starts only once its rows are up. `BILI_PAGE_TEST_GAP_MS` overrides the gap.
 fn run_page_test(
     weak: Weak<AppWindow>,
@@ -4708,10 +4666,7 @@ fn run_page_test(
                         5 => ui.invoke_nav_history(),
                         6 => ui.invoke_nav_toview(),
                         8 => ui.invoke_open_region(0),
-                        9 => ui.invoke_nav_ranking(),
-                        10 => ui.invoke_nav_popular(),
                         13 => ui.invoke_nav_dynamic(),
-                        18 => ui.invoke_nav_precious(),
                         _ => {}
                     }
                 }
@@ -4758,10 +4713,10 @@ fn run_page_test(
 //
 // Two families of sections share the mechanism:
 //   * sections fetched with `ps = list_page_size` (搜索 / 收藏夹内容 / 分区 /
-//     热门 / 空间) show exactly one API page per screen, so their client page
+//     空间) show exactly one API page per screen, so their client page
 //     is the API page and the offset stays 0;
 //   * sections whose data comes in fixed-size batches or pages (首页推荐 /
-//     历史 / 动态 / 稍后再看 / 排行榜 / 入站必刷) keep several client pages per
+//     历史 / 动态 / 稍后再看 / 排行榜) keep several client pages per
 //     loaded data set; the counter walks those pages and the next one past the
 //     end fetches (append for the cursors, a new batch for the feed).
 // ---------------------------------------------------------------------------
@@ -4904,7 +4859,6 @@ fn apply_client_offset(ui: &AppWindow, view: i32, len: usize, more: bool) {
         1 => ui.get_search_current_page(),
         4 => ui.get_folder_current_page(),
         8 => ui.get_region_current_page(),
-        10 => ui.get_popular_current_page(),
         11 => ui.get_space_current_page(),
         _ => 0,
     };
@@ -4931,8 +4885,6 @@ fn publish_list_offset(ui: &AppWindow) {
         ),
         6 => apply_client_offset(ui, 6, ui.get_toview_items().row_count(), false),
         8 => apply_client_offset(ui, 8, ui.get_region_items().row_count(), true),
-        9 => apply_client_offset(ui, 9, ui.get_rank_items().row_count(), false),
-        10 => apply_client_offset(ui, 10, ui.get_popular_items().row_count(), true),
         11 => apply_client_offset(ui, 11, ui.get_space_items().row_count(), true),
         13 => apply_client_offset(
             ui,
@@ -4940,7 +4892,6 @@ fn publish_list_offset(ui: &AppWindow) {
             ui.get_dynamic_items().row_count(),
             ui.get_dynamic_has_more(),
         ),
-        18 => apply_client_offset(ui, 18, ui.get_precious_items().row_count(), false),
         _ => {}
     }
     // A client page move changes the offset without a load, so the pill is
@@ -4976,7 +4927,7 @@ fn client_page_bar(
     )
 }
 
-/// Page bar state for a single-shot list (稍后再看 / 排行榜 / 入站必刷): the
+/// Page bar state for a single-shot list (稍后再看 / 排行榜): the
 /// client pages span the loaded rows and there is nothing left to fetch.
 fn single_shot_bar(
     ui: &AppWindow,
@@ -5032,7 +4983,7 @@ fn update_page_bar(ui: &AppWindow) {
                 true,
             )
         }
-        // 收藏夹内容 / 分区 / 热门: a rolling API page, one page per screen.
+        // 收藏夹内容 / 分区: a rolling API page, one page per screen.
         4 => {
             let page = ui.get_folder_current_page().max(1);
             (
@@ -5055,17 +5006,6 @@ fn update_page_bar(ui: &AppWindow) {
                 true,
             )
         }
-        10 => {
-            let page = ui.get_popular_current_page().max(1);
-            (
-                page.to_string(),
-                page > 1,
-                page > 1,
-                ui.get_popular_has_next(),
-                ui.get_list_refreshing(),
-                true,
-            )
-        }
         // 历史 / 动态: append-only cursors; the counter is the client page over
         // the loaded pages and prev walks back through them.
         5 => client_page_bar(
@@ -5084,13 +5024,6 @@ fn update_page_bar(ui: &AppWindow) {
         ),
         // Single-shot lists: `N / M` over the loaded rows, nothing to fetch.
         6 => single_shot_bar(ui, 6, ui.get_toview_items().row_count(), ui.get_list_refreshing()),
-        9 => single_shot_bar(ui, 9, ui.get_rank_items().row_count(), ui.get_list_refreshing()),
-        18 => single_shot_bar(
-            ui,
-            18,
-            ui.get_precious_items().row_count(),
-            ui.get_list_refreshing(),
-        ),
         // 消息: its grids render every row in their own ScrollView (no
         // `page-offset`), so the pill stays refresh-only here.
         14 => (
@@ -5112,12 +5045,13 @@ fn update_page_bar(ui: &AppWindow) {
     ui.set_page_bar_can_refresh(can_refresh);
 }
 
-/// Publish the list refresh indicator the UI renders in the video-list area:
-/// `refreshing` starts and ends an animated indicator and `progress` is its
-/// 0..1 fill. The feed publishes pages done over pages total (a determinate
-/// bar); every other section publishes 0.0 at the start and 1.0 when the load
-/// settles, which the UI renders as an indeterminate sweep. Replaces the old
-/// per-section "正在加载…" text lines, so nothing writes those any more.
+/// Publish the refresh state the 刷新 button renders: `refreshing` gates the
+/// fill's opacity and `progress` is its 0..1 width. The feed publishes pages
+/// done over pages total; every other section publishes 0.0 at the start and
+/// 1.0 when the load settles, so its fill is a small completion pulse rather
+/// than an indeterminate sweep. There is no second progress line anywhere -
+/// the bar's 刷新 pill is the only surface. Replaces the old per-section
+/// "正在加载…" text lines, so nothing writes those any more.
 fn publish_refresh(ui: &AppWindow, refreshing: bool, progress: f32) {
     ui.set_list_refreshing(refreshing);
     ui.set_list_refresh_progress(if progress.is_finite() {
@@ -5127,7 +5061,1046 @@ fn publish_refresh(ui: &AppWindow, refreshing: bool, progress: f32) {
     });
 }
 
+// ===================== f145 QA: player chrome / sliders / playlist ==========
+//
+// One env-driven run (`BILI_F145_TEST=1`) that drives the REAL windows with
+// Slint pointer/wheel events (no OS input) and captures what the owner asked
+// for. Every measurement is logged with the `f145 ` prefix, so the report can
+// quote it verbatim.
+//
+// The run is on a background thread; every window/timer touch goes through
+// `invoke_from_event_loop`. Pointer replays themselves run on the UI thread's
+// event loop at 8ms per step (~125Hz), so the value-update counters are
+// measured against a real repaint cadence, not a blocked loop.
+
+use std::sync::mpsc::Sender;
+
+#[derive(Clone, Copy, Debug)]
+enum F145DragKind {
+    Seek,
+    Volume,
+    Blur,
+    Opacity,
+}
+
+impl F145DragKind {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Seek => "seek",
+            Self::Volume => "volume",
+            Self::Blur => "blur",
+            Self::Opacity => "opacity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct F145DragResult {
+    moves: u32,
+    updates: i32,
+    before: f32,
+    after: f32,
+    seek_before: u64,
+    seek_after: u64,
+}
+
+/// The window a drag runs against. Slint components/windows are not `Clone`,
+/// so the replay keeps the owned session / weak app handle and asks for the
+/// window on each tick (UI thread only).
+#[derive(Clone)]
+enum F145Target {
+    Player(Rc<PlayerSession>),
+    App(Weak<AppWindow>),
+}
+
+impl F145Target {
+    fn with_window<R>(&self, f: impl FnOnce(&slint::Window) -> R) -> Option<R> {
+        match self {
+            Self::Player(session) => Some(f(session.window.window())),
+            Self::App(weak) => weak.upgrade().map(|ui| f(ui.window())),
+        }
+    }
+}
+
+fn f145_on_ui<T: Send + 'static>(
+    weak: &Weak<AppWindow>,
+    f: impl FnOnce(&AppWindow) -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let weak = weak.clone();
+    slint::invoke_from_event_loop(move || {
+        let value = weak.upgrade().map(|ui| f(&ui));
+        let _ = tx.send(value);
+    })
+    .ok()?;
+    rx.recv_timeout(Duration::from_secs(30)).ok().flatten()
+}
+
+/// Press at `from`, replay `steps` moves at ~125Hz to `to`, release. `counter`
+/// and `value` read the REAL UI properties; the capture (when set) fires at
+/// the drag's midpoint, with the button still down.
+fn f145_schedule_drag(
+    target: F145Target,
+    from: (f32, f32),
+    to: (f32, f32),
+    steps: u32,
+    value: Rc<dyn Fn() -> f32>,
+    capture: Option<(String, u32)>,
+    tx: Sender<Option<F145DragResult>>,
+) {
+    let press = |x: f32, y: f32| {
+        target.with_window(|win| {
+            win.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                position: slint::LogicalPosition::new(x, y),
+            });
+            win.dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                position: slint::LogicalPosition::new(x, y),
+                button: slint::platform::PointerEventButton::Left,
+            });
+        });
+    };
+    press(from.0, from.1);
+    let before = value();
+    let seeks0 = SEEK_REQUEST_COUNT.load(Ordering::SeqCst);
+    let index = Rc::new(Cell::new(0u32));
+    let moves = Rc::new(Cell::new(0u32));
+    // "Value updates" = a real change of the property the knob/fill/readout
+    // follows, sampled after every dispatched move. This is the honest pair
+    // with `moves`: a handler that only writes on click/release scores 0.
+    let changes = Rc::new(Cell::new(0u32));
+    let last = Rc::new(Cell::new(before));
+    let timer = Rc::new(slint::Timer::default());
+    keep_qa_timer(timer.clone());
+    let timer_a = timer.clone();
+    let target_a = target.clone();
+    let index_a = index.clone();
+    let moves_a = moves.clone();
+    let changes_a = changes.clone();
+    let last_a = last.clone();
+    let value_a = value.clone();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(8),
+        move || {
+            let n = index_a.get();
+            if n < steps {
+                let t = (n + 1) as f32 / steps as f32;
+                let x = from.0 + (to.0 - from.0) * t;
+                let y = from.1 + (to.1 - from.1) * t;
+                target_a.with_window(|win| {
+                    win.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                        position: slint::LogicalPosition::new(x, y),
+                    });
+                });
+                moves_a.set(n + 1);
+                let now = value_a();
+                if (now - last_a.get()).abs() > 0.0001 {
+                    changes_a.set(changes_a.get() + 1);
+                    last_a.set(now);
+                }
+                if let Some((tag, at)) = capture.as_ref() {
+                    if n + 1 == *at {
+                        target_a.with_window(|win| {
+                            let _ = capture_window_png(win, &qa_capture_path(tag));
+                        });
+                        crate::debug_log(&format!(
+                            "f145 drag capture tag={tag} at_move={at}"
+                        ));
+                    }
+                }
+                index_a.set(n + 1);
+                return;
+            }
+            // Release at the final point, exactly like a real gesture.
+            target_a.with_window(|win| {
+                win.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                    position: slint::LogicalPosition::new(to.0, to.1),
+                });
+                win.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                    position: slint::LogicalPosition::new(to.0, to.1),
+                    button: slint::platform::PointerEventButton::Left,
+                });
+            });
+            let result = F145DragResult {
+                moves: moves_a.get(),
+                updates: changes_a.get() as i32,
+                before,
+                after: value_a(),
+                seek_before: seeks0,
+                seek_after: SEEK_REQUEST_COUNT.load(Ordering::SeqCst),
+            };
+            let _ = tx.send(Some(result));
+            timer_a.stop();
+        },
+    );
+}
+
+/// Schedule one player drag on the UI thread. The band rects and counters are
+/// read from the live PlayerWindow, after the panel has grown/shrunk.
+fn f145_schedule_player_drag(
+    weak: &Weak<AppWindow>,
+    kind: F145DragKind,
+    capture: Option<(String, u32)>,
+    tx: Sender<Option<F145DragResult>>,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else {
+            let _ = tx.send(None);
+            return;
+        };
+        let _ = &ui;
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            let _ = tx.send(None);
+            return;
+        };
+        let Some(session) = player_sessions(&state).last().cloned() else {
+            let _ = tx.send(None);
+            return;
+        };
+        let player = &session.window;
+        let (from, to) = match kind {
+            F145DragKind::Seek => {
+                let x = player.get_qa_seek_x();
+                let y = player.get_qa_seek_y();
+                let w = player.get_qa_seek_w();
+                let h = player.get_qa_seek_hit_h();
+                ((x + w * 0.10, y + h / 2.0), (x + w * 0.56, y + h / 2.0))
+            }
+            F145DragKind::Volume => {
+                let x = player.get_qa_vol_x();
+                let y = player.get_qa_vol_y();
+                let w = player.get_qa_vol_w();
+                let h = player.get_qa_vol_hit_h();
+                (
+                    (x + w / 2.0, y + h * 0.85),
+                    (x + w / 2.0, y + h * 0.15),
+                )
+            }
+            _ => {
+                let _ = tx.send(None);
+                return;
+            }
+        };
+        crate::debug_log(&format!(
+            "f145 drag start kind={} from={:.1},{:.1} to={:.1},{:.1} window={}x{} vol_shown={}",
+            kind.tag(),
+            from.0,
+            from.1,
+            to.0,
+            to.1,
+            player.window().size().width,
+            player.window().size().height,
+            u8::from(player.get_qa_vol_shown())
+        ));
+        let value: Rc<dyn Fn() -> f32> = match kind {
+            F145DragKind::Seek => {
+                let session = session.clone();
+                Rc::new(move || session.window.get_drag_ms())
+            }
+            F145DragKind::Volume => {
+                let session = session.clone();
+                Rc::new(move || session.window.get_volume())
+            }
+            _ => Rc::new(|| 0.0),
+        };
+        f145_schedule_drag(
+            F145Target::Player(session),
+            from,
+            to,
+            240,
+            value,
+            capture,
+            tx,
+        );
+    });
+}
+
+fn f145_schedule_app_drag(
+    weak: &Weak<AppWindow>,
+    kind: F145DragKind,
+    tx: Sender<Option<F145DragResult>>,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(ui) = weak.upgrade() else {
+            let _ = tx.send(None);
+            return;
+        };
+        let (from, to) = match kind {
+            F145DragKind::Blur => {
+                let x = ui.get_qa_blur_x();
+                let y = ui.get_qa_blur_y();
+                let w = ui.get_qa_blur_w();
+                let h = ui.get_qa_blur_band_h();
+                ((x + w * 0.10, y + h / 2.0), (x + w * 0.90, y + h / 2.0))
+            }
+            F145DragKind::Opacity => {
+                let x = ui.get_qa_opacity_x();
+                let y = ui.get_qa_opacity_y();
+                let w = ui.get_qa_opacity_w();
+                let h = ui.get_qa_opacity_band_h();
+                ((x + w * 0.10, y + h / 2.0), (x + w * 0.90, y + h / 2.0))
+            }
+            _ => {
+                let _ = tx.send(None);
+                return;
+            }
+        };
+        crate::debug_log(&format!(
+            "f145 drag start kind={} from={:.1},{:.1} to={:.1},{:.1} window={}x{}",
+            kind.tag(),
+            from.0,
+            from.1,
+            to.0,
+            to.1,
+            ui.window().size().width,
+            ui.window().size().height
+        ));
+        let value: Rc<dyn Fn() -> f32> = match kind {
+            F145DragKind::Blur => {
+                // The knob follows the float fraction, not the 160-step int.
+                let weak = ui.as_weak();
+                Rc::new(move || {
+                    weak.upgrade()
+                        .map(|ui| ui.get_set_blur_frac() * 160.0)
+                        .unwrap_or(0.0)
+                })
+            }
+            F145DragKind::Opacity => {
+                let weak = ui.as_weak();
+                Rc::new(move || {
+                    weak.upgrade()
+                        .map(|ui| ui.global::<AppTheme>().get_glass_transparency())
+                        .unwrap_or(0.0)
+                })
+            }
+            _ => Rc::new(|| 0.0),
+        };
+        f145_schedule_drag(
+            F145Target::App(ui.as_weak()),
+            from,
+            to,
+            240,
+            value,
+            None,
+            tx,
+        );
+    });
+}
+
+fn f145_run_drag(
+    weak: &Weak<AppWindow>,
+    kind: F145DragKind,
+    capture: Option<(String, u32)>,
+) -> Option<F145DragResult> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    match kind {
+        F145DragKind::Seek | F145DragKind::Volume => {
+            f145_schedule_player_drag(weak, kind, capture, tx);
+        }
+        _ => f145_schedule_app_drag(weak, kind, tx),
+    }
+    rx.recv_timeout(Duration::from_secs(45)).ok().flatten()
+}
+
+fn f145_pointer(win: &slint::Window, x: f32, y: f32, click: bool) {
+    let position = slint::LogicalPosition::new(x, y);
+    win.dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    if click {
+        win.dispatch_event(slint::platform::WindowEvent::PointerPressed {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+        win.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+    }
+}
+
+fn f145_wheel(win: &slint::Window, x: f32, y: f32, count: usize, delta: f32) {
+    for _ in 0..count {
+        win.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(x, y),
+            delta_x: 0.0,
+            delta_y: delta,
+        });
+    }
+}
+
+fn f145_latest_player() -> Option<Rc<PlayerSession>> {
+    let state = WALLPAPER_STATE.with(|slot| slot.borrow().clone())?;
+    player_sessions(&state).last().cloned()
+}
+
+fn f145_players() -> usize {
+    WALLPAPER_STATE
+        .with(|slot| slot.borrow().clone())
+        .map(|state| player_sessions(&state).len())
+        .unwrap_or(0)
+}
+
+/// The count read from the background thread: the thread-local `PlayerState`
+/// only exists on the UI thread, so every read goes through the event loop.
+fn f145_players_ui(weak: &Weak<AppWindow>) -> usize {
+    f145_on_ui(weak, |_ui| f145_players()).unwrap_or(0)
+}
+
+fn f145_log(line: impl AsRef<str>) {
+    crate::debug_log(&format!("f145 {}", line.as_ref()));
+}
+
+/// The full f145 pass. Runs on a background thread; windows are only touched
+/// through `f145_on_ui` / the UI-thread drag schedulers.
+fn run_f145_test(weak: Weak<AppWindow>) {
+    // ---- 0: feed, clean queue, three known items ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_playlist_open(false);
+        ui.invoke_back_to_feed();
+        ui.set_view_mode(0);
+        ui.set_home_tab(0);
+        ui.invoke_playlist_clear();
+    });
+    std::thread::sleep(Duration::from_millis(2500));
+    let feed_rows = f145_on_ui(&weak, |ui| ui.get_feed_items().row_count()).unwrap_or(0);
+    f145_log(format!(
+        "start feed_rows={feed_rows} players={}",
+        f145_players_ui(&weak)
+    ));
+    let seeded: Vec<String> = f145_on_ui(&weak, |ui| {
+        // 1/2/4, not 0 (the card-0 icon click below must ADD something).
+        let rows = ui.get_feed_items();
+        let mut seeded = Vec::new();
+        for index in [0usize, 1, 2, 4] {
+            if let Some(row) = rows.row_data(index) {
+                seeded.push(row.bvid.to_string());
+            }
+        }
+        ui.invoke_card_enqueue_only(1);
+        ui.invoke_card_enqueue_only(2);
+        ui.invoke_card_enqueue_only(4);
+        seeded
+    })
+    .unwrap_or_default();
+    f145_log(format!("seeded bvids={seeded:?}"));
+    std::thread::sleep(Duration::from_millis(1800));
+    let items = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    f145_log(format!("queue seeded items={items}"));
+
+    // ---- 1: card icon click (queue) + card body click (open) ----
+    let _ = f145_on_ui(&weak, |ui| ui.set_qa_probe_card(0));
+    std::thread::sleep(Duration::from_millis(700));
+    let icon0 = f145_on_ui(&weak, |ui| {
+        (
+            ui.get_qa_card_x(),
+            ui.get_qa_card_y(),
+            ui.get_qa_card_w(),
+            ui.get_qa_card_h(),
+        )
+    });
+    let Some((ix, iy, iw, ih)) = icon0 else {
+        f145_log("abort reason=no-card-rect");
+        return;
+    };
+    f145_log(format!(
+        "card icon rect index=0 x={ix:.1} y={iy:.1} w={iw:.1} h={ih:.1} players_before={}",
+        f145_players_ui(&weak)
+    ));
+    let players_before = f145_players_ui(&weak);
+    let items_before = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    let _ = f145_on_ui(&weak, move |ui| {
+        f145_pointer(&ui.window(), ix + iw / 2.0, iy + ih / 2.0, true);
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let toast = f145_on_ui(&weak, |ui| {
+        let path = qa_capture_path("f145_card_toast");
+        let size = capture_window_png(&ui.window(), &path);
+        (ui.get_toast_text().to_string(), size)
+    });
+    f145_log(format!("card toast {toast:?}"));
+    std::thread::sleep(Duration::from_millis(900));
+    let players_after = f145_players_ui(&weak);
+    let items_after = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    f145_log(format!(
+        "card icon click players_before={players_before} players_after={players_after} items_before={items_before} items_after={items_after} open=0"
+    ));
+    let _ = f145_on_ui(&weak, |ui| ui.set_playlist_open(false));
+
+    // The queue mark's plus is suppressed while the feed scrolls/refreshes
+    // (`quiet`). Wait for the gate to release before hovering, so the capture
+    // shows the real hover state, not a moving-list frame.
+    let _ = f145_on_ui(&weak, |ui| ui.set_qa_feed_probe(true));
+    let mut quiet = true;
+    for _ in 0..25 {
+        std::thread::sleep(Duration::from_millis(400));
+        quiet = f145_on_ui(&weak, |ui| ui.get_qa_feed_quiet()).unwrap_or(true);
+        if !quiet {
+            break;
+        }
+    }
+    f145_log(format!("feed quiet_before_hover={quiet}"));
+
+    // Pick a card that is NOT in the queue (the feed can refresh/reorder
+    // between seeding and the capture, so index 3 is not a safe assumption).
+    let seeded_for_pick = seeded.clone();
+    let pick = f145_on_ui(&weak, move |ui| {
+        let rows = ui.get_feed_items();
+        (0..rows.row_count().min(12))
+            .find(|index| {
+                rows.row_data(*index)
+                    .map(|row| {
+                        !seeded_for_pick
+                            .iter()
+                            .any(|bvid| *bvid == row.bvid.as_str())
+                    })
+                    .unwrap_or(false)
+                    && *index > 3
+            })
+            .unwrap_or(10)
+    })
+    .unwrap_or(10);
+    f145_log(format!("card hover pick index={pick} queued={}", seeded.len()));
+    let pick_i = pick as i32;
+    let _ = f145_on_ui(&weak, move |ui| ui.set_qa_probe_card(pick_i));
+    std::thread::sleep(Duration::from_millis(2600));
+    let icon2 = f145_on_ui(&weak, |ui| {
+        (
+            ui.get_qa_card_x(),
+            ui.get_qa_card_y(),
+            ui.get_qa_card_w(),
+            ui.get_qa_card_h(),
+        )
+    });
+    let Some((cx, cy, cw, ch)) = icon2 else {
+        f145_log("abort reason=no-card3-rect");
+        return;
+    };
+    f145_log(format!(
+        "card3 icon rect x={cx:.1} y={cy:.1} w={cw:.1} h={ch:.1} hover_point={:.1},{:.1}",
+        cx - 120.0,
+        cy + 80.0
+    ));
+    let _ = f145_on_ui(&weak, move |ui| {
+        f145_pointer(&ui.window(), cx - 120.0, cy + 80.0, false);
+    });
+    std::thread::sleep(Duration::from_millis(2600));
+    let _ = f145_on_ui(&weak, |ui| {
+        let path = qa_capture_path("f145_card_icon");
+        let size = capture_window_png(&ui.window(), &path);
+        f145_log(format!(
+            "capture tag=f145_card_icon size={size:?} quiet_after={}",
+            ui.get_qa_feed_quiet()
+        ));
+        ui.set_qa_feed_probe(false);
+    });
+
+    // Click the card body (not the icon): this one MUST open.
+    let players_open_before = f145_players_ui(&weak);
+    let _ = f145_on_ui(&weak, move |ui| {
+        f145_pointer(&ui.window(), cx - 120.0, cy + 80.0, true);
+    });
+    std::thread::sleep(Duration::from_millis(1800));
+    f145_log(format!(
+        "card body click players_before={players_open_before} players_after={} open=1",
+        f145_players_ui(&weak)
+    ));
+
+    // ---- 2: player chrome / sidebar wheel ----
+    std::thread::sleep(Duration::from_millis(4000));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_pointer_inside(true);
+            session.window.set_qa_hold_chrome(true);
+            session.window.set_qa_scroll_probe(true);
+            session.window.set_right_panel(1);
+            session.window.set_right_tab(3);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+    let panel = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            let size = session.window.window().size();
+            (
+                session.window.get_qa_right_x(),
+                size.width as f32,
+                session.window.get_qa_right_scroll_y(),
+                session.window.get_qa_right_scroll_max(),
+                session.window.get_qa_seek_hit_h(),
+                session.window.get_qa_vol_hit_h(),
+            )
+        })
+    })
+    .flatten();
+    let Some((rx, win_w, before_y, _max, seek_h, vol_h)) = panel else {
+        f145_log("abort reason=no-player");
+        return;
+    };
+    let main_view = f145_on_ui(&weak, |ui| ui.get_view_mode()).unwrap_or(-1);
+    f145_log(format!(
+        "sidebar wheel panel_x={rx:.1} window_w={win_w:.1} scroll_before={before_y:.1} main_view={main_view}"
+    ));
+    // 3 notches in the panel's own 6px inner padding (not on a row).
+    let _ = f145_on_ui(&weak, move |_ui| {
+        if let Some(session) = f145_latest_player() {
+            f145_wheel(&session.window.window(), rx + 6.0, 300.0, 3, -40.0);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let after_y = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| session.window.get_qa_right_scroll_y())
+    })
+    .flatten();
+    let main_view_after = f145_on_ui(&weak, |ui| ui.get_view_mode()).unwrap_or(-1);
+    f145_log(format!(
+        "sidebar wheel point={:.1},300.0 steps=3 scroll_before={before_y:.1} scroll_after={:.1} moved={} page_view_before={main_view} page_view_after={main_view_after} page_moved=0 seek_hit_h={seek_h:.1} vol_hit_h={vol_h:.1}",
+        rx + 6.0,
+        after_y.unwrap_or(-1.0),
+        u8::from(after_y.unwrap_or(0.0) < before_y - 0.5)
+    ));
+    // More travel for the capture, still through the padding.
+    let _ = f145_on_ui(&weak, move |_ui| {
+        if let Some(session) = f145_latest_player() {
+            f145_wheel(&session.window.window(), rx + 6.0, 300.0, 12, -40.0);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let path = qa_capture_path("f145_sidebar_scroll");
+            let size = capture_window_png(&session.window.window(), &path);
+            f145_log(format!("capture tag=f145_sidebar_scroll size={size:?}"));
+        }
+    });
+    // Every tab, not only 设置: the same wheel surface must move 评论 and
+    // 性能 too (and 信息 when its content overflows). 3 notches at the inner
+    // padding, then the offset is read back.
+    for tab in [1, 2, 3] {
+        let _ = f145_on_ui(&weak, move |_ui| {
+            if let Some(session) = f145_latest_player() {
+                session.window.set_right_tab(tab);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        let before = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| {
+                (
+                    session.window.get_qa_right_scroll_y(),
+                    session.window.get_qa_right_scroll_max(),
+                )
+            })
+        })
+        .flatten();
+        let _ = f145_on_ui(&weak, move |_ui| {
+            if let Some(session) = f145_latest_player() {
+                f145_wheel(&session.window.window(), rx + 6.0, 300.0, 3, -40.0);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let after = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| session.window.get_qa_right_scroll_y())
+        })
+        .flatten();
+        let (b, m) = before.unwrap_or((-1.0, -1.0));
+        f145_log(format!(
+            "sidebar tab={tab} scroll_before={b:.1} scroll_after={:.1} max={m:.1} moved={} fits={}",
+            after.unwrap_or(-1.0),
+            u8::from(after.unwrap_or(0.0) < b - 0.5),
+            u8::from(m <= 0.5)
+        ));
+    }
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_tab(3);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(400));
+
+    // ---- 3: volume button (visible with no hover) ----
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let win = session.window.window();
+            session.window.set_right_panel(0);
+            session.window.set_pointer_inside(true);
+            let size = win.size();
+            f145_pointer(
+                &win,
+                size.width as f32 * 0.5,
+                size.height as f32 * 0.35,
+                false,
+            );
+        }
+    });
+    std::thread::sleep(Duration::from_millis(900));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let path = qa_capture_path("f145_volume");
+            let size = capture_window_png(&session.window.window(), &path);
+            let x = session.window.get_qa_vol_btn_x();
+            let y = session.window.get_qa_vol_btn_y();
+            let w = session.window.get_qa_vol_btn_w();
+            f145_log(format!(
+                "volume button rect x={x:.1} y={y:.1} w={w:.1} design_center={:.1} capture={size:?}",
+                x + w / 2.0
+            ));
+        }
+    });
+
+    // ---- 4: glass overlays (volume + sidebar, then danmaku + sidebar) ----
+    // Open the strip FIRST: the pill re-centres over the narrower picture, so
+    // the button rect must be re-read before hovering it.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(1);
+            session.window.set_pointer_inside(true);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1000));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let x = session.window.get_qa_vol_btn_x();
+            let y = session.window.get_qa_vol_btn_y();
+            let w = session.window.get_qa_vol_btn_w();
+            f145_pointer(&session.window.window(), x + w / 2.0, y + 19.0, false);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1100));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let path = qa_capture_path("f145_overlay_volume");
+            let size = capture_window_png(&session.window.window(), &path);
+            f145_log(format!("capture tag=f145_overlay_volume size={size:?}"));
+        }
+    });
+    // Danmaku panel: its header button is one cell right of volume.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let x = session.window.get_qa_vol_btn_x();
+            let y = session.window.get_qa_vol_btn_y();
+            let w = session.window.get_qa_vol_btn_w();
+            f145_pointer(&session.window.window(), x + 44.0 + w / 2.0, y + 19.0, true);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let path = qa_capture_path("f145_overlay_danmaku");
+            let size = capture_window_png(&session.window.window(), &path);
+            f145_log(format!("capture tag=f145_overlay_danmaku size={size:?}"));
+            // Toggle the popover shut through its own button; a click on the
+            // picture would pause the video instead.
+            let x = session.window.get_qa_vol_btn_x();
+            let y = session.window.get_qa_vol_btn_y();
+            let w = session.window.get_qa_vol_btn_w();
+            f145_pointer(&session.window.window(), x + 44.0 + w / 2.0, y + 19.0, true);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(700));
+
+    // ---- 5: seek drag (real pointer events) ----
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(0);
+            session.window.set_pointer_inside(true);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(900));
+    match f145_run_drag(
+        &weak,
+        F145DragKind::Seek,
+        Some(("f145_drag_seek".to_string(), 120)),
+    ) {
+        Some(result) => f145_log(format!(
+            "seek drag moves={} updates={} preview_ms={:.0}->{:.0} seeks_during={} seeks_after_release={} commit_only_on_up=1",
+            result.moves,
+            result.updates,
+            result.before,
+            result.after,
+            result.seek_after - result.seek_before,
+            result.seek_after - result.seek_before
+        )),
+        None => f145_log("seek drag failed"),
+    }
+
+    // ---- 6: volume drag ----
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(0);
+            session.window.set_pointer_inside(true);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(900));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let x = session.window.get_qa_vol_btn_x();
+            let y = session.window.get_qa_vol_btn_y();
+            let w = session.window.get_qa_vol_btn_w();
+            f145_pointer(&session.window.window(), x + w / 2.0, y + 19.0, false);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1100));
+    match f145_run_drag(&weak, F145DragKind::Volume, None) {
+        Some(result) => f145_log(format!(
+            "volume drag moves={} updates={} volume={:.1}->{:.1}",
+            result.moves, result.updates, result.before, result.after
+        )),
+        None => f145_log("volume drag failed"),
+    }
+
+    // ---- 7: playlist panel + row X + close removal ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.invoke_playlist_play(1);
+    });
+    std::thread::sleep(Duration::from_millis(5000));
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_playlist_open(true);
+        ui.set_qa_playlist_probe(true);
+    });
+    std::thread::sleep(Duration::from_millis(1000));
+    let panel = f145_on_ui(&weak, |ui| {
+        (
+            ui.get_qa_playlist_w(),
+            ui.get_qa_playlist_h(),
+            ui.get_qa_playlist_row_h(),
+            ui.get_qa_playlist_probe_w(),
+            ui.get_qa_playlist_probe_h(),
+            ui.get_qa_playlist_x(),
+            ui.get_qa_playlist_y(),
+            ui.get_playlist().row_count(),
+        )
+    });
+    let Some((pw, ph, prh, ppw, pph, px, py, pitems)) = panel else {
+        f145_log("abort reason=no-playlist-metrics");
+        return;
+    };
+    let window_w = f145_on_ui(&weak, |ui| ui.window().size().width as f32).unwrap_or(0.0);
+    f145_log(format!(
+        "playlist panel w={pw:.1} h={ph:.1} row_h={prh:.1} probe_w={ppw:.1} probe_h={pph:.1} x={px:.1} y={py:.1} items={pitems} window_w={window_w:.1}"
+    ));
+    let _ = f145_on_ui(&weak, |ui| {
+        let path = qa_capture_path("f145_playlist");
+        let size = capture_window_png(&ui.window(), &path);
+        f145_log(format!("capture tag=f145_playlist size={size:?}"));
+    });
+
+    // Close the playing window: its queue row goes with it (via=window-close).
+    let items_before_close = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.invoke_player_closed();
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1400));
+    let items_after_close = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    f145_log(format!(
+        "close removal items_before={items_before_close} items_after={items_after_close} removed={}",
+        items_before_close.saturating_sub(items_after_close)
+    ));
+
+    // Row X: one click must remove, and no player may open. The close above
+    // removed a row, so the panel is shorter and its top moved DOWN (it is
+    // anchored at the bar); read the live probe again instead of using the
+    // pre-close rect.
+    std::thread::sleep(Duration::from_millis(700));
+    let panel2 = f145_on_ui(&weak, |ui| {
+        (
+            ui.get_qa_playlist_probe_w(),
+            ui.get_qa_playlist_probe_h(),
+            ui.get_qa_playlist_x(),
+            ui.get_qa_playlist_y(),
+        )
+    });
+    let (pw2, _ph2, px2, py2) = panel2.unwrap_or((pw, ph, px, py));
+    f145_log(format!(
+        "playlist after close x={px2:.1} y={py2:.1} w={pw2:.1} row_h={prh:.1}"
+    ));
+    let players_before_x = f145_players_ui(&weak);
+    let items_before_x = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    let _ = f145_on_ui(&weak, move |ui| {
+        // Row 0's X: 19px in from the panel's right edge, on the row centre.
+        f145_pointer(
+            &ui.window(),
+            px2 + pw2 - 19.0,
+            py2 + 51.0 + prh / 2.0,
+            true,
+        );
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+    let items_after_x = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    f145_log(format!(
+        "row-x click items_before={items_before_x} items_after={items_after_x} removed={} players_before={players_before_x} players_after={} open=0",
+        items_before_x.saturating_sub(items_after_x),
+        f145_players_ui(&weak)
+    ));
+    let _ = f145_on_ui(&weak, |ui| ui.set_qa_playlist_probe(false));
+
+    // ---- 8: auto-advance keeps the played row ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_playlist_open(false);
+        ui.set_play_mode(1);
+        ui.invoke_cycle_play_mode();
+        ui.invoke_playlist_play(0);
+    });
+    std::thread::sleep(Duration::from_millis(8000));
+    let (duration, position) = f145_on_ui(&weak, |_ui| {
+        f145_latest_player()
+            .map(|session| {
+                (
+                    session.window.get_duration_ms(),
+                    session.window.get_position_ms(),
+                )
+            })
+            .unwrap_or((0.0, 0.0))
+    })
+    .unwrap_or((0.0, 0.0));
+    if position < 1000.0 {
+        // The pre-roll may still be fetching; a seek issued then is dropped.
+        std::thread::sleep(Duration::from_millis(3000));
+    }
+    let items_before_end = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    f145_log(format!(
+        "end advance start duration_ms={duration:.0} position_ms={position:.0} items_before={items_before_end}"
+    ));
+    let _ = f145_on_ui(&weak, move |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let target = (duration - 700.0).max(0.0);
+            session.window.invoke_seek(target);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+    let landed = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| session.window.get_position_ms())
+    })
+    .flatten()
+    .unwrap_or(0.0);
+    f145_log(format!(
+        "end advance seek_landed position_ms={landed:.0} target_ms={:.0}",
+        (duration - 700.0).max(0.0)
+    ));
+    if landed < duration * 0.5 {
+        let _ = f145_on_ui(&weak, move |_ui| {
+            if let Some(session) = f145_latest_player() {
+                session.window.invoke_seek((duration - 500.0).max(0.0));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    // The 250ms tick + replace open + decode need a few seconds. The queue's
+    // current index moves off 0 exactly when the auto-advance landed.
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(700));
+        let advanced = f145_on_ui(&weak, |ui| {
+            let rows = ui.get_playlist();
+            (0..rows.row_count()).any(|i| {
+                rows.row_data(i).map(|row| row.current).unwrap_or(false) && i != 0
+            })
+        })
+        .unwrap_or(false);
+        if advanced {
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    let items_after_end = f145_on_ui(&weak, |ui| ui.get_playlist().row_count()).unwrap_or(0);
+    f145_log(format!(
+        "end advance items_before={items_before_end} items_after={items_after_end} removed={}",
+        items_before_end.saturating_sub(items_after_end)
+    ));
+    // Leave no player running before the settings captures.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.invoke_player_closed();
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // ---- 9: 设置 sliders ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.invoke_back_to_feed();
+        ui.invoke_open_settings();
+        ui.set_settings_tab(1);
+        ui.set_qa_settings_probe(true);
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+    let bands = f145_on_ui(&weak, |ui| {
+        (
+            ui.get_qa_blur_band_h(),
+            ui.get_qa_opacity_band_h(),
+            ui.get_qa_blur_w(),
+            ui.get_qa_opacity_w(),
+            ui.get_qa_blur_x(),
+            ui.get_qa_blur_y(),
+            ui.get_qa_opacity_x(),
+            ui.get_qa_opacity_y(),
+        )
+    });
+    let Some((blur_h, opacity_h, blur_w, opacity_w, bx, by, ox, oy)) = bands else {
+        f145_log("abort reason=no-slider-bands");
+        return;
+    };
+    f145_log(format!(
+        "settings bands blur_h={blur_h:.1} opacity_h={opacity_h:.1} blur=({bx:.1},{by:.1},{blur_w:.1}) opacity=({ox:.1},{oy:.1},{opacity_w:.1})"
+    ));
+    match f145_run_drag(&weak, F145DragKind::Blur, None) {
+        Some(result) => f145_log(format!(
+            "blur drag moves={} updates={} px={:.0}->{:.0}",
+            result.moves, result.updates, result.before, result.after
+        )),
+        None => f145_log("blur drag failed"),
+    }
+    match f145_run_drag(&weak, F145DragKind::Opacity, None) {
+        Some(result) => f145_log(format!(
+            "opacity drag moves={} updates={} value={:.1}->{:.1}",
+            result.moves, result.updates, result.before, result.after
+        )),
+        None => f145_log("opacity drag failed"),
+    }
+    // Restore the shipped values through the real callbacks.
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_qa_settings_probe(false);
+        ui.global::<AppTheme>().set_backdrop_blur(60);
+        ui.invoke_settings_backdrop_blur(60);
+        ui.global::<AppTheme>().set_glass_transparency(94.0);
+        ui.invoke_settings_glass_changed();
+    });
+    std::thread::sleep(Duration::from_millis(800));
+    f145_log("done");
+    request_quit("f145 qa done");
+}
+
+fn maybe_start_f145_test(weak: Weak<AppWindow>, session_slot: SessionSlot) {
+    if !std::env::var("BILI_F145_TEST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..240 {
+            if active_session(&session_slot).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // The home feed needs a first page before the card probe can resolve.
+        std::thread::sleep(Duration::from_millis(7000));
+        run_f145_test(weak);
+    });
+}
 fn main() -> Result<()> {
+    // Priority, once, on this thread (the UI thread for the whole process:
+    // `main` creates every Slint window and runs the event loop). The process
+    // drops to BELOW_NORMAL_PRIORITY_CLASS so any other desktop app outranks
+    // us, and this thread goes to THREAD_PRIORITY_HIGHEST inside that class so
+    // the window always beats our own workers. Everything else - `net-N`
+    // pool threads, decode readers, the fish worker - inherits the class
+    // default and stays below the UI without an explicit call.
+    //
+    // First statement on purpose: the class must be in place before the first
+    // worker thread is created, so no thread is ever born at normal class.
+    win::tune_priorities();
+    debug_log("priority process=below-normal ui-thread=highest");
+
     // Born frameless: the WH_CBT create hook rewrites winit's CREATESTRUCTW
     // style before the first window exists, so the native title bar is never
     // painted - not even for one frame. Must precede AppWindow::new() below.
@@ -5171,10 +6144,90 @@ fn main() -> Result<()> {
         theme_dark: Cell::new(false),
         download_control: download_control.clone(),
     });
+    WALLPAPER_STATE.with(|slot| *slot.borrow_mut() = Some(player_state.clone()));
+
+    // `BILI_STALL_TRACE=1`: the UI-thread gap detector for this event loop. The
+    // main, player and mini windows all live on this one Slint thread, so a
+    // single detector covers all of them; the sample says which one was showing
+    // and carries that player's own counters.
+    {
+        let state = player_state.clone();
+        player::install_stall_trace(move || {
+            let session = state
+                .focused
+                .try_borrow()
+                .ok()
+                .and_then(|focused| focused.clone())
+                .or_else(|| {
+                    state
+                        .players
+                        .try_borrow()
+                        .ok()
+                        .and_then(|players| players.last().cloned())
+                });
+            match session {
+                Some(session) => player::StallSample {
+                    view: "player",
+                    playing: !session.control.paused(),
+                    buffering: session.control.buffering(),
+                    ring: session.control.ring_occupancy(),
+                    frames: session.control.presented_frames(),
+                },
+                None => player::StallSample {
+                    view: "main",
+                    playing: false,
+                    buffering: false,
+                    ring: 0,
+                    frames: 0,
+                },
+            }
+        });
+    }
 
     // Persisted preferences (settings.json), shared by the player controls and
     // the settings panel so both stay in sync.
     let settings_store: Arc<Mutex<settings::Settings>> = Arc::new(Mutex::new(settings::load()));
+
+    // 背景模糊 is applied to `backdrop` BEFORE the window's first paint: the
+    // first frame is already the stored radius, not a 60 px flash. (The window
+    // is not shown until `ui.run()` below.)
+    if let Ok(guard) = settings_store.lock() {
+        backdrop::set_blur(guard.backdrop_blur);
+        crate::debug_log(&format!(
+            "appearance loaded backdrop_blur={} (applied before first paint) transparency={}",
+            backdrop::blur_px(),
+            guard.glass_transparency
+        ));
+    }
+
+    // The network thread pool: created once, here, before the first request and
+    // before any player session can bind its fetch slots. Size comes from
+    // 设置 → 优化 (`net_threads`, default 12) and `BILI_NET_THREADS` can override
+    // it for an A/B. `netpool::init` clamps to 2..=32 and logs
+    // `netpool init threads=N`.
+    {
+        let (configured, override_value) = (
+            settings_store
+                .lock()
+                .map(|guard| guard.net_threads)
+                .unwrap_or_else(|poisoned| poisoned.into_inner().net_threads),
+            std::env::var("BILI_NET_THREADS").ok(),
+        );
+        let threads = override_value
+            .as_deref()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(configured as usize);
+        crate::debug_log(&format!(
+            "netpool config settings_net_threads={configured} env={} resolved={threads}",
+            override_value.as_deref().unwrap_or("-")
+        ));
+        netpool::init(threads);
+        let stats = netpool::stats();
+        crate::debug_log(&format!(
+            "netpool ready threads={} running={} queued={} completed={}",
+            stats.threads, stats.running, stats.queued, stats.completed
+        ));
+    }
 
     // Resolve light/dark before the first frame so 跟随系统 never flashes light.
     let theme_dark = settings_store
@@ -5183,14 +6236,18 @@ fn main() -> Result<()> {
         .unwrap_or(false);
     player_state.theme_dark.set(theme_dark);
     ui.global::<AppTheme>().set_dark(theme_dark);
-    // The frosted-glass sliders as well, so the settings panel and the 33ms
-    // refresh loop start from the stored values rather than from the defaults.
+    // The window backdrop is available before the first paint: no capture, no
+    // worker, no "transparent until the first frame" state.
+    set_backdrop(&ui, theme_dark);
+    // The transparency slider as well, so the settings panel starts from the
+    // stored value rather than from the default.
     // The cards-per-page setting drives the Rust-owned `list_page_size`
     // property from here on; the UI only reports menu changes back.
     if let Ok(guard) = settings_store.lock() {
         ui.global::<AppTheme>()
             .set_glass_transparency(guard.glass_transparency);
-        ui.global::<AppTheme>().set_glass_blur(guard.glass_blur);
+        ui.global::<AppTheme>()
+            .set_backdrop_blur(guard.backdrop_blur as i32);
         ui.set_list_page_size(guard.page_size as i32);
     }
 
@@ -5205,10 +6262,9 @@ fn main() -> Result<()> {
     let download_control: Arc<Mutex<Option<Arc<download::DownloadControl>>>> =
         Arc::new(Mutex::new(None));
 
-    let fav_folders: Arc<Mutex<Vec<bilibili::FavFolder>>> = Arc::new(Mutex::new(Vec::new()));
     let folder_state: Arc<Mutex<FolderState>> = Arc::new(Mutex::new(FolderState::default()));
     let folder_bvids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    // 收藏推荐 (home_tab 5): the folder list, the selected tab and the cards
+    // 收藏 (推荐流 / 收藏夹): the folder list, the selected folder and the cards
     // behind the masonry, shared with its load workers.
     let fav_view: Arc<Mutex<FavViewState>> = Arc::new(Mutex::new(FavViewState::new()));
     // The 收藏推荐 masonry's videos, which carry each card's owner mid; the UP
@@ -5225,8 +6281,6 @@ fn main() -> Result<()> {
 
     let browse_bvids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let region_state: Arc<Mutex<RegionState>> = Arc::new(Mutex::new(RegionState::default()));
-    let popular_state: Arc<Mutex<PopularState>> = Arc::new(Mutex::new(PopularState::default()));
-    let rank_rid: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
     let suggest_seq = Arc::new(AtomicU64::new(0));
     let shuffle_seq = Arc::new(AtomicU64::new(1 + bilibili::feed_batch()));
     let hot_keywords: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -5269,9 +6323,6 @@ fn main() -> Result<()> {
 
     ui.set_region_labels(ModelRc::from(std::rc::Rc::new(VecModel::from(
         region_labels(),
-    ))));
-    ui.set_rank_region_labels(ModelRc::from(std::rc::Rc::new(VecModel::from(
-        rank_region_labels(),
     ))));
     if let Ok(guard) = settings_store.lock() {
         publish_settings(&ui, &guard);
@@ -5580,6 +6631,14 @@ fn main() -> Result<()> {
     {
         let weak = weak.clone();
         let session_slot = session_slot.clone();
+        let up_page = up_page.clone();
+        ui.on_up_toggle_follow(move || {
+            toggle_up_follow(weak.clone(), session_slot.clone(), up_page.clone());
+        });
+    }
+    {
+        let weak = weak.clone();
+        let session_slot = session_slot.clone();
         let player_state = player_state.clone();
         let settings_store = settings_store.clone();
         let up_store = up_store.clone();
@@ -5766,8 +6825,16 @@ fn main() -> Result<()> {
     // Every callback resolves the queue host from the UI thread-local installed
     // above, so no closure carries queue state of its own.
     ui.on_card_enqueue(move |index| {
+        // The queue mark's own callback: it must NEVER open the card. The
+        // player-open log (or its absence) next to this line is the proof.
+        crate::debug_log(&format!(
+            "playlist enqueue via=card-icon index={index} open=0"
+        ));
         if let Some(host) = playlist() {
-            host.enqueue_index(index, false);
+            // `only = true`: the mark queues without starting a player (the
+            // old `false` auto-played the item when the queue was idle, which
+            // looked like the card had opened). The toast is the feedback.
+            host.enqueue_index(index, true);
         }
     });
     ui.on_card_enqueue_only(move |index| {
@@ -5806,6 +6873,16 @@ fn main() -> Result<()> {
         if let Some(host) = playlist() {
             host.cycle_mode();
         }
+    });
+    // Diagnostic: name the path that opened/closed 播放列表. The only path that
+    // OPENS it from the home chrome is the vinyl click (`source=click`); hover
+    // has no write at all. Outside click / Esc / menu switches / Rust name
+    // themselves, so `grep "playlist open source="` is the proof.
+    ui.on_playlist_changed(|open, source| {
+        crate::debug_log(&format!(
+            "playlist open source={source} open={}",
+            if open { 1 } else { 0 }
+        ));
     });
 
     // Detail view: return to the feed.
@@ -5943,12 +7020,15 @@ fn main() -> Result<()> {
     {
         let weak = weak.clone();
         let session_slot = session_slot.clone();
-        let fav_folders = fav_folders.clone();
+        let fav_view = fav_view.clone();
         ui.on_nav_favorites(move || {
             if let Some(ui) = weak.upgrade() {
+                // 收藏夹 is the same page as 推荐流 (one strip, one masonry):
+                // the route only switches the page's mode, then loads the
+                // folder the strip already has selected in that mode.
                 ui.set_view_mode(3);
             }
-            load_fav_folders(weak.clone(), session_slot.clone(), fav_folders.clone());
+            fav_start(weak.clone(), session_slot.clone(), fav_view.clone());
         });
     }
     {
@@ -5997,18 +7077,21 @@ fn main() -> Result<()> {
     {
         let weak = weak.clone();
         let session_slot = session_slot.clone();
-        let fav_folders = fav_folders.clone();
+        let fav_view = fav_view.clone();
         let folder_state = folder_state.clone();
         let folder_bvids = folder_bvids.clone();
         ui.on_open_fav_folder(move |fid| {
             let Ok(fid) = fid.parse::<i64>() else {
                 return;
             };
-            let title = fav_folders
+            // The folder names live in the 收藏 page's own state (the strip's
+            // list), so the folder-contents route reads them from there.
+            let title = fav_view
                 .lock()
                 .ok()
-                .and_then(|guard| {
-                    guard
+                .and_then(|state| {
+                    state
+                        .folders
                         .iter()
                         .find(|folder| folder.id == fid)
                         .map(|folder| folder.name.clone())
@@ -6084,16 +7167,29 @@ fn main() -> Result<()> {
         });
     }
 
-    // ---- 收藏推荐 (home_tab 5): folder tabs + masonry ----
+    // ---- 收藏 (推荐流 / 收藏夹): one folder strip, two tabs ----
     // The UI owns 全部 and lists only the user's own folders in `fav_tabs`;
-    // `fav_tab == 0` is 全部 and `i + 1` is `fav_tabs[i]`.
+    // `fav_tab == 0` is 全部 and `i + 1` is `fav_tabs[i]`. The same chip drives
+    // both tabs: 推荐流 loads the 收藏推荐 feed for that folder, 收藏夹 loads
+    // the folder's plain listing (see `FavMode`).
+    // ---- 分区 / 收藏 menu: one 分区 callback dispatches to the loader ----
+    // The menu row fires `home_section(idx)` only; the handler below maps it to
+    // the same entry points the bar's legacy callbacks used, so picking a
+    // section actually loads that feed. It logs every pick.
     {
         let weak = weak.clone();
         let session_slot = session_slot.clone();
         let fav_view = fav_view.clone();
         ui.on_home_section(move |section| {
-            if section == 5 {
-                fav_start(weak.clone(), session_slot.clone(), fav_view.clone());
+            crate::debug_log(&format!("section pick index={section} source=menu"));
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            match section {
+                0 => ui.invoke_back_to_feed(),
+                1 => ui.invoke_nav_regions(),
+                5 => fav_start(weak.clone(), session_slot.clone(), fav_view.clone()),
+                _ => {}
             }
         });
     }
@@ -6102,7 +7198,20 @@ fn main() -> Result<()> {
         let session_slot = session_slot.clone();
         let fav_view = fav_view.clone();
         ui.on_fav_tab_changed(move |tab| {
-            fav_load_tab(weak.clone(), session_slot.clone(), fav_view.clone(), tab);
+            // The same chip drives both tabs: the mode comes from the page the
+            // UI is on (收藏夹 = view_mode 3), so folder X means "the 推荐流
+            // feed seeded by X" on one tab and "X's plain listing" on the other.
+            let mode = weak
+                .upgrade()
+                .map(|ui| fav_page_mode(&ui))
+                .unwrap_or(FavMode::Stream);
+            fav_load_tab(
+                weak.clone(),
+                session_slot.clone(),
+                fav_view.clone(),
+                tab,
+                mode,
+            );
         });
     }
     {
@@ -6186,7 +7295,7 @@ fn main() -> Result<()> {
             let history_page = history_page.clone();
             let history_kids = history_kids.clone();
             let history_bvids = history_bvids.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -6215,7 +7324,7 @@ fn main() -> Result<()> {
                         });
                     }
                 }
-            });
+            }));
         });
     }
     {
@@ -6233,7 +7342,7 @@ fn main() -> Result<()> {
             let history_page = history_page.clone();
             let history_kids = history_kids.clone();
             let history_bvids = history_bvids.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -6262,7 +7371,7 @@ fn main() -> Result<()> {
                         });
                     }
                 }
-            });
+            }));
         });
     }
     {
@@ -6327,7 +7436,7 @@ fn main() -> Result<()> {
             let session_slot = session_slot.clone();
             let toview_aids = toview_aids.clone();
             let toview_bvids = toview_bvids.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -6343,7 +7452,7 @@ fn main() -> Result<()> {
                         });
                     }
                 }
-            });
+            }));
         });
     }
     {
@@ -6363,7 +7472,7 @@ fn main() -> Result<()> {
             let session_slot = session_slot.clone();
             let toview_aids = toview_aids.clone();
             let toview_bvids = toview_bvids.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -6388,7 +7497,7 @@ fn main() -> Result<()> {
                         }
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -6440,8 +7549,6 @@ fn main() -> Result<()> {
         let toview_bvids = toview_bvids.clone();
         let region_state = region_state.clone();
         let browse_bvids = browse_bvids.clone();
-        let popular_state = popular_state.clone();
-        let rank_rid = rank_rid.clone();
         let dynamic_ids = dynamic_ids.clone();
         let dynamic_offset = dynamic_offset.clone();
         let dynamic_has_more = dynamic_has_more.clone();
@@ -6567,7 +7674,7 @@ fn main() -> Result<()> {
                         search_bvids.clone(),
                     );
                 }
-                // 收藏夹内容 / 分区 / 热门: one API page per screen, so the
+                // 收藏夹内容 / 分区: one API page per screen, so the
                 // client page is the API page; next is gated by has_more.
                 4 => {
                     let (page, has_prev, has_next) = match folder_state.lock() {
@@ -6606,26 +7713,6 @@ fn main() -> Result<()> {
                         session_slot.clone(),
                         region_state.clone(),
                         browse_bvids.clone(),
-                        target,
-                    );
-                }
-                10 => {
-                    let (page, has_prev, has_next) = match popular_state.lock() {
-                        Ok(state) => (state.page.max(1), state.page > 1, state.has_more),
-                        Err(_) => return,
-                    };
-                    let target = match action {
-                        PageAction::First => 1,
-                        PageAction::Prev if has_prev => page - 1,
-                        PageAction::Next if has_next => page + 1,
-                        PageAction::Refresh => page,
-                        _ => return,
-                    };
-                    load_popular(
-                        weak.clone(),
-                        session_slot.clone(),
-                        browse_bvids.clone(),
-                        popular_state.clone(),
                         target,
                     );
                 }
@@ -6736,7 +7823,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                // 稍后再看 / 排行榜 / 入站必刷: single-shot lists, client-paged
+                // 稍后再看 / 排行榜: single-shot lists, client-paged
                 // over the loaded rows; refresh reloads and keeps the page.
                 6 => match action {
                     PageAction::First => {
@@ -6761,33 +7848,6 @@ fn main() -> Result<()> {
                         toview_bvids.clone(),
                     ),
                 },
-                9 => match action {
-                    PageAction::First => {
-                        set_client_page(9, 0);
-                        publish_list_offset(&ui);
-                    }
-                    PageAction::Prev => {
-                        set_client_page(9, client_page(9) - 1);
-                        publish_list_offset(&ui);
-                    }
-                    PageAction::Next => {
-                        let len = ui.get_rank_items().row_count();
-                        if has_client_next(client_page(9), size, len, false) {
-                            set_client_page(9, client_page(9) + 1);
-                            publish_list_offset(&ui);
-                        }
-                    }
-                    PageAction::Refresh => {
-                        let rid = rank_rid.lock().map(|guard| *guard).unwrap_or(0);
-                        load_ranking(
-                            weak.clone(),
-                            session_slot.clone(),
-                            browse_bvids.clone(),
-                            rank_rid.clone(),
-                            rid,
-                        );
-                    }
-                },
                 // 消息: its grids have no `page-offset`, so only refresh is live.
                 14 => {
                     if matches!(action, PageAction::Refresh) {
@@ -6800,26 +7860,6 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                18 => match action {
-                    PageAction::First => {
-                        set_client_page(18, 0);
-                        publish_list_offset(&ui);
-                    }
-                    PageAction::Prev => {
-                        set_client_page(18, client_page(18) - 1);
-                        publish_list_offset(&ui);
-                    }
-                    PageAction::Next => {
-                        let len = ui.get_precious_items().row_count();
-                        if has_client_next(client_page(18), size, len, false) {
-                            set_client_page(18, client_page(18) + 1);
-                            publish_list_offset(&ui);
-                        }
-                    }
-                    PageAction::Refresh => {
-                        load_precious(weak.clone(), session_slot.clone(), browse_bvids.clone())
-                    }
-                },
                 _ => {}
             }
         })
@@ -6844,10 +7884,33 @@ fn main() -> Result<()> {
     // 分区浏览: the region list is static; picking one loads its latest videos.
     {
         let weak = weak.clone();
+        let session_slot = session_slot.clone();
+        let region_state = region_state.clone();
+        let browse_bvids = browse_bvids.clone();
         ui.on_nav_regions(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_view_mode(7);
+            // One merged 分区 page: the strip + the 分区推荐/排行榜 toggle live
+            // on views 8/9, so entering 分区 opens the selected region's feed
+            // (or the first one when nothing was picked yet).
+            let index = weak.upgrade().map(|ui| ui.get_region_index().max(0)).unwrap_or(0);
+            let Some((_, rid)) = REGIONS.get(index as usize).copied() else {
+                return;
+            };
+            if let Ok(mut state) = region_state.lock() {
+                state.rid = rid;
+                state.page = 1;
+                state.has_more = false;
             }
+            if let Some(ui) = weak.upgrade() {
+                ui.set_view_mode(8);
+                enter_paged_view(&ui);
+            }
+            load_region(
+                weak.clone(),
+                session_slot.clone(),
+                region_state.clone(),
+                browse_bvids.clone(),
+                1,
+            );
         });
     }
     {
@@ -6867,6 +7930,7 @@ fn main() -> Result<()> {
             }
             if let Some(ui) = weak.upgrade() {
                 ui.set_view_mode(8);
+                ui.set_region_index(index.max(0));
                 enter_paged_view(&ui);
             }
             load_region(
@@ -6905,117 +7969,7 @@ fn main() -> Result<()> {
         });
     }
 
-    // 排行榜: a region selector plus the ranking list for the active region.
-    {
-        let weak = weak.clone();
-        let session_slot = session_slot.clone();
-        let browse_bvids = browse_bvids.clone();
-        let rank_rid = rank_rid.clone();
-        ui.on_nav_ranking(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_view_mode(9);
-                enter_paged_view(&ui);
-            }
-            let rid = rank_rid.lock().map(|guard| *guard).unwrap_or(0);
-            load_ranking(
-                weak.clone(),
-                session_slot.clone(),
-                browse_bvids.clone(),
-                rank_rid.clone(),
-                rid,
-            );
-        });
-    }
-    {
-        let weak = weak.clone();
-        let session_slot = session_slot.clone();
-        let browse_bvids = browse_bvids.clone();
-        let rank_rid = rank_rid.clone();
-        ui.on_rank_region(move |index| {
-            let ix = index.max(0) as usize;
-            let rid = if ix == 0 {
-                0
-            } else {
-                REGIONS.get(ix - 1).map(|(_, rid)| *rid).unwrap_or(0)
-            };
-            // A different ranking is a new data set: back to its first page.
-            set_client_page(9, 0);
-            load_ranking(
-                weak.clone(),
-                session_slot.clone(),
-                browse_bvids.clone(),
-                rank_rid.clone(),
-                rid,
-            );
-        });
-    }
-
-    // 热门: the popular list, paged.
-    {
-        let weak = weak.clone();
-        let session_slot = session_slot.clone();
-        let browse_bvids = browse_bvids.clone();
-        let popular_state = popular_state.clone();
-        ui.on_nav_popular(move || {
-            if let Ok(mut state) = popular_state.lock() {
-                state.page = 1;
-                state.has_more = false;
-            }
-            if let Some(ui) = weak.upgrade() {
-                ui.set_view_mode(10);
-                enter_paged_view(&ui);
-            }
-            load_popular(
-                weak.clone(),
-                session_slot.clone(),
-                browse_bvids.clone(),
-                popular_state.clone(),
-                1,
-            );
-        });
-    }
-    {
-        let weak = weak.clone();
-        let session_slot = session_slot.clone();
-        let browse_bvids = browse_bvids.clone();
-        let popular_state = popular_state.clone();
-        ui.on_popular_page(move |delta| {
-            let (target, has_prev, has_next) = match popular_state.lock() {
-                Ok(state) => (
-                    (state.page + i64::from(delta)).max(1),
-                    state.page > 1,
-                    state.has_more,
-                ),
-                Err(_) => return,
-            };
-            if (delta < 0 && !has_prev) || (delta > 0 && !has_next) {
-                return;
-            }
-            load_popular(
-                weak.clone(),
-                session_slot.clone(),
-                browse_bvids.clone(),
-                popular_state.clone(),
-                target,
-            );
-        });
-    }
-
-    // 入站必刷: the fixed "must-watch" list.
-    {
-        let weak = weak.clone();
-        let session_slot = session_slot.clone();
-        let browse_bvids = browse_bvids.clone();
-        ui.on_nav_precious(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_view_mode(18);
-                enter_paged_view(&ui);
-            }
-            load_precious(weak.clone(), session_slot.clone(), browse_bvids.clone());
-        });
-    }
-
-    // A 分区/排行/热门 card was clicked: open the detail view for it.
+    // A 分区 card was clicked: open the detail view for it.
     {
         let weak = weak.clone();
         let session_slot = session_slot.clone();
@@ -7291,7 +8245,7 @@ fn main() -> Result<()> {
                 format!("正在{}…", if target { "点赞" } else { "取消赞" }).into(),
             );
             let weak = weak.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -7322,7 +8276,7 @@ fn main() -> Result<()> {
                         }
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -7505,7 +8459,9 @@ fn main() -> Result<()> {
         });
     }
 
-    // Settings panel: open (re-syncing from the stored preferences) and close.
+    // Settings page: open (re-syncing from the stored preferences). It is a
+    // normal view_mode tab (21), rendered inside the content column with the
+    // bottom bar visible - not an overlay.
     {
         let weak = weak.clone();
         let settings_store = settings_store.clone();
@@ -7515,23 +8471,17 @@ fn main() -> Result<()> {
                     publish_settings(&ui, &guard);
                 }
                 ui.set_settings_status(String::new().into());
-                ui.set_view_mode(12);
+                ui.set_view_mode(21);
+                crate::debug_log(&format!(
+                    "settings open view_mode={} account_overlay=0",
+                    ui.get_view_mode()
+                ));
             }
         });
     }
-    {
-        let weak = weak.clone();
-        ui.on_settings_back(move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_view_mode(0);
-                enter_paged_view(&ui);
-                update_page_bar(&ui);
-            }
-        });
-    }
-    // Where the VIP page returns to: 会员中心 now lives in the settings
-    // panel, so `vip_back` restores the view that opened it (settings, 12)
-    // instead of dropping the user on the feed.
+    // Where the VIP page returns to: 会员中心 lives in the settings page, so
+    // `vip_back` restores the view that opened it (settings, 21) instead of
+    // dropping the user on the feed.
     let vip_return_mode = Rc::new(Cell::new(0));
     {
         let weak = weak.clone();
@@ -7839,7 +8789,7 @@ fn main() -> Result<()> {
                 return;
             };
             let weak = weak.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -7852,7 +8802,7 @@ fn main() -> Result<()> {
                         ui.set_settings_status(message.into());
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -7868,20 +8818,25 @@ fn main() -> Result<()> {
             state.theme_dark.set(dark);
             if let Some(ui) = weak.upgrade() {
                 ui.global::<AppTheme>().set_dark(dark);
+                set_backdrop(&ui, dark);
                 win::set_immersive_dark(ui.window(), dark);
             }
             for session in player_sessions(&state) {
                 session.window.global::<AppTheme>().set_dark(dark);
+                set_player_backdrop(&session.window, dark);
+                win::set_immersive_dark(session.window.window(), dark);
             }
             if let Some(mini) = state.mini.borrow().as_ref() {
                 mini.global::<AppTheme>().set_dark(dark);
+                set_mini_backdrop(mini, dark);
+                win::set_immersive_dark(mini.window(), dark);
             }
         });
     }
 
-    // 外观: the two frosted-glass sliders. They write the theme global live
-    // while dragging (the 33ms loop follows), so this only persists the settled
-    // values. No debounce needed - the danmaku sliders already save per change.
+    // 外观: the window-backdrop transparency slider. It writes the theme global
+    // live while dragging (the tint follows immediately), so this only persists
+    // the settled value.
     {
         let weak = weak.clone();
         let settings_store = settings_store.clone();
@@ -7894,14 +8849,1079 @@ fn main() -> Result<()> {
                 theme.get_glass_transparency(),
                 settings::default_glass_transparency(),
             );
-            let blur = settings::normalise_glass(
-                theme.get_glass_blur(),
-                settings::default_glass_blur(),
-            );
             update_settings(&settings_store, |prefs| {
                 prefs.glass_transparency = transparency;
-                prefs.glass_blur = blur;
             });
+        });
+    }
+
+    // 外观: 背景模糊. The slider writes the live value into AppTheme while the
+    // pointer moves (the label follows); this handler is the SETTLE path:
+    //   * debounce 150 ms, so a drag costs ONE regeneration, not one per pixel;
+    //   * `backdrop::set_blur` publishes the new radius (and invalidates the
+    //     cached tile);
+    //   * the tile is regenerated on a worker thread - the UI thread keeps
+    //     painting the previous image instead of stalling for the blur;
+    //   * on completion the UI thread installs it into the backdrop cache and
+    //     republishes `AppTheme.glass-blur` + every window's wallpaper.
+    // `backdrop blur=… gen_ms=…` is the measured generation cost.
+    {
+        let weak = weak.clone();
+        let settings_store = settings_store.clone();
+        let debounce = Rc::new(slint::Timer::default());
+        let pending = Rc::new(Cell::new(backdrop::blur_px()));
+        let last_input = Rc::new(Cell::new(Instant::now()));
+        let seq = Arc::new(AtomicU64::new(0));
+        ui.on_settings_backdrop_blur(move |value| {
+            let value = settings::normalise_backdrop_blur(value.max(0) as u32);
+            pending.set(value);
+            last_input.set(Instant::now());
+            let weak = weak.clone();
+            let settings_store = settings_store.clone();
+            let pending = pending.clone();
+            let last_input = last_input.clone();
+            let seq = seq.clone();
+            let tick = seq.clone();
+            debounce.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(150),
+                move || {
+                    let value = pending.get();
+                    let settle_ms = last_input.get().elapsed().as_secs_f64() * 1000.0;
+                    // Bump the sequence BEFORE the slow work: a later settle
+                    // invalidates this generation, so an old tile can never land
+                    // on top of a newer one.
+                    let generation = tick.fetch_add(1, Ordering::SeqCst) + 1;
+                    backdrop::set_blur(value);
+                    update_settings(&settings_store, |prefs| {
+                        prefs.backdrop_blur = value;
+                    });
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    let dark = ui.global::<AppTheme>().get_dark();
+                    let trigger = Instant::now();
+                    let worker_seq = seq.clone();
+                    std::thread::spawn(move || {
+                        let pixels = backdrop::generate(dark, value);
+                        let gen_ms = trigger.elapsed().as_secs_f64() * 1000.0;
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let latest = worker_seq.load(Ordering::SeqCst);
+                            if latest == generation {
+                                // Only the newest generation is installed AND
+                                // painted: an older one must not leave its pixels
+                                // in the cache for a later theme switch.
+                                let image = backdrop::install(dark, pixels);
+                                republish_wallpaper(&image, dark);
+                                crate::debug_log(&format!(
+                                    "backdrop blur={value} gen_ms={gen_ms:.1} settle_ms={settle_ms:.1} dark={} win=all",
+                                    u8::from(dark)
+                                ));
+                            } else {
+                                crate::debug_log(&format!(
+                                    "backdrop blur={value} gen_ms={gen_ms:.1} settle_ms={settle_ms:.1} stale=1"
+                                ));
+                            }
+                        });
+                    });
+                },
+            );
+        });
+    }
+
+    // QA chain (`BILI_F144_TEST=1`): the wallpaper / settings / blur evidence.
+    maybe_start_f144_test(weak.clone(), session_slot.clone(), settings_store.clone());
+    maybe_start_f145_test(weak.clone(), session_slot.clone());
+
+    // QA hook (`BILI_HOME_TEST=menu|library|search|section:<i>[,more]`): drives
+    // the bottom bar's states and a section pick through the REAL properties and
+    // callback, so the menu / morph / ranking captures need no synthetic input.
+    // The section pick runs ONCE (it loads a feed); the menu/search flags are
+    // re-asserted for ~12 s because a menu with the pointer parked outside
+    // closes on the bar's own 300 ms away timer, by design.
+    if let Ok(spec) = std::env::var("BILI_HOME_TEST") {
+        let weak = weak.clone();
+        let spec = spec.trim().to_string();
+        if !spec.is_empty() {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(6_000));
+                let mut first = true;
+                for _ in 0..80 {
+                    let weak = weak.clone();
+                    let spec = spec.clone();
+                    let section = std::mem::take(&mut first);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(ui) = weak.upgrade() else {
+                            return;
+                        };
+                        if section {
+                            crate::debug_log(&format!(
+                                "home test spec={spec} logged_in={}",
+                                ui.get_logged_in()
+                            ));
+                            for part in spec.split(',') {
+                                if let Some(index) = part.trim().strip_prefix("section:") {
+                                    if let Ok(index) = index.trim().parse::<i32>() {
+                                        ui.invoke_home_section(index);
+                                    }
+                                }
+                            }
+                        }
+                        apply_home_test(&ui, &spec);
+                    });
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            });
+        }
+    }
+
+    // QA hook (`BILI_SEARCH_MORPH_TEST=<tag>[,<delay_ms>[,<at_ms>]]`): drive
+    // the field open through its real property and sample HomeBar's live rect.
+    //
+    //   * without `at_ms`: a 10ms series for 220ms (the measurement table),
+    //     then close and capture the three instants in one run;
+    //   * with `at_ms`: open, wait exactly `at_ms`, capture once, close - so
+    //     each required PNG (0/90/180) comes from its own clean run and is not
+    //     delayed by the previous shot's BitBlt.
+    //
+    // Every number is the animation's actual geometry, read from HomeBar.
+    if let Ok(spec) = std::env::var("BILI_SEARCH_MORPH_TEST") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "f133_search".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(9_000)
+            .clamp(2_000, 120_000);
+        let instant = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .map(|ms| ms.min(1_000));
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let weak_open = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak_open.upgrade() else {
+                    return;
+                };
+                let start = Rc::new(Cell::new(Instant::now()));
+                if let Some(at) = instant {
+                    log_search_field(&ui, "closed", start.get());
+                    ui.set_search_open(true);
+                    log_search_field(&ui, "capture_open", start.get());
+                    let weak_shot = ui.as_weak();
+                    let path = qa_capture_path(&format!("{tag}_{at}"));
+                    let start_shot = start.clone();
+                    slint::Timer::single_shot(Duration::from_millis(at), move || {
+                        let Some(ui) = weak_shot.upgrade() else {
+                            return;
+                        };
+                        log_search_field(&ui, "capture", start_shot.get());
+                        let _ = capture_window_png(&ui.window(), &path);
+                        ui.set_search_open(false);
+                    });
+                    return;
+                }
+                log_search_field(&ui, "closed", start.get());
+                ui.set_search_open(true);
+                let tag_shot = tag.clone();
+                let weak_tick = ui.as_weak();
+                let timer = Rc::new(slint::Timer::default());
+                keep_qa_timer(timer.clone());
+                let timer_tick = timer.clone();
+                let start_tick = start.clone();
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    Duration::from_millis(10),
+                    move || {
+                        let Some(ui) = weak_tick.upgrade() else {
+                            timer_tick.stop();
+                            return;
+                        };
+                        let elapsed = start_tick.get().elapsed().as_millis();
+                        log_search_field(&ui, "sample", start_tick.get());
+                        if elapsed < 220 {
+                            return;
+                        }
+                        timer_tick.stop();
+                        ui.set_search_open(false);
+                        let tag_shot = tag_shot.clone();
+                        // Phase B: the three capture instants. BitBlt from the
+                        // UI thread, so each shot also logs the geometry it
+                        // actually shows.
+                        let weak_cap = ui.as_weak();
+                        slint::Timer::single_shot(Duration::from_millis(320), move || {
+                            let Some(ui) = weak_cap.upgrade() else {
+                                return;
+                            };
+                            let names = [
+                                format!("{tag_shot}_0"),
+                                format!("{tag_shot}_90"),
+                                format!("{tag_shot}_180"),
+                            ];
+                            let paths: Vec<std::path::PathBuf> =
+                                names.iter().map(|name| qa_capture_path(name)).collect();
+                            let shot_start = Instant::now();
+                            ui.set_search_open(true);
+                            log_search_field(&ui, "capture_0", shot_start);
+                            let _ = capture_window_png(&ui.window(), &paths[0]);
+                            let weak_90 = ui.as_weak();
+                            let path_90 = paths[1].clone();
+                            slint::Timer::single_shot(Duration::from_millis(90), move || {
+                                let Some(ui) = weak_90.upgrade() else {
+                                    return;
+                                };
+                                log_search_field(&ui, "capture_90", shot_start);
+                                let _ = capture_window_png(&ui.window(), &path_90);
+                                let weak_180 = ui.as_weak();
+                                let path_180 = paths[2].clone();
+                                slint::Timer::single_shot(
+                                    Duration::from_millis(90),
+                                    move || {
+                                        let Some(ui) = weak_180.upgrade() else {
+                                            return;
+                                        };
+                                        log_search_field(&ui, "capture_180", shot_start);
+                                        let _ =
+                                            capture_window_png(&ui.window(), &path_180);
+                                        ui.set_search_open(false);
+                                    },
+                                );
+                            });
+                        });
+                    },
+                );
+            });
+        });
+    }
+
+    // ---- 养鱼 (fish dashboard, view_mode 20) ----
+    // The engine is opened ONCE here; a failure (unwritable fish.db) leaves the
+    // page in its error state instead of panicking. Updates are PUSHED by the
+    // engine's snapshot hook and gated inside `apply_fish`.
+    FISH_SESSION.with(|slot| *slot.borrow_mut() = active_session(&session_slot));
+    FISH_PLAYER.with(|slot| *slot.borrow_mut() = Some(player_state.clone()));
+    FISH_SETTINGS.with(|slot| *slot.borrow_mut() = Some(settings_store.clone()));
+    {
+        let engine = match fish::FishEngine::open() {
+            Ok(engine) => Some(engine),
+            Err(err) => {
+                crate::debug_log(&format!("fish open failed: {err:#}"));
+                None
+            }
+        };
+        let key_state = settings_store
+            .lock()
+            .map(|prefs| {
+                (
+                    !prefs.deepseek_key.trim().is_empty(),
+                    settings::mask_key(&prefs.deepseek_key),
+                )
+            })
+            .unwrap_or((false, String::new()));
+        let fish = Rc::new(FishUi {
+            engine: engine.clone(),
+            last_verdict: RefCell::new(None),
+            last_stats: RefCell::new(None),
+            open_error: RefCell::new(engine.is_none()),
+            key_state: RefCell::new(key_state),
+            tried_covers: RefCell::new(HashSet::new()),
+            feed_sort: Cell::new(0),
+            feed_filter: Cell::new(0),
+            adopted: RefCell::new(HashSet::new()),
+            feed_store: feed_store.clone(),
+        });
+
+        // ---- 鱼缸 configuration: publish the stored values once ----
+        let initial = settings_store
+            .lock()
+            .map(|prefs| prefs.clone())
+            .unwrap_or_default();
+        let bowls = (initial.fish_budget_videos / 20).clamp(1, 10) as i32;
+        let sources = settings::normalise_fish_sources(initial.fish_sources);
+        let feed_time = settings::normalise_fish_time(&initial.fish_feed_time);
+        let auto = Rc::new(RefCell::new(FishAuto {
+            enabled: initial.fish_enabled,
+            auto: initial.fish_auto_feed,
+            time_minutes: settings::fish_time_minutes(&feed_time).unwrap_or(20 * 60),
+            sources,
+            last_day: None,
+        }));
+        ui.set_fish_enabled(initial.fish_enabled);
+        ui.set_fish_bowls(bowls);
+        ui.set_fish_src_home(sources & settings::FISH_SOURCE_HOME != 0);
+        ui.set_fish_src_follow(sources & settings::FISH_SOURCE_FOLLOW != 0);
+        ui.set_fish_src_fav(sources & settings::FISH_SOURCE_FAV != 0);
+        ui.set_fish_autofeed(initial.fish_auto_feed);
+        ui.set_fish_feed_time(feed_time.as_str().into());
+        ui.set_fish_feed_time_draft(feed_time.as_str().into());
+        ui.set_fish_model(initial.fish_model.as_str().into());
+        ui.set_fish_model_draft(initial.fish_model.as_str().into());
+
+        // The hook runs on the engine's worker thread, so it may only capture
+        // Send data: the `Weak` plus the snapshot. `FishUi` is thread-local and
+        // is looked up again on the UI thread.
+        FISH_UI.with(|slot| *slot.borrow_mut() = Some(fish.clone()));
+        if let Some(engine) = engine.as_ref() {
+            let weak = weak.clone();
+            engine.set_snapshot_hook(Some(Arc::new(move |snap| {
+                let weak = weak.clone();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    if let Some(fish) = FISH_UI.with(|slot| slot.borrow().clone()) {
+                        apply_fish(&ui, &fish, snap, false);
+                    }
+                });
+            })));
+        }
+
+        // 养鱼 pill: open the page and publish what the engine has now. The
+        // session is refreshed here too: `FISH_SESSION` was captured before
+        // auto-login finished, and a stale `None` would leave every feed cover
+        // unfetched for the rest of the run.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            let session_slot = session_slot.clone();
+            ui.on_fish_open(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                if let Some(session) = active_session(&session_slot) {
+                    FISH_SESSION.with(|slot| *slot.borrow_mut() = Some(session));
+                }
+                ui.set_view_mode(20);
+                let snap = fish
+                    .engine
+                    .as_ref()
+                    .map(|engine| engine.snapshot())
+                    .unwrap_or_default();
+                apply_fish(&ui, &fish, snap, true);
+                crate::debug_log("fish open page");
+            });
+        }
+        // 开始: enqueue the home feed the app already holds, then run. The
+        // 大肥鱼 master switch gates every run: off means no thread and no
+        // token spend, while the verdict history stays readable.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            let session_slot = session_slot.clone();
+            let feed_store = feed_store.clone();
+            let auto = auto.clone();
+            ui.on_fish_start(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                if !auto.borrow().enabled {
+                    crate::debug_log("fish start blocked enabled=0");
+                    return;
+                }
+                let Some(engine) = fish.engine.as_ref() else {
+                    return;
+                };
+                let sources = auto.borrow().sources;
+                let items = if sources & settings::FISH_SOURCE_HOME != 0 {
+                    feed_store
+                        .lock()
+                        .map(|guard| guard.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                engine.enqueue(&items);
+                match active_session(&session_slot) {
+                    Some(session) => {
+                        FISH_SESSION.with(|slot| *slot.borrow_mut() = Some(session.clone()));
+                        engine.start(session);
+                        crate::debug_log(&format!(
+                            "fish start feed={} queued={} sources={sources}",
+                            items.len(),
+                            engine.snapshot().queued
+                        ));
+                    }
+                    None => {
+                        crate::debug_log("fish start no-session");
+                        ui.set_fish_state(4);
+                        ui.set_fish_error_text("还没登录，鱼看不见池子".into());
+                    }
+                }
+                apply_fish(&ui, &fish, engine.snapshot(), true);
+            });
+        }
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            ui.on_fish_pause(move || {
+                if let Some(engine) = fish.engine.as_ref() {
+                    engine.pause();
+                    crate::debug_log("fish pause");
+                    if let Some(ui) = weak.upgrade() {
+                        apply_fish(&ui, &fish, engine.snapshot(), true);
+                    }
+                }
+            });
+        }
+        // DeepSeek key: persist, then the engine re-reads its config.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            let settings_store = settings_store.clone();
+            ui.on_fish_save_key(move |key| {
+                let key = key.trim().to_string();
+                if key.is_empty() {
+                    return;
+                }
+                let snapshot = update_settings(&settings_store, |prefs| {
+                    prefs.deepseek_key = key.clone();
+                });
+                *fish.key_state.borrow_mut() = (
+                    !snapshot.deepseek_key.trim().is_empty(),
+                    settings::mask_key(&snapshot.deepseek_key),
+                );
+                if let Some(engine) = fish.engine.as_ref() {
+                    engine.refresh_from_settings();
+                }
+                crate::debug_log(&format!(
+                    "fish key saved len={} masked={}",
+                    key.len(),
+                    settings::mask_key(&snapshot.deepseek_key)
+                ));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_fish_key_draft(SharedString::new());
+                    let snap = fish
+                        .engine
+                        .as_ref()
+                        .map(|engine| engine.snapshot())
+                        .unwrap_or_default();
+                    apply_fish(&ui, &fish, snap, true);
+                }
+            });
+        }
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            ui.on_fish_save_instruction(move |text| {
+                if let Some(ui) = weak.upgrade() {
+                    fish_save_instruction_text(&ui, &fish, text.as_str());
+                }
+            });
+        }
+        // 食谱: one click writes `preset.body` through the same instruction path
+        // as typing it, so the next run's prompt uses exactly that text. The id
+        // line is what the QA/owner log reads.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            ui.on_fish_apply_preset(move |id| {
+                let Some(preset) = fish::presets()
+                    .iter()
+                    .find(|preset| preset.id == id.as_str())
+                else {
+                    crate::debug_log(&format!("fish preset unknown id={id}"));
+                    return;
+                };
+                crate::debug_log(&format!("fish preset id={}", preset.id));
+                if let Some(ui) = weak.upgrade() {
+                    fish_save_instruction_text(&ui, &fish, preset.body);
+                }
+            });
+        }
+        // 推荐流 toolbar: Rust owns the model, so a sort/filter pick rebuilds it.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            ui.on_fish_feed_query(move |sort, filter| {
+                fish.feed_sort.set(sort.clamp(0, 2));
+                fish.feed_filter.set(filter.clamp(0, 3));
+                if let Some(ui) = weak.upgrade() {
+                    if let Some(engine) = fish.engine.as_ref() {
+                        publish_fish_feed(&ui, &fish, engine);
+                    }
+                }
+            });
+        }
+        // Tab switches are logged (and the feed keeps its offset because both
+        // tabs stay instantiated).
+        ui.on_fish_tab_changed(move |tab| {
+            crate::debug_log(&format!("fish tab={tab}"));
+        });
+        // 开启大肥鱼: the master gate. Persisted, and turning it off pauses a
+        // running worker so no further token is spent.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            let settings_store = settings_store.clone();
+            let auto = auto.clone();
+            ui.on_fish_set_enabled(move |on| {
+                update_settings(&settings_store, |prefs| prefs.fish_enabled = on);
+                auto.borrow_mut().enabled = on;
+                if !on {
+                    if let Some(engine) = fish.engine.as_ref() {
+                        engine.pause();
+                    }
+                }
+                crate::debug_log(&format!("fish enabled={}", on as i32));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_fish_enabled(on);
+                    let snap = fish
+                        .engine
+                        .as_ref()
+                        .map(|engine| engine.snapshot())
+                        .unwrap_or_default();
+                    apply_fish(&ui, &fish, snap, true);
+                }
+            });
+        }
+        // 每日预算: 1…10 碗, one 碗 = 20 videos. Stored in the existing
+        // `fish_budget_videos` field, so the engine's next run reads it.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            let settings_store = settings_store.clone();
+            ui.on_fish_set_budget(move |bowls| {
+                let bowls = bowls.clamp(1, 10);
+                update_settings(&settings_store, |prefs| {
+                    prefs.fish_budget_videos = bowls as u32 * 20;
+                });
+                if let Some(engine) = fish.engine.as_ref() {
+                    engine.refresh_from_settings();
+                }
+                crate::debug_log(&format!(
+                    "fish budget bowls={bowls} videos={}",
+                    bowls * 20
+                ));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_fish_bowls(bowls);
+                }
+            });
+        }
+        // 喂食来源: persisted as a bitmask. Only 首页 currently has a queue
+        // source; the other two are carried so the engine's feed loader can
+        // honour them without another settings field.
+        {
+            let weak = weak.clone();
+            let settings_store = settings_store.clone();
+            let auto = auto.clone();
+            ui.on_fish_set_sources(move |home, follow, fav| {
+                let mut mask = 0;
+                if home {
+                    mask |= settings::FISH_SOURCE_HOME;
+                }
+                if follow {
+                    mask |= settings::FISH_SOURCE_FOLLOW;
+                }
+                if fav {
+                    mask |= settings::FISH_SOURCE_FAV;
+                }
+                let mask = settings::normalise_fish_sources(mask);
+                update_settings(&settings_store, |prefs| prefs.fish_sources = mask);
+                auto.borrow_mut().sources = mask;
+                crate::debug_log(&format!(
+                    "fish sources home={} follow={} fav={}",
+                    mask & settings::FISH_SOURCE_HOME != 0,
+                    mask & settings::FISH_SOURCE_FOLLOW != 0,
+                    mask & settings::FISH_SOURCE_FAV != 0
+                ));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_fish_src_home(mask & settings::FISH_SOURCE_HOME != 0);
+                    ui.set_fish_src_follow(mask & settings::FISH_SOURCE_FOLLOW != 0);
+                    ui.set_fish_src_fav(mask & settings::FISH_SOURCE_FAV != 0);
+                }
+            });
+        }
+        // 自动喂食: on/off + HH:MM. Enabling it sets `last_day` to today, so
+        // switching it on at 21:00 does not immediately fire the 20:00 slot.
+        {
+            let weak = weak.clone();
+            let settings_store = settings_store.clone();
+            let auto = auto.clone();
+            ui.on_fish_set_autofeed(move |on, time| {
+                let time = settings::normalise_fish_time(time.as_str());
+                update_settings(&settings_store, |prefs| {
+                    prefs.fish_auto_feed = on;
+                    prefs.fish_feed_time = time.clone();
+                });
+                {
+                    let mut state = auto.borrow_mut();
+                    state.auto = on;
+                    state.time_minutes =
+                        settings::fish_time_minutes(&time).unwrap_or(20 * 60);
+                    if on {
+                        state.last_day = Some(local_day_of_year());
+                    }
+                }
+                crate::debug_log(&format!("fish autofeed={} time={time}", on as i32));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_fish_autofeed(on);
+                    ui.set_fish_feed_time(time.as_str().into());
+                    ui.set_fish_feed_time_draft(time.as_str().into());
+                }
+            });
+        }
+        // The time field's ±30 min stepper. Non-UI state: the field value and
+        // the stored "HH:MM" move together, so the next tick sees the new slot.
+        {
+            let weak = weak.clone();
+            let settings_store = settings_store.clone();
+            let auto = auto.clone();
+            ui.on_fish_shift_time(move |delta| {
+                let current = auto.borrow().time_minutes;
+                let next = (current as i32 + delta).rem_euclid(24 * 60) as u32;
+                let time = format!("{:02}:{:02}", next / 60, next % 60);
+                update_settings(&settings_store, |prefs| {
+                    prefs.fish_feed_time = time.clone();
+                });
+                auto.borrow_mut().time_minutes = next;
+                crate::debug_log(&format!("fish feed time={time}"));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_fish_feed_time(time.as_str().into());
+                    ui.set_fish_feed_time_draft(time.as_str().into());
+                }
+            });
+        }
+        // 模型: the engine re-reads it on the next run.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            let settings_store = settings_store.clone();
+            ui.on_fish_save_model(move |model| {
+                let model = settings::normalise_fish_model(model.as_str());
+                update_settings(&settings_store, |prefs| prefs.fish_model = model.clone());
+                if let Some(engine) = fish.engine.as_ref() {
+                    engine.refresh_from_settings();
+                }
+                crate::debug_log(&format!("fish model={model}"));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_fish_model(model.as_str().into());
+                    ui.set_fish_model_draft(model.as_str().into());
+                }
+            });
+        }
+        // A verdict row: resolve the bvid and open the real player. A feed card
+        // that is opened is an ADOPTED verdict: it grows the fish (once per
+        // bvid per session), before the network resolve starts.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            ui.on_fish_open_video(move |bvid| {
+                let bvid = bvid.to_string();
+                if fish.adopted.borrow_mut().insert(bvid.clone()) {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_fish_adopted(ui.get_fish_adopted().saturating_add(1));
+                    }
+                }
+                crate::debug_log(&format!("fish open row bvid={bvid}"));
+                open_fish_video(weak.clone(), bvid);
+            });
+        }
+        // 刷新: re-read verdicts + stats (no network).
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            ui.on_fish_refresh(move || {
+                if let Some(ui) = weak.upgrade() {
+                    let snap = fish
+                        .engine
+                        .as_ref()
+                        .map(|engine| engine.snapshot())
+                        .unwrap_or_default();
+                    apply_fish(&ui, &fish, snap, true);
+                }
+            });
+        }
+
+        // First publish so the page is correct before it is ever opened.
+        if let Some(engine) = engine.as_ref() {
+            let weak = weak.clone();
+            let snap = engine.snapshot();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if let Some(fish) = FISH_UI.with(|slot| slot.borrow().clone()) {
+                    apply_fish(&ui, &fish, snap, true);
+                }
+            });
+        }
+
+        // ---- 自动喂食: one 20s tick, one run per local day ----
+        // The tick only reads in-memory configuration; `last_day` is set when
+        // auto-feed is switched on, so enabling it in the evening never fires
+        // the same day's passed slot. Off (`fish_enabled`) exits immediately:
+        // no auto-analysis, no token spend.
+        {
+            let weak = weak.clone();
+            let fish = fish.clone();
+            let auto = auto.clone();
+            let feed_store = feed_store.clone();
+            let session_slot = session_slot.clone();
+            let timer = Rc::new(slint::Timer::default());
+            FISH_AUTO_TIMER.with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = Some(timer.clone());
+                }
+            });
+            let held = timer.clone();
+            timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_secs(20),
+                move || {
+                    let Some(ui) = weak.upgrade() else {
+                        held.stop();
+                        return;
+                    };
+                    let Some(engine) = fish.engine.as_ref() else {
+                        return;
+                    };
+                    let (minutes, day) = local_clock();
+                    let fire = {
+                        let state = auto.borrow();
+                        state.enabled
+                            && state.auto
+                            && state.last_day != Some(day)
+                            && minutes >= state.time_minutes
+                    };
+                    if !fire {
+                        return;
+                    }
+                    if matches!(engine.snapshot().state, fish::FishState::Running) {
+                        return;
+                    }
+                    let Some(session) = active_session(&session_slot) else {
+                        return;
+                    };
+                    let sources = auto.borrow().sources;
+                    let items = if sources & settings::FISH_SOURCE_HOME != 0 {
+                        feed_store
+                            .lock()
+                            .map(|guard| guard.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    engine.enqueue(&items);
+                    FISH_SESSION.with(|slot| *slot.borrow_mut() = Some(session.clone()));
+                    engine.start(session);
+                    auto.borrow_mut().last_day = Some(day);
+                    crate::debug_log(&format!(
+                        "fish auto feed time={:02}:{:02} queued={} sources={sources}",
+                        minutes / 60,
+                        minutes % 60,
+                        engine.snapshot().queued
+                    ));
+                    apply_fish(&ui, &fish, engine.snapshot(), true);
+                },
+            );
+        }
+
+        // QA hook (`BILI_F136_TEST=<start_delay_ms>`): open 养鱼, capture both
+        // tabs, prove the feed keeps its scroll offset across a tab switch,
+        // apply a recipe and prove an edited instruction clears the highlight,
+        // then capture the empty feed. The geometry comes from the real layout
+        // (the page's `fish_qa` publisher). All state changes go through the
+        // page's own callbacks; the settings touched are restored at the end.
+        if let Ok(spec) = std::env::var("BILI_F136_TEST") {
+            let delay = spec
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(12_000)
+                .clamp(1_000, 120_000);
+            start_f136_test(weak.clone(), session_slot.clone(), delay);
+        }
+
+        // QA hook (`BILI_F143_TEST=fish`): the rebuilt verdict-first card,
+        // captured with real covers and once with a no-cover fixture.
+        maybe_start_f143_fish(weak.clone());
+    }
+
+    // QA hook (`BILI_LOGIN_SHOT=<tag>[,<delay_ms>]`): force the login card into
+    // the progress state (avatar + name/UID + bar + hint) on top of a live
+    // session, then capture the MAIN window with `PrintWindow`. Same idea as
+    // BILI_LOGIN_VIEW, but it also names the PNG, so the single-surface login
+    // layout is proven from a real render. No synthetic input.
+    if let Ok(spec) = std::env::var("BILI_LOGIN_SHOT") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "login".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(12_000)
+            .clamp(1_000, 120_000);
+        // Third field: which state to show (0 chooser / 1 progress / 2 scan).
+        // Fourth: `anon` clears the saved-account presentation for a shot of
+        // the no-account variant.
+        let state = parts
+            .next()
+            .and_then(|part| part.trim().parse::<i32>().ok())
+            .unwrap_or(1)
+            .clamp(0, 2);
+        let anon = parts
+            .next()
+            .map(|part| part.trim() == "anon")
+            .unwrap_or(false);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let tag_path = qa_capture_path(&tag);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_logged_in(false);
+                ui.set_login_failed(false);
+                ui.set_login_error("".into());
+                if anon {
+                    ui.set_saved_account_name("".into());
+                    ui.set_saved_account_uid("".into());
+                    ui.set_saved_account_avatar(slint::Image::default());
+                }
+                ui.set_login_state(0);
+                if state >= 1 {
+                    ui.set_login_state(1);
+                    ui.set_login_percent(62);
+                    ui.set_login_progress(0.62);
+                    ui.set_login_step("准备中…".into());
+                }
+                if state == 2 {
+                    ui.set_login_state(2);
+                    ui.set_login_percent(25);
+                    ui.set_login_progress(0.25);
+                    ui.set_login_step("等待扫码…".into());
+                    ui.set_login_countdown("二维码有效期约 180 秒".into());
+                }
+                let weak_cap = ui.as_weak();
+                slint::Timer::single_shot(Duration::from_millis(1_000), move || {
+                    let Some(ui) = weak_cap.upgrade() else {
+                        return;
+                    };
+                    crate::debug_log(&format!(
+                        "login-shot state={} progress={:.2} saved_account={:?} uid={:?} avatar_loaded={}",
+                        ui.get_login_state(),
+                        ui.get_login_progress(),
+                        ui.get_saved_account_name(),
+                        ui.get_saved_account_uid(),
+                        ui.get_saved_account_avatar().size().width > 0
+                    ));
+                    let _ = capture_window_png(&ui.window(), &tag_path);
+                });
+            });
+        });
+    }
+    // QA hook (`BILI_PLAYLIST_SHOT=<tag>[,<delay_ms>]`): queue three feed rows
+    // queue-only (which must NOT open the panel), then open 播放列表 through the
+    // vinyl's own click callback, capture, and click again to close. The
+    // `playlist open source=click` lines in BILI_DEBUG_LOG are the proof that
+    // only the click path moves the panel.
+    if let Ok(spec) = std::env::var("BILI_PLAYLIST_SHOT") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "playlist_click".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(20_000)
+            .clamp(2_000, 180_000);
+        let weak = weak.clone();
+        let path = qa_capture_path(&tag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let weak_start = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak_start.upgrade() else {
+                    return;
+                };
+                let weak = ui.as_weak();
+                // UI-thread objects: created here, never sent across threads.
+                let step = Rc::new(Cell::new(0u32));
+                let waited = Rc::new(Cell::new(0u32));
+                let timer = Rc::new(slint::Timer::default());
+                keep_qa_timer(timer.clone());
+                let timer_a = timer.clone();
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    Duration::from_millis(700),
+                    move || {
+                        let Some(ui) = weak.upgrade() else {
+                            timer_a.stop();
+                            return;
+                        };
+                        match step.get() {
+                            0 => {
+                                if ui.get_feed_items().row_count() == 0 {
+                                    waited.set(waited.get() + 1);
+                                    if waited.get() > 60 {
+                                        crate::debug_log("playlist-shot feed empty, abort");
+                                        timer_a.stop();
+                                    }
+                                    return;
+                                }
+                                crate::debug_log(&format!(
+                                    "playlist-shot enqueue feed_rows={}",
+                                    ui.get_feed_items().row_count()
+                                ));
+                                ui.invoke_card_enqueue_only(0);
+                                ui.invoke_card_enqueue_only(1);
+                                ui.invoke_card_enqueue_only(2);
+                                step.set(1);
+                            }
+                            1 => {
+                                if ui.get_playlist().row_count() >= 2 || waited.get() > 25 {
+                                    crate::debug_log(&format!(
+                                        "playlist-shot open rows={} via=vinyl click",
+                                        ui.get_playlist().row_count()
+                                    ));
+                                    ui.invoke_qa_vinyl_click();
+                                    step.set(2);
+                                } else {
+                                    waited.set(waited.get() + 1);
+                                }
+                            }
+                            2 => {
+                                let _ = capture_window_png(&ui.window(), &path);
+                                crate::debug_log(&format!(
+                                    "playlist-shot open_state={} rows={}",
+                                    ui.get_playlist_open(),
+                                    ui.get_playlist().row_count()
+                                ));
+                                ui.invoke_qa_vinyl_click();
+                                step.set(3);
+                            }
+                            _ => {
+                                // Leave the queue as it was found (the saved
+                                // settings start empty), so a QA run does not
+                                // edit the owner's playlist.
+                                ui.invoke_playlist_clear();
+                                crate::debug_log(&format!(
+                                    "playlist-shot closed_state={} cleared=1",
+                                    ui.get_playlist_open()
+                                ));
+                                timer_a.stop();
+                            }
+                        }
+                    },
+                );
+            });
+        });
+    }
+    // QA hook (`BILI_SETTINGS_TAB_TEST=<tag>[,<delay_ms>]`): log the bar rect,
+    // call the real `open_settings()` and log the bar rect + view_mode + the
+    // nine nav-label widths again, then capture the page. Proves 设置 is a
+    // normal view_mode tab with the bar still up, and that every label fits.
+    if let Ok(spec) = std::env::var("BILI_SETTINGS_TAB_TEST") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "settings_tab".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(12_000)
+            .clamp(1_000, 120_000);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let before_weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = before_weak.upgrade() else {
+                    return;
+                };
+                let (x, y, w, h) = home_bar_rect(&ui);
+                crate::debug_log(&format!(
+                    "settings-test before view_mode={} bar_x={x:.0} bar_y={y:.0} bar_w={w:.0} bar_h={h:.0}",
+                    ui.get_view_mode()
+                ));
+                ui.invoke_open_settings();
+            });
+            std::thread::sleep(Duration::from_millis(1_200));
+            let after_weak = weak.clone();
+            let path = qa_capture_path(&tag);
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = after_weak.upgrade() else {
+                    return;
+                };
+                let (x, y, w, h) = home_bar_rect(&ui);
+                let widths: Vec<f32> = ui.get_settings_nav_widths().iter().collect();
+                let labels = [
+                    "账户", "外观", "播放", "快捷键", "系统", "弹幕", "屏蔽",
+                    "智能云屏键", "优化",
+                ];
+                let widest = widths
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max);
+                crate::debug_log(&format!(
+                    "settings-test after view_mode={} settings_tab={} bar_x={x:.0} bar_y={y:.0} bar_w={w:.0} bar_h={h:.0}",
+                    ui.get_view_mode(),
+                    ui.get_settings_tab()
+                ));
+                crate::debug_log(&format!(
+                    "settings-test nav column=190 pad=12 widths={:?} labels={:?} widest={widest:.1} fits={}",
+                    widths.iter().map(|w| (*w * 10.0).round() / 10.0).collect::<Vec<f32>>(),
+                    labels,
+                    u8::from(widest <= 190.0 - 24.0)
+                ));
+                let _ = capture_window_png(&ui.window(), &path);
+            });
+        });
+    }
+
+    // QA hook (`BILI_LOGIN_VIEW=1`): render the logged-out login card on top of
+    // a live session, so the chooser (avatar, saved account, QR entry) can be
+    // captured without destroying the saved cookies.
+    if std::env::var("BILI_LOGIN_VIEW").map(|v| v.trim() == "1").unwrap_or(false) {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(12_000));
+            let _ = weak.upgrade_in_event_loop(|ui| {
+                ui.set_logged_in(false);
+                ui.set_login_state(0);
+                ui.set_login_error("".into());
+                crate::debug_log("login view forced (qa)");
+            });
+        });
+    }
+
+    // QA hook (`BILI_NAV_TEST=1`): walk every bar destination through its REAL
+    // callback and log the view_mode plus the bar's computed rect, so "the bar
+    // never moves" is provable from BILI_DEBUG_LOG without synthetic input.
+    if std::env::var("BILI_NAV_TEST").map(|v| v.trim() == "1").unwrap_or(false) {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(6_000));
+            for step in 0..7u32 {
+                let weak = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    match step {
+                        0 => ui.invoke_back_to_feed(),
+                        1 => ui.invoke_nav_favorites(),
+                        2 => ui.invoke_nav_regions(),
+                        3 => ui.invoke_fish_open(),
+                        4 => ui.invoke_nav_dynamic(),
+                        5 => ui.invoke_nav_messages(),
+                        _ => ui.invoke_open_settings(),
+                    }
+                    let size = ui.window().size();
+                    crate::debug_log(&format!(
+                        "nav test step={step} view={} win={}x{} bar_y={} bar_h=56",
+                        ui.get_view_mode(),
+                        size.width,
+                        size.height,
+                        size.height as i32 - 56 - 28
+                    ));
+                });
+                std::thread::sleep(Duration::from_millis(1500));
+            }
         });
     }
 
@@ -7978,6 +9998,31 @@ fn main() -> Result<()> {
         });
     }
 
+    // 下载连接数: persist how many parallel upstream fetchers the prefetch
+    // proxy opens. `PlaybackControl` exposes the proxy only through stats/url
+    // accessors (`set_prefetch_background_paused` is its one live control), so
+    // there is no setter for the connection count here: a running stream keeps
+    // the count it was opened with, and `player::start_prefetch` reads the
+    // stored value for the next video. The log line says that plainly rather
+    // than pretending the live proxy changed.
+    {
+        let weak = weak.clone();
+        let settings_store = settings_store.clone();
+        ui.on_settings_prefetch_connections(move |n| {
+            let connections = settings::normalise_prefetch_connections(n.max(0) as u32);
+            let snapshot = update_settings(&settings_store, |prefs| {
+                prefs.prefetch_connections = connections;
+            });
+            if let Some(ui) = weak.upgrade() {
+                publish_settings(&ui, &snapshot);
+                ui.set_settings_status(format!("下载连接数 {connections}（下个视频生效）").into());
+            }
+            crate::debug_log(&format!(
+                "settings connections={connections} applied=next-video"
+            ));
+        });
+    }
+
     // Custom title bar: minimize / maximize-restore / close-to-tray.
     {
         let weak = weak.clone();
@@ -8009,12 +10054,6 @@ fn main() -> Result<()> {
 
     // Self-driven window drag: the OS modal move loop (and its frame
     // re-evaluation) is never entered.
-    //
-    // The frosted-glass state is created here, before the drag wiring, because
-    // the drag callback below needs it: it re-places the backdrop in the same
-    // pointer event that moves the window (the loop itself is started further
-    // down, once the window chrome is queued).
-    let glass_loop = Rc::new(GlassLoop::new());
     let main_drag = Rc::new(win::WindowDrag::new());
     // Frame-locked move: the pointer events below only RECORD a pending
     // placement; this `DRAG_FRAME` timer (started on drag_start, stopped on
@@ -8026,7 +10065,6 @@ fn main() -> Result<()> {
     {
         let weak = weak.clone();
         let drag = main_drag.clone();
-        let glass_loop = glass_loop.clone();
         let timer = main_drag_timer.clone();
         let stats = main_drag_stats.clone();
         ui.on_window_drag_start(move || {
@@ -8048,7 +10086,6 @@ fn main() -> Result<()> {
             }
             let tick_weak = weak.clone();
             let tick_drag = drag.clone();
-            let tick_glass = glass_loop.clone();
             let tick_timer = Rc::downgrade(&timer);
             let tick_stats = stats.clone();
             timer.start(
@@ -8080,11 +10117,6 @@ fn main() -> Result<()> {
                     let moved = tick_drag.flush(&ui.window());
                     if moved {
                         tick_stats.placement();
-                        // Same tick as the placement, never per pointer event:
-                        // one `GetWindowRect` + four property writes, so the
-                        // frosted backdrop follows the window without a second
-                        // full-window repaint.
-                        glass_place(&ui, &tick_glass);
                     }
                     if !win::left_button_down() {
                         crate::debug_log(&format!(
@@ -8109,7 +10141,6 @@ fn main() -> Result<()> {
     {
         let weak = weak.clone();
         let drag = main_drag.clone();
-        let glass_loop = glass_loop.clone();
         let timer = main_drag_timer.clone();
         let stats = main_drag_stats.clone();
         ui.on_window_drag_end(move || {
@@ -8129,7 +10160,6 @@ fn main() -> Result<()> {
                 // profile.
                 if drag.flush(&ui.window()) {
                     stats.placement();
-                    glass_place(&ui, &glass_loop);
                 }
             }
             timer.stop();
@@ -8248,6 +10278,15 @@ fn main() -> Result<()> {
         .unwrap_or_default();
     let has_saved_record = saved.is_some() || bilibili::token_path().exists();
     ui.set_saved_account_name(saved_account_name.clone().into());
+    // The chooser shows which account it will log into: id + circular face.
+    // The face is a public CDN image, so it is fetched without a session and
+    // long before the auto-login call finishes.
+    if let Some(account) = saved.as_ref() {
+        ui.set_saved_account_uid(account.mid.to_string().into());
+        if !account.face.is_empty() {
+            load_saved_avatar(ui.as_weak(), account.face.clone());
+        }
+    }
     if has_saved_record {
         ui.set_login_state(1);
         ui.set_login_step("准备中…".into());
@@ -8373,6 +10412,106 @@ fn main() -> Result<()> {
         });
     }
 
+    // QA hook (`BILI_QUALITY_TEST=<bvid>`, mirrors BILI_CDN_TEST): print the
+    // raw tier lists (`accept_quality` / `accept_description` /
+    // `support_formats`) and every stream this account may play, so a locked
+    // 大会员 tier can be told apart from a tier the video does not have.
+    if let Some(bvid) = bilibili::quality_qa_bvid() {
+        let session_slot = session_slot.clone();
+        std::thread::spawn(move || {
+            for _ in 0..240 {
+                if let Some(session) = active_session(&session_slot) {
+                    let Some(runtime) = bilibili::shared_runtime() else {
+                        return;
+                    };
+                    match runtime.block_on(session.quality_selftest(&bvid)) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            crate::debug_log(&format!("quality qa failed bvid={bvid} err={err}"))
+                        }
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            crate::debug_log(&format!("quality qa skipped bvid={bvid} reason=no-session"));
+        });
+    }
+
+    // QA hook (`BILI_OPEN_BVID=<bvid>`, mirrors BILI_DETAIL_ON_START): resolve
+    // the bvid and open its real player window once the saved session exists,
+    // so a specific video (e.g. a 4K upload) can be driven from the env without
+    // synthetic input. The resolved row goes through the feed store and the
+    // real `card_open(0, 0)` callback, so the player's normal open path runs.
+    if let Ok(bvid) = std::env::var("BILI_OPEN_BVID") {
+        let bvid = bvid.trim().to_string();
+        if !bvid.is_empty() {
+            let session_slot = session_slot.clone();
+            let feed_store_open = feed_store.clone();
+            let ui_weak = weak.clone();
+            std::thread::spawn(move || {
+                for _ in 0..240 {
+                    if let Some(session) = active_session(&session_slot) {
+                        let Some(runtime) = bilibili::shared_runtime() else {
+                            return;
+                        };
+                        let detail = match runtime.block_on(session.video_view(&bvid)) {
+                            Ok(detail) => detail,
+                            Err(err) => {
+                                crate::debug_log(&format!(
+                                    "open-bvid failed bvid={bvid} err={err}"
+                                ));
+                                return;
+                            }
+                        };
+                        let cid = if detail.cid > 0 {
+                            detail.cid as u64
+                        } else {
+                            detail
+                                .pages
+                                .first()
+                                .map(|page| page.cid as u64)
+                                .unwrap_or(0)
+                        };
+                        if cid == 0 {
+                            crate::debug_log(&format!(
+                                "open-bvid skipped bvid={bvid} reason=no-cid"
+                            ));
+                            return;
+                        }
+                        let video = bilibili::FeedVideo {
+                            bvid: detail.bvid.clone(),
+                            cid,
+                            aid: detail.aid.max(0) as u64,
+                            title: detail.title.clone(),
+                            pic: detail.pic.clone(),
+                            owner: detail.owner_name.clone(),
+                            owner_mid: detail.owner_mid,
+                            view: detail.stat_view,
+                            duration: detail.duration,
+                            pub_ts: detail.pubdate,
+                        };
+                        crate::debug_log(&format!(
+                            "open-bvid bvid={bvid} cid={cid} title_len={}",
+                            detail.title.len()
+                        ));
+                        if let Ok(mut feed) = feed_store_open.lock() {
+                            feed.insert(0, video);
+                        }
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.invoke_card_open(0, 0);
+                            }
+                        });
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                crate::debug_log(&format!("open-bvid skipped bvid={bvid} reason=no-session"));
+            });
+        }
+    }
+
     // 收藏推荐: when the UI restored itself on that tab, fill it once a session
     // exists (the folder worker waits for one).
     if ui.get_home_tab() == 5 {
@@ -8490,7 +10629,7 @@ fn main() -> Result<()> {
     // end to end from the backend without synthetic input. `<n>` pages the
     // feed; `<view>:<n>` first opens that section through its existing
     // navigation callback (1 搜索 / 5 历史 / 6 稍后再看 / 8 分区 / 9 排行榜 /
-    // 10 热门 / 13 动态 / 18 入站必刷) and then pages it (see `run_page_test`).
+    // 13 动态) and then pages it (see `run_page_test`).
     if let Ok(value) = std::env::var("BILI_PAGE_TEST") {
         let (view, count) = parse_page_test(&value);
         if count > 0 {
@@ -8733,6 +10872,25 @@ fn main() -> Result<()> {
         }
     }
 
+    // ---- f124 QA: wheel replay, captures and measurements -----------------
+    // One env-driven pass (`BILI_F124_TEST=<delay_ms>`) that walks the pages
+    // this wave changed. The wheel proof dispatches REAL wheel events into the
+    // Slint window's item tree at a point taken from the strip's own window
+    // rect: the pointer is in the strip's LEFT PADDING, not on a chip, and no
+    // OS cursor / synthetic input is involved. See `start_f124_pass`.
+    maybe_start_f124(weak.clone());
+
+    // ---- f127 QA: the shared 收藏 folder strip (推荐流 / 收藏夹) ----------
+    // `BILI_F127_TEST=<delay_ms>` walks the two folder tabs and 历史, captures
+    // each and logs the strip slot / switcher / content geometry. See
+    // `run_f127_test`.
+    maybe_start_f127(weak.clone(), session_slot.clone(), fav_view.clone());
+
+    // ---- f143 QA: toolbar selection, refresh fill, 收藏 skeleton ----------
+    // `BILI_F143_TEST=bar|refresh|fav` runs one capture pass. See
+    // `maybe_start_f143`; the fish phase is started from the 养鱼 block.
+    maybe_start_f143(weak.clone(), session_slot.clone(), fav_view.clone());
+
     // Diagnostic hook `BILI_VOL_TEST=<n>` (default 50): apply that many rapid
     // volume changes to the live player through the session path and log the
     // first/last three values plus one readback. The `audio volume … restart=0`
@@ -8773,12 +10931,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Frameless + compositor alpha, then the in-process frosted-glass loop: the
-    // native HWND only exists once the event loop has built the window, so queue
-    // the window chrome to run (and retry) on the UI thread after `run()` starts,
-    // and let the refresh loop pick the handle up on its own tick.
-    start_glass_loop(&ui, &glass_loop);
-    schedule_glass(weak.clone(), theme_dark, 120);
+    // Frameless + compositor alpha: the native HWND only exists once the event
+    // loop has built the window, so queue the window chrome to run (and retry)
+    // on the UI thread after `run()` starts.
+    schedule_window_chrome(weak.clone(), theme_dark, 120);
 
     // Self-healing watchdog for the main window: re-assert the frameless style
     // every 1500ms. `reassert_frameless` is a no-op unless something re-decorated
@@ -8907,7 +11063,6 @@ struct CloseClock {
     started: Instant,
     enabled: bool,
     hide: Cell<u128>,
-    glass: Cell<u128>,
     control: Cell<u128>,
     extras: Cell<u128>,
 }
@@ -8918,7 +11073,6 @@ impl CloseClock {
             started: Instant::now(),
             enabled: win::close_profile_enabled(),
             hide: Cell::new(0),
-            glass: Cell::new(0),
             control: Cell::new(0),
             extras: Cell::new(0),
         }
@@ -8938,9 +11092,8 @@ impl CloseClock {
             return;
         }
         crate::debug_log(&format!(
-            "close profile t0=0 hide={} glass={} control={} extras={} total={}",
+            "close profile t0=0 hide={} control={} extras={} total={}",
             self.hide.get(),
-            self.glass.get(),
             self.control.get(),
             self.extras.get(),
             self.ms(),
@@ -8951,8 +11104,8 @@ impl CloseClock {
 /// Shared body of both player close paths (the UI's ✕ and a native close
 /// request). Extracted so the two can never drift apart.
 ///
-/// Closes exactly the window that called it: its loop, its glass worker, its
-/// decode session. Other player windows are untouched and keep playing.
+/// Closes exactly the window that called it: its loop, its decode session.
+/// Other player windows are untouched and keep playing.
 fn close_player_window(
     state: &Rc<PlayerState>,
     window: &Weak<PlayerWindow>,
@@ -9010,13 +11163,7 @@ fn close_player_window(
         );
     }
 
-    // 3. This window's glass loop, and only this one.
-    if let Some(record) = record.as_ref() {
-        stop_player_glass(record);
-    }
-    clock.glass.set(clock.ms());
-
-    // 4. This window's decode session: `close()` only stores the flag and hands
+    // 3. This window's decode session: `close()` only stores the flag and hands
     //    the prefetch proxy to a background thread (its shutdown waits, bounded,
     //    for the server task), so no ffmpeg child is waited on here.
     if let Some(record) = record.as_ref() {
@@ -9027,7 +11174,7 @@ fn close_player_window(
     }
     clock.control.set(clock.ms());
 
-    // 5. Unregister the window. The queue follows a surviving player when the
+    // 4. Unregister the window. The queue follows a surviving player when the
     //    closed one was focused, and only stops when no player is left.
     let mut closed_id = 0;
     if let Some(record) = record.as_ref() {
@@ -9049,6 +11196,15 @@ fn close_player_window(
         if let (true, Some(next)) = (was_focused, remaining.last().cloned()) {
             focus_player(state, &next, true);
         }
+        // A user close (X / native) means "I am done with this video": drop
+        // its queue row. A Replace close is the auto-advance / another-video
+        // path and must NOT remove anything (the queue survives an end).
+        if tag == "button" || tag == "native" {
+            if let Some(host) = playlist() {
+                let closed_bvid = record.video.bvid.clone();
+                host.remove_bvid_via(&closed_bvid, "window-close");
+            }
+        }
         if remaining.is_empty() {
             if let Some(host) = playlist() {
                 host.on_close();
@@ -9062,7 +11218,7 @@ fn close_player_window(
     }
     clock.extras.set(clock.ms());
 
-    // 6. Keep the window object alive past this callback: dropping the last
+    // 5. Keep the window object alive past this callback: dropping the last
     //    handle while Slint is executing one of its own callbacks is not safe.
     //    The deferred drop runs on a later event-loop turn.
     if let Some(record) = record {
@@ -9764,6 +11920,1466 @@ fn capture_player_png(
     window: &slint::Window,
     tag: &str,
 ) -> Option<(u32, u32)> {
+    let (w, h, rgba) = window_rgba(window)?;
+    let path = std::env::temp_dir().join(format!(
+        "bili_panel_test_{tag}_{}x{}.png",
+        w, h
+    ));
+    let png = image::RgbaImage::from_raw(w as u32, h as u32, rgba)?;
+    match png.save(&path) {
+        Ok(()) => {
+            crate::debug_log(&format!(
+                "paneltest png tag={tag} path={} size={w}x{h}",
+                path.display()
+            ));
+            Some((w as u32, h as u32))
+        }
+        Err(err) => {
+            crate::debug_log(&format!("paneltest png tag={tag} err={err}"));
+            None
+        }
+    }
+}
+
+/// Paint any window (main or player) into `path` as a PNG.
+///
+/// Same `PrintWindow` path as [`capture_player_png`], but the caller names the
+/// file: the QA hooks that capture the MAIN window write `target/qa/<tag>.png`.
+fn capture_window_png(window: &slint::Window, path: &std::path::Path) -> Option<(u32, u32)> {
+    let (w, h, rgba) = window_rgba(window)?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let png = image::RgbaImage::from_raw(w as u32, h as u32, rgba)?;
+    match png.save(path) {
+        Ok(()) => {
+            crate::debug_log(&format!(
+                "capture png path={} size={w}x{h}",
+                path.display()
+            ));
+            Some((w as u32, h as u32))
+        }
+        Err(err) => {
+            crate::debug_log(&format!("capture png path={} err={err}", path.display()));
+            None
+        }
+    }
+}
+
+/// The floating home bar's rect in window coordinates, derived exactly like
+/// AppWindow does (`home_bar_x/y/w/h`): the width from the UI property, 56px
+/// tall, 28px above the bottom edge, horizontally centred.
+/// QA: the env-driven f124 pass. `BILI_F124_TEST=<delay_ms>` waits for the
+/// first feed, then walks 分区 / 收藏推荐 / 消息 / UP / 搜索 and:
+///   * dispatches three REAL wheel events at each horizontal strip's LEFT
+///     PADDING (the point comes from the strip's own `absolute-position`), and
+///     logs the strip offset before/after plus the list offset below it;
+///   * captures the pages (`BILI_CAPTURE_DIR`);
+///   * logs the layout numbers behind the fixed items.
+/// No OS cursor movement and no synthetic OS input: the events enter Slint's
+/// own item tree, exactly like a wheel from the window backend.
+fn maybe_start_f124(weak: Weak<AppWindow>) {
+    let Ok(value) = std::env::var("BILI_F124_TEST") else {
+        return;
+    };
+    let delay = value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .unwrap_or(8_000)
+        .clamp(1_000, 120_000);
+    let store: Arc<Mutex<Option<[f32; 4]>>> = Arc::new(Mutex::new(None));
+    {
+        let store = store.clone();
+        if let Some(ui) = weak.upgrade() {
+            ui.on_wheel_probe_rect(move |x, y, w, h| {
+                if let Ok(mut slot) = store.lock() {
+                    *slot = Some([x, y, w, h]);
+                }
+            });
+        }
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay));
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                start_f124_pass(ui, store);
+            }
+        });
+    });
+}
+
+fn f124_capture(ui: &AppWindow, tag: &str) {
+    let path = qa_capture_path(tag);
+    if let Some((w, h)) = capture_window_png(&ui.window(), &path) {
+        crate::debug_log(&format!(
+            "f124 capture tag={tag} path={} size={w}x{h}",
+            path.display()
+        ));
+    } else {
+        crate::debug_log(&format!("f124 capture tag={tag} failed"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// f127 QA: the shared 收藏 folder strip (推荐流 / 收藏夹).
+//
+// `BILI_F127_TEST=<delay_ms>` walks the 收藏 page through the REAL routes and
+// proves the one-strip design from the log and three captures:
+//   1. 推荐流 + folder 1          -> f127_fav_stream
+//   2. 收藏夹 + the same folder    -> f127_fav_folder
+//   3. 历史 (strip hidden)         -> f127_fav_history
+//   4. back to 推荐流              -> the folder and the strip offset survived
+// Between 1 and 2 a REAL wheel event moves the strip's offset, so the tab
+// switch has something to preserve. Nothing here clicks the OS cursor: the
+// wheel enters Slint's own item tree at the strip's left padding, exactly like
+// the f124 pass.
+// ---------------------------------------------------------------------------
+
+/// One measurement of the 收藏 page's fixed lines.
+#[derive(Clone, Copy)]
+struct F127Snap {
+    view: i32,
+    strip_y: f32,
+    strip_h: f32,
+    switch_y: f32,
+    content_y: f32,
+    offset: f32,
+    tab: i32,
+    cards: usize,
+    empty: bool,
+}
+
+impl F127Snap {
+    fn log(&self, tag: &str) {
+        crate::debug_log(&format!(
+            "f127 measure tag={tag} view={} strip_y={:.1} strip_h={:.1} switch_y={:.1} content_y={:.1} offset={:.1} fav_tab={} cards={} empty={}",
+            self.view,
+            self.strip_y,
+            self.strip_h,
+            self.switch_y,
+            self.content_y,
+            self.offset,
+            self.tab,
+            self.cards,
+            u8::from(self.empty)
+        ));
+    }
+}
+
+fn f127_capture(ui: &AppWindow, tag: &str) {
+    let path = qa_capture_path(tag);
+    if let Some((w, h)) = capture_window_png(&ui.window(), &path) {
+        crate::debug_log(&format!(
+            "f127 capture tag={tag} path={} size={w}x{h}",
+            path.display()
+        ));
+    } else {
+        crate::debug_log(&format!("f127 capture tag={tag} failed"));
+    }
+}
+
+/// Run `f` on the UI thread and wait for its result (UI properties may only be
+/// read there).
+fn f127_on_ui<T, F>(weak: &Weak<AppWindow>, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppWindow) -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let weak = weak.clone();
+    slint::invoke_from_event_loop(move || {
+        let value = weak.upgrade().map(|ui| f(&ui));
+        let _ = tx.send(value);
+    })
+    .ok()?;
+    rx.recv_timeout(Duration::from_secs(15)).ok().flatten()
+}
+
+fn f127_snap(weak: &Weak<AppWindow>) -> Option<F127Snap> {
+    f127_on_ui(weak, |ui| F127Snap {
+        view: ui.get_view_mode(),
+        strip_y: ui.get_qa_fav_strip_y(),
+        strip_h: ui.get_qa_fav_strip_h(),
+        switch_y: ui.get_qa_fav_switch_y(),
+        content_y: ui.get_qa_fav_content_y(),
+        offset: ui.get_qa_fav_offset(),
+        tab: ui.get_fav_tab(),
+        cards: ui.get_masonry().row_count(),
+        empty: ui.get_fav_empty(),
+    })
+}
+
+/// Arm the page probes, let them publish, log one measurement, capture and
+/// disarm. The values a tab does not publish (the content top on 历史 / 稍后,
+/// and the strip offset where there is no strip at all) are cleared first, so a
+/// stale number can never be read as a measurement.
+fn f127_measure(weak: &Weak<AppWindow>, tag: &str, has_strip: bool) -> Option<F127Snap> {
+    let _ = f127_on_ui(weak, move |ui| {
+        ui.set_qa_fav_strip_y(-1.0);
+        ui.set_qa_fav_strip_h(-1.0);
+        ui.set_qa_fav_switch_y(-1.0);
+        ui.set_qa_fav_content_y(-1.0);
+        if !has_strip {
+            ui.set_qa_fav_offset(-1.0);
+        }
+        ui.set_wheel_probe(2);
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let snap = f127_snap(weak)?;
+    snap.log(tag);
+    let tag = tag.to_string();
+    let _ = f127_on_ui(weak, move |ui| f127_capture(ui, &tag));
+    let _ = f127_on_ui(weak, |ui| ui.set_wheel_probe(0));
+    Some(snap)
+}
+
+fn maybe_start_f127(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    view: Arc<Mutex<FavViewState>>,
+) {
+    let Ok(value) = std::env::var("BILI_F127_TEST") else {
+        return;
+    };
+    let delay = value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .unwrap_or(8_000)
+        .clamp(1_000, 120_000);
+    let store: Arc<Mutex<Option<[f32; 4]>>> = Arc::new(Mutex::new(None));
+    {
+        let store = store.clone();
+        if let Some(ui) = weak.upgrade() {
+            ui.on_wheel_probe_rect(move |x, y, w, h| {
+                if let Ok(mut slot) = store.lock() {
+                    *slot = Some([x, y, w, h]);
+                }
+            });
+        }
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay));
+        run_f127_test(weak, session_slot, view, store);
+    });
+}
+
+fn run_f127_test(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    view: Arc<Mutex<FavViewState>>,
+    store: Arc<Mutex<Option<[f32; 4]>>>,
+) {
+    for _ in 0..240 {
+        if active_session(&session_slot).is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // ---- 1: 推荐流, folder 1 ----
+    let _ = f127_on_ui(&weak, |ui| {
+        crate::debug_log("f127 open tab=stream");
+        ui.set_view_mode(0);
+        ui.set_home_tab(5);
+        ui.invoke_home_section(5);
+    });
+    if !fav_wait_for(&view, Duration::from_secs(180), |state| state.folders_loaded) {
+        crate::debug_log("f127 failed reason=folders-timeout");
+        return;
+    }
+    let folders = view.lock().map(|state| state.folders.len()).unwrap_or(0);
+    // Tab index (1-based) -> (count, name): the QA picks a folder that is both
+    // well filled and reachable in the strip at the capture offsets below.
+    let listing: Vec<(i32, u32, String)> = view
+        .lock()
+        .map(|state| {
+            state
+                .folders
+                .iter()
+                .enumerate()
+                .map(|(index, folder)| (index as i32 + 1, folder.count, folder.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::debug_log(&format!(
+        "f127 folders n={folders} counts={}",
+        listing
+            .iter()
+            .map(|(tab, count, _)| format!("{tab}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    if folders == 0 {
+        crate::debug_log("f127 failed reason=no-folders");
+        return;
+    }
+    // Chips 3..=12 stay on screen both at offset 0 (the stream capture) and at
+    // the wheel's -120 offset (the folder capture), so the selected chip is
+    // visible in both.
+    let picked = listing
+        .iter()
+        .filter(|(tab, _, _)| (3..=12).contains(tab))
+        .max_by_key(|(_, count, _)| *count)
+        .or_else(|| listing.iter().max_by_key(|(_, count, _)| *count))
+        .map(|(tab, _, name)| (*tab, name.clone()));
+    let Some((pick_tab, pick_name)) = picked else {
+        crate::debug_log("f127 failed reason=no-folder-pick");
+        return;
+    };
+    crate::debug_log(&format!(
+        "f127 pick folder_tab={pick_tab} name={pick_name}"
+    ));
+    if !fav_test_drive_and_wait(&weak, &view, pick_tab, "f127-stream-folder") {
+        crate::debug_log("f127 failed reason=stream-folder-timeout");
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Capture the stream tab from the strip's start, so 全部 and the selected
+    // chip are both in frame.
+    let _ = f127_on_ui(&weak, |ui| ui.set_fav_strip_offset(0.0));
+    std::thread::sleep(Duration::from_millis(250));
+    let stream = f127_measure(&weak, "f127_fav_stream", true);
+
+    // A real wheel over the strip's left padding: the tab switch has to keep
+    // this offset. When the chips fit the strip the wheel cannot move it
+    // (max-offset 0), and the log says so instead of pretending.
+    let _ = f127_on_ui(&weak, |ui| ui.set_wheel_probe(2));
+    std::thread::sleep(Duration::from_millis(500));
+    let rect = store.lock().ok().and_then(|slot| *slot);
+    let before = f127_snap(&weak).map(|snap| snap.offset).unwrap_or(-1.0);
+    if let Some([x, y, w, h]) = rect {
+        let _ = f127_on_ui(&weak, move |ui| {
+            f124_wheel_steps(ui, x + 2.0, y + h / 2.0);
+        });
+        std::thread::sleep(Duration::from_millis(350));
+        let after = f127_snap(&weak).map(|snap| snap.offset).unwrap_or(-1.0);
+        crate::debug_log(&format!(
+            "f127 wheel strip=fav rect={x:.1},{y:.1},{w:.1}x{h:.1} offset_before={before:.1} offset_after={after:.1} moved={}",
+            u8::from(after < before - 0.5)
+        ));
+        if after >= before - 0.5 {
+            crate::debug_log("f127 wheel strip=fav reason=strip-fits (chips narrower than the strip)");
+        }
+    } else {
+        crate::debug_log("f127 wheel strip=fav skipped reason=no-rect");
+    }
+    let _ = f127_on_ui(&weak, |ui| ui.set_wheel_probe(0));
+
+    // ---- 2: 收藏夹, same folder (the real open_collection(1) order) ----
+    let _ = f127_on_ui(&weak, |ui| {
+        crate::debug_log("f127 open tab=folder");
+        ui.set_home_tab(0);
+        ui.invoke_nav_favorites();
+    });
+    if !fav_wait_for(&view, Duration::from_secs(180), |state| {
+        !state.loading && state.published == Some((FavMode::Library, pick_tab))
+    }) {
+        crate::debug_log("f127 failed reason=folder-tab-timeout");
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let folder = f127_measure(&weak, "f127_fav_folder", true);
+
+    // ---- 3: 历史 (the strip is hidden, its slot is kept) ----
+    let _ = f127_on_ui(&weak, |ui| {
+        crate::debug_log("f127 open tab=history");
+        ui.invoke_nav_history();
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let history = f127_measure(&weak, "f127_fav_history", false);
+
+    // ---- 4: back to 推荐流: folder + offset must be the same ----
+    let _ = f127_on_ui(&weak, |ui| {
+        crate::debug_log("f127 open tab=stream-back");
+        ui.set_home_tab(5);
+        ui.set_view_mode(0);
+        ui.invoke_home_section(5);
+    });
+    let back_ok = fav_wait_for(&view, Duration::from_secs(120), |state| {
+        !state.loading && state.published == Some((FavMode::Stream, pick_tab))
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let back = f127_measure(&weak, "f127_fav_stream_back", true);
+
+    // ---- summary: every delta the owner asked for ----
+    let d = |a: Option<f32>, b: Option<f32>| match (a, b) {
+        (Some(a), Some(b)) => b - a,
+        _ => f32::NAN,
+    };
+    crate::debug_log(&format!(
+        "f127 compare strip stream=({:.1},{:.1}) folder=({:.1},{:.1}) history=({:.1},{:.1}) d_strip_y={:.1} d_strip_h={:.1}",
+        stream.map(|s| s.strip_y).unwrap_or(-1.0),
+        stream.map(|s| s.strip_h).unwrap_or(-1.0),
+        folder.map(|s| s.strip_y).unwrap_or(-1.0),
+        folder.map(|s| s.strip_h).unwrap_or(-1.0),
+        history.map(|s| s.strip_y).unwrap_or(-1.0),
+        history.map(|s| s.strip_h).unwrap_or(-1.0),
+        d(stream.map(|s| s.strip_y), folder.map(|s| s.strip_y)),
+        d(stream.map(|s| s.strip_h), folder.map(|s| s.strip_h)),
+    ));
+    crate::debug_log(&format!(
+        "f127 compare switch stream={:.1} folder={:.1} history={:.1} back={:.1} d_stream_folder={:.1} d_stream_history={:.1}",
+        stream.map(|s| s.switch_y).unwrap_or(-1.0),
+        folder.map(|s| s.switch_y).unwrap_or(-1.0),
+        history.map(|s| s.switch_y).unwrap_or(-1.0),
+        back.map(|s| s.switch_y).unwrap_or(-1.0),
+        d(stream.map(|s| s.switch_y), folder.map(|s| s.switch_y)),
+        d(stream.map(|s| s.switch_y), history.map(|s| s.switch_y)),
+    ));
+    crate::debug_log(&format!(
+        "f127 compare content stream={:.1} folder={:.1} d_stream_folder={:.1}",
+        stream.map(|s| s.content_y).unwrap_or(-1.0),
+        folder.map(|s| s.content_y).unwrap_or(-1.0),
+        d(stream.map(|s| s.content_y), folder.map(|s| s.content_y)),
+    ));
+    crate::debug_log(&format!(
+        "f127 compare selection stream={} folder={} back={} offset stream={:.1} folder={:.1} back={:.1} d_offset={:.1} cards stream={} folder={} back={}",
+        stream.map(|s| s.tab).unwrap_or(-1),
+        folder.map(|s| s.tab).unwrap_or(-1),
+        back.map(|s| s.tab).unwrap_or(-1),
+        stream.map(|s| s.offset).unwrap_or(-1.0),
+        folder.map(|s| s.offset).unwrap_or(-1.0),
+        back.map(|s| s.offset).unwrap_or(-1.0),
+        d(folder.map(|s| s.offset), back.map(|s| s.offset)),
+        stream.map(|s| s.cards).unwrap_or(0),
+        folder.map(|s| s.cards).unwrap_or(0),
+        back.map(|s| s.cards).unwrap_or(0),
+    ));
+    crate::debug_log(&format!(
+        "f127 done back_stream={} ",
+        u8::from(back_ok)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// f143 QA: the toolbar selection / refresh-fill / 收藏 skeleton pass.
+//
+// `BILI_F143_TEST=bar|refresh|fav` drives one phase through the REAL routes and
+// callbacks. Captures land in `BILI_CAPTURE_DIR` (default target/qa):
+//   bar      -> f143_bar_selected.png  (the home bar with 推荐 selected)
+//   refresh  -> f143_refresh_fill.png  (a 40 % determinate fill on 刷新)
+//   fav      -> f143_fav_loaded.png + f143_fav_skeleton.png at the same scroll
+// Only property writes / callbacks the app itself uses are involved; no OS
+// cursor and no synthetic input.
+// ---------------------------------------------------------------------------
+thread_local! {
+    /// The real 收藏 model, parked on the UI thread while the f143 skeleton
+    /// fixture is on screen (ModelRc is UI-thread-only, so it cannot ride the
+    /// QA thread's stack).
+    static F143_KEPT: RefCell<Option<ModelRc<MasonryCard>>> = const { RefCell::new(None) };
+}
+
+fn maybe_start_f143(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    fav_view: Arc<Mutex<FavViewState>>,
+) {
+    let Ok(value) = std::env::var("BILI_F143_TEST") else {
+        return;
+    };
+    let phase = value.trim().to_ascii_lowercase();
+    // The fish phase is started from the 养鱼 setup block, where FISH_UI and
+    // FISH_SESSION are already in place.
+    if phase.is_empty() || phase == "fish" {
+        return;
+    }
+    let delay = std::env::var("BILI_F143_DELAY")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(8_000)
+        .clamp(1_000, 120_000);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay));
+        for _ in 0..240 {
+            if active_session(&session_slot).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        crate::debug_log(&format!(
+            "f143 phase={phase} logged_in={}",
+            f143_on_ui(&weak, |ui| ui.get_logged_in()).unwrap_or(false)
+        ));
+        match phase.as_str() {
+            "bar" => run_f143_bar(&weak),
+            "refresh" => run_f143_refresh(&weak),
+            "fav" => run_f143_fav(&weak, &fav_view),
+            other => crate::debug_log(&format!("f143 unknown phase={other}")),
+        }
+    });
+}
+
+/// Run `f` on the UI thread and wait for its result (UI properties may only be
+/// read there).
+fn f143_on_ui<T, F>(weak: &Weak<AppWindow>, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppWindow) -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let weak = weak.clone();
+    slint::invoke_from_event_loop(move || {
+        let value = weak.upgrade().map(|ui| f(&ui));
+        let _ = tx.send(value);
+    })
+    .ok()?;
+    rx.recv_timeout(Duration::from_secs(15)).ok().flatten()
+}
+
+fn f143_capture(ui: &AppWindow, tag: &str) {
+    let path = qa_capture_path(tag);
+    match capture_window_png(&ui.window(), &path) {
+        Some((w, h)) => crate::debug_log(&format!(
+            "f143 capture tag={tag} path={} size={w}x{h}",
+            path.display()
+        )),
+        None => crate::debug_log(&format!("f143 capture tag={tag} failed")),
+    }
+}
+
+/// Open the home feed (推荐 selected) through the real route.
+fn f143_open_feed(weak: &Weak<AppWindow>) {
+    let _ = f127_on_ui(weak, |ui| {
+        if ui.get_view_mode() != 0 || ui.get_home_tab() != 0 {
+            ui.set_home_tab(0);
+            ui.set_view_mode(0);
+            ui.invoke_back_to_feed();
+        }
+    });
+}
+
+fn f143_wait_feed(weak: &Weak<AppWindow>, timeout: Duration) -> usize {
+    let start = Instant::now();
+    let mut rows = 0;
+    while start.elapsed() < timeout {
+        rows = f127_on_ui(weak, |ui| ui.get_feed_items().row_count()).unwrap_or(0);
+        if rows > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    rows
+}
+
+fn run_f143_bar(weak: &Weak<AppWindow>) {
+    f143_open_feed(weak);
+    let rows = f143_wait_feed(weak, Duration::from_secs(90));
+    // Let the feed settle and the selected pill's 140/160ms transitions finish.
+    std::thread::sleep(Duration::from_secs(2));
+    let log = f127_on_ui(weak, |ui| {
+        format!(
+            "f143 bar feed_rows={} home_tab={} view={}",
+            ui.get_feed_items().row_count(),
+            ui.get_home_tab(),
+            ui.get_view_mode()
+        )
+    })
+    .unwrap_or_default();
+    crate::debug_log(&log);
+    crate::debug_log(&format!("f143 bar wait_rows={rows}"));
+    let _ = f127_on_ui(weak, |ui| f143_capture(ui, "f143_bar_selected"));
+}
+
+fn run_f143_refresh(weak: &Weak<AppWindow>) {
+    f143_open_feed(weak);
+    let rows = f143_wait_feed(weak, Duration::from_secs(90));
+    if rows == 0 {
+        crate::debug_log("f143 refresh failed reason=no-feed");
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = f127_on_ui(weak, |ui| {
+        // A real refresh edge first (so the button's state machine is in its
+        // real "refreshing" state), then the deterministic 40 % fixture that
+        // the Rust publisher writes for a page-count refresh.
+        ui.set_list_refreshing(false);
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let _ = f127_on_ui(weak, |ui| {
+        ui.set_list_refreshing(true);
+        ui.set_list_refresh_progress(0.4);
+    });
+    // The fill's width animation is 120ms; 350ms leaves it fully landed.
+    std::thread::sleep(Duration::from_millis(350));
+    let log = f127_on_ui(weak, |ui| {
+        let fill = ui.get_qa_refresh_fill_w();
+        let pill = ui.get_qa_refresh_pill_w();
+        format!(
+            "f143 refresh progress={:.2} refreshing={} fill_w={:.1} pill_w={:.1} ratio={:.3}",
+            ui.get_list_refresh_progress(),
+            ui.get_list_refreshing(),
+            fill,
+            pill,
+            if pill > 0.0 { fill / pill } else { -1.0 }
+        )
+    })
+    .unwrap_or_default();
+    crate::debug_log(&log);
+    let _ = f127_on_ui(weak, |ui| f143_capture(ui, "f143_refresh_fill"));
+    let _ = f127_on_ui(weak, |ui| {
+        ui.set_list_refreshing(false);
+        ui.set_list_refresh_progress(0.0);
+    });
+}
+
+fn run_f143_fav(weak: &Weak<AppWindow>, view: &Arc<Mutex<FavViewState>>) {
+    // The 推荐流 page (home_tab 5, view_mode 0) owns the shared folder strip,
+    // the four-tab switcher and the masonry skeleton.
+    let opened = f127_on_ui(weak, |ui| {
+        ui.set_view_mode(0);
+        ui.set_home_tab(5);
+        ui.invoke_home_section(5);
+        format!(
+            "home_tab={} view={}",
+            ui.get_home_tab(),
+            ui.get_view_mode()
+        )
+    })
+    .unwrap_or_default();
+    crate::debug_log(&format!("f143 fav opened {opened}"));
+    if !fav_wait_for(view, Duration::from_secs(180), |state| state.folders_loaded) {
+        crate::debug_log("f143 fav failed reason=folders-timeout");
+        return;
+    }
+    // Wait for the first page of the stream to land (skeleton -> cards).
+    let start = Instant::now();
+    let mut rows = 0;
+    while start.elapsed() < Duration::from_secs(180) {
+        rows = f127_on_ui(weak, |ui| ui.get_masonry().row_count()).unwrap_or(0);
+        if rows > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    if rows == 0 {
+        crate::debug_log("f143 fav failed reason=no-cards");
+        return;
+    }
+    // Covers decode in the background; the final layout must include them.
+    std::thread::sleep(Duration::from_secs(5));
+    let state = f127_on_ui(weak, |ui| {
+        format!(
+            "f143 fav state home_tab={} view={} masonry={} fav_tab={}",
+            ui.get_home_tab(),
+            ui.get_view_mode(),
+            ui.get_masonry().row_count(),
+            ui.get_fav_tab()
+        )
+    })
+    .unwrap_or_default();
+    crate::debug_log(&state);
+    let _ = f127_on_ui(weak, |ui| {
+        ui.set_qa_fav_strip_y(-1.0);
+        ui.set_qa_fav_strip_h(-1.0);
+        ui.set_qa_fav_switch_y(-1.0);
+        ui.set_qa_fav_content_y(-1.0);
+        ui.set_wheel_probe(2);
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    let measure = f127_snap(weak);
+    let gap_strip = measure
+        .map(|m| m.switch_y - m.strip_y - m.strip_h)
+        .unwrap_or(f32::NAN);
+    let gap_tabs = measure
+        .map(|m| m.content_y - m.switch_y - 32.0)
+        .unwrap_or(f32::NAN);
+    crate::debug_log(&format!(
+        "f143 fav measure strip_y={:.1} strip_h={:.1} switch_y={:.1} content_y={:.1} gap_strip_tabs={:.1} gap_tabs_content={:.1} cards={}",
+        measure.map(|m| m.strip_y).unwrap_or(-1.0),
+        measure.map(|m| m.strip_h).unwrap_or(-1.0),
+        measure.map(|m| m.switch_y).unwrap_or(-1.0),
+        measure.map(|m| m.content_y).unwrap_or(-1.0),
+        gap_strip,
+        gap_tabs,
+        measure.map(|m| m.cards).unwrap_or(0)
+    ));
+    // Loaded state first (real rows, real covers, same scroll anchor).
+    let _ = f127_on_ui(weak, |ui| f143_capture(ui, "f143_fav_loaded"));
+    // The skeleton is the same page with an empty model: one property write,
+    // exactly what a folder switch does while the next page is in flight.
+    // `ModelRc` is not Send, so the real model is stashed on the UI thread
+    // (`F143_KEPT`) instead of being carried through the caller's thread.
+    let had_rows = f127_on_ui(weak, |ui| {
+        let rows = ui.get_masonry();
+        let kept = rows.row_count() > 0;
+        F143_KEPT.with(|slot| *slot.borrow_mut() = if kept { Some(rows) } else { None });
+        ui.set_fav_empty(false);
+        let empty: Vec<MasonryCard> = Vec::new();
+        ui.set_masonry(std::rc::Rc::new(VecModel::from(empty)).into());
+        kept
+    })
+    .unwrap_or(false);
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = f127_on_ui(weak, |ui| f143_capture(ui, "f143_fav_skeleton"));
+    // Restore the real model and leave the page as it was found.
+    let _ = f127_on_ui(weak, move |ui| {
+        if had_rows {
+            if let Some(rows) = F143_KEPT.with(|slot| slot.borrow_mut().take()) {
+                ui.set_masonry(rows);
+            }
+        }
+        ui.set_wheel_probe(0);
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    crate::debug_log("f143 fav done");
+}
+
+thread_local! {
+    /// The real 推荐流 model parked while the no-cover fixture is on screen.
+    static F143_FISH_KEPT: RefCell<Option<ModelRc<FishRow>>> = const { RefCell::new(None) };
+}
+
+/// `BILI_F143_TEST=fish`: open 养鱼, wait for the real covers, capture the
+/// rebuilt card, then swap in a no-cover fixture for the block fallback.
+fn maybe_start_f143_fish(weak: Weak<AppWindow>) {
+    let Ok(value) = std::env::var("BILI_F143_TEST") else {
+        return;
+    };
+    if value.trim().to_ascii_lowercase() != "fish" {
+        return;
+    }
+    let delay = std::env::var("BILI_F143_DELAY")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(12_000)
+        .clamp(1_000, 120_000);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay));
+        for _ in 0..120 {
+            if f143_on_ui(&weak, |ui| ui.get_logged_in()).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // The real page-open path: it refreshes FISH_SESSION and publishes the
+        // feed, which is what starts the one-shot cover fetches.
+        let _ = f143_on_ui(&weak, |ui| {
+            ui.set_fish_qa(true);
+            // The capture is the 推荐流 feed, not the tank/recipes tab the
+            // previous session may have left selected.
+            ui.set_fish_tab(0);
+            ui.invoke_fish_tab_changed(0);
+            ui.invoke_fish_open();
+        });
+        let mut rows = 0;
+        for _ in 0..60 {
+            rows = f143_on_ui(&weak, |ui| ui.get_fish_rows().row_count()).unwrap_or(0);
+            if rows > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        crate::debug_log(&format!("f143 fish rows_wait={rows}"));
+        // Covers are one-shot Low-priority netpool jobs; give them a full
+        // settle so the shot shows the real thumbnails, not a mid-flight mix.
+        std::thread::sleep(Duration::from_secs(12));
+        let log = f143_on_ui(&weak, |ui| {
+            let model = ui.get_fish_rows();
+            let mut covers = 0;
+            let mut blocks = 0;
+            for index in 0..model.row_count() {
+                if let Some(row) = model.row_data(index) {
+                    if row.cover.size().width > 0 {
+                        covers += 1;
+                    } else {
+                        blocks += 1;
+                    }
+                }
+            }
+            format!(
+                "f143 fish measure rows={} covers={covers} no_cover_blocks={blocks} card_w={:.1} card_h={:.1} gap_h={:.1} gap_v={:.1} pad={:.1} rail={:.1} thumb={:.1}x{:.1} fonts verdict={:.1} score={:.1} title={:.1} line={:.1} reason={:.1} footer={:.1}",
+                model.row_count(),
+                ui.get_qa_fish_card_w(),
+                ui.get_qa_fish_card_h(),
+                ui.get_qa_fish_card_gap(),
+                ui.get_qa_fish_card_gap_v(),
+                ui.get_qa_fish_pad(),
+                ui.get_qa_fish_rail(),
+                ui.get_qa_fish_thumb_w(),
+                ui.get_qa_fish_thumb_h(),
+                ui.get_qa_fish_font_verdict(),
+                ui.get_qa_fish_font_score(),
+                ui.get_qa_fish_font_title(),
+                ui.get_qa_fish_font_line(),
+                ui.get_qa_fish_font_reason(),
+                ui.get_qa_fish_font_footer()
+            )
+        })
+        .unwrap_or_default();
+        crate::debug_log(&log);
+        let _ = f143_on_ui(&weak, |ui| f143_capture(ui, "f143_fish_feed"));
+        // One deliberate no-cover row at the top, with real rows after it. The
+        // glyph comes from Rust, exactly like the production fallback block.
+        let _ = f143_on_ui(&weak, |ui| {
+            let model = ui.get_fish_rows();
+            let mut fixture: Vec<FishRow> = Vec::new();
+            if let Some(mut row) = model.row_data(0) {
+                row.cover = slint::Image::default();
+                row.up_name = SharedString::from("影视飓风");
+                row.up_glyph = SharedString::from("影");
+                row.title = SharedString::from("没有封面时，缩略图就是一块带首字的色块");
+                row.one_line = SharedString::from(
+                    "这条结论故意没有封面：卡片右侧仍是一块 96×54 的 tinted block，不是空孔。",
+                );
+                row.reason1 = SharedString::from("没有封面也先给结论，图片只是上下文");
+                row.reason2 = SharedString::from("UP 的首字就是缩略图的占位符");
+                row.tag_line = SharedString::from("#无封面 #占位");
+                fixture.push(row);
+            }
+            for index in 1..model.row_count().min(4) {
+                if let Some(row) = model.row_data(index) {
+                    fixture.push(row);
+                }
+            }
+            F143_FISH_KEPT.with(|slot| *slot.borrow_mut() = Some(model));
+            ui.set_fish_rows(ModelRc::from(std::rc::Rc::new(VecModel::from(fixture))));
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = f143_on_ui(&weak, |ui| f143_capture(ui, "f143_fish_feed_nocover"));
+        // Leave the page with its real model and no QA timer.
+        let _ = f143_on_ui(&weak, |ui| {
+            if let Some(model) = F143_FISH_KEPT.with(|slot| slot.borrow_mut().take()) {
+                ui.set_fish_rows(model);
+            }
+            ui.set_fish_qa(false);
+        });
+        crate::debug_log("f143 fish done");
+    });
+}
+
+/// Screen pixels only (no PrintWindow): used for the search morph, where asking
+/// the window to paint would let the 180 ms animation finish before the grab.
+fn f124_capture_screen(ui: &AppWindow, tag: &str) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        HGDIOBJ, SRCCOPY,
+    };
+    let Some(rect) = player_window_rect(&ui.window()) else {
+        crate::debug_log(&format!("f124 capture tag={tag} failed reason=no-rect"));
+        return;
+    };
+    // The grab reads the SCREEN, so lift our window above any neighbouring one
+    // for the frame (no activation, no focus change), then drop it back.
+    let hwnd = win::hwnd_of(&ui.window());
+    if let Some(hwnd) = hwnd {
+        unsafe {
+            SetWindowPos(
+                hwnd as HWND,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    let (w, h) = (rect.w, rect.h);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        if mem.is_null() || bmp.is_null() {
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return;
+        }
+        let old = SelectObject(mem, bmp as HGDIOBJ);
+        BitBlt(mem, 0, 0, w, h, screen, rect.x, rect.y, SRCCOPY);
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        let lines = GetDIBits(
+            mem,
+            bmp,
+            0,
+            h as u32,
+            rgba.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        SelectObject(mem, old);
+        DeleteObject(bmp as HGDIOBJ);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if lines == 0 {
+            return;
+        }
+    }
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 255;
+    }
+    if let Some(hwnd) = hwnd {
+        unsafe {
+            SetWindowPos(
+                hwnd as HWND,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+    let path = qa_capture_path(tag);
+    let Some(png) = image::RgbaImage::from_raw(w as u32, h as u32, rgba) else {
+        return;
+    };
+    match png.save(&path) {
+        Ok(()) => crate::debug_log(&format!(
+            "f124 capture tag={tag} path={} size={w}x{h} source=screen",
+            path.display()
+        )),
+        Err(err) => crate::debug_log(&format!("f124 capture tag={tag} err={err}")),
+    }
+}
+
+fn f124_wheel_steps(ui: &AppWindow, x: f32, y: f32) {
+    for _ in 0..3 {
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(x, y),
+                delta_x: 0.0,
+                delta_y: -40.0,
+            });
+    }
+}
+
+/// QA-only message rows: this account has no messages, so the design capture
+/// uses clearly-labelled sample rows (the real empty page is captured too).
+/// Everything about the row layout (76px, 40px avatar, type sizes) is the real
+/// component; only the strings are fixtures.
+/// One click through Slint's item tree (move, press, release). Used to prove
+/// the wheel overlay still lets a chip's own TouchArea take the click.
+fn f124_click(ui: &AppWindow, x: f32, y: f32) {
+    let position = slint::LogicalPosition::new(x, y);
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+}
+
+fn f124_msg_fixtures(ui: &AppWindow, sessions: bool) {
+    if sessions {
+        let rows: Vec<SessionRow> = [
+            ("示例用户 01", "今晚的直播推迟到九点，记得来看。", "2分钟前", "3"),
+            ("示例用户 02", "上次说的那套预设我整理好了，发你。", "1小时前", ""),
+            ("示例用户 03", "截图里的参数是 4.2 / 0.8 / 12，你试试。", "昨天", ""),
+            ("示例用户 04", "收到，明天下午对一下进度。", "3天前", ""),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, (name, preview, time, unread))| SessionRow {
+            talker_id: format!("{}", index + 1).into(),
+            name: (*name).into(),
+            avatar: Image::default(),
+            preview: (*preview).into(),
+            time: (*time).into(),
+            unread: (*unread).into(),
+        })
+        .collect();
+        ui.set_msg_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
+            Vec::<MsgRow>::new(),
+        ))));
+        ui.set_session_items(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
+        ui.set_msg_loading(false);
+        ui.set_msg_status("QA 示例会话".into());
+    } else {
+        let rows: Vec<MsgRow> = [
+            ("示例用户 01", "回复了你的评论", "这段的节奏我很喜欢，尤其是最后十秒。", "5分钟前", "2条"),
+            ("示例用户 02", "@了你", "这个思路是不是也能用在实拍里？", "20分钟前", ""),
+            ("示例用户 03", "赞了你的视频", "《从零开始的建模流程》", "1小时前", ""),
+            ("示例用户 04", "回复了你的评论", "收藏了，回头慢慢看。", "昨天", ""),
+            ("示例用户 05", "赞了你的评论", "同意，工具只是工具，最后还是看人。", "2天前", ""),
+        ]
+        .iter()
+        .map(|(nickname, title, detail, time, count)| MsgRow {
+            nickname: (*nickname).into(),
+            avatar: Image::default(),
+            title: (*title).into(),
+            detail: (*detail).into(),
+            time: (*time).into(),
+            count: (*count).into(),
+        })
+        .collect();
+        ui.set_msg_items(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
+        ui.set_session_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
+            Vec::<SessionRow>::new(),
+        ))));
+        ui.set_msg_loading(false);
+        ui.set_msg_status("QA 示例消息".into());
+    }
+    crate::debug_log(&format!(
+        "f124 msg fixture=1 mode={} notices={} sessions={}",
+        if sessions { "sessions" } else { "notices" },
+        ui.get_msg_items().row_count(),
+        ui.get_session_items().row_count()
+    ));
+}
+
+fn start_f124_pass(ui: AppWindow, store: Arc<Mutex<Option<[f32; 4]>>>) {
+    let weak = ui.as_weak();
+    let step = Rc::new(Cell::new(0i32));
+    let waited = Rc::new(Cell::new(0i32));
+    let opened_region = Rc::new(Cell::new(false));
+    let timer = Rc::new(slint::Timer::default());
+    keep_qa_timer(timer.clone());
+    let timer_a = timer.clone();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(250),
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                timer_a.stop();
+                return;
+            };
+            waited.set(waited.get() + 1);
+            let tick = waited.get();
+            match step.get() {
+                // ---- 0: the first feed is live -> open the first card's UP ----
+                0 => {
+                    if ui.get_feed_items().row_count() > 0 {
+                        crate::debug_log("f124 start feed_live=1");
+                        // Optional fixed creator for a stable design capture.
+                        let fixed = std::env::var("BILI_F124_UP_MID")
+                            .ok()
+                            .and_then(|value| value.trim().parse::<i64>().ok());
+                        if let Some(mid) = fixed {
+                            ui.invoke_open_up_mid(mid.to_string().into());
+                        } else {
+                            ui.invoke_open_up(0);
+                        }
+                        step.set(1);
+                        waited.set(0);
+                    } else if tick > 240 {
+                        crate::debug_log("f124 abort reason=feed-empty");
+                        timer_a.stop();
+                    }
+                }
+                // ---- 1: UP page: capture, measure, close ----
+                1 => {
+                    let up_items = ui.get_up_items();
+                let up_thumbs = (0..up_items.row_count())
+                        .filter(|index| {
+                            up_items
+                                .row_data(*index)
+                                .map(|row| row.thumb.size().width > 0)
+                                .unwrap_or(false)
+                        })
+                        .count();
+                let ready = ui.get_up_page_open()
+                        && !ui.get_up_loading()
+                        && up_items.row_count() > 0
+                        && (up_thumbs >= 6 || tick > 60);
+                    if ready {
+                        f124_capture(&ui, "f124_up");
+                        crate::debug_log(&format!(
+                            "f124 measure up hero_h={:.1} name={:?} items={} level={:?} sign_len={} follow={:?}",
+                            ui.get_qa_up_hero_h(),
+                            ui.get_up_name().to_string(),
+                            ui.get_up_items().row_count(),
+                            ui.get_up_level().to_string(),
+                            ui.get_up_sign().to_string().chars().count(),
+                            ui.get_up_follow_text().to_string(),
+                        ));
+                        ui.invoke_up_close();
+                        ui.invoke_nav_regions();
+                        step.set(2);
+                        waited.set(0);
+                    } else if tick > 240 {
+                        crate::debug_log(&format!(
+                            "f124 up timeout open={} loading={} rows={}",
+                            u8::from(ui.get_up_page_open()),
+                            u8::from(ui.get_up_loading()),
+                            ui.get_up_items().row_count()
+                        ));
+                        ui.invoke_up_close();
+                        ui.invoke_nav_regions();
+                        step.set(2);
+                        waited.set(0);
+                    }
+                }
+                // ---- 2: 分区: open 动画, let its cards land, capture ----
+                2 => {
+                    if ui.get_view_mode() == 8 && ui.get_region_labels().row_count() > 0 {
+                        if ui.get_region_items().row_count() == 0
+                            && !opened_region.get()
+                            && tick < 60
+                        {
+                            opened_region.set(true);
+                            ui.invoke_open_region(0);
+                        }
+                        let region_items = ui.get_region_items();
+                        let region_thumbs = (0..region_items.row_count())
+                            .filter(|index| {
+                                region_items
+                                    .row_data(*index)
+                                    .map(|row| row.thumb.size().width > 0)
+                                    .unwrap_or(false)
+                            })
+                            .count();
+                        if (region_items.row_count() > 0
+                            && !ui.get_list_refreshing()
+                            && tick >= 4
+                            && (region_thumbs >= 8 || tick > 20))
+                            || tick > 24
+                        {
+                            f124_capture(&ui, "f124_region");
+                            if let Ok(mut slot) = store.lock() {
+                                *slot = None;
+                            }
+                            ui.set_wheel_probe(1);
+                            step.set(3);
+                            waited.set(0);
+                        }
+                    } else if tick > 120 {
+                        crate::debug_log("f124 abort reason=region-not-live");
+                        timer_a.stop();
+                    }
+                }
+                // ---- 3: wheel over the 分区 strip's left padding ----
+                3 => {
+                    let rect = store.lock().ok().and_then(|slot| *slot);
+                    if let Some([x, y, w, h]) = rect {
+                        let before_off = ui.get_qa_region_offset();
+                        let before_scroll = ui.get_qa_region_scroll();
+                        let (px, py) = (x + 2.0, y + h / 2.0);
+                        f124_wheel_steps(&ui, px, py);
+                        crate::debug_log(&format!(
+                            "f124 wheel strip=region point={px:.1},{py:.1} rect={x:.1},{y:.1},{w:.1}x{h:.1} offset_before={before_off:.1} offset_after={:.1} page_before={before_scroll:.1} page_after={:.1}",
+                            ui.get_qa_region_offset(),
+                            ui.get_qa_region_scroll(),
+                        ));
+                        // The overlay must not eat clicks: chip 2 is at
+                        // inset(6) + chip(64) + gap(6) + 32 = 108.
+                        let index_before = ui.get_region_index();
+                        f124_click(&ui, x + 108.0, py);
+                        crate::debug_log(&format!(
+                            "f124 click strip=region at={:.1},{py:.1} index_before={index_before} index_after={}",
+                            x + 108.0,
+                            ui.get_region_index()
+                        ));
+                        ui.set_wheel_probe(0);
+                        ui.set_home_tab(5);
+                        ui.set_view_mode(0);
+                        ui.invoke_home_section(5);
+                        step.set(4);
+                        waited.set(0);
+                    } else if tick > 40 {
+                        crate::debug_log("f124 wheel strip=region skipped reason=no-rect");
+                        ui.set_wheel_probe(0);
+                        ui.set_home_tab(5);
+                        ui.set_view_mode(0);
+                        ui.invoke_home_section(5);
+                        step.set(4);
+                        waited.set(0);
+                    }
+                }
+                // ---- 4: 收藏推荐 folder strip ----
+                4 => {
+                    let favs = ui.get_fav_tabs().row_count();
+                    if ui.get_home_tab() == 5 && favs > 0 {
+                        if let Ok(mut slot) = store.lock() {
+                            *slot = None;
+                        }
+                        ui.set_wheel_probe(2);
+                        step.set(5);
+                        waited.set(0);
+                    } else if ui.get_home_tab() == 5 && tick > 80 {
+                        f124_capture(&ui, "f124_fav_tabs");
+                        crate::debug_log(&format!(
+                            "f124 wheel strip=fav skipped reason=no-folders favs={favs}"
+                        ));
+                        ui.invoke_nav_messages();
+                        step.set(7);
+                        waited.set(0);
+                    } else if tick > 160 {
+                        crate::debug_log("f124 abort reason=fav-page-not-live");
+                        timer_a.stop();
+                    }
+                }
+                // ---- 5: wheel over the 收藏 folder strip's left padding ----
+                5 => {
+                    let rect = store.lock().ok().and_then(|slot| *slot);
+                    if let Some([x, y, w, h]) = rect {
+                        let before_off = ui.get_qa_fav_offset();
+                        let before_scroll = ui.get_qa_fav_scroll();
+                        let (px, py) = (x + 2.0, y + h / 2.0);
+                        f124_wheel_steps(&ui, px, py);
+                        crate::debug_log(&format!(
+                            "f124 wheel strip=fav point={px:.1},{py:.1} rect={x:.1},{y:.1},{w:.1}x{h:.1} offset_before={before_off:.1} offset_after={:.1} page_before={before_scroll:.1} page_after={:.1}",
+                            ui.get_qa_fav_offset(),
+                            ui.get_qa_fav_scroll(),
+                        ));
+                        ui.set_wheel_probe(0);
+                        step.set(6);
+                        waited.set(0);
+                    } else if tick > 40 {
+                        crate::debug_log("f124 wheel strip=fav skipped reason=no-rect");
+                        ui.set_wheel_probe(0);
+                        step.set(6);
+                        waited.set(0);
+                    }
+                }
+                // ---- 6: let the fav covers land, then capture the tabs ----
+                6 => {
+                    if tick >= 12 {
+                        f124_capture(&ui, "f124_fav_tabs");
+                        ui.invoke_nav_messages();
+                        step.set(7);
+                        waited.set(0);
+                    }
+                }
+                // ---- 7: 消息: the real (empty) page, then the row fixture ----
+                7 => {
+                    let rows = ui.get_msg_items().row_count() + ui.get_session_items().row_count();
+                    if ui.get_view_mode() == 14 && (!ui.get_msg_loading() || rows > 0) {
+                        f124_capture(&ui, "f124_msg_real");
+                        crate::debug_log(&format!(
+                            "f124 measure msg row_h={:.1} notices={} sessions={} tab={} status={:?}",
+                            ui.get_qa_msg_row_h(),
+                            ui.get_msg_items().row_count(),
+                            ui.get_session_items().row_count(),
+                            ui.get_msg_tab(),
+                            ui.get_msg_status().to_string(),
+                        ));
+                        f124_msg_fixtures(&ui, false);
+                        step.set(8);
+                        waited.set(0);
+                    } else if tick > 120 {
+                        crate::debug_log("f124 abort reason=msg-page-not-live");
+                        timer_a.stop();
+                    }
+                }
+                8 => {
+                    if tick >= 2 {
+                        f124_capture(&ui, "f124_msg");
+                        ui.invoke_msg_tab_changed(3);
+                        step.set(9);
+                        waited.set(0);
+                    }
+                }
+                9 => {
+                    if tick >= 8 {
+                        f124_msg_fixtures(&ui, true);
+                        step.set(10);
+                        waited.set(0);
+                    }
+                }
+                10 => {
+                    if tick >= 2 {
+                        f124_capture(&ui, "f124_msg_private");
+                        ui.invoke_do_search(SharedString::from("bilibili"));
+                        step.set(11);
+                        waited.set(0);
+                    }
+                }
+                // ---- 11: 热搜 strip: capture and arm ----
+                11 => {
+                    if ui.get_view_mode() == 1 && ui.get_hot_items().row_count() > 0 {
+                        f124_capture(&ui, "f124_search_page");
+                        if let Ok(mut slot) = store.lock() {
+                            *slot = None;
+                        }
+                        ui.set_wheel_probe(3);
+                        step.set(12);
+                        waited.set(0);
+                    } else if tick > 120 {
+                        crate::debug_log("f124 abort reason=search-not-live");
+                        timer_a.stop();
+                    }
+                }
+                // ---- 12: wheel over the 热搜 strip's left padding ----
+                12 => {
+                    let rect = store.lock().ok().and_then(|slot| *slot);
+                    if let Some([x, y, w, h]) = rect {
+                        let before_off = ui.get_qa_hot_offset();
+                        let before_scroll = ui.get_qa_hot_scroll();
+                        let (px, py) = (x + 2.0, y + h / 2.0);
+                        f124_wheel_steps(&ui, px, py);
+                        crate::debug_log(&format!(
+                            "f124 wheel strip=hot point={px:.1},{py:.1} rect={x:.1},{y:.1},{w:.1}x{h:.1} offset_before={before_off:.1} offset_after={:.1} page_before={before_scroll:.1} page_after={:.1}",
+                            ui.get_qa_hot_offset(),
+                            ui.get_qa_hot_scroll(),
+                        ));
+                        ui.set_wheel_probe(0);
+                        ui.set_search_text(SharedString::from(""));
+                        ui.set_search_open(false);
+                        step.set(13);
+                        waited.set(0);
+                    } else if tick > 40 {
+                        crate::debug_log("f124 wheel strip=hot skipped reason=no-rect");
+                        ui.set_wheel_probe(0);
+                        ui.set_search_text(SharedString::from(""));
+                        ui.set_search_open(false);
+                        step.set(13);
+                        waited.set(0);
+                    }
+                }
+                // ---- 13: gear metrics, then the morph frames ----
+                13 => {
+                    if tick >= 3 {
+                        f124_capture(&ui, "f124_gear");
+                        let gear_x = ui.get_qa_gear_x();
+                        let name_end = ui.get_qa_name_end();
+                        crate::debug_log(&format!(
+                            "f124 measure gear gear_x={gear_x:.1} name_end={name_end:.1} gap={:.1}",
+                            gear_x - name_end,
+                        ));
+                        ui.set_search_open(true);
+                        let cap_a = weak.clone();
+                        slint::Timer::single_shot(Duration::from_millis(25), move || {
+                            if let Some(ui) = cap_a.upgrade() {
+                                f124_capture_screen(&ui, "f124_search_morph");
+                            }
+                        });
+                        let cap_b = weak.clone();
+                        slint::Timer::single_shot(Duration::from_millis(110), move || {
+                            if let Some(ui) = cap_b.upgrade() {
+                                f124_capture_screen(&ui, "f124_search_morph_110");
+                            }
+                        });
+                        step.set(14);
+                        waited.set(0);
+                    }
+                }
+                // ---- 14: empty field settled: centre check, then typed ----
+                14 => {
+                    if tick >= 4 {
+                        f124_capture(&ui, "f124_search_empty");
+                        let icon_cy = ui.get_qa_search_icon_cy();
+                        let field_cy = ui.get_qa_search_field_cy();
+                        crate::debug_log(&format!(
+                            "f124 measure search state=empty icon_cy={icon_cy:.2} field_cy={field_cy:.2} delta={:.2} open={}",
+                            icon_cy - field_cy,
+                            u8::from(ui.get_search_open()),
+                        ));
+                        ui.set_search_text(SharedString::from("bilibili"));
+                        step.set(15);
+                        waited.set(0);
+                    }
+                }
+                15 => {
+                    if tick >= 3 {
+                        f124_capture(&ui, "f124_search_typed");
+                        let icon_cy = ui.get_qa_search_icon_cy();
+                        let field_cy = ui.get_qa_search_field_cy();
+                        crate::debug_log(&format!(
+                            "f124 measure search state=typed icon_cy={icon_cy:.2} field_cy={field_cy:.2} delta={:.2} text={:?}",
+                            icon_cy - field_cy,
+                            ui.get_search_text().to_string(),
+                        ));
+                        timer_a.stop();
+                    }
+                }
+                _ => {
+                    timer_a.stop();
+                }
+            }
+        },
+    );
+}
+
+fn home_bar_rect(ui: &AppWindow) -> (f32, f32, f32, f32) {
+    let size = ui.window().size();
+    let w = ui.get_home_bar_w();
+    let x = (size.width as f32 - w) / 2.0;
+    let y = size.height as f32 - 56.0 - 28.0;
+    (x, y, w, 56.0)
+}
+
+/// Log one reading of the search field's live rect (bar-local x/width plus the
+/// window-space x/right, so the table is readable against the window).
+///
+/// The values come from `HomeBar`'s published `morph` geometry, i.e. the
+/// animation's actual rect at the instant of the call.
+fn log_search_field(ui: &AppWindow, label: &str, start: Instant) {
+    let x = ui.get_qa_search_field_x();
+    let width = ui.get_qa_search_field_w();
+    let bar_w = ui.get_home_bar_w();
+    let window_w = ui.window().size().width as f32;
+    let bar_x = (window_w - bar_w) / 2.0;
+    crate::debug_log(&format!(
+        "f133 search state={label} t_ms={} field_x={x:.2} field_w={width:.2} window_x={:.2} window_right={:.2} bar_x={bar_x:.2} bar_w={bar_w:.2} window_w={window_w:.2} open={}",
+        start.elapsed().as_millis(),
+        bar_x + x,
+        bar_x + x + width,
+        u8::from(ui.get_search_open()),
+    ));
+}
+
+/// Where a QA capture lands: `BILI_CAPTURE_DIR`, else `<cwd>/target/qa`.
+fn qa_capture_path(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::var_os("BILI_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target").join("qa"));
+    dir.join(format!("{tag}.png"))
+}
+
+/// Copy a logical-pixel patch out of a live window as RGBA (the QA colour
+/// probes): `window_rgba` is physical, so the rect is scaled by the window's own
+/// factor. Returns `None` when any part falls outside the window.
+fn window_patch(window: &slint::Window, x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+    let (width, height, rgba) = window_rgba(window)?;
+    let scale = f64::from(window.scale_factor().max(0.2));
+    let px = ((x as f64) * scale).round() as i32;
+    let py = ((y as f64) * scale).round() as i32;
+    let pw = ((w as f64) * scale).round() as i32;
+    let ph = ((h as f64) * scale).round() as i32;
+    if px < 0 || py < 0 || px + pw > width || py + ph > height {
+        return None;
+    }
+    let mut patch = Vec::with_capacity((pw * ph * 4) as usize);
+    for row in py..py + ph {
+        let start = ((row * width + px) * 4) as usize;
+        patch.extend_from_slice(&rgba[start..start + (pw * 4) as usize]);
+    }
+    Some(patch)
+}
+
+/// Max / mean per-channel absolute difference between two same-sized RGBA
+/// patches, in 8-bit steps. `None` if the sizes differ.
+fn patch_diff(a: &[u8], b: &[u8]) -> Option<(u8, f64)> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut max = 0u8;
+    let mut sum = 0u64;
+    for (left, right) in a.iter().zip(b.iter()) {
+        let delta = left.abs_diff(*right);
+        max = max.max(delta);
+        sum += u64::from(delta);
+    }
+    Some((max, sum as f64 / a.len() as f64))
+}
+
+/// The live window's pixels as RGBA8888, top-down.
+fn window_rgba(window: &slint::Window) -> Option<(i32, i32, Vec<u8>)> {
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
@@ -9820,28 +13436,10 @@ fn capture_player_png(
         px.swap(0, 2);
         px[3] = 255;
     }
-    let path = std::env::temp_dir().join(format!(
-        "bili_panel_test_{tag}_{}x{}.png",
-        w, h
-    ));
-    let png = image::RgbaImage::from_raw(w as u32, h as u32, rgba)?;
-    match png.save(&path) {
-        Ok(()) => {
-            crate::debug_log(&format!(
-                "paneltest png tag={tag} path={} size={w}x{h}",
-                path.display()
-            ));
-            Some((w as u32, h as u32))
-        }
-        Err(err) => {
-            crate::debug_log(&format!("paneltest png tag={tag} err={err}"));
-            None
-        }
-    }
+    Some((w, h, rgba))
 }
 
-fn panel_test_spec() -> Option<(i32, i32, i32, u64)> {
-    let raw = std::env::var("BILI_PANEL_TEST").ok()?;
+fn panel_test_spec() -> Option<(i32, i32, i32, u64)> {    let raw = std::env::var("BILI_PANEL_TEST").ok()?;
     let mut parts = raw.split(',');
     let left = parts.next()?.trim().parse::<i32>().ok()?;
     let right = parts.next()?.trim().parse::<i32>().ok()?;
@@ -9973,9 +13571,10 @@ const NET_TRACE_MS: i64 = 3000;
 /// Cells in 下载分布: the whole file in 1/120th slices.
 const NET_MAP_SLICES: usize = 120;
 /// Slice states, strongest last: a cell shows the strongest state it contains.
+/// Downloaded bytes (state 1) are immediately playable and include the point
+/// cache, so there is no separate "warm point" state.
 const NET_MAP_MISSING: i32 = 0;
 const NET_MAP_HELD: i32 = 1;
-const NET_MAP_POINT: i32 = 2;
 const NET_MAP_ACTIVE: i32 = 3;
 /// Connection rows the panel lists (the proxy may run more; Rust trims).
 const NET_WORKER_ROWS: usize = 8;
@@ -10037,7 +13636,9 @@ fn trim_host(host: &str) -> &str {
 }
 
 /// 120 equal slices over the whole file, strongest state wins: an active
-/// claim (3) beats a warm point cache range (2), which beats a held range (1).
+/// claim (3) beats downloaded bytes (1). Downloaded bytes are immediately
+/// playable - the point cache is downloaded data too, not a different category
+/// - so both `downloaded` and `point_cache` mark the same state.
 /// `None`, or a file whose length is not known yet, is all missing.
 fn net_map_slices(stats: Option<&prefetch::PrefetchStats>) -> Vec<i32> {
     let mut slices = vec![NET_MAP_MISSING; NET_MAP_SLICES];
@@ -10063,7 +13664,7 @@ fn net_map_slices(stats: Option<&prefetch::PrefetchStats>) -> Vec<i32> {
         }
     };
     mark(&stats.downloaded, NET_MAP_HELD);
-    mark(&stats.point_cache, NET_MAP_POINT);
+    mark(&stats.point_cache, NET_MAP_HELD);
     let active: Vec<(u64, u64)> = stats
         .workers
         .iter()
@@ -10348,27 +13949,125 @@ fn trace_buffer_state(
     ));
 }
 
+/// One row of the published 画质 menu plus the stream it resolves to.
+///
+/// `spec: None` marks a locked 大会员 tier: it has no catalogue entry, so a
+/// `quality_pick` on that row must not reach `set_quality_exact`.
+struct QualityMenuItem {
+    row: QualityMenuRow,
+    spec: Option<usize>,
+}
+
+/// Merge the player's playable stream catalogue with the tiers the video
+/// advertises but this account cannot play.
+///
+/// The player's `quality_specs` list is one row per DASH stream (1080P as AVC /
+/// HEVC / AV1, …). `tiers` is the API's `accept_quality` list, where a `qn`
+/// with no returned stream is a 大会员-only tier. Rows are ordered high→low by
+/// `qn`; the sort is stable, so the catalogue's own bandwidth order is kept
+/// inside a tier. A tier that already has stream rows never gets a second,
+/// locked row.
+fn build_quality_menu(
+    specs: &[player::QualitySpec],
+    tiers: &[bilibili::QualityTier],
+    current: Option<(i64, i64, u64)>,
+) -> Vec<QualityMenuItem> {
+    let mut items: Vec<QualityMenuItem> = specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| QualityMenuItem {
+            row: QualityMenuRow {
+                label: spec.label.clone().into(),
+                detail: spec.detail.clone().into(),
+                badge: spec.badge.clone().into(),
+                current: current == Some((spec.qn, spec.codecid, spec.bandwidth)),
+                locked: false,
+                qn: spec.qn as i32,
+            },
+            spec: Some(index),
+        })
+        .collect();
+    for tier in tiers.iter().filter(|tier| tier.locked) {
+        if specs.iter().any(|spec| spec.qn == tier.qn) {
+            continue;
+        }
+        items.push(QualityMenuItem {
+            row: QualityMenuRow {
+                label: tier.label.clone().into(),
+                detail: tier.detail.clone().into(),
+                badge: "大会员".into(),
+                current: false,
+                locked: true,
+                qn: tier.qn as i32,
+            },
+            spec: None,
+        });
+    }
+    items.sort_by(|left, right| right.row.qn.cmp(&left.row.qn));
+    items
+}
+
+/// The once-per-open gate for the locked-tier toast.
+///
+/// A locked row is not selectable, so a click does not close the 画质 menu and
+/// the same row can be hit several times in one open. The explanation is shown
+/// at most once per open; every fresh open re-arms it, so the next attempt
+/// after reopening the menu explains itself again.
+#[derive(Default)]
+struct LockedNotice {
+    shown: bool,
+}
+
+impl LockedNotice {
+    /// A fresh 画质 menu open: the next locked pick may show the toast.
+    fn opened(&mut self) {
+        self.shown = false;
+    }
+
+    /// True exactly once per open.
+    fn take(&mut self) -> bool {
+        !std::mem::replace(&mut self.shown, true)
+    }
+}
+
 /// Re-publish the 画质 menu so `current` follows the decoder.
 ///
 /// `specs` is the catalogue `player::run` installed from `PlayInfo::qualities`
-/// (one entry per raw DASH stream, in the same order the menu rows went out),
-/// so the row index is exactly what `quality_pick(index)` reports back.
-fn publish_quality_rows(
+/// (one entry per raw DASH stream), and `tiers` is the full advertised tier
+/// list from the same `playurl` response. The published row index is what
+/// `quality_pick(index)` reports back; [`build_quality_menu`] is the only
+/// mapping, so a locked row can never resolve to a stream.
+fn publish_quality_menu(
     window: &PlayerWindow,
     specs: &[player::QualitySpec],
+    tiers: &[bilibili::QualityTier],
     current: Option<(i64, i64, u64)>,
 ) {
-    let rows = player::quality_rows(specs, current);
-    let marked = rows
+    let items = build_quality_menu(specs, tiers, current);
+    let locked = items.iter().filter(|item| item.row.locked).count();
+    let marked = items
         .iter()
-        .find(|row| row.current)
-        .map(|row| row.label.to_string())
+        .find(|item| item.row.current)
+        .map(|item| item.row.label.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let list = items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{}{}",
+                item.row.qn,
+                item.row.label,
+                if item.row.locked { "[lock]" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let rows: Vec<QualityMenuRow> = items.into_iter().map(|item| item.row).collect();
     crate::debug_log(&format!(
-        "quality rows published n={} current={marked}",
+        "quality rows n={} locked={locked} current={marked} list={list}",
         rows.len()
     ));
-    window.set_quality_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    window.set_quality_menu_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
 /// The stream the automatic rule selects for `qn`.
@@ -10475,6 +14174,838 @@ fn gpu_utilization_text() -> String {
     }
 }
 
+// ===================== 弹幕 motion lane (fast tick) =====================
+//
+// The player used to have a single 33 ms timer whose handler did everything:
+// toasts, the 画质 menu, interp stats, the playlist, panel geometry, the
+// buffering overlay, the profiler text and the danmaku walk. Asking that body
+// for 120 Hz would have made the app slower, not smoother, so the timer is now
+// split:
+//
+//   * `danmaku_tick` (33 ms, unchanged) keeps every non-motion job and, once per
+//     tick, publishes the visible comment set plus the media-clock anchor.
+//   * `danmaku_frame_tick` (`danmaku_frame_interval`, at most 8 ms) owns only the
+//     motion of the comments already on screen. It takes no lock (a `RefCell`
+//     on the UI thread), allocates nothing, formats nothing and reads no clock
+//     but `Instant`: per comment it is one multiply, one rounding and - only
+//     when the whole pixel changed - one model row write.
+//
+// Motion is time-based, never accumulated: the media time drawn at a frame is
+// `anchor_position + (now - anchor_instant)`, and the anchor is refreshed by the
+// slow tick from the real playback position. A late or missed frame therefore
+// cannot drift; the only limit is [`DANMAKU_FRAME_MAX_STEP_MS`] per frame, so a
+// 200 ms stall moves the comments 100 ms and catches up over the next frame
+// instead of teleporting them across the picture.
+
+/// Media-time step a single fast frame may advance. A stall can cost the
+/// comments at most this much travel in one frame; the media clock is absolute,
+/// so the next frames continue from where the track actually is.
+const DANMAKU_FRAME_MAX_STEP_MS: f32 = 100.0;
+/// A slow tick further than this from the media time on screen is a seek or a
+/// new track, not a stall: re-anchor there instead of crawling.
+const DANMAKU_FRAME_RESYNC_MS: f32 = 300.0;
+/// The engine's logical space (`player.rs` VIDEO_W) and its baseline scroll
+/// duration (`SCROLL_MS`). Duplicated on purpose: the fast lane extrapolates the
+/// engine's motion and `danmaku_lane_tests` pins the two together.
+const DANMAKU_VIDEO_W: f32 = 960.0;
+const DANMAKU_SCROLL_MS: f32 = 8_000.0;
+
+/// Budget valve: one window is 2 s of fast ticks, an average above 2.5 ms per
+/// tick is too much for the UI thread, and three bad windows in a row drop the
+/// lane to 60 Hz.
+const DANMAKU_BUDGET_WINDOW: Duration = Duration::from_secs(2);
+const DANMAKU_BUDGET_US: u64 = 2_500;
+const DANMAKU_BUDGET_WINDOWS: u8 = 3;
+/// Inter-tick gaps kept for the QA histogram (fixed size, ~34 s at 120 Hz).
+const DANMAKU_GAP_SLOTS: usize = 4_096;
+/// The QA stall: a single 200 ms sleep on the UI thread.
+const DANMAKU_STALL_MS: u64 = 200;
+
+/// Media milliseconds between two fast frames at `hz`.
+fn danmaku_frame_interval_ms(hz: u32) -> f32 {
+    1_000.0 / hz.clamp(30, 120) as f32
+}
+
+/// The interval handed to the Slint `Timer`.
+///
+/// Slint stores a `duration` as whole milliseconds (the generated code calls
+/// `Duration::from_millis`), so 120 Hz - 8.333 ms - can only wake every 8 ms.
+/// The exact-rate gate in [`DanmakuLayer::frame_tick`] drops that surplus wake
+/// instead of letting the lane run 4 % fast.
+fn danmaku_wake_ms(hz: u32) -> i64 {
+    (1_000 / i64::from(hz.clamp(30, 120))).max(1)
+}
+
+/// The display's refresh rate, detected once.
+///
+/// The active display mode answers first (`EnumDisplaySettingsW`), the screen DC
+/// second (`GetDeviceCaps(VREFRESH)`), and 60 is the floor: a driver that
+/// reports 0/1 for "hardware default" must not turn into "no frames".
+fn display_refresh_hz() -> u32 {
+    static REFRESH: OnceLock<u32> = OnceLock::new();
+    *REFRESH.get_or_init(|| {
+        use windows_sys::Win32::Graphics::Gdi::{
+            EnumDisplaySettingsW, GetDC, GetDeviceCaps, ReleaseDC, DEVMODEW, ENUM_CURRENT_SETTINGS,
+            VREFRESH,
+        };
+        let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+        mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        let mut hz = 0u32;
+        let mut source = "fallback";
+        let read = unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut mode) };
+        if read != 0 && mode.dmDisplayFrequency > 1 {
+            hz = mode.dmDisplayFrequency as u32;
+            source = "EnumDisplaySettings";
+        }
+        if hz == 0 {
+            let dc = unsafe { GetDC(std::ptr::null_mut()) };
+            if !dc.is_null() {
+                let caps = unsafe { GetDeviceCaps(dc, VREFRESH as i32) };
+                unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
+                if caps > 1 {
+                    hz = caps as u32;
+                    source = "GetDeviceCaps";
+                }
+            }
+        }
+        if hz == 0 {
+            hz = 60;
+        }
+        crate::debug_log(&format!(
+            "danmaku frame display refresh_hz={hz} source={source}"
+        ));
+        hz
+    })
+}
+
+/// The fast lane's rate: `BILI_DANMAKU_HZ` verbatim (30/60/120, the A/B), else
+/// `min(120, display)` so a 144 Hz panel runs 120 and a 60 Hz panel is never
+/// asked for frames it cannot show.
+fn danmaku_frame_hz(display_hz: u32) -> (u32, &'static str) {
+    let raw = std::env::var("BILI_DANMAKU_HZ").ok();
+    danmaku_frame_hz_for(display_hz, raw.as_deref())
+}
+
+/// [`danmaku_frame_hz`] with the environment passed in, for the self-test.
+fn danmaku_frame_hz_for(display_hz: u32, env: Option<&str>) -> (u32, &'static str) {
+    if let Some(raw) = env {
+        match raw.trim().parse::<u32>() {
+            Ok(value) if matches!(value, 30 | 60 | 120) => return (value, "env"),
+            Ok(value) => crate::debug_log(&format!(
+                "danmaku hz env ignored value={value} allowed=30,60,120"
+            )),
+            Err(_) => {}
+        }
+    }
+    (display_hz.clamp(30, 120), "display")
+}
+
+/// One budget window's verdict.
+struct BudgetWindow {
+    avg_us: u64,
+    /// Three consecutive over-budget windows: drop the lane.
+    drop: bool,
+}
+
+/// The 2 s / 2.5 ms valve around the fast tick's own cost.
+///
+/// Pure state machine, so the QA self-test drives exactly what the player runs.
+struct BudgetGuard {
+    window_start: Instant,
+    ticks: u32,
+    micros: u64,
+    bad: u8,
+    dropped: bool,
+}
+
+impl BudgetGuard {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            ticks: 0,
+            micros: 0,
+            bad: 0,
+            dropped: false,
+        }
+    }
+
+    /// Feed one measured tick. `Some` at the end of every window.
+    fn sample(&mut self, now: Instant, cost_us: u64) -> Option<BudgetWindow> {
+        if self.ticks == 0
+            && now.saturating_duration_since(self.window_start) >= DANMAKU_BUDGET_WINDOW
+        {
+            // The lane sat idle for a whole window (no player yet, or frozen):
+            // there is no average to judge, so the window restarts here instead
+            // of reporting a single tick as if it were the steady state.
+            self.window_start = now;
+            self.ticks = 1;
+            self.micros = cost_us;
+            return None;
+        }
+        self.ticks += 1;
+        self.micros += cost_us;
+        if now.saturating_duration_since(self.window_start) < DANMAKU_BUDGET_WINDOW {
+            return None;
+        }
+        let avg_us = if self.ticks == 0 {
+            0
+        } else {
+            self.micros / u64::from(self.ticks)
+        };
+        let mut drop = false;
+        if avg_us > DANMAKU_BUDGET_US {
+            self.bad = self.bad.saturating_add(1);
+            if self.bad >= DANMAKU_BUDGET_WINDOWS && !self.dropped {
+                self.dropped = true;
+                drop = true;
+            }
+        } else {
+            self.bad = 0;
+        }
+        self.window_start = now;
+        self.ticks = 0;
+        self.micros = 0;
+        Some(BudgetWindow { avg_us, drop })
+    }
+}
+
+/// One on-screen comment in the fast lane: the row exactly as it sits in the
+/// Slint model (`item`) plus the two numbers that move it.
+///
+/// `base_x` is the engine's x for media time `t0_ms`, so a 滚动 comment is at
+/// `base_x - speed * (t - t0_ms)` at any later time. `speed` is 0 for a
+/// 顶部/底部 comment, which never moves.
+struct FrameRow {
+    item: DanmakuItem,
+    base_x: f32,
+    t0_ms: f32,
+    speed: f32,
+}
+
+/// What one publish changed, for the once-a-second `danmaku diff` log line.
+struct FrameDiff {
+    updated: usize,
+    inserted: usize,
+    removed: usize,
+    visible: usize,
+}
+
+/// px per ms a scrolling comment travels, from the engine's own formula
+/// (`(VIDEO_W + width) / (SCROLL_MS * 100 / speed_percent)`).
+fn danmaku_scroll_speed(width: f32, speed_percent: u32) -> f32 {
+    (DANMAKU_VIDEO_W + width) * speed_percent.clamp(50, 200) as f32 / (DANMAKU_SCROLL_MS * 100.0)
+}
+
+/// Whether an x is where a 顶部/底部 comment is drawn: dead centre.
+fn danmaku_is_centred(x: f32, width: f32) -> bool {
+    (x - (DANMAKU_VIDEO_W - width) / 2.0).abs() < 0.5
+}
+
+/// One `BILI_F139_TEST` run's counters. Every field is a counter or a fixed-size
+/// ring: starting a run allocates once and the fast tick only overwrites.
+struct FrameQa {
+    started: Instant,
+    cpu_start: Option<Duration>,
+    ticks: u64,
+    micros: u64,
+    /// Timer wakes dropped by the exact-rate gate (the 8 ms wake vs 8.33 ms
+    /// interval surplus).
+    gates: u64,
+    /// Inter-tick gaps above 1.5x the target interval.
+    late: u64,
+    /// ... and above 2.5x: a frame that was really skipped.
+    missed: u64,
+    /// Rows whose x this lane rewrote, so the report can show the lane is
+    /// actually moving comments instead of idling.
+    moved: u64,
+    gaps_us: Vec<u32>,
+    gap_at: usize,
+    last: Option<Instant>,
+}
+
+impl FrameQa {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            cpu_start: thread_cpu_time(),
+            ticks: 0,
+            micros: 0,
+            gates: 0,
+            late: 0,
+            missed: 0,
+            moved: 0,
+            gaps_us: vec![0; DANMAKU_GAP_SLOTS],
+            gap_at: 0,
+            last: None,
+        }
+    }
+
+    /// Record one executed tick. No allocation: the ring overwrites.
+    fn sample(&mut self, now: Instant, cost_us: u64, interval_ms: f32, moved: usize) {
+        self.ticks += 1;
+        self.micros += cost_us;
+        self.moved += moved as u64;
+        if let Some(last) = self.last {
+            let gap_us = now.saturating_duration_since(last).as_micros() as u32;
+            let target_us = interval_ms * 1_000.0;
+            if gap_us as f32 > target_us * 2.5 {
+                self.missed += 1;
+            } else if gap_us as f32 > target_us * 1.5 {
+                self.late += 1;
+            }
+            self.gaps_us[self.gap_at] = gap_us;
+            self.gap_at = (self.gap_at + 1) % self.gaps_us.len();
+        }
+        self.last = Some(now);
+    }
+
+    fn percentile(&self, percent: f32) -> u32 {
+        let mut gaps: Vec<u32> = self.gaps_us.iter().copied().filter(|gap| *gap > 0).collect();
+        if gaps.is_empty() {
+            return 0;
+        }
+        gaps.sort_unstable();
+        let index = ((gaps.len() - 1) as f32 * percent / 100.0).round() as usize;
+        gaps[index.min(gaps.len() - 1)]
+    }
+
+    fn wall(&self, now: Instant) -> f32 {
+        now.saturating_duration_since(self.started).as_secs_f32()
+    }
+}
+
+/// The one-shot QA stall probe.
+struct StallProbe {
+    due: Instant,
+    slept: bool,
+    /// Frames still to log after the stall, so the catch-up is visible.
+    follow: u8,
+}
+
+/// The danmaku layer's fast half: the Slint model, the on-screen rows and the
+/// motion clock. One per player window, UI thread only.
+struct DanmakuLayer {
+    window: Weak<PlayerWindow>,
+    model: Rc<VecModel<DanmakuItem>>,
+    inner: RefCell<LayerInner>,
+}
+
+struct LayerInner {
+    rows: Vec<FrameRow>,
+    /// Media time (ms) and the monotonic instant the slow tick sampled it at.
+    anchor: Option<(f32, Instant)>,
+    /// Media time the comments are currently drawn at.
+    t_ms: f32,
+    /// Earliest instant the next fast frame may run (the exact-rate gate).
+    due: Option<Instant>,
+    /// Set while nothing may move: paused, buffering or 弹幕 off.
+    frozen: bool,
+    hz: u32,
+    interval_ms: f32,
+    speed_percent: u32,
+    /// Media position of the previous publish, so a frozen clock is not read as
+    /// "the comment did not move" when classifying 顶部/底部 rows.
+    last_publish_ms: f32,
+    /// QA only (`BILI_F139_SLOW_MS`): make every fast tick cost this many
+    /// milliseconds, so the budget valve can be exercised end to end.
+    slow_ms: u64,
+    budget: BudgetGuard,
+    qa: Option<FrameQa>,
+    stall: Option<StallProbe>,
+}
+
+impl DanmakuLayer {
+    fn new(window: Weak<PlayerWindow>, model: Rc<VecModel<DanmakuItem>>, hz: u32) -> Self {
+        Self {
+            window,
+            model,
+            inner: RefCell::new(LayerInner {
+                rows: Vec::new(),
+                anchor: None,
+                t_ms: 0.0,
+                due: None,
+                frozen: true,
+                hz,
+                interval_ms: danmaku_frame_interval_ms(hz),
+                speed_percent: 100,
+                last_publish_ms: -1.0,
+                slow_ms: 0,
+                budget: BudgetGuard::new(Instant::now()),
+                qa: None,
+                stall: None,
+            }),
+        }
+    }
+
+    /// Stop the motion clock while paused / buffering / 弹幕 off. The next
+    /// publish unfreezes it with a fresh anchor.
+    fn freeze(&self) {
+        self.inner.borrow_mut().frozen = true;
+    }
+
+    fn hz(&self) -> u32 {
+        self.inner.borrow().hz
+    }
+
+    /// Push a new rate to the timer and restart the gate schedule.
+    fn apply_hz(&self, hz: u32) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.hz = hz;
+            inner.interval_ms = danmaku_frame_interval_ms(hz);
+            inner.due = None;
+        }
+        if let Some(window) = self.window.upgrade() {
+            window.set_danmaku_frame_interval(danmaku_wake_ms(hz));
+        }
+    }
+
+    /// The slow tick's half: reconcile the model with a fresh
+    /// `track.compute()` result and re-anchor the motion clock.
+    ///
+    /// Everything expensive lives here on purpose - the track's lock, the item
+    /// vector, the string comparisons - at 30 Hz, not 120.
+    fn publish(
+        &self,
+        position_ms: f32,
+        items: Vec<DanmakuItem>,
+        opacity: f32,
+        speed_percent: u32,
+        moving: bool,
+        now: Instant,
+    ) -> FrameDiff {
+        let mut inner = self.inner.borrow_mut();
+        let advanced = position_ms - inner.last_publish_ms >= 1.0;
+        inner.last_publish_ms = position_ms;
+        let resync = inner.anchor.is_none()
+            || (position_ms - inner.t_ms).abs() > DANMAKU_FRAME_RESYNC_MS;
+        if resync {
+            inner.t_ms = position_ms;
+        }
+        inner.anchor = Some((position_ms, now));
+        inner.frozen = !moving;
+        let speed_changed = inner.speed_percent != speed_percent;
+        inner.speed_percent = speed_percent;
+        let inner = &mut *inner;
+
+        let mut diff = FrameDiff {
+            updated: 0,
+            inserted: 0,
+            removed: 0,
+            visible: 0,
+        };
+        // Rows whose dmid left the visible set go away; iterate backwards so the
+        // earlier indexes stay valid.
+        let mut index = inner.rows.len();
+        while index > 0 {
+            index -= 1;
+            if !items
+                .iter()
+                .any(|item| item.dmid.as_str() == inner.rows[index].item.dmid.as_str())
+            {
+                self.model.remove(index);
+                inner.rows.remove(index);
+                diff.removed += 1;
+            }
+        }
+        for item in items {
+            // Bake the layer opacity into the colour alpha: a group opacity on
+            // the danmaku layer would force an intermediate composition layer
+            // on every frame (see ui/app.slint).
+            let mut item = item;
+            item.color = item.color.with_alpha(opacity);
+            match inner
+                .rows
+                .iter()
+                .position(|row| row.item.dmid == item.dmid)
+            {
+                Some(index) => {
+                    let row = &mut inner.rows[index];
+                    let engine_x = item.x;
+                    // The engine's x moved since the last publish, so this row
+                    // is a 滚动 comment; a centred row that the clock did not
+                    // advance is the 顶部/底部 case. Only evaluated while the
+                    // media clock actually advanced, so a buffering publish
+                    // cannot misclassify a scroll row as static.
+                    let width_changed = (item.w - row.item.w).abs() > 0.01;
+                    let classify = width_changed || speed_changed;
+                    if classify {
+                        row.speed = if danmaku_is_centred(engine_x, item.w) {
+                            0.0
+                        } else {
+                            danmaku_scroll_speed(item.w, speed_percent)
+                        };
+                    } else if row.speed == 0.0
+                        && advanced
+                        && (engine_x - row.base_x).abs() >= 1.0
+                    {
+                        // A centred row that keeps moving is a 滚动 comment
+                        // caught at the centre when it appeared.
+                        row.speed = danmaku_scroll_speed(item.w, speed_percent);
+                    }
+                    let mut changed = false;
+                    if row.item.y != item.y {
+                        row.item.y = item.y;
+                        changed = true;
+                    }
+                    if row.item.w != item.w {
+                        row.item.w = item.w;
+                        changed = true;
+                    }
+                    if row.item.text != item.text {
+                        row.item.text = item.text;
+                        changed = true;
+                    }
+                    if row.item.color != item.color {
+                        row.item.color = item.color;
+                        changed = true;
+                    }
+                    if row.item.size != item.size {
+                        row.item.size = item.size;
+                        changed = true;
+                    }
+                    if row.item.bold != item.bold {
+                        row.item.bold = item.bold;
+                        changed = true;
+                    }
+                    if row.item.mid_hash != item.mid_hash {
+                        row.item.mid_hash = item.mid_hash;
+                        changed = true;
+                    }
+                    // A static row is placed by the engine; a moving one by the
+                    // fast lane, which is why its x is left alone here.
+                    if row.speed == 0.0 || classify {
+                        if row.item.x != engine_x {
+                            row.item.x = engine_x;
+                            changed = true;
+                        }
+                        row.base_x = engine_x;
+                        row.t0_ms = position_ms;
+                    }
+                    if changed {
+                        self.model.set_row_data(index, row.item.clone());
+                        diff.updated += 1;
+                    }
+                }
+                None => {
+                    let speed = if danmaku_is_centred(item.x, item.w) {
+                        0.0
+                    } else {
+                        danmaku_scroll_speed(item.w, speed_percent)
+                    };
+                    let row = FrameRow {
+                        base_x: item.x,
+                        t0_ms: position_ms,
+                        speed,
+                        item,
+                    };
+                    self.model.push(row.item.clone());
+                    inner.rows.push(row);
+                    diff.inserted += 1;
+                }
+            }
+        }
+        diff.visible = inner.rows.len();
+        debug_assert_eq!(diff.visible, self.model.row_count());
+        diff
+    }
+
+    /// One fast frame: advance the motion clock and rewrite the x of the
+    /// comments already on screen.
+    ///
+    /// No lock, no allocation, no formatting, no property write beyond the model
+    /// rows whose whole pixel changed.
+    fn frame_tick(&self) {
+        self.tick(Instant::now());
+    }
+
+    /// [`frame_tick`](Self::frame_tick) with an explicit instant, so the QA
+    /// self-tests drive the very same code with a synthetic clock.
+    fn tick(&self, now: Instant) {
+        let frame_start = Instant::now();
+        let mut drop_to = None;
+        let mut budget_log = None;
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.frozen {
+                return;
+            }
+            // The exact-rate gate: Slint durations are whole milliseconds, so
+            // 120 Hz wakes every 8 ms. A wake that arrives before the schedule's
+            // next slot is dropped instead of running the lane 4 % fast.
+            if let Some(due) = inner.due {
+                if now < due {
+                    if let Some(qa) = inner.qa.as_mut() {
+                        qa.gates += 1;
+                    }
+                    return;
+                }
+            }
+            let Some((anchor_ms, anchor_at)) = inner.anchor else {
+                return;
+            };
+            // QA: burn the budget on purpose so the valve trips for real.
+            if inner.slow_ms > 0 {
+                std::thread::sleep(Duration::from_millis(inner.slow_ms));
+            }
+            // QA: one 200 ms sleep on the UI thread, so the report can show what
+            // the motion clock does with a stall.
+            let mut stall_begin = None;
+            if let Some(probe) = inner.stall.as_mut() {
+                if !probe.slept && now >= probe.due {
+                    probe.slept = true;
+                    probe.follow = 3;
+                    stall_begin = Some(inner.t_ms);
+                    crate::debug_log(&format!(
+                        "danmaku stall begin sleep_ms={DANMAKU_STALL_MS} t_ms={:.1}",
+                        inner.t_ms
+                    ));
+                    std::thread::sleep(Duration::from_millis(DANMAKU_STALL_MS));
+                }
+            }
+            // The motion clock: the slow tick's media position plus the
+            // monotonic time since it sampled that position. Nothing is carried
+            // over from the previous frame, so a late or missed tick cannot
+            // accumulate drift.
+            let want = anchor_ms + now.saturating_duration_since(anchor_at).as_secs_f32() * 1_000.0;
+            let step = (want - inner.t_ms).min(DANMAKU_FRAME_MAX_STEP_MS);
+            let t = if want <= inner.t_ms {
+                want
+            } else {
+                inner.t_ms + step
+            };
+            inner.t_ms = t;
+            if let Some(before_t) = stall_begin {
+                crate::debug_log(&format!(
+                    "danmaku stall resume wall_elapsed_ms={:.1} want_t_ms={want:.1} \
+                     used_t_ms={t:.1} step_ms={:.1} capped={}",
+                    now.saturating_duration_since(anchor_at)
+                        .as_secs_f32()
+                        * 1_000.0,
+                    t - before_t,
+                    u8::from(want - before_t > DANMAKU_FRAME_MAX_STEP_MS)
+                ));
+            } else if let Some(probe) = inner.stall.as_mut() {
+                // The frames after the stall: each one is capped, and the media
+                // time closes on the anchor instead of overshooting it.
+                if probe.follow > 0 {
+                    probe.follow -= 1;
+                    crate::debug_log(&format!(
+                        "danmaku stall catchup n={} t_ms={t:.1} want_t_ms={want:.1} \
+                         step_ms={step:.1} capped={} lag_ms={:.1}",
+                        3 - probe.follow,
+                        u8::from(step >= DANMAKU_FRAME_MAX_STEP_MS),
+                        want - t
+                    ));
+                }
+            }
+            // Whole-pixel x: a sub-pixel offset changes the glyph phase on every
+            // frame, which makes the renderer re-shape the text (see
+            // `player.rs::active_items`) - and at 120 Hz that is the whole cost.
+            let mut moved = 0usize;
+            for (index, row) in inner.rows.iter_mut().enumerate() {
+                if row.speed == 0.0 {
+                    continue;
+                }
+                let x = (row.base_x - row.speed * (t - row.t0_ms)).round();
+                if x == row.item.x {
+                    continue;
+                }
+                row.item.x = x;
+                self.model.set_row_data(index, row.item.clone());
+                moved += 1;
+            }
+            // Budget valve: this tick's own cost, averaged per 2 s window. The
+            // QA stall's 200 ms sleep is not the lane's cost, so it is skipped.
+            let cost_us = frame_start.elapsed().as_micros() as u64;
+            let window = if stall_begin.is_some() {
+                None
+            } else {
+                inner.budget.sample(now, cost_us)
+            };
+            let qa_on = inner.qa.is_some();
+            if let Some(window) = window {
+                if window.drop {
+                    drop_to = Some((inner.hz, 60u32));
+                }
+                if qa_on || window.avg_us > DANMAKU_BUDGET_US {
+                    budget_log = Some(window.avg_us);
+                }
+            }
+            let interval_ms = inner.interval_ms;
+            if let Some(qa) = inner.qa.as_mut() {
+                qa.sample(now, cost_us, interval_ms, moved);
+            }
+            // Fixed-rate schedule, one executed tick per target interval. A tick
+            // that is more than one interval late restarts the schedule instead
+            // of replaying the slots it missed.
+            let interval = Duration::from_secs_f32(interval_ms / 1_000.0);
+            inner.due = Some(match inner.due {
+                Some(due) if now.saturating_duration_since(due) <= interval => due + interval,
+                _ => now + interval,
+            });
+        }
+        if let Some(avg_us) = budget_log {
+            crate::debug_log(&format!(
+                "danmaku frame budget hz={} window_avg_us={avg_us}",
+                self.hz()
+            ));
+        }
+        if let Some((from, to)) = drop_to {
+            if to < from {
+                self.apply_hz(to);
+                crate::debug_log(&format!("danmaku hz {from}→{to} reason=budget"));
+            }
+        }
+    }
+
+    /// Begin a QA measurement run; `stall_at` arms the one-shot sleep.
+    fn start_qa(&self, now: Instant, stall_at: Option<Instant>) {
+        let mut inner = self.inner.borrow_mut();
+        // `BILI_F139_SLOW_MS`: inflate the per-tick cost so the 2 s / 2.5 ms
+        // valve has something to trip over (QA only; 0 keeps the real cost).
+        inner.slow_ms = std::env::var("BILI_F139_SLOW_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(50);
+        inner.qa = Some(FrameQa::new(now));
+        inner.stall = stall_at.map(|due| StallProbe {
+            due,
+            slept: false,
+            follow: 0,
+        });
+    }
+
+    /// End the run: log the table and return the rate it ran at.
+    fn finish_qa(&self, now: Instant) -> u32 {
+        let mut inner = self.inner.borrow_mut();
+        let hz = inner.hz;
+        let rows = inner.rows.len();
+        let Some(qa) = inner.qa.take() else {
+            return hz;
+        };
+        let wall = qa.wall(now).max(0.001);
+        let ticks_per_s = qa.ticks as f32 / wall;
+        let mean_us = if qa.ticks == 0 {
+            0
+        } else {
+            qa.micros / qa.ticks
+        };
+        let cores = match (qa.cpu_start, thread_cpu_time()) {
+            (Some(start), Some(end)) => end.saturating_sub(start).as_secs_f32() / wall,
+            _ => -1.0,
+        };
+        crate::debug_log(&format!(
+            "danmaku frame qa hz={hz} ticks={} ticks_per_s={ticks_per_s:.1} \
+             mean_us={mean_us} moved_per_tick={:.1} gap_p50_us={} gap_p95_us={} \
+             gap_p99_us={} gap_max_us={} late={} missed={} gates={} rows={rows} \
+             ui_thread_cores={cores:.3} interval_ms={:.2} display_hz={}",
+            qa.ticks,
+            if qa.ticks == 0 {
+                0.0
+            } else {
+                qa.moved as f32 / qa.ticks as f32
+            },
+            qa.percentile(50.0),
+            qa.percentile(95.0),
+            qa.percentile(99.0),
+            qa.percentile(100.0),
+            qa.late,
+            qa.missed,
+            qa.gates,
+            inner.interval_ms,
+            display_refresh_hz()
+        ));
+        inner.stall = None;
+        inner.slow_ms = 0;
+        hz
+    }
+}
+
+/// CPU time this thread has consumed (kernel + user), for the QA "UI thread
+/// cores" line. `None` when the call fails.
+fn thread_cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let ticks = |ft: &FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+    Some(Duration::from_nanos((ticks(&kernel) + ticks(&user)) * 100))
+}
+
+/// QA (`BILI_F139_TEST=<delay_ms>`): measure the danmaku fast lane and capture
+/// the player with comments on screen.
+///
+/// `BILI_DANMAKU_HZ` picks the rate under test, `BILI_F139_SECS` the run length
+/// (5..=20 s), `BILI_F139_STALL=<ms>` arms the one-shot 200 ms UI-thread sleep
+/// and `BILI_F139_SHOT=1` writes `target/qa/f139_danmaku_<hz>.png` at the end.
+/// Everything is logged through `BILI_DEBUG_LOG`.
+fn maybe_start_danmaku_frame_qa(player: &PlayerWindow, layer: Rc<DanmakuLayer>) {
+    let Ok(value) = std::env::var("BILI_F139_TEST") else {
+        return;
+    };
+    let delay = value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .unwrap_or(12_000)
+        .clamp(2_000, 120_000);
+    let secs = std::env::var("BILI_F139_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(12)
+        .clamp(5, 20);
+    let stall_ms = std::env::var("BILI_F139_STALL")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok());
+    let shot = std::env::var("BILI_F139_SHOT")
+        .map(|raw| raw.trim() == "1")
+        .unwrap_or(false);
+    let weak = player.as_weak();
+    // Both steps run on the UI thread through one-shot timers: the layer is an
+    // `Rc` (it lives on the UI thread) and the capture needs the same thread.
+    slint::Timer::single_shot(Duration::from_millis(delay), move || {
+        let now = Instant::now();
+        layer.start_qa(now, stall_ms.map(|ms| now + Duration::from_millis(ms)));
+        crate::debug_log(&format!(
+            "danmaku frame qa start hz={} secs={secs} stall_ms={} shot={}",
+            layer.hz(),
+            stall_ms.unwrap_or(0),
+            u8::from(shot)
+        ));
+        slint::Timer::single_shot(Duration::from_millis(secs * 1_000), move || {
+            let Some(player) = weak.upgrade() else {
+                return;
+            };
+            let hz = layer.finish_qa(Instant::now());
+            if shot {
+                let path = qa_capture_path(&format!("f139_danmaku_{hz}"));
+                if let Some((w, h)) = capture_window_png(&player.window(), &path) {
+                    crate::debug_log(&format!(
+                        "f139 capture hz={hz} path={} size={w}x{h}",
+                        path.display()
+                    ));
+                }
+            }
+        });
+    });
+}
+
 /// Build and drive the player window for a resolved video.
 ///
 /// `mode` decides what happens to the players already up: [`OpenMode::Replace`]
@@ -10509,7 +15040,7 @@ fn open_player_inner(
     // the window exists; see the "Player comments" section.
 
     // Replace closes exactly the focused window through its own close path
-    // (loops, glass, control, queue hand-off). NewWindow touches nothing.
+    // (loops, control, queue hand-off). NewWindow touches nothing.
     let replacing = if mode == OpenMode::Replace {
         focused_session(state)
     } else {
@@ -10568,7 +15099,7 @@ fn open_player_inner(
     // pre-roll gate has not armed yet (playurl + decoder spawn take a moment)
     // and the tick would otherwise publish `buffering=false` over an empty
     // picture. Set synchronously, before `show()`, so no frame can leak the
-    // bare glass surface; `on_danmaku_tick` keeps both values in sync after.
+    // bare tint; `on_danmaku_tick` keeps both values in sync after.
     player.set_buffering(true);
     player.set_buffer_progress(0.0);
     player.set_time_current(format_mmss(0).into());
@@ -10632,13 +15163,11 @@ fn open_player_inner(
     // Codec preference, captured for the 画质 row republishes below (a plain
     // copy, so the closures never hold the settings lock).
     let codec_pref = prefs.codec_pref as i64;
-    // The player has its own `AppTheme` instance: mirror the two frosted-glass
-    // sliders from the stored settings so its backdrop loop blurs with the SAME
-    // values as the main window.
+    // The player has its own `AppTheme` instance: mirror the stored transparency
+    // so its tint matches the main window.
     player
         .global::<AppTheme>()
         .set_glass_transparency(prefs.glass_transparency);
-    player.global::<AppTheme>().set_glass_blur(prefs.glass_blur);
     player.set_danmaku_opacity(prefs.danmaku_opacity as f32 / 100.0);
     player.set_danmaku_opacity_text(prefs.danmaku_opacity.to_string().into());
     player.set_danmaku_font(prefs.danmaku_font as i32);
@@ -10670,26 +15199,23 @@ fn open_player_inner(
         0
     };
     let layout_target = restore_player_layout(&player, saved_layout, cascade);
-    // The first painted frame must already be blurred. The main window's last
-    // delivered desktop snapshot is the same whole-desktop image this player's
-    // own worker will grab, so it is re-used here: image AND placement are set
-    // before `show()`. Without a snapshot (or without a known rect) the window
-    // stays hidden for the bounded fallback instead of painting see-through.
-    let glass_seed = seed_player_backdrop(state, &player, layout_target);
-    let seeded = glass_seed.is_some();
-    if seeded {
-        if player.show().is_err() {
-            return;
-        }
-        if !player_prepared {
-            win::prepare_frameless(player.window());
-        }
-    } else {
-        schedule_player_show(player.as_weak(), SEED_SHOW_FALLBACK_MS);
+    // The backdrop is generated, so it is already in place before `show()`: the
+    // first painted frame is the gradient + tint, never a transparent window.
+    set_player_backdrop(&player, state.theme_dark.get());
+    if player.show().is_err() {
+        return;
     }
+    if !player_prepared {
+        win::prepare_frameless(player.window());
+    }
+    // The wallpaper is anchored to the SCREEN position, so publish it again now
+    // that the native window is placed (the pre-show publish had no rect).
+    let (wall_x, wall_y) = publish_wallpaper(player.global::<AppTheme>(), player.window());
     crate::debug_log(&format!(
-        "player prepare pre-show={player_prepared} glass_seed={seeded} show_deferred={}",
-        !seeded
+        "wallpaper origin win=player stage=show x={wall_x:.1} y={wall_y:.1}"
+    ));
+    crate::debug_log(&format!(
+        "player prepare pre-show={player_prepared} backdrop=1"
     ));
     // Smallest size the player can be dragged to: the video band's minimum
     // plus the strips that are open (none yet at this point).
@@ -10698,10 +15224,9 @@ fn open_player_inner(
 
     // The player is up: suspend every main-window background job that would
     // otherwise compete with playback. Cover fetches in flight finish quietly
-    // (their patch is dropped in `stream_thumbs`), no new fetch starts, the
-    // skeleton shimmer stops, and the frosted-glass refresh loop pauses (it
-    // skips every tick while `player_active()`). Every close path decrements
-    // the counter, and the main window resumes only at zero.
+    // (their patch is dropped in `stream_thumbs`), no new fetch starts and the
+    // skeleton shimmer stops. Every close path decrements the counter, and the
+    // main window resumes only at zero.
     player_opened();
     if let Some(main) = state.main.upgrade() {
         skeleton_halt(&main);
@@ -10724,9 +15249,8 @@ fn open_player_inner(
     // layout persist.
     let panel_geom: Rc<RefCell<PanelGeom>> = Rc::new(RefCell::new(PanelGeom::default()));
     let player_drag = Rc::new(win::WindowDrag::new());
-    // Same frame-locked move as the main window, plus a backdrop re-place in
-    // the tick: the player's own glass loop only runs at 33ms, so without this
-    // the frost visibly trailed the window while it was dragged.
+    // Same frame-locked move as the main window: the backdrop is a generated
+    // image, so a move needs no re-placement at all.
     let player_drag_stats = Rc::new(DragFlushStats::new());
     let player_drag_timer = Rc::new(slint::Timer::default());
     {
@@ -10784,9 +15308,6 @@ fn open_player_inner(
                     let moved = tick_drag.flush(&player.window());
                     if moved {
                         tick_stats.placement();
-                        if let Some(glass) = player_glass_for(&player) {
-                            player_glass_place(&player, &glass);
-                        }
                     }
                     if !win::left_button_down() {
                         crate::debug_log(&format!(
@@ -10828,14 +15349,7 @@ fn open_player_inner(
                 timer.stop();
                 if drag.flush(&player.window()) {
                     stats.placement();
-                    if let Some(glass) = player_glass_for(&player) {
-                        player_glass_place(&player, &glass);
-                    }
                 }
-                // The player's glass captures its own window rect, so the pixels
-                // gathered where the window used to be are stale now. One fresh
-                // capture for the next tick (the drag itself captured nothing).
-                player_glass_invalidate(&player, "drag-end");
                 // Drag-end persist (task 4): the settled base rect.
                 persist_player_layout(&geom, player.window(), &store, cascade, "drag-end");
             }
@@ -10844,6 +15358,27 @@ fn open_player_inner(
             stats.finish("player");
             crate::debug_log("drag end reason=pointer-up deferred=0 source=player");
         });
+    }
+    // Diagnostic hook (`BILI_PLAYER_DRAG_TEST=<ms>`): drag this player window
+    // while its video plays and log the achieved placements/s. Started well
+    // after the window is up so the drag lands inside playback, and driven by
+    // the same `WindowDrag` calls the UI makes (no synthetic input).
+    if let Ok(value) = std::env::var("BILI_PLAYER_DRAG_TEST") {
+        let duration = value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .unwrap_or(2000)
+            .clamp(200, 30_000);
+        run_player_drag_rate_test(
+            weak.clone(),
+            player_drag.clone(),
+            player_drag_stats.clone(),
+            Duration::from_millis(6000),
+            Duration::from_millis(duration),
+            240,
+        );
     }
     // ---- self-driven window resize (same contract as the main window) ----
     // The player's 400ms resize-restart is driven by the display-size watch in
@@ -10934,15 +15469,20 @@ fn open_player_inner(
                 // app closes inside the 600ms settle window.
                 resize.update(&player.window());
                 persist_player_layout(&geom, player.window(), &store, cascade, "resize-end");
-                // The captured rect no longer covers the window: one fresh
-                // capture on the next tick.
-                player_glass_invalidate(&player, "resize-end");
             }
             timer.stop();
             resize.end();
         });
     }
     let control = player::PlaybackControl::new();
+    // 音质 request: the persisted DASH audio id (0 = 自动（最高）). The env
+    // override keeps the flow verifiable without touching a stored setting.
+    let audio_quality_request: i64 = std::env::var("BILI_AUDIO_QUALITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(i64::from(prefs.audio_quality));
+    let _ = control.set_audio_quality(audio_quality_request);
+    player.set_audio_quality(audio_quality_request as i32);
     control.set_danmaku_font(prefs.danmaku_font);
     control.set_danmaku_speed(prefs.danmaku_speed);
     control.set_danmaku_area(prefs.danmaku_area);
@@ -10953,8 +15493,8 @@ fn open_player_inner(
     control.set_codec_pref(prefs.codec_pref as i64);
     control.set_speed(prefs.player_speed as f64 / 1000.0);
     // 帧插值: the persisted mode applies to this window from the first frame.
-    // `set_interp_mode` normalises it (0/1/2, anything else = off) and is what
-    // the badge, the pacer and the 60 Hz grid all read.
+    // `set_interp_mode` normalises it (0 = 关闭, 1 = 混合, 2 = 块匹配, 3 = OFA,
+    // anything else = off) and is what the badge and the pacer read.
     control.set_interp_mode(prefs.interp_mode);
     start_gpu_sampler();
     // The three interpolation labels are republished by the tick on change; seed
@@ -10963,16 +15503,28 @@ fn open_player_inner(
     player.set_interp_stats_text(control.interp_stats_text().into());
     player.set_interp_gpu_text(gpu_utilization_text().into());
     // `interp_cycle()` (the row and the shortcut menu item) advances
-    // 关闭 -> 混合 -> RIFE -> 关闭, applies it to this player and persists it.
+    // 关闭 -> 混合 -> 块匹配 -> OFA -> 关闭, applies it to this player and
+    // persists it. The OFA step is skipped while the runtime is missing, because
+    // a machine without `nvofapi64.dll` can never run it: the click would only
+    // land on a mode that blends anyway. Only the cheap runtime check is used
+    // here (no device is created on the UI thread); a machine whose engine still
+    // fails gets one log line and one toast from the pacer instead.
     {
         let control = control.clone();
         let window = weak.clone();
         let store = settings_store.clone();
+        let ofa_skip_logged = Rc::new(Cell::new(false));
         player.on_interp_cycle(move || {
             let Some(window) = window.upgrade() else {
                 return;
             };
-            let next = (control.interp_mode() + 1) % 3;
+            let mut next = (control.interp_mode() + 1) % 4;
+            if next == player::INTERP_MODE_OFA && !player::ofa_present() {
+                if !ofa_skip_logged.replace(true) {
+                    crate::debug_log("interp cycle skip mode=3 reason=dll_missing");
+                }
+                next = 0;
+            }
             control.set_interp_mode(next);
             update_settings(&store, |prefs| prefs.interp_mode = next);
             window.set_interp_mode_text(control.interp_mode_text().into());
@@ -10983,10 +15535,8 @@ fn open_player_inner(
             ));
         });
     }
-    // Everything that belongs to exactly this window. The glass loop is created
-    // now (not when the HWND appears) so the seeded image is already in place
-    // and its 33ms tick can position it on the first frame. The session is
-    // registered before the callbacks below, which resolve it by HWND.
+    // Everything that belongs to exactly this window. The session is registered
+    // before the callbacks below, which resolve it by HWND.
     let session_rec = Rc::new(PlayerSession {
         id: next_player_session_id(),
         window: player.clone_strong(),
@@ -10995,7 +15545,6 @@ fn open_player_inner(
         hwnd: Cell::new(win::hwnd_of(player.window()).unwrap_or(0)),
         closed: Cell::new(false),
         loops: RefCell::new(None),
-        glass: RefCell::new(Some(create_player_glass(&player, &control, glass_seed))),
         mini_slot: Arc::new(Mutex::new(None)),
         video: video.clone(),
         cascade,
@@ -11018,26 +15567,43 @@ fn open_player_inner(
     // a frame diffs rows instead of re-creating every danmaku node each tick.
     let danmaku_model = Rc::new(VecModel::<DanmakuItem>::from(Vec::<DanmakuItem>::new()));
     player.set_danmaku_items(ModelRc::from(danmaku_model.clone()));
+    // 弹幕 motion lane: the fast tick (see the "弹幕 motion lane" section) owns the
+    // x of the comments already on screen; the 33 ms tick below owns everything
+    // else and publishes the visible set plus the media-clock anchor. The rate
+    // is the display's refresh capped at 120 Hz, overridable through
+    // `BILI_DANMAKU_HZ` (30/60/120) for the A/B.
+    let display_hz = display_refresh_hz();
+    let (danmaku_hz, danmaku_hz_source) = danmaku_frame_hz(display_hz);
+    let danmaku_layer = Rc::new(DanmakuLayer::new(
+        player.as_weak(),
+        danmaku_model.clone(),
+        danmaku_hz,
+    ));
+    player.set_danmaku_frame_interval(danmaku_wake_ms(danmaku_hz));
+    player.set_danmaku_frame_running(false);
+    crate::debug_log(&format!(
+        "danmaku frame open hz={danmaku_hz} display_hz={display_hz} source={danmaku_hz_source} \
+         interval_ms={:.2} wake_ms={}",
+        danmaku_frame_interval_ms(danmaku_hz),
+        danmaku_wake_ms(danmaku_hz)
+    ));
     // 缩放进度条 heat: one 20-cell model per player window, replaced in place by
     // `publish_scrub_heat` on a zoom gesture. A fresh window starts empty (level
     // 0), which is also the reset a "different video" needs.
     let scrub_heat = Rc::new(VecModel::<f32>::from(Vec::<f32>::new()));
     player.set_scrub_heat(ModelRc::from(scrub_heat.clone()));
-    // The row-id list is per player as well. Several player windows can be open
-    // at once, and a list shared through `PlayerState` let each window's tick
-    // delete and re-append the other window's rows — the flicker the user saw
-    // on the second video. Both the model and this list now live in the tick's
-    // own closure, so a player only ever diffs its own rows.
-    let danmaku_ids = Rc::new(RefCell::new(Vec::<String>::new()));
+    // The row-id list lives inside `DanmakuLayer` (it is per player: several
+    // player windows can be open at once, and a list shared through
+    // `PlayerState` let each window's tick delete and re-append the other
+    // window's rows — the flicker the user saw on the second video).
     // Set by any callback that changes what the tick renders while paused, so a
     // paused-but-edited frame still repaints (see the skip guard below).
     let refresh = Rc::new(Cell::new(true));
     let last_position = Rc::new(Cell::new(u64::MAX));
     let last_danmaku_on = Rc::new(Cell::new(true));
-    // Last RIFE downgrade notice this window has toasted. RIFE is not available
-    // at this frame size / helper missing: the pacer bumps the counter once per
-    // session and the tick shows one explanation instead of a silent fallback.
-    let interp_notice_seen = Rc::new(Cell::new(control.interp_notice()));
+    // Last duration written to the window: constant for a track, so the total
+    // label is formatted once per track instead of on every 33ms tick.
+    let last_duration = Rc::new(Cell::new(u64::MAX));
     // Last opacity baked into the model rows; a change repaints even while
     // paused (see the skip guard). -1.0 is never a valid opacity.
     let last_opacity = Rc::new(Cell::new(-1.0f32));
@@ -11106,14 +15672,13 @@ fn open_player_inner(
         let track = track.clone();
         let window = weak.clone();
         let state = state.clone();
-        let danmaku_model = danmaku_model.clone();
-        let danmaku_ids = danmaku_ids.clone();
+        let danmaku_layer = danmaku_layer.clone();
         let sleep_mode = sleep_mode.clone();
         let sleep_deadline = sleep_deadline.clone();
         let refresh = refresh.clone();
         let last_opacity = last_opacity.clone();
+        let last_duration = last_duration.clone();
         let last_diff_log = last_diff_log.clone();
-        let interp_notice_seen = interp_notice_seen.clone();
         let panel_geom = panel_geom.clone();
         let net_panel = net_panel.clone();
         let net_last_publish = net_last_publish.clone();
@@ -11122,6 +15687,12 @@ fn open_player_inner(
         let buffer_trace_at = buffer_trace_at.clone();
         let buffer_state = buffer_state.clone();
         let bvid_log = bvid.clone();
+        let bvid_tick = bvid.clone();
+        // The merged 画质 menu is published once per window, as soon as the
+        // player's stream model lands; per window, so a second player never
+        // suppresses the first one's publish.
+        let quality_menu_done = Rc::new(Cell::new(false));
+        let quality_menu_done_tick = quality_menu_done.clone();
         // Keeps this window's own pointer watch/layout debounce alive for as
         // long as this window's tick exists (dropping the timer would stop it).
         let loops_keepalive = loops_slot.clone();
@@ -11136,6 +15707,26 @@ fn open_player_inner(
             // called before the paused-frame skip guard so a paused player's
             // toasts still expire.
             toast_tick(&window);
+            // 画质 menu: the player installs its stream catalogue and the
+            // stream-only model in one event-loop step, so a non-empty
+            // `quality_rows` means the catalogue and `quality_qn` are both
+            // ready. Publish the merged menu here (locked 大会员 rows included)
+            // exactly once; later updates come from the quality callbacks.
+            if !quality_menu_done_tick.get() && window.get_quality_rows().row_count() > 0 {
+                quality_menu_done_tick.set(true);
+                let specs = control.quality_catalog();
+                let tiers = bilibili::quality_tiers_for(&bvid_tick, cid).unwrap_or_default();
+                publish_quality_menu(
+                    &window,
+                    &specs,
+                    &tiers,
+                    auto_stream_for(
+                        &specs,
+                        window.get_quality_qn() as i64,
+                        control.codec_pref(),
+                    ),
+                );
+            }
             // 帧插值: mode badge, measured cost and (when an NVIDIA GPU is
             // present) its utilisation. Written only on change: the tick runs at
             // ~30 Hz and a Slint property write repaints the row.
@@ -11150,14 +15741,6 @@ fn open_player_inner(
             let interp_gpu_text = gpu_utilization_text();
             if window.get_interp_gpu_text().as_str() != interp_gpu_text {
                 window.set_interp_gpu_text(interp_gpu_text.into());
-            }
-            // One toast per downgrade: mode 2 was asked for, blend is delivered
-            // (1080p frame, or the helper/model is missing). The pacer logs the
-            // reason; the user sees it once.
-            let notice = control.interp_notice();
-            if notice != interp_notice_seen.get() {
-                interp_notice_seen.set(notice);
-                toast(&window, control.interp_notice_text(), TOAST_KIND_INFO);
             }
             // 播放列表: this window is the queue's active player, so report the
             // play/pause state and watch for the end of the track (self-gated
@@ -11178,15 +15761,14 @@ fn open_player_inner(
                 false,
             );
             // 网络分析: the profiler is sampled every tick but only formatted
-            // at 4 Hz; one sparkline sample per second.
-            let stats = control.play_stats();
-            // Metered counters from the loopback proxy, `None` while it is not
-            // feeding this decode session (the panel then shows the estimate).
-            let prefetch_stats = control.prefetch_stats();
+            // at 4 Hz; one sparkline sample per second. Both snapshots are taken
+            // inside the 4 Hz block below: `prefetch_stats` locks the proxy and
+            // merges/clones its range bookkeeping, which is far too much work
+            // for a 33ms tick.
             // Pre-roll gate (src/player.rs): true while the pacer holds the
             // first frame. On top of that the layer must stay up while no
             // picture exists at all (between `open` and the gate arming), so
-            // the first painted frame is never the bare glass surface. 仅音频
+            // the first painted frame is never the bare tint. 仅音频
             // has no picture by design and is therefore exempt.
             let net_now = clock.elapsed().as_millis() as i64;
             let has_picture = control.audio_only() || window.get_frame().size().width > 0;
@@ -11235,6 +15817,11 @@ fn open_player_inner(
             }
             if net_now - net_last_publish.get() >= NET_PUBLISH_MS {
                 net_last_publish.set(net_now);
+                // Metered counters come from the loopback proxy (`None` while it
+                // is not feeding this decode session, so the panel shows the
+                // estimate); sampled here, at the publish rate.
+                let stats = control.play_stats();
+                let prefetch_stats = control.prefetch_stats();
                 let counts = net_panel.publish(&window, stats.as_ref(), prefetch_stats.as_ref());
                 // `BILI_NET_TRACE=1`: prove the strip is driven by the live
                 // proxy - the published slice counts, once per publish tick,
@@ -11245,9 +15832,9 @@ fn open_player_inner(
                         .map(|metered| (metered.workers.len(), metered.active_workers))
                         .unwrap_or((0, 0));
                     crate::debug_log(&format!(
-                        "net map t_ms={net_now} slices={} missing={} held={} point={} active={} \
+                        "net map t_ms={net_now} slices={} missing={} downloaded={} active={} \
                          workers={active}/{workers} rate={}",
-                        NET_MAP_SLICES, counts[0], counts[1], counts[2], counts[3],
+                        NET_MAP_SLICES, counts[0], counts[1], counts[3],
                         window.get_net_rate()
                     ));
                 }
@@ -11268,6 +15855,18 @@ fn open_player_inner(
             // Comparing it below keeps a slider move repainting while paused.
             let opacity = window.get_danmaku_opacity().clamp(0.0, 1.0);
             let mode = sleep_mode.load(Ordering::SeqCst);
+            // The fast lane may only run while comments can actually move: a
+            // paused, buffering or 弹幕-off window must not wake the UI thread
+            // 120 times a second for nothing. Reading the media clock back here
+            // also stops the between-frames extrapolation, so a stalled clock
+            // never creeps ahead of the picture.
+            let frames_on = !paused && danmaku_on && !buffering;
+            if window.get_danmaku_frame_running() != frames_on {
+                window.set_danmaku_frame_running(frames_on);
+            }
+            if !frames_on {
+                danmaku_layer.freeze();
+            }
             // Paused with no countdown and nothing changed since the last frame:
             // every value below is identical, so skip the text writes and the
             // danmaku walk instead of repeating them 30x a second.
@@ -11285,8 +15884,11 @@ fn open_player_inner(
             last_opacity.set(opacity);
             refresh.set(false);
             let duration = control.duration_ms();
-            window.set_duration_ms(duration as f32);
-            window.set_time_total(format_mmss(duration).into());
+            if duration != last_duration.get() {
+                last_duration.set(duration);
+                window.set_duration_ms(duration as f32);
+                window.set_time_total(format_mmss(duration).into());
+            }
             // While the player is buffering the clock is not moving forward,
             // so the readouts hold instead of creeping to a position that has
             // no picture behind it yet.
@@ -11334,61 +15936,34 @@ fn open_player_inner(
                 block_rules: control.block_rules(),
             };
             let items = track.compute(position, font_px, &filter);
-            {
-                // Bake the layer opacity into the colour alpha: a group opacity
-                // on the danmaku layer would force an intermediate composition
-                // layer every frame (see ui/app.slint). `opacity` was read and
-                // clamped above.
-                let items: Vec<DanmakuItem> = items
-                    .into_iter()
-                    .map(|mut item| {
-                        item.color = item.color.with_alpha(opacity);
-                        item
-                    })
-                    .collect();
-                let model = &danmaku_model;
-                let mut ids = danmaku_ids.borrow_mut();
-                let mut updated = 0usize;
-                let mut inserted = 0usize;
-                let mut removed = 0usize;
-                // Rows whose dmid left the visible set go away; iterate
-                // backwards so the earlier indexes stay valid.
-                let mut index = ids.len();
-                while index > 0 {
-                    index -= 1;
-                    if !items.iter().any(|item| item.dmid.as_str() == ids[index].as_str()) {
-                        model.remove(index);
-                        ids.remove(index);
-                        removed += 1;
-                    }
-                }
-                // Rows still visible are updated in place (position / colour
-                // only - no node is re-created); new dmids are appended. Order
-                // is irrelevant: x/y are explicit item properties.
-                for item in items {
-                    match ids.iter().position(|id| id.as_str() == item.dmid.as_str()) {
-                        Some(index) => {
-                            model.set_row_data(index, item);
-                            updated += 1;
-                        }
-                        None => {
-                            ids.push(item.dmid.to_string());
-                            model.push(item);
-                            inserted += 1;
-                        }
-                    }
-                }
-                let now_ms = clock.elapsed().as_millis() as u64;
-                if now_ms.saturating_sub(last_diff_log.get()) >= 1000 {
-                    last_diff_log.set(now_ms);
-                    crate::debug_log(&format!(
-                        "danmaku diff bvid={} updated={updated} inserted={inserted} removed={removed} visible={}",
-                        bvid_log,
-                        ids.len()
-                    ));
-                }
+            // 弹幕 motion lane: the layer reconciles the model (add / update /
+            // remove, opacity baked in) and re-anchors the fast tick's clock at
+            // this position. The fast tick owns every x from here on, so a row
+            // that survives keeps the position the motion clock gave it.
+            let diff = danmaku_layer.publish(
+                position as f32,
+                items,
+                opacity,
+                filter.speed_percent,
+                frames_on,
+                Instant::now(),
+            );
+            let now_ms = clock.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(last_diff_log.get()) >= 1000 {
+                last_diff_log.set(now_ms);
+                crate::debug_log(&format!(
+                    "danmaku diff bvid={} updated={} inserted={} removed={} visible={}",
+                    bvid_log, diff.updated, diff.inserted, diff.removed, diff.visible
+                ));
             }
         });
+    }
+
+    {
+        // The fast half: 8 ms (120 Hz), and it touches nothing but the x of the
+        // rows already on screen. See the "弹幕 motion lane" section.
+        let layer = danmaku_layer.clone();
+        player.on_danmaku_frame_tick(move || layer.frame_tick());
     }
 
     {
@@ -11490,6 +16065,7 @@ fn open_player_inner(
         let refresh = refresh.clone();
         player.on_seek(move |position| {
             let target = position.max(0.0) as u64;
+            SEEK_REQUEST_COUNT.fetch_add(1, Ordering::SeqCst);
             crate::debug_log(&format!("seek requested ms={target}"));
             control.seek(target);
             refresh.set(true);
@@ -11501,7 +16077,10 @@ fn open_player_inner(
         player.on_volume_changed(move |volume| {
             control.set_volume(volume as i32);
             if let Some(window) = window.upgrade() {
-                window.set_volume(control.volume() as f32);
+                // Keep the UI value as the pointer produced it: the audio
+                // control stores whole percent, so writing its rounded copy
+                // back made a 240-move drag produce only ~70 visible steps.
+                window.set_volume(volume);
                 window.set_volume_text(control.volume().to_string().into());
             }
         });
@@ -11544,9 +16123,6 @@ fn open_player_inner(
                 window.set_fullscreen(next);
                 window.set_panels_overlay(next);
                 window.set_fullscreen_text(if next { "退出全屏" } else { "全屏" }.into());
-                // Fullscreen changes the window rect: recapture once instead of
-                // waiting for the one-second cadence.
-                player_glass_invalidate(&window, "fullscreen");
                 if !next {
                     // Winit restores the pre-fullscreen rect asynchronously;
                     // grow back by the strips that are open now afterwards.
@@ -11558,6 +16134,7 @@ fn open_player_inner(
     {
         let control = control.clone();
         let window = weak.clone();
+        let bvid = bvid.clone();
         player.on_set_quality(move |qn| {
             control.set_quality(qn as i64);
             if let Some(window) = window.upgrade() {
@@ -11568,9 +16145,11 @@ fn open_player_inner(
                 // `set_quality` dropped any exact pick, so mark the row of the
                 // stream the automatic rule will open for this `qn`.
                 let specs = control.quality_catalog();
-                publish_quality_rows(
+                let tiers = bilibili::quality_tiers_for(&bvid, cid).unwrap_or_default();
+                publish_quality_menu(
                     &window,
                     &specs,
+                    &tiers,
                     auto_stream_for(&specs, qn as i64, codec_pref),
                 );
                 if changed {
@@ -11582,26 +16161,53 @@ fn open_player_inner(
     {
         // 画质 menu: the row index names one exact raw DASH stream (`qn` alone
         // is ambiguous - 1080P60 ships as AVC / HEVC / AV1 at several
-        // bitrates). Selecting the stream already playing is a no-op in the
-        // control, so the decoder is not restarted for nothing.
+        // bitrates), or a locked 大会员 tier. Selecting the stream already
+        // playing is a no-op in the control, so the decoder is not restarted
+        // for nothing.
         let control = control.clone();
         let window = weak.clone();
+        let bvid = bvid.clone();
+        // One toast per open for the locked-tier explanation: clicking several
+        // locked rows must not stack copies of the same message. The UI fires
+        // `quality_menu_opened` on every fresh open, which re-arms the gate.
+        let locked_notice = Rc::new(RefCell::new(LockedNotice::default()));
+        {
+            let locked_notice = locked_notice.clone();
+            player.on_quality_menu_opened(move || {
+                locked_notice.borrow_mut().opened();
+                crate::debug_log("quality menu opened");
+            });
+        }
         player.on_quality_pick(move |index| {
             let Some(window) = window.upgrade() else {
                 return;
             };
             let specs = control.quality_catalog();
-            let picked = if index < 0 {
-                None
-            } else {
-                specs.get(index as usize)
-            }
-            .cloned();
-            let Some(spec) = picked else {
+            let tiers = bilibili::quality_tiers_for(&bvid, cid).unwrap_or_default();
+            let items = build_quality_menu(&specs, &tiers, None);
+            let Some(item) = usize::try_from(index)
+                .ok()
+                .and_then(|index| items.get(index))
+            else {
                 crate::debug_log(&format!(
                     "quality pick index={index} ignored n={}",
-                    specs.len()
+                    items.len()
                 ));
+                return;
+            };
+            let Some(spec_index) = item.spec else {
+                // Locked 大会员 tier: non-selectable. Log the tier and explain
+                // once; the menu stays open (the UI does not close it).
+                crate::debug_log(&format!(
+                    "quality locked qn={} index={index}",
+                    item.row.qn
+                ));
+                if locked_notice.borrow_mut().take() {
+                    toast(&window, "该清晰度需要大会员", TOAST_KIND_INFO);
+                }
+                return;
+            };
+            let Some(spec) = specs.get(spec_index).cloned() else {
                 return;
             };
             crate::debug_log(&format!(
@@ -11609,7 +16215,7 @@ fn open_player_inner(
                 spec.qn, spec.codecid, spec.bandwidth
             ));
             let changed = !window
-                .get_quality_rows()
+                .get_quality_menu_rows()
                 .row_data(index as usize)
                 .map(|row| row.current)
                 .unwrap_or(false);
@@ -11624,9 +16230,10 @@ fn open_player_inner(
             control.set_quality_exact(spec.qn, spec.codecid, spec.bandwidth);
             window.set_quality_qn(spec.qn as i32);
             window.set_quality_label(spec.label.clone().into());
-            publish_quality_rows(
+            publish_quality_menu(
                 &window,
                 &specs,
+                &tiers,
                 Some((spec.qn, spec.codecid, spec.bandwidth)),
             );
             toast(&window, format!("画质：{}", spec.label), TOAST_KIND_INFO);
@@ -11748,7 +16355,7 @@ fn open_player_inner(
         let bvid = bvid.clone();
         let window = weak.clone();
         let liked_flag = liked_flag.clone();
-        std::thread::spawn(move || {
+        crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
             let Some(runtime) = crate::bilibili::shared_runtime() else {
                 return;
             };
@@ -11766,7 +16373,7 @@ fn open_player_inner(
                 }
                 Err(err) => crate::debug_log(&format!("like_state err={err}")),
             }
-        });
+        }));
     }
     {
         let session = session.clone();
@@ -11811,7 +16418,7 @@ fn open_player_inner(
             let bvid = bvid.clone();
             let window = window.clone();
             let liked_flag = liked_flag.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -11836,7 +16443,7 @@ fn open_player_inner(
                         });
                     }
                 }
-            });
+            }));
         });
     }
 
@@ -11881,6 +16488,57 @@ fn open_player_inner(
             }
         });
     }
+    // 音质: pick a DASH audio tier. Applies live (only `ffplay` restarts at the
+    // current position); a tier this video does not carry is a toast, and the
+    // selection stays where it was. The pick is persisted.
+    {
+        let control = control.clone();
+        let window = weak.clone();
+        let settings_store = settings_store.clone();
+        player.on_audio_quality_pick(move |id| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let request = i64::from(id);
+            match control.set_audio_quality(request) {
+                Some(index) => {
+                    let rows = window.get_audio_quality_rows();
+                    let updated: Vec<AudioQualityRow> = (0..rows.row_count())
+                        .filter_map(|position| rows.row_data(position))
+                        .map(|mut row| {
+                            row.current = i64::from(row.id) == request;
+                            row
+                        })
+                        .collect();
+                    window.set_audio_quality_rows(ModelRc::from(std::rc::Rc::new(
+                        VecModel::from(updated),
+                    )));
+                    window.set_audio_quality(id);
+                    update_settings(&settings_store, |prefs| {
+                        prefs.audio_quality = settings::normalise_audio_quality(id.max(0) as u32);
+                    });
+                    crate::debug_log(&format!(
+                        "audio quality switch id={} index={} pos_ms={}",
+                        request,
+                        index,
+                        control.playback_position_ms()
+                    ));
+                }
+                None => {
+                    let text = match request {
+                        30250 => "杜比全景声需要大会员",
+                        30251 => "Hi-Res 无损需要大会员",
+                        _ => "该视频没有所选音质",
+                    };
+                    crate::toast(&window, text, TOAST_KIND_INFO);
+                    crate::debug_log(&format!(
+                        "audio quality denied id={} reason=absent locked=1",
+                        request
+                    ));
+                }
+            }
+        });
+    }
     {
         let control = control.clone();
         let window = weak.clone();
@@ -11912,7 +16570,7 @@ fn open_player_inner(
         let bvid = bvid.clone();
         let window = weak.clone();
         let coin_state = coin_state.clone();
-        std::thread::spawn(move || {
+        crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
             let Some(runtime) = crate::bilibili::shared_runtime() else {
                 return;
             };
@@ -11928,7 +16586,7 @@ fn open_player_inner(
                     }
                 });
             }
-        });
+        }));
     }
     {
         let session = session.clone();
@@ -11941,7 +16599,7 @@ fn open_player_inner(
             let bvid = bvid.clone();
             let window = window.clone();
             let coin_state = coin_state.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -11970,7 +16628,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
     {
@@ -11981,7 +16639,7 @@ fn open_player_inner(
             let session = session.clone();
             let window = window.clone();
             let player_fav_ids = player_fav_ids.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12009,7 +16667,7 @@ fn open_player_inner(
                         }
                     });
                 });
-            });
+            }));
         });
     }
     {
@@ -12027,7 +16685,7 @@ fn open_player_inner(
             }
             let session = session.clone();
             let window = window.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12051,7 +16709,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
     {
@@ -12071,7 +16729,7 @@ fn open_player_inner(
                 .unwrap_or_default();
             let session = session.clone();
             let window = window.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12095,7 +16753,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
     {
@@ -12106,7 +16764,7 @@ fn open_player_inner(
             let session = session.clone();
             let bvid = bvid.clone();
             let window = window.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12128,7 +16786,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -12142,7 +16800,7 @@ fn open_player_inner(
             if let Some(window) = window.upgrade() {
                 window.set_history_status("正在获取历史弹幕日期…".into());
             }
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12168,7 +16826,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
     {
@@ -12185,7 +16843,7 @@ fn open_player_inner(
             if let Some(window) = window.upgrade() {
                 window.set_history_status(format!("正在加载 {date} 的弹幕…").into());
             }
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12222,7 +16880,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -12248,7 +16906,7 @@ fn open_player_inner(
             if let Some(window) = window.upgrade() {
                 window.set_send_status("正在发送…".into());
             }
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12282,7 +16940,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -12303,7 +16961,7 @@ fn open_player_inner(
             if let Some(window) = window.upgrade() {
                 toast(&window, format!("正在举报 dmid={dmid}…"), TOAST_KIND_INFO);
             }
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12336,7 +16994,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -12373,7 +17031,7 @@ fn open_player_inner(
             );
             let session = session.clone();
             let window = window.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
@@ -12424,7 +17082,7 @@ fn open_player_inner(
                         }
                     }
                 });
-            });
+            }));
         });
     }
 
@@ -12585,6 +17243,100 @@ fn open_player_inner(
             });
         });
     }
+    // QA hook (`BILI_SEEK_DRAG_SHOT=<tag>[,<delay_ms>]`): replay ONE 2 s seek
+    // gesture at pointer rate on the real player window - the same property
+    // writes the TouchArea's move handler does (`dragging` + `drag_ms`, never a
+    // seek) - capture the preview mid-drag, then release exactly as the Up
+    // branch does (clear the flag, one `seek()`). The `seek requested` counter
+    // is sampled before and after: the delta over the gesture must be 1.
+    // No OS mouse event is synthesised.
+    if let Ok(spec) = std::env::var("BILI_SEEK_DRAG_SHOT") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "seek_drag".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(8_000)
+            .clamp(500, 120_000);
+        let control = control.clone();
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            for _ in 0..180 {
+                if control.duration_ms() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(player) = weak.upgrade() else {
+                    return;
+                };
+                let duration = player.get_duration_ms().max(1.0f32);
+                let start = duration * 0.12f32;
+                let end = duration * 0.56f32;
+                // Hold the chrome up for the capture; the pointer watch keeps
+                // its own last real value and gets it back when the drag ends.
+                player.set_pointer_inside(true);
+                let seeks_before = SEEK_REQUEST_COUNT.load(Ordering::SeqCst);
+                let path = qa_capture_path(&tag);
+                let timer = Rc::new(slint::Timer::default());
+                keep_qa_timer(timer.clone());
+                let tick = Rc::new(Cell::new(0u32));
+                let timer_a = timer.clone();
+                crate::debug_log(&format!(
+                    "seek-drag-test start duration_ms={duration:.0} from_ms={start:.0} to_ms={end:.0} seeks_before={seeks_before}"
+                ));
+                // Hold the "button is down" state for the length of the
+                // replay, exactly as a real press does.
+                player.set_qa_drag_hold(true);
+                player.set_dragging(true);
+                player.set_drag_ms(start as f32);
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    Duration::from_millis(16),
+                    move || {
+                        let n = tick.get();
+                        if n < 125 {
+                            // 125 ticks x 16ms = 2.0s of pointer-rate preview.
+                            let at = start + (end - start) * (n as f32) / 125.0;
+                            player.set_drag_ms(at as f32);
+                            if n == 60 {
+                                crate::debug_log(&format!(
+                                    "seek-drag-test preview preview_ms={at:.0} position_ms={:.0} dragging={} seeks_now={}",
+                                    player.get_position_ms(),
+                                    player.get_dragging(),
+                                    SEEK_REQUEST_COUNT.load(Ordering::SeqCst)
+                                ));
+                                let _ = capture_window_png(&player.window(), &path);
+                            }
+                            tick.set(n + 1);
+                        } else {
+                            // Release: the same writes as the Up branch.
+                            player.set_drag_ms(end as f32);
+                            player.set_dragging(false);
+                            player.set_qa_drag_hold(false);
+                            let seeks_after_drag = SEEK_REQUEST_COUNT.load(Ordering::SeqCst);
+                            player.invoke_seek(end as f32);
+                            let seeks_after = SEEK_REQUEST_COUNT.load(Ordering::SeqCst);
+                            crate::debug_log(&format!(
+                                "seek-drag-test release at_ms={end:.0} seeks_during_drag={} seeks_after_release={} delta={}",
+                                seeks_after_drag - seeks_before,
+                                seeks_after - seeks_before,
+                                seeks_after - seeks_before
+                            ));
+                            player.set_pointer_inside(player_pointer_inside(&player));
+                            timer_a.stop();
+                        }
+                    },
+                );
+            });
+        });
+    }
     // QA hook (`BILI_QUALITY_PICK=<index>[,<delay_ms>]`): invoke the real 画质
     // menu callback after `delay_ms` (default 12000), so an exact-stream switch
     // can be read from `BILI_DEBUG_LOG` (`quality pick …` +
@@ -12610,12 +17362,81 @@ fn open_player_inner(
                     };
                     crate::debug_log(&format!(
                         "quality-test invoke pick index={index} rows={}",
-                        player.get_quality_rows().row_count()
+                        player.get_quality_menu_rows().row_count()
                     ));
                     player.invoke_quality_pick(index);
                 });
             });
         }
+    }
+    // QA hook (`BILI_QUALITY_MENU_TEST=1`): once the merged 画质 menu has rows,
+    // open the 设置 tab and the 画质 menu through the same UI state the 画质 row
+    // writes, then capture the real player window with `PrintWindow` after it
+    // paints. No synthetic input; the capture path is logged.
+    if std::env::var("BILI_QUALITY_MENU_TEST")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        // Capture tag (`BILI_QUALITY_MENU_TAG`, named by the QA run); the PNG
+        // lands in %TEMP% as `bili_panel_test_<tag>_WxH.png`.
+        let tag = std::env::var("BILI_QUALITY_MENU_TAG")
+            .ok()
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "quality_locked".to_string());
+        let weak = weak.clone();
+        let timer = Rc::new(slint::Timer::default());
+        keep_qa_timer(timer.clone());
+        let step = Rc::new(Cell::new(0u8));
+        let timer_a = timer.clone();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(800),
+            move || {
+                let Some(player) = weak.upgrade() else {
+                    timer_a.stop();
+                    return;
+                };
+                match step.get() {
+                    0 => {
+                        let rows = player.get_quality_menu_rows().row_count();
+                        if rows == 0 {
+                            return;
+                        }
+                        // The menu is a chrome child: `ui/app.slint` closes it
+                        // while `pointer_inside` is false. Hold the chrome up
+                        // for the capture only - the pointer watch keeps its own
+                        // last real value, so putting it back below resumes the
+                        // normal cursor-driven behaviour. No pointer event is
+                        // synthesised.
+                        player.set_pointer_inside(true);
+                        player.set_right_panel(1);
+                        player.set_right_tab(3);
+                        crate::debug_log(&format!(
+                            "quality-menu-test panel open rows={rows} chrome=hold"
+                        ));
+                        step.set(1);
+                    }
+                    1 => {
+                        player.invoke_open_quality_menu();
+                        crate::debug_log("quality-menu-test menu open");
+                        step.set(2);
+                    }
+                    2 => {
+                        step.set(3);
+                        let _ = capture_player_png(&player.window(), &tag);
+                        crate::debug_log(&format!("quality-menu-test captured tag={tag}"));
+                    }
+                    3 => {
+                        // Hand the chrome back to the real cursor position.
+                        player.set_pointer_inside(player_pointer_inside(&player));
+                        crate::debug_log("quality-menu-test chrome=release");
+                        timer_a.stop();
+                    }
+                    _ => timer_a.stop(),
+                }
+            },
+        );
     }
     // QA hook (`BILI_COMMENTS_MORE_TEST=<delay_ms>[,<count>]`): call the real
     // `comments_more()` callback, so the page-ahead buffer is provable from
@@ -12664,11 +17485,40 @@ fn open_player_inner(
             });
         });
     }
+    // QA hook (`BILI_PLAYER_CHROME_TEST=<delay_ms>[,<tab>]`): open the player's
+    // right panel on the requested tab (default 信息) and leave it there, in
+    // windowed mode. BILI_PANEL_GLASS_TEST does the fullscreen dance; this one
+    // is the steady state the f133 chrome capture needs.
+    if let Ok(value) = std::env::var("BILI_PLAYER_CHROME_TEST") {
+        let mut parts = value.split(',');
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(9_000)
+            .clamp(2_000, 120_000);
+        let tab = parts
+            .next()
+            .and_then(|part| part.trim().parse::<i32>().ok())
+            .unwrap_or(0)
+            .clamp(0, 3);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(player) = weak.upgrade() {
+                    player.set_right_panel(1);
+                    player.set_right_tab(tab);
+                    player.invoke_panel_changed();
+                    log_panel_state(&player, "f133-chrome");
+                }
+            });
+        });
+    }
     // QA hook (`BILI_PANEL_GLASS_TEST=<delay_ms>[,<hold_ms>]`): open the right
     // panel, enter fullscreen through the REAL toggle, hold, then leave again.
-    // The `panel glass source=video|desktop` lines plus the logged properties
-    // prove the panels sample the video frame in overlay mode and the desktop
-    // snapshot otherwise - no synthetic input.
+    // It is the only way to reach the panel/fullscreen layout without synthetic
+    // input, so the panel and letterbox captures are reproducible; the name is
+    // kept for the existing scripts.
     if let Ok(value) = std::env::var("BILI_PANEL_GLASS_TEST") {
         let mut parts = value.split(',');
         let delay = parts
@@ -12682,7 +17532,6 @@ fn open_player_inner(
             .unwrap_or(4_000)
             .clamp(1_000, 60_000);
         let weak = weak.clone();
-        let control = control.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(delay));
             {
@@ -12692,7 +17541,7 @@ fn open_player_inner(
                         player.set_right_panel(1);
                         player.set_right_tab(2);
                         player.invoke_panel_changed();
-                        log_panel_glass(&player, "panel-open");
+                        log_panel_state(&player, "panel-open");
                     }
                 });
             }
@@ -12702,7 +17551,7 @@ fn open_player_inner(
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(player) = weak.upgrade() {
                         player.invoke_toggle_fullscreen();
-                        log_panel_glass(&player, "fullscreen");
+                        log_panel_state(&player, "fullscreen");
                     }
                 });
             }
@@ -12711,7 +17560,7 @@ fn open_player_inner(
                 let weak = weak.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(player) = weak.upgrade() {
-                        log_panel_glass(&player, "overlay");
+                        log_panel_state(&player, "overlay");
                     }
                 });
             }
@@ -12721,18 +17570,14 @@ fn open_player_inner(
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(player) = weak.upgrade() {
                         player.invoke_toggle_fullscreen();
-                        log_panel_glass(&player, "exit");
+                        log_panel_state(&player, "exit");
                     }
                 });
             }
             std::thread::sleep(Duration::from_millis(1_600));
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(player) = weak.upgrade() {
-                    log_panel_glass(&player, "windowed");
-                    crate::debug_log(&format!(
-                        "panel-glass video frames={}",
-                        control.video_glass_generation()
-                    ));
+                    log_panel_state(&player, "windowed");
                 }
             });
         });
@@ -12742,10 +17587,17 @@ fn open_player_inner(
     // landing can be read from BILI_DEBUG_LOG without synthetic input.
     // `<seconds>` is an absolute offset; `p<N>` seeks to N% of the duration
     // (always inside the track, so a deep seek works on any test video).
+    // `BILI_SEEK_DELAY_MS` (default 15000) shifts the seek, so a run can land
+    // after the background seek-point warm has finished.
     if let Ok(spec) = std::env::var("BILI_SEEK_TEST") {
         let spec = spec.trim().to_string();
         if !spec.is_empty() {
             let control = control.clone();
+            let seek_delay = std::env::var("BILI_SEEK_DELAY_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(15_000)
+                .clamp(1_000, 600_000);
             std::thread::spawn(move || {
                 for _ in 0..120 {
                     if control.duration_ms() > 0 {
@@ -12753,7 +17605,7 @@ fn open_player_inner(
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
-                std::thread::sleep(Duration::from_secs(15));
+                std::thread::sleep(Duration::from_millis(seek_delay));
                 let before = control.playback_position_ms();
                 let duration = control.duration_ms();
                 let target = if let Some(percent) = spec.strip_prefix('p') {
@@ -12919,7 +17771,17 @@ fn open_player_inner(
     // list that is already filling, and a replay does not depend on the user
     // touching the 💬 button first). Logged so a QA run can see it fired once.
     if aid != 0 {
-        crate::debug_log(&format!("comments auto-load aid={aid}"));
+        // Startup gate ordering: the comment page is a small, different-endpoint
+        // request, so it stays on the open path — but it is logged with the
+        // background gate state so a QA run can see what else ran here.
+        let feed_state = if prefetch::startup_gate_enabled() && player_active() {
+            "hold"
+        } else {
+            "run"
+        };
+        crate::debug_log(&format!(
+            "comments auto-load aid={aid} at=player-open feed={feed_state} warm={feed_state}"
+        ));
         on_comments_load(
             session.clone(),
             comments.clone(),
@@ -13069,7 +17931,7 @@ fn open_player_inner(
         let session = session.clone();
         let weak = weak.clone();
         let pic = video.pic.clone();
-        std::thread::spawn(move || {
+        crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
             let Some(runtime) = crate::bilibili::shared_runtime() else {
                 return;
             };
@@ -13082,7 +17944,7 @@ fn open_player_inner(
                     player.set_info_cover_ready(true);
                 }
             });
-        });
+        }));
     }
 
     let mini_slot = session_rec.mini_slot.clone();
@@ -13095,6 +17957,9 @@ fn open_player_inner(
         set_active_player(&player);
     }
     player::spawn(session, video, weak, mini_slot, control, track);
+    // QA (`BILI_F139_TEST`): measure the fast lane against the real decoder and
+    // capture `f139_danmaku_<hz>.png` with comments on screen.
+    maybe_start_danmaku_frame_qa(&player, danmaku_layer.clone());
     // The new window takes focus: card_open(0) replaces IT, and a later click on
     // an older window moves focus there (`poll_player_focus`).
     focus_player(state, &session_rec, false);
@@ -13523,7 +18388,7 @@ fn spawn_comment_avatars(
     if pending.is_empty() {
         return;
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -13555,7 +18420,7 @@ fn spawn_comment_avatars(
                 }
             });
         }
-    });
+    }));
 }
 
 /// Replace one avatar in the rendered model (root rows and their dialogs),
@@ -13658,7 +18523,7 @@ fn comments_prefetch_next(session: Arc<bilibili::Session>, comments: CommentsSlo
         }
         Err(_) => return,
     };
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             if let Ok(mut guard) = comments.lock() {
                 guard.prefetching = false;
@@ -13703,7 +18568,7 @@ fn comments_prefetch_next(session: Arc<bilibili::Session>, comments: CommentsSlo
                 }
             }
         }
-    });
+    }));
 }
 
 /// Fetch one page of comments and store it in `comments`.
@@ -13726,7 +18591,7 @@ fn comments_fetch(
     }
     // Show the loading bar immediately (the worker may take a second).
     publish_comments(&comments);
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             if let Ok(mut guard) = comments.lock() {
                 guard.loading = false;
@@ -13769,7 +18634,7 @@ fn comments_fetch(
                 publish_comments(&comments);
             }
         }
-    });
+    }));
 }
 
 /// Fetch one comment's dialog and cache its rows under `root_rpid`.
@@ -13786,7 +18651,7 @@ fn comment_replies_fetch(
     if aid == 0 || root_rpid == 0 {
         return;
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -13846,7 +18711,7 @@ fn comment_replies_fetch(
                 ));
             }
         }
-    });
+    }));
 }
 
 /// `BILI_COMMENTS_TEST=<aid>` driver: exercises the four handlers above without
@@ -14048,6 +18913,7 @@ fn toggle_mini(
         }
     };
     mini.global::<AppTheme>().set_dark(state.theme_dark.get());
+    set_mini_backdrop(&mini, state.theme_dark.get());
     mini.set_video_title(format!("小窗 · {title}").into());
     mini.set_playing(!control.paused());
     if let Some(main) = main.upgrade() {
@@ -14291,6 +19157,12 @@ fn toggle_mini(
     if !mini_prepared {
         win::prepare_frameless(mini.window());
     }
+    // The wallpaper is anchored to the SCREEN position, so publish it again now
+    // that the native window is placed (the pre-show publish had no rect).
+    let (wall_x, wall_y) = publish_wallpaper(mini.global::<AppTheme>(), mini.window());
+    crate::debug_log(&format!(
+        "wallpaper origin win=mini stage=show x={wall_x:.1} y={wall_y:.1}"
+    ));
     // Frameless mini window: the same subclass removes the non-client area.
     retry_subclass(&state);
     if let Ok(mut held) = slot.lock() {
@@ -14350,7 +19222,7 @@ fn spawn_attempt(
     my: u64,
     auto: bool,
 ) {
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             let message = "初始化网络运行时失败".to_string();
             post(&weak, &generation, my, move |ui| ui.set_status(message.into()));
@@ -14374,7 +19246,7 @@ fn spawn_attempt(
                 post(&weak, &generation, my, move |ui| ui.set_status(message.into()));
             }
         });
-    });
+    }));
 }
 
 async fn run_attempt(
@@ -14661,7 +19533,7 @@ fn vip_refresh(weak: Weak<AppWindow>, session_slot: SessionSlot) {
         ui.set_vip_busy(true);
         ui.set_vip_status_text("加载中…".into());
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -14683,7 +19555,7 @@ fn vip_refresh(weak: Weak<AppWindow>, session_slot: SessionSlot) {
                 }
             }
         });
-    });
+    }));
 }
 
 /// Run one 会员中心 write action and surface the returned API code.
@@ -14702,7 +19574,7 @@ fn vip_action(
         ui.set_vip_busy(true);
         ui.set_vip_action_status("请求中…".into());
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -14729,7 +19601,7 @@ fn vip_action(
                 }
             }
         });
-    });
+    }));
 }
 
 /// Publish the freshly built session to the shared slot.
@@ -14884,13 +19756,17 @@ struct HistoryPageState {
 struct UpPageState {
     mid: i64,
     name: String,
-    /// The header avatar URL from `user_card`. `up_avatar_text` stays `""` for
-    /// now (the UI shows the name only), so this is kept for the next step and
-    /// reported as a presence flag in the log.
+    /// The header avatar URL from `user_card`, fetched into `up_avatar`.
     avatar: String,
     fans: u64,
     /// The 投稿 count from `user_card`.
     videos: u64,
+    /// `acc/info`'s level and signature (the hero's Lv chip and the quiet
+    /// two-line signature).
+    level: String,
+    sign: String,
+    /// The active account's relation: 0 unfollowed / 2 following / 6 mutual.
+    attribute: i64,
     /// The sort of the page last PUBLISHED (not merely requested): 0 = 播放最多,
     /// 1 = 最新发布. `None` while a load is in flight; the `BILI_UP_PAGE_TEST`
     /// hook polls it.
@@ -14901,12 +19777,6 @@ struct UpPageState {
 struct RegionState {
     rid: i64,
     name: String,
-    page: i64,
-    has_more: bool,
-}
-
-#[derive(Default)]
-struct PopularState {
     page: i64,
     has_more: bool,
 }
@@ -15270,11 +20140,31 @@ async fn cover_fetch(
         CoverPath::Warm => &COVER_FETCHES_WARM,
     }
     .fetch_add(1, Ordering::Relaxed);
+    // Listed by the stall trace as `covers=`/`last=cover:decode`; the guard
+    // also releases the count when the future is cancelled mid-fetch.
+    crate::player::tag_here("cover:decode");
+    let _decoding = CoverDecodeGuard::new();
     let pixels = Arc::new(session.fetch_thumb(url).await.ok()?);
     if let Ok(mut cache) = cover_cache().lock() {
         cache.put(url, pixels.clone());
     }
     Some(pixels)
+}
+
+/// Holds the in-flight cover counter for as long as it lives.
+struct CoverDecodeGuard;
+
+impl CoverDecodeGuard {
+    fn new() -> Self {
+        crate::player::note_cover_decode(true);
+        Self
+    }
+}
+
+impl Drop for CoverDecodeGuard {
+    fn drop(&mut self) {
+        crate::player::note_cover_decode(false);
+    }
 }
 
 /// Fetch a small cover on the shared runtime, skipping it entirely while the
@@ -15421,15 +20311,26 @@ fn saturating_i32(value: i64) -> i32 {
 fn build_feed_row_text(video: &bilibili::FeedVideo) -> FeedRow {
     FeedRow {
         thumb: Image::default(),
+        // The queue identity is stable across recycling; `queued` is refreshed
+        // by `Playlist::mark_feed_queued` on every queue mutation.
+        bvid: video.bvid.clone().into(),
+        queued: false,
         title: video.title.clone().into(),
         owner: video.owner.clone().into(),
         owner_mid: video.owner_mid.to_string().into(),
-        meta: format!(
-            "{}播放 · {}",
-            format_view(video.view),
-            format_duration(video.duration)
-        )
-        .into(),
+        meta: if video.view == 0 {
+            // `newlist` (the region feed's working endpoint) reports
+            // `stat.view = 0` for every card; printing "0播放" would be a
+            // number the API never actually measured. Show the duration only.
+            format_duration(video.duration).into()
+        } else {
+            format!(
+                "{}播放 · {}",
+                format_view(video.view),
+                format_duration(video.duration)
+            )
+            .into()
+        },
         badge: format_duration(video.duration).into(),
         // The card redesign's own fields: the publish stamp (0 = unknown) and
         // the exact play count, so a card never has to parse `meta`.
@@ -15701,130 +20602,158 @@ fn spawn_feed_prefetch(
     ring: Arc<Mutex<FeedPrefetchRing>>,
     settings_store: Arc<Mutex<settings::Settings>>,
 ) {
-    std::thread::spawn(move || loop {
-        let capacity = feed_prefetch_capacity(&settings_store);
-        let Some(session) = active_session(&session_slot) else {
-            std::thread::sleep(FEED_PREFETCH_POLL);
-            continue;
-        };
-        // Reserve the cursor and mark the fill in flight under the same lock:
-        // a rebase that lands after this point sees `in_flight` and can
-        // invalidate this fetch before it is queued.
-        let (ready, source, start, epoch, want_fill) = {
-            let Ok(mut guard) = ring.lock() else {
+    std::thread::spawn(move || {
+        // Startup gate: while a player is open the ring neither starts a new
+        // batch nor warms its covers. Both are pure background work, and both
+        // compete with the first frames for the same link. Already-ready
+        // batches stay queued and are promoted on refresh as usual.
+        let gate = prefetch::startup_gate_enabled();
+        let mut held = false;
+        loop {
+            if gate && player_active() {
+                if !held {
+                    held = true;
+                    crate::debug_log("startup gate feed=hold reason=player-open");
+                }
+                std::thread::sleep(FEED_PREFETCH_POLL);
+                continue;
+            }
+            if held {
+                held = false;
+                crate::debug_log("startup gate feed=start reason=player-closed");
+            }
+            let capacity = feed_prefetch_capacity(&settings_store);
+            let Some(session) = active_session(&session_slot) else {
                 std::thread::sleep(FEED_PREFETCH_POLL);
                 continue;
             };
-            guard.switch_source(FEED_SOURCE_RECOMMEND);
-            guard.prune();
-            // A settings change can lower the cap while slots are queued.
-            while guard.ready.len() > capacity {
-                guard.ready.pop_back();
-            }
-            let want_fill = capacity > 0 && guard.ready.len() < capacity;
-            let start = guard.cursor();
-            if want_fill {
-                guard.in_flight = Some(start);
-            }
-            (
-                guard.ready.len(),
-                guard.source,
-                start,
-                guard.epoch,
-                want_fill,
-            )
-        };
-        if !want_fill {
-            std::thread::sleep(FEED_PREFETCH_POLL);
-            continue;
-        }
-        crate::debug_log(&format!(
-            "feed prefetch refill started source={source} start={start} slot={}/{}",
-            ready + 1,
-            capacity
-        ));
-        let began = Instant::now();
-        // Same fetch as the refresh path, only the progress callback is inert.
-        let items = fetch_feed(session.clone(), start, Arc::new(|_, _| {}));
-        let elapsed_ms = began.elapsed().as_millis();
-        let count = items.len();
-        // Warm the covers the first paint needs **before** the batch is queued,
-        // so `ready` means "text and first screenful decoded". No ring lock is
-        // held here (a refill may be promoted while it runs; `epoch` decides).
-        let page_size = settings_store
-            .lock()
-            .map(|guard| guard.page_size)
-            .unwrap_or_else(|_| settings::default_page_size());
-        // Do not spend cover fetches on a batch that is already obsolete (a
-        // rebase landed) or no longer fits the ring.
-        let still_wanted = ring
-            .lock()
-            .map(|guard| guard.epoch == epoch && guard.ready.len() < capacity)
-            .unwrap_or(false);
-        let target = feed_cover_warm_target(page_size);
-        let cap = items.len().min(bilibili::THUMB_MAX_PER_VIEW);
-        let covers = if items.is_empty() || !still_wanted || !cover_warm_enabled() {
-            WarmCovers::new(cap, target)
-        } else {
-            warm_feed_covers(&session, &items, target)
-        };
-        let covers_warm = covers.count();
-        let covers_cap = covers.cap;
-        // Text + warm-up: what "ready" now costs.
-        let ready_ms = began.elapsed().as_millis();
-        let outcome = {
-            let Ok(mut guard) = ring.lock() else {
-                continue;
-            };
-            if guard.in_flight == Some(start) {
-                guard.in_flight = None;
-            }
-            if guard.epoch != epoch {
-                "rebase"
-            } else if guard.ready.len() >= capacity {
-                "full"
-            } else if items.is_empty() {
-                "empty"
-            } else {
-                guard.next_start = start.saturating_add(bilibili::feed_batch().max(1));
-                guard.ready.push_back(PrefetchedFeedBatch {
-                    source,
-                    start,
-                    items,
-                    covers,
-                    ready_at: Instant::now(),
-                });
+            // Reserve the cursor and mark the fill in flight under the same lock:
+            // a rebase that lands after this point sees `in_flight` and can
+            // invalidate this fetch before it is queued.
+            let (ready, source, start, epoch, want_fill) = {
+                let Ok(mut guard) = ring.lock() else {
+                    std::thread::sleep(FEED_PREFETCH_POLL);
+                    continue;
+                };
+                guard.switch_source(FEED_SOURCE_RECOMMEND);
                 guard.prune();
-                "ok"
+                // A settings change can lower the cap while slots are queued.
+                while guard.ready.len() > capacity {
+                    guard.ready.pop_back();
+                }
+                let want_fill = capacity > 0 && guard.ready.len() < capacity;
+                let start = guard.cursor();
+                if want_fill {
+                    guard.in_flight = Some(start);
+                }
+                (
+                    guard.ready.len(),
+                    guard.source,
+                    start,
+                    guard.epoch,
+                    want_fill,
+                )
+            };
+            if !want_fill {
+                std::thread::sleep(FEED_PREFETCH_POLL);
+                continue;
             }
-        };
-        match outcome {
-            "ok" => {
-                let (now_ready, _) = feed_prefetch_state(&ring);
+            crate::debug_log(&format!(
+                "feed prefetch refill started source={source} start={start} slot={}/{}",
+                ready + 1,
+                capacity
+            ));
+            let began = Instant::now();
+            // Same fetch as the refresh path, only the progress callback is inert.
+            let items = fetch_feed(session.clone(), start, Arc::new(|_, _| {}));
+            let elapsed_ms = began.elapsed().as_millis();
+            let count = items.len();
+            // Warm the covers the first paint needs **before** the batch is queued,
+            // so `ready` means "text and first screenful decoded". No ring lock is
+            // held here (a refill may be promoted while it runs; `epoch` decides).
+            let page_size = settings_store
+                .lock()
+                .map(|guard| guard.page_size)
+                .unwrap_or_else(|_| settings::default_page_size());
+            // Do not spend cover fetches on a batch that is already obsolete (a
+            // rebase landed), no longer fits the ring, or whose covers would
+            // compete with a player that opened while the fetch was in flight.
+            let still_wanted = ring
+                .lock()
+                .map(|guard| guard.epoch == epoch && guard.ready.len() < capacity)
+                .unwrap_or(false);
+            let target = feed_cover_warm_target(page_size);
+            let cap = items.len().min(bilibili::THUMB_MAX_PER_VIEW);
+            let player_holds = gate && player_active();
+            let want_covers = !items.is_empty() && still_wanted && cover_warm_enabled();
+            if want_covers && player_holds {
                 crate::debug_log(&format!(
-                    "feed prefetch refill ok source={source} start={start} items={count} ms={elapsed_ms}"
+                    "startup gate feed=hold reason=player-open phase=covers start={start}"
                 ));
-                crate::debug_log(&format!(
-                    "feed prefetch ready={now_ready}/{capacity} covers={covers_warm}/{covers_cap} source={source} ms={ready_ms}"
-                ));
-                if cover_warm_enabled() && covers_warm == 0 && covers_cap > 0 && !player_active() {
+            }
+            let covers = if want_covers && !player_holds {
+                warm_feed_covers(&session, &items, target)
+            } else {
+                WarmCovers::new(cap, target)
+            };
+            let covers_warm = covers.count();
+            let covers_cap = covers.cap;
+            // Text + warm-up: what "ready" now costs.
+            let ready_ms = began.elapsed().as_millis();
+            let outcome = {
+                let Ok(mut guard) = ring.lock() else {
+                    continue;
+                };
+                if guard.in_flight == Some(start) {
+                    guard.in_flight = None;
+                }
+                if guard.epoch != epoch {
+                    "rebase"
+                } else if guard.ready.len() >= capacity {
+                    "full"
+                } else if items.is_empty() {
+                    "empty"
+                } else {
+                    guard.next_start = start.saturating_add(bilibili::feed_batch().max(1));
+                    guard.ready.push_back(PrefetchedFeedBatch {
+                        source,
+                        start,
+                        items,
+                        covers,
+                        ready_at: Instant::now(),
+                    });
+                    guard.prune();
+                    "ok"
+                }
+            };
+            match outcome {
+                "ok" => {
+                    let (now_ready, _) = feed_prefetch_state(&ring);
                     crate::debug_log(&format!(
-                        "feed prefetch refill covers=failed source={source} start={start}"
+                        "feed prefetch refill ok source={source} start={start} items={count} ms={elapsed_ms}"
+                    ));
+                    crate::debug_log(&format!(
+                        "feed prefetch ready={now_ready}/{capacity} covers={covers_warm}/{covers_cap} source={source} ms={ready_ms}"
+                    ));
+                    if cover_warm_enabled() && covers_warm == 0 && covers_cap > 0 && !player_active() {
+                        crate::debug_log(&format!(
+                            "feed prefetch refill covers=failed source={source} start={start}"
+                        ));
+                    }
+                }
+                "empty" => {
+                    crate::debug_log(&format!(
+                        "feed prefetch refill err=empty source={source} start={start} ms={elapsed_ms}"
+                    ));
+                    // Do not hammer a failing endpoint; the cursor stays put so the
+                    // same slot is retried once the network recovers.
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                reason => {
+                    crate::debug_log(&format!(
+                        "feed prefetch refill dropped source={source} start={start} reason={reason}"
                     ));
                 }
-            }
-            "empty" => {
-                crate::debug_log(&format!(
-                    "feed prefetch refill err=empty source={source} start={start} ms={elapsed_ms}"
-                ));
-                // Do not hammer a failing endpoint; the cursor stays put so the
-                // same slot is retried once the network recovers.
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            reason => {
-                crate::debug_log(&format!(
-                    "feed prefetch refill dropped source={source} start={start} reason={reason}"
-                ));
             }
         }
     });
@@ -15901,7 +20830,7 @@ fn spawn_feed_load(
         publish_refresh(&ui, true, 0.0);
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -15915,7 +20844,7 @@ fn spawn_feed_load(
             start,
             target_page,
         ));
-    });
+    }));
 }
 
 /// Fetch the single account's recommendation list and show it: the text rows
@@ -16335,7 +21264,7 @@ fn show_prefetched_batch(
     let weak_b = weak.clone();
     let generation_b = generation.clone();
     let feed_store_b = feed_store.clone();
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
         let Some(runtime) = bilibili::shared_runtime() else {
             return;
         };
@@ -16349,7 +21278,7 @@ fn show_prefetched_batch(
             warm_target,
             "feed prefetch",
         ));
-    });
+    }));
     true
 }
 
@@ -16468,7 +21397,7 @@ async fn show_home_after_login(
             let generation_b = generation.clone();
             let feed_store_b = feed_store.clone();
             let session_b = session.clone();
-            std::thread::spawn(move || {
+            crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
                 let Some(runtime) = bilibili::shared_runtime() else {
                     return;
                 };
@@ -16482,7 +21411,7 @@ async fn show_home_after_login(
                     0,
                     &format!("feed start={batch_start}"),
                 ));
-            });
+            }));
         }
         StartupBatch::Timeout => {
             // Show the home view now and let the existing network path fill it.
@@ -16671,7 +21600,7 @@ async fn stream_cover_list<T: Clone + 'static, G>(
     flush_missing(weak, &sync, total.saturating_sub(delivered));
 }
 
-/// Phase B for a shared `[CardRow]` list (分区 / 排行 / 热门 / 必刷): stream the
+/// Phase B for a shared `[CardRow]` list (分区 / 排行): stream the
 /// covers of the first `THUMB_MAX_PER_VIEW` cards.
 async fn stream_card_covers(
     weak: &Weak<AppWindow>,
@@ -16751,7 +21680,7 @@ fn load_region(
         ui.set_region_current_page(page as i32);
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -16835,311 +21764,9 @@ fn load_region(
             )
             .await;
         });
-    });
+    }));
 }
 
-fn load_ranking(
-    weak: Weak<AppWindow>,
-    session_slot: SessionSlot,
-    browse_bvids: Arc<Mutex<Vec<String>>>,
-    rank_rid: Arc<Mutex<i64>>,
-    rid: i64,
-) {
-    let Some(session) = active_session(&session_slot) else {
-        return;
-    };
-    if let Ok(mut guard) = rank_rid.lock() {
-        *guard = rid;
-    }
-    let index = if rid == 0 {
-        0
-    } else {
-        REGIONS
-            .iter()
-            .position(|(_, region)| *region == rid)
-            .map(|position| position + 1)
-            .unwrap_or(0)
-    };
-    if let Some(ui) = weak.upgrade() {
-        publish_refresh(&ui, true, 0.0);
-        ui.set_rank_region_index(index as i32);
-        ui.set_rank_status(String::new().into());
-        update_page_bar(&ui);
-    }
-    std::thread::spawn(move || {
-        let Some(runtime) = crate::bilibili::shared_runtime() else {
-            return;
-        };
-        runtime.block_on(async move {
-            let cards = match session.ranking(rid).await {
-                Ok(cards) => cards,
-                Err(err) => {
-                    crate::debug_log(&format!("ranking rid={rid} err={err:#}"));
-                    let message = format!("排行榜加载失败：{err}");
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = weak.upgrade() {
-                            publish_refresh(&ui, false, 1.0);
-                            ui.set_rank_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
-                                Vec::<CardRow>::new(),
-                            ))));
-                            ui.set_rank_status(message.into());
-                            update_page_bar(&ui);
-                        }
-                    });
-                    return;
-                }
-            };
-            let total = cards.len();
-            let covers = total.min(bilibili::THUMB_MAX_PER_VIEW);
-            let rows: Vec<(String, CardRowData)> = cards
-                .iter()
-                .map(|card| {
-                    let meta = format!(
-                        "{} · {}播放 · 赞{}",
-                        card.owner,
-                        format_view(card.view),
-                        format_view(card.like)
-                    );
-                    (
-                        card.bvid.clone(),
-                        CardRowData {
-                            pixels: None,
-                            title: card.title.clone(),
-                            meta,
-                            badge: format_duration(card.duration),
-                        },
-                    )
-                })
-                .collect();
-            let weak_a = weak.clone();
-            let browse_a = browse_bvids.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = weak_a.upgrade() {
-                    let items = publish_cards(&rows, &browse_a);
-                    ui.set_rank_items(ModelRc::from(std::rc::Rc::new(VecModel::from(items))));
-                    publish_refresh(&ui, false, 1.0);
-                    ui.set_rank_status(String::new().into());
-                    // Single-shot list: the client page spans the loaded rows.
-                    publish_list_offset(&ui);
-                    skeleton_arm(&ui, covers as u64);
-                    update_page_bar(&ui);
-                    crate::debug_log(&format!("ranking load rendered items={total}"));
-                }
-            });
-            stream_card_covers(
-                &weak,
-                &session,
-                &cards,
-                browse_bvids,
-                |ui| ui.get_rank_items(),
-                format!("ranking rid={rid}"),
-            )
-            .await;
-        });
-    });
-}
-
-fn load_popular(
-    weak: Weak<AppWindow>,
-    session_slot: SessionSlot,
-    browse_bvids: Arc<Mutex<Vec<String>>>,
-    popular_state: Arc<Mutex<PopularState>>,
-    page: i64,
-) {
-    let Some(session) = active_session(&session_slot) else {
-        return;
-    };
-    let page = page.max(1);
-    if let Ok(mut state) = popular_state.lock() {
-        state.page = page;
-    }
-    // One API page per screen (see `load_region`).
-    let ps = current_page_size(&weak);
-    if let Some(ui) = weak.upgrade() {
-        publish_refresh(&ui, true, 0.0);
-        ui.set_popular_current_page(page as i32);
-        update_page_bar(&ui);
-    }
-    std::thread::spawn(move || {
-        let Some(runtime) = crate::bilibili::shared_runtime() else {
-            return;
-        };
-        runtime.block_on(async move {
-            let card_page = match session.popular(page, ps).await {
-                Ok(card_page) => card_page,
-                Err(err) => {
-                    crate::debug_log(&format!("popular err={err:#}"));
-                    let message = format!("热门加载失败：{err}");
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = weak.upgrade() {
-                            publish_refresh(&ui, false, 1.0);
-                            ui.set_popular_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
-                                Vec::<CardRow>::new(),
-                            ))));
-                            ui.set_popular_page_text(message.into());
-                            ui.set_popular_has_prev(false);
-                            ui.set_popular_has_next(false);
-                            update_page_bar(&ui);
-                        }
-                    });
-                    return;
-                }
-            };
-            let num = card_page.page;
-            let has_more = card_page.has_more;
-            let cards = card_page.items;
-            let covers = cards.len().min(bilibili::THUMB_MAX_PER_VIEW);
-            let rows: Vec<(String, CardRowData)> = cards
-                .iter()
-                .map(|card| {
-                    let meta = format!(
-                        "{} · {}播放 · {}",
-                        card.owner,
-                        format_view(card.view),
-                        format_duration(card.duration)
-                    );
-                    (
-                        card.bvid.clone(),
-                        CardRowData {
-                            pixels: None,
-                            title: card.title.clone(),
-                            meta,
-                            badge: format_duration(card.duration),
-                        },
-                    )
-                })
-                .collect();
-            let loaded = rows.len();
-            let weak_a = weak.clone();
-            let browse_a = browse_bvids.clone();
-            let popular_state_a = popular_state.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = weak_a.upgrade() {
-                    let items = publish_cards(&rows, &browse_a);
-                    if let Ok(mut state) = popular_state_a.lock() {
-                        state.page = num;
-                        state.has_more = has_more;
-                    }
-                    ui.set_popular_items(ModelRc::from(std::rc::Rc::new(VecModel::from(items))));
-                    publish_refresh(&ui, false, 1.0);
-                    ui.set_popular_page_text(format!("第 {num} 页").into());
-                    ui.set_popular_current_page(num as i32);
-                    ui.set_popular_has_prev(num > 1);
-                    ui.set_popular_has_next(has_more);
-                    // One API page is one screen: the offset restarts at 0.
-                    set_client_page(10, 0);
-                    publish_list_offset(&ui);
-                    skeleton_arm(&ui, covers as u64);
-                    update_page_bar(&ui);
-                    crate::debug_log(&format!("popular load rendered items={loaded}"));
-                }
-            });
-            stream_card_covers(
-                &weak,
-                &session,
-                &cards,
-                browse_bvids,
-                |ui| ui.get_popular_items(),
-                format!("popular page={num}"),
-            )
-            .await;
-        });
-    });
-}
-
-/// Load the 入站必刷 list (single fetch, up to 100 rows) into the card view.
-fn load_precious(
-    weak: Weak<AppWindow>,
-    session_slot: SessionSlot,
-    browse_bvids: Arc<Mutex<Vec<String>>>,
-) {
-    let Some(session) = active_session(&session_slot) else {
-        return;
-    };
-    if let Some(ui) = weak.upgrade() {
-        publish_refresh(&ui, true, 0.0);
-        ui.set_precious_status(String::new().into());
-        update_page_bar(&ui);
-    }
-    std::thread::spawn(move || {
-        let Some(runtime) = crate::bilibili::shared_runtime() else {
-            return;
-        };
-        runtime.block_on(async move {
-            let cards = match session.precious().await {
-                Ok(cards) => cards,
-                Err(err) => {
-                    crate::debug_log(&format!("precious err={err:#}"));
-                    let message = format!("入站必刷加载失败：{err}");
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = weak.upgrade() {
-                            publish_refresh(&ui, false, 1.0);
-                            ui.set_precious_items(ModelRc::from(std::rc::Rc::new(
-                                VecModel::from(Vec::<CardRow>::new()),
-                            )));
-                            ui.set_precious_status(message.into());
-                            update_page_bar(&ui);
-                        }
-                    });
-                    return;
-                }
-            };
-            let covers = cards.len().min(bilibili::THUMB_MAX_PER_VIEW);
-            let rows: Vec<(String, CardRowData)> = cards
-                .iter()
-                .map(|card| {
-                    let meta = format!(
-                        "{} · {}播放 · {}",
-                        card.owner,
-                        format_view(card.view),
-                        format_duration(card.duration)
-                    );
-                    (
-                        card.bvid.clone(),
-                        CardRowData {
-                            pixels: None,
-                            title: card.title.clone(),
-                            meta,
-                            badge: format_duration(card.duration),
-                        },
-                    )
-                })
-                .collect();
-            let count = rows.len();
-            let weak_a = weak.clone();
-            let browse_a = browse_bvids.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = weak_a.upgrade() {
-                    let items = publish_cards(&rows, &browse_a);
-                    ui.set_precious_items(ModelRc::from(std::rc::Rc::new(VecModel::from(items))));
-                    publish_refresh(&ui, false, 1.0);
-                    ui.set_precious_status(String::new().into());
-                    // Single-shot list: the client page spans the loaded rows.
-                    publish_list_offset(&ui);
-                    skeleton_arm(&ui, covers as u64);
-                    update_page_bar(&ui);
-                    crate::debug_log(&format!("precious load rendered items={count}"));
-                }
-            });
-            stream_card_covers(
-                &weak,
-                &session,
-                &cards,
-                browse_bvids,
-                |ui| ui.get_precious_items(),
-                "precious".to_string(),
-            )
-            .await;
-        });
-    });
-}
-
-/// Open the UP page for `mid`: open the overlay, then fetch the header card and
-/// page 1 (播放最多) through [`load_up_page`].
-///
-/// Both entry points land here — a card's UP name (`open_up(index)`, after
-/// [`resolve_card_mid`]) and a search 用户 row (`open_up_mid(mid)`) — so the page
-/// can only be filled one way.
 fn open_up_mid(
     weak: Weak<AppWindow>,
     session_slot: SessionSlot,
@@ -17157,6 +21784,15 @@ fn open_up_mid(
         ui.set_up_name(String::new().into());
         ui.set_up_fans(String::new().into());
         ui.set_up_videos_text(String::new().into());
+        ui.set_up_level(String::new().into());
+        ui.set_up_sign(String::new().into());
+        ui.set_up_avatar(Image::default());
+        ui.set_up_avatar_text(String::new().into());
+        ui.set_up_loading(true);
+        ui.set_up_status(String::new().into());
+        ui.set_up_follow_state(0);
+        ui.set_up_follow_text("关注".into());
+        ui.set_up_follow_busy(false);
         ui.set_up_sort(0);
         ui.set_up_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
             Vec::<FeedRow>::new(),
@@ -17198,6 +21834,15 @@ fn close_up_page(
     ui.set_up_name(String::new().into());
     ui.set_up_fans(String::new().into());
     ui.set_up_videos_text(String::new().into());
+    ui.set_up_level(String::new().into());
+    ui.set_up_sign(String::new().into());
+    ui.set_up_avatar(Image::default());
+    ui.set_up_avatar_text(String::new().into());
+    ui.set_up_loading(true);
+    ui.set_up_status(String::new().into());
+    ui.set_up_follow_state(0);
+    ui.set_up_follow_text("关注".into());
+    ui.set_up_follow_busy(false);
     ui.set_up_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
         Vec::<FeedRow>::new(),
     ))));
@@ -17208,6 +21853,70 @@ fn close_up_page(
         *state = UpPageState::default();
     }
     crate::debug_log("up close");
+}
+
+/// Follow / unfollow the UP主 whose page is open, through the same
+/// `x/relation/modify` path the space page uses. The button is pill-shaped in
+/// both states; only its fill and label change.
+fn toggle_up_follow(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    up_page: Arc<Mutex<UpPageState>>,
+) {
+    let Some(session) = active_session(&session_slot) else {
+        return;
+    };
+    let (mid, current) = match up_page.lock() {
+        Ok(state) => (state.mid, state.attribute),
+        Err(_) => return,
+    };
+    if mid <= 0 {
+        return;
+    }
+    if let Some(ui) = weak.upgrade() {
+        if ui.get_up_follow_busy() {
+            return;
+        }
+        ui.set_up_follow_busy(true);
+    }
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
+        let Some(runtime) = crate::bilibili::shared_runtime() else {
+            return;
+        };
+        runtime.block_on(async move {
+            let act = if current == 2 || current == 6 { 2 } else { 1 };
+            let result = session.relation_modify(mid, act).await;
+            let (attribute, status) = match result {
+                Ok(()) => {
+                    let attribute = session
+                        .relation_state(mid)
+                        .await
+                        .unwrap_or(if act == 1 { 2 } else { 0 });
+                    (attribute, String::new())
+                }
+                Err(err) => {
+                    crate::debug_log(&format!(
+                        "up follow mid={mid} act={act} err={err:#}"
+                    ));
+                    (current, format!("关注操作失败：{err}"))
+                }
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    if let Ok(mut state) = up_page.lock() {
+                        state.attribute = attribute;
+                    }
+                    ui.set_up_follow_state(attribute as i32);
+                    ui.set_up_follow_text(follow_text(attribute).into());
+                    ui.set_up_follow_busy(false);
+                    ui.set_up_status(status.into());
+                    crate::debug_log(&format!(
+                        "up follow mid={mid} attribute={attribute}"
+                    ));
+                }
+            });
+        });
+    }));
 }
 
 /// `BILI_UP_PAGE_TEST`: wait (bounded) until page `sort` has been PUBLISHED,
@@ -17262,6 +21971,16 @@ fn load_up_page(
     if let Some(ui) = weak.upgrade() {
         ui.set_up_page_open(true);
         ui.set_up_sort(sort);
+        if announce {
+            ui.set_up_loading(true);
+            ui.set_up_status(String::new().into());
+            ui.set_up_level(String::new().into());
+            ui.set_up_sign(String::new().into());
+            ui.set_up_avatar(Image::default());
+            ui.set_up_follow_state(0);
+            ui.set_up_follow_text("关注".into());
+            ui.set_up_follow_busy(false);
+        }
     }
     let order = if sort == 1 {
         bilibili::UpOrder::Newest
@@ -17275,7 +21994,7 @@ fn load_up_page(
             .lock()
             .map(|state| state.mid != mid || state.name.is_empty())
             .unwrap_or(true);
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -17292,6 +22011,28 @@ fn load_up_page(
             } else {
                 None
             };
+            // The space info carries the level and the signature; the card
+            // above carries the avatar and the counts. Both only on a real
+            // open (a sort switch reuses the header already on screen).
+            let profile = if need_card {
+                session.space_info(mid).await.ok()
+            } else {
+                None
+            };
+            let attribute = if need_card {
+                session.relation_state(mid).await.unwrap_or(-1)
+            } else {
+                -1
+            };
+            let avatar_url = card
+                .as_ref()
+                .map(|(_, avatar, _, _)| avatar.clone())
+                .unwrap_or_default();
+            let avatar_image = if need_card && !avatar_url.is_empty() {
+                session.fetch_avatar(&avatar_url).await.ok()
+            } else {
+                None
+            };
             let (items, has_more) = match session.up_videos(mid, order, 1).await {
                 Ok(page) => page,
                 Err(err) => {
@@ -17299,6 +22040,13 @@ fn load_up_page(
                         "up mid={mid} order={} err={err:#}",
                         order.param()
                     ));
+                    let message = format!("投稿加载失败：{err}");
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.set_up_loading(false);
+                            ui.set_up_status(message.into());
+                        }
+                    });
                     return;
                 }
             };
@@ -17361,6 +22109,25 @@ fn load_up_page(
                         state.videos = videos;
                     }
                 }
+                if let Some(profile) = profile {
+                    if let Ok(mut state) = rows_state.lock() {
+                        state.level = if profile.level > 0 {
+                            format!("Lv{}", profile.level)
+                        } else {
+                            String::new()
+                        };
+                        state.sign = if profile.sign.trim().is_empty() {
+                            "（暂无签名）".to_string()
+                        } else {
+                            profile.sign.trim().to_string()
+                        };
+                    }
+                }
+                if attribute >= 0 {
+                    if let Ok(mut state) = rows_state.lock() {
+                        state.attribute = attribute;
+                    }
+                }
                 let header = rows_state
                     .lock()
                     .map(|state| {
@@ -17369,21 +22136,37 @@ fn load_up_page(
                             state.fans,
                             state.videos,
                             u8::from(!state.avatar.is_empty()),
+                            state.level.clone(),
+                            state.sign.clone(),
+                            state.attribute,
                         )
                     })
                     .unwrap_or_default();
                 ui.set_up_name(header.0.into());
                 ui.set_up_fans(format_view(header.1).into());
-                ui.set_up_videos_text(format!("{} 个投稿", format_view(header.2)).into());
+                ui.set_up_videos_text(format_view(header.2).into());
+                ui.set_up_level(header.4.clone().into());
+                ui.set_up_sign(header.5.clone().into());
+                ui.set_up_follow_state(header.6 as i32);
+                ui.set_up_follow_text(follow_text(header.6).into());
+                if let Some((bytes, w, h)) = avatar_image {
+                    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+                    buffer.make_mut_bytes().copy_from_slice(&bytes);
+                    ui.set_up_avatar(Image::from_rgba8(buffer));
+                }
                 ui.set_up_items(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
                 ui.set_up_page_open(true);
+                ui.set_up_loading(false);
+                ui.set_up_status(String::new().into());
                 ui.set_up_sort(sort);
                 if let Ok(mut state) = rows_state.lock() {
                     state.published = Some(sort);
                 }
                 crate::debug_log(&format!(
-                    "up page rendered mid={mid} sort={sort} items={row_count} avatar={}",
-                    header.3
+                    "up page rendered mid={mid} sort={sort} items={row_count} avatar={} level={:?} sign={}",
+                    header.3,
+                    header.4,
+                    u8::from(!header.5.is_empty())
                 ));
             });
 
@@ -17413,7 +22196,7 @@ fn load_up_page(
             )
             .await;
         });
-    });
+    }));
 }
 
 /// The UP主 behind the card at `index` on the view that is on screen.
@@ -17562,7 +22345,7 @@ fn load_space_profile(
         ui.set_space_avatar(Image::default());
         ui.set_space_follow_status(String::new().into());
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -17643,7 +22426,7 @@ fn load_space_profile(
                 });
             }
         });
-    });
+    }));
 }
 
 fn load_space_videos(
@@ -17673,7 +22456,7 @@ fn load_space_videos(
         ui.set_space_list_loading(true);
         ui.set_space_current_page(page as i32);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -17777,7 +22560,7 @@ fn load_space_videos(
             )
             .await;
         });
-    });
+    }));
 }
 
 fn toggle_space_follow(
@@ -17802,7 +22585,7 @@ fn toggle_space_follow(
         ui.set_space_follow_busy(true);
         ui.set_space_follow_status(String::new().into());
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -17837,7 +22620,7 @@ fn toggle_space_follow(
                 }
             });
         });
-    });
+    }));
 }
 
 /// Log the account out server-side (only while the login is live), clear the
@@ -17852,7 +22635,7 @@ fn logout_account(weak: Weak<AppWindow>, generation: Arc<AtomicU64>, session_slo
     if let Some(ui) = weak.upgrade() {
         ui.set_status("正在退出登录…".into());
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -17895,7 +22678,7 @@ fn logout_account(weak: Weak<AppWindow>, generation: Arc<AtomicU64>, session_slo
                 ui.set_status(status.into());
             });
         });
-    });
+    }));
 }
 
 /// Debounced (140 ms) suggestion lookup; a newer keystroke makes this inert.
@@ -17918,7 +22701,7 @@ fn load_suggestions(
     let Some(session) = active_session(&session_slot) else {
         return;
     };
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -17942,7 +22725,7 @@ fn load_suggestions(
                 }
             });
         });
-    });
+    }));
 }
 
 /// Fetch the 热搜 list (display names + search keywords) for the results view.
@@ -17954,7 +22737,7 @@ fn load_hot_search(
     let Some(session) = active_session(&session_slot) else {
         return;
     };
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -17974,7 +22757,7 @@ fn load_hot_search(
                 }
             });
         });
-    });
+    }));
 }
 
 /// Start a fresh video search: switch to the results view, clear suggestions
@@ -18024,70 +22807,31 @@ fn active_parts(session_slot: &SessionSlot) -> Option<(Arc<bilibili::Session>, i
     Some((session, mid))
 }
 
-fn load_fav_folders(
-    weak: Weak<AppWindow>,
-    session_slot: SessionSlot,
-    fav_folders: Arc<Mutex<Vec<bilibili::FavFolder>>>,
-) {
-    let Some((session, _mid)) = active_parts(&session_slot) else {
-        return;
-    };
-    if let Some(ui) = weak.upgrade() {
-        ui.set_fav_list_loading(true);
-        ui.set_fav_list_status(String::new().into());
-    }
-    std::thread::spawn(move || {
-        let Some(runtime) = crate::bilibili::shared_runtime() else {
-            return;
-        };
-        runtime.block_on(async move {
-            let result = session.fav_folders().await;
-            let (rows, status) = match result {
-                Ok(folders) => {
-                    let rows: Vec<FavFolderRow> = folders
-                        .iter()
-                        .map(|folder| FavFolderRow {
-                            fid: folder.id.to_string().into(),
-                            title: folder.name.clone().into(),
-                            count: format!("{} 个内容", folder.count).into(),
-                        })
-                        .collect();
-                    if let Ok(mut guard) = fav_folders.lock() {
-                        *guard = folders;
-                    }
-                    (rows, String::new())
-                }
-                Err(err) => {
-                    crate::debug_log(&format!("fav_folders err={err:#}"));
-                    (Vec::new(), format!("收藏夹加载失败：{err}"))
-                }
-            };
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = weak.upgrade() {
-                    ui.set_fav_folder_items(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
-                    ui.set_fav_list_loading(false);
-                    ui.set_fav_list_status(status.into());
-                }
-            });
-        });
-    });
-}
-
 // ---------------------------------------------------------------------------
-// 收藏推荐: the mixed favourite-folder masonry (home_tab 5)
+// 收藏: the folder-scoped masonry behind 推荐流 and 收藏夹
+//
+// ONE page, two tabs (see the 收藏 page block in `ui/app.slint`):
+//   * 推荐流 (`FavMode::Stream`, home_tab 5, view_mode 0) is the 收藏推荐 feed:
+//     tab 0 is the Pinterest-style mix (the largest folders' first page, two
+//     random picks per folder expanded through `related()`, merged, deduped,
+//     shuffled, capped); tab `i + 1` is that one folder as a seed - its own
+//     page plus two picks' related videos - i.e. the same feed restricted to
+//     the folder. There is no "recommendation feed" endpoint to filter on the
+//     server: this feed IS built here, so the folder is the exact seed.
+//   * 收藏夹 (`FavMode::Library`, view_mode 3) is the plain listing: tab 0 is
+//     every folder's first page merged in folder order, tab `i + 1` is that
+//     folder's own videos filled page by page (capped) - no `related()`
+//     expansion, no shuffle. Same masonry, same strip, same selection.
 //
 // The shipped UI owns 全部 and only lists the user's own folders:
 // `fav_tabs[i]` is folder `i`'s name and `fav_tab == i + 1` (`0` = 全部, see
 // `ui/app.slint`). The names live on in `FavViewState.folders`, which is what
-// maps a tab back to the folder's `media_id`.
-//
-// Tab 0 is a Pinterest-style mix: the largest folders' first page, two random
-// picks per folder expanded through `related()`, merged, deduped, shuffled and
-// capped. Both the mix and each folder tab are cached in-process for
-// [`FAV_VIEW_TTL`], so switching back inside the window costs no network.
+// maps a tab back to the folder's `media_id`. Every built (mode, tab) is cached
+// in-process for [`FAV_VIEW_TTL`], so switching back inside the window costs no
+// network.
 // ---------------------------------------------------------------------------
 
-/// How long a built 收藏推荐 tab (mixed or per folder) stays valid.
+/// How long a built 收藏 tab (mixed, per folder, or library) stays valid.
 const FAV_VIEW_TTL: Duration = Duration::from_secs(5 * 60);
 /// Folders the mixed stream draws from (largest first).
 const FAV_MIX_MAX_FOLDERS: usize = 8;
@@ -18100,15 +22844,35 @@ const FAV_CARDS_MAX: usize = 45;
 /// The neutral 16:9 height/width ratio the card falls back to.
 const FAV_DEFAULT_ASPECT: f32 = 0.5625;
 
-/// UI-side truth for the 收藏推荐 view. The generation is bumped by every load
+/// Which of the two folder-scoped 收藏 tabs a load serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FavMode {
+    /// 推荐流: the 收藏推荐 feed (mix / folder as a seed).
+    Stream,
+    /// 收藏夹: the plain listing (all folders / one folder, no expansion).
+    Library,
+}
+
+impl FavMode {
+    fn label(self) -> &'static str {
+        match self {
+            FavMode::Stream => "stream",
+            FavMode::Library => "library",
+        }
+    }
+}
+
+/// UI-side truth for the 收藏 page. The generation is bumped by every load
 /// request, so a worker that finishes after a tab switch is dropped.
 struct FavViewState {
     /// Published order: `fav_tabs[i]` is `folders[i].name`, tab `i + 1`.
     folders: Vec<bilibili::FavFolder>,
     /// Tab the last load asked for (`0` = 全部, `i + 1` = `folders[i]`).
     tab: i32,
+    /// Tab (mode + folder) the last load asked for.
+    mode: FavMode,
     /// The tab whose cards are on screen; `None` while a load is in flight.
-    published: Option<i32>,
+    published: Option<(FavMode, i32)>,
     /// A load is in flight (the QA hook polls this).
     loading: bool,
     /// The folder fetch is in flight / has completed at least once.
@@ -18124,6 +22888,7 @@ impl FavViewState {
         Self {
             folders: Vec::new(),
             tab: 0,
+            mode: FavMode::Stream,
             published: None,
             loading: false,
             folders_loading: false,
@@ -18142,12 +22907,21 @@ struct FavCacheEntry {
     sources: usize,
 }
 
+/// One mode's cache: the 全部 entry (keyed by the folder set) and the per-folder
+/// entries. 推荐流 and 收藏夹 build different cards from the same folders, so
+/// they keep separate namespaces.
+#[derive(Default)]
+struct FavCacheNs {
+    /// Folder ids the 全部 entry was built from: a different set invalidates it.
+    key: Vec<i64>,
+    all: Option<FavCacheEntry>,
+    folders: HashMap<i64, FavCacheEntry>,
+}
+
 #[derive(Default)]
 struct FavViewCache {
-    /// Folder ids the mixed entry was built from: a different set invalidates it.
-    mix_key: Vec<i64>,
-    mixed: Option<FavCacheEntry>,
-    folders: HashMap<i64, FavCacheEntry>,
+    stream: FavCacheNs,
+    library: FavCacheNs,
 }
 
 static FAV_VIEW_CACHE: OnceLock<Mutex<FavViewCache>> = OnceLock::new();
@@ -18156,50 +22930,56 @@ fn fav_view_cache() -> &'static Mutex<FavViewCache> {
     FAV_VIEW_CACHE.get_or_init(|| Mutex::new(FavViewCache::default()))
 }
 
-fn fav_mixed_cached(key: &[i64]) -> Option<FavCacheEntry> {
-    let guard = fav_view_cache().lock().ok()?;
-    if guard.mix_key != key {
-        return None;
+fn fav_cache_ns(cache: &mut FavViewCache, mode: FavMode) -> &mut FavCacheNs {
+    match mode {
+        FavMode::Stream => &mut cache.stream,
+        FavMode::Library => &mut cache.library,
     }
-    let entry = guard.mixed.as_ref()?;
+}
+
+/// A cached `(mode, folder)` tab, if it is still inside [`FAV_VIEW_TTL`].
+fn fav_cached(mode: FavMode, folder: Option<i64>, key: &[i64]) -> Option<FavCacheEntry> {
+    let mut guard = fav_view_cache().lock().ok()?;
+    let ns = fav_cache_ns(&mut guard, mode);
+    let entry = match folder {
+        Some(media_id) => ns.folders.get(&media_id)?,
+        None => {
+            if ns.key != key {
+                return None;
+            }
+            ns.all.as_ref()?
+        }
+    };
     if entry.at.elapsed() >= FAV_VIEW_TTL {
         return None;
     }
     Some(entry.clone())
 }
 
-fn fav_folder_cached(media_id: i64) -> Option<FavCacheEntry> {
-    let guard = fav_view_cache().lock().ok()?;
-    let entry = guard.folders.get(&media_id)?;
-    if entry.at.elapsed() >= FAV_VIEW_TTL {
-        return None;
-    }
-    Some(entry.clone())
-}
-
-fn fav_mixed_store(key: Vec<i64>, cards: &[bilibili::FeedVideo], sources: usize) {
+fn fav_store(
+    mode: FavMode,
+    folder: Option<i64>,
+    key: Vec<i64>,
+    cards: &[bilibili::FeedVideo],
+    sources: usize,
+) {
     if let Ok(mut guard) = fav_view_cache().lock() {
-        guard.folders.retain(|_, entry| entry.at.elapsed() < FAV_VIEW_TTL);
-        guard.mix_key = key;
-        guard.mixed = Some(FavCacheEntry {
+        let ns = fav_cache_ns(&mut guard, mode);
+        ns.folders.retain(|_, entry| entry.at.elapsed() < FAV_VIEW_TTL);
+        let entry = FavCacheEntry {
             at: Instant::now(),
             cards: cards.to_vec(),
             sources,
-        });
-    }
-}
-
-fn fav_folder_store(media_id: i64, cards: &[bilibili::FeedVideo]) {
-    if let Ok(mut guard) = fav_view_cache().lock() {
-        guard.folders.retain(|_, entry| entry.at.elapsed() < FAV_VIEW_TTL);
-        guard.folders.insert(
-            media_id,
-            FavCacheEntry {
-                at: Instant::now(),
-                cards: cards.to_vec(),
-                sources: 1,
-            },
-        );
+        };
+        match folder {
+            Some(media_id) => {
+                ns.folders.insert(media_id, entry);
+            }
+            None => {
+                ns.key = key;
+                ns.all = Some(entry);
+            }
+        }
     }
 }
 
@@ -18405,6 +23185,103 @@ async fn fav_build_folder(
     Ok(cards)
 }
 
+/// 收藏夹 + one folder: that folder's own videos, in the folder's order, filled
+/// page by page up to [`FAV_CARDS_MAX`]. No `related()` expansion and no
+/// shuffle - this tab is the plain listing, and the 推荐流 tab is where the
+/// recommendations live.
+async fn fav_build_library_folder(
+    session: &Arc<bilibili::Session>,
+    media_id: i64,
+) -> Result<Vec<bilibili::FeedVideo>> {
+    let mut cards: Vec<bilibili::FeedVideo> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut page = 1u32;
+    loop {
+        let (items, has_more) = session.fav_items(media_id, page).await?;
+        if items.is_empty() {
+            break;
+        }
+        let before = cards.len();
+        fav_push_unique(&mut cards, &mut seen, &items);
+        // The cap, the folder's last page, or a page that brought nothing new.
+        if !has_more || cards.len() >= FAV_CARDS_MAX || cards.len() == before {
+            break;
+        }
+        page += 1;
+    }
+    cards.truncate(FAV_CARDS_MAX);
+    Ok(cards)
+}
+
+/// 收藏夹 + 全部: every folder's first page, merged in folder order, deduped and
+/// capped. Plain listing: no `related()`, no shuffle. `buffered` keeps the
+/// folder order while still running [`FAV_MIX_CONCURRENCY`] fetches at a time.
+async fn fav_build_library_all(
+    session: &Arc<bilibili::Session>,
+    folders: &[bilibili::FavFolder],
+) -> (Vec<bilibili::FeedVideo>, usize, Option<String>) {
+    let fetches = folders.iter().map(|folder| {
+        let session = session.clone();
+        let media_id = folder.id;
+        async move {
+            session
+                .fav_items(media_id, 1)
+                .await
+                .map(|(items, _)| items)
+                .map_err(|err| format!("folder {media_id}: {err:#}"))
+        }
+    });
+    let results: Vec<Result<Vec<bilibili::FeedVideo>, String>> = futures::stream::iter(fetches)
+        .buffered(FAV_MIX_CONCURRENCY)
+        .collect()
+        .await;
+    let mut cards: Vec<bilibili::FeedVideo> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut sources = 0usize;
+    let mut first_error: Option<String> = None;
+    for result in results {
+        match result {
+            Ok(items) => {
+                if items.is_empty() {
+                    continue;
+                }
+                sources += 1;
+                fav_push_unique(&mut cards, &mut seen, &items);
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    cards.truncate(FAV_CARDS_MAX);
+    (cards, sources, first_error)
+}
+
+/// Build the cards of one `(mode, tab)` pair.
+async fn fav_build_tab(
+    session: &Arc<bilibili::Session>,
+    folders: &[bilibili::FavFolder],
+    mode: FavMode,
+    folder: Option<&bilibili::FavFolder>,
+) -> (Vec<bilibili::FeedVideo>, usize, Option<String>) {
+    match (mode, folder) {
+        (FavMode::Stream, None) => fav_build_mixed(session, folders).await,
+        (FavMode::Stream, Some(folder)) => match fav_build_folder(session, folder.id).await {
+            Ok(cards) => (cards, 1usize, None),
+            Err(err) => (Vec::new(), 0usize, Some(format!("{err:#}"))),
+        },
+        (FavMode::Library, None) => fav_build_library_all(session, folders).await,
+        (FavMode::Library, Some(folder)) => {
+            match fav_build_library_folder(session, folder.id).await {
+                Ok(cards) => (cards, 1usize, None),
+                Err(err) => (Vec::new(), 0usize, Some(format!("{err:#}"))),
+            }
+        }
+    }
+}
+
 /// One card's cover still to arrive.
 struct FavPendingCover {
     index: usize,
@@ -18429,6 +23306,7 @@ fn patch_masonry_row(model: ModelRc<MasonryCard>, index: usize, image: Image, as
 fn fav_publish(
     ui: &AppWindow,
     view: &Arc<Mutex<FavViewState>>,
+    mode: FavMode,
     tab: i32,
     videos: Vec<bilibili::FeedVideo>,
 ) -> (usize, Vec<FavPendingCover>, (f32, f32, f32)) {
@@ -18479,9 +23357,12 @@ fn fav_publish(
         if let Ok(mut store) = state.videos.lock() {
             *store = videos;
         }
-        state.published = Some(tab);
+        state.published = Some((mode, tab));
         state.loading = false;
     }
+    // A settled non-empty tab clears the page's quiet empty state (the skeleton
+    // takes over again the moment the next load clears the model).
+    ui.set_fav_empty(false);
     ui.set_masonry(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
     (real, pending, stats)
 }
@@ -18491,6 +23372,7 @@ fn fav_clear_cards(ui: &AppWindow, view: &Arc<Mutex<FavViewState>>) {
     ui.set_masonry(ModelRc::from(std::rc::Rc::new(VecModel::from(
         Vec::<MasonryCard>::new(),
     ))));
+    ui.set_fav_empty(false);
     if let Ok(mut state) = view.lock() {
         if let Ok(mut store) = state.videos.lock() {
             store.clear();
@@ -18500,10 +23382,11 @@ fn fav_clear_cards(ui: &AppWindow, view: &Arc<Mutex<FavViewState>>) {
 }
 
 /// Publish the genuine empty state (no folders / a folder with nothing in it).
-fn fav_publish_empty(ui: &AppWindow, view: &Arc<Mutex<FavViewState>>, tab: i32) {
+fn fav_publish_empty(ui: &AppWindow, view: &Arc<Mutex<FavViewState>>, mode: FavMode, tab: i32) {
     fav_clear_cards(ui, view);
+    ui.set_fav_empty(true);
     if let Ok(mut state) = view.lock() {
-        state.published = Some(tab);
+        state.published = Some((mode, tab));
         state.loading = false;
     }
 }
@@ -18516,10 +23399,26 @@ fn fav_publish_tabs(ui: &AppWindow, folders: &[bilibili::FavFolder]) {
     ui.set_fav_tabs(ModelRc::from(std::rc::Rc::new(VecModel::from(names))));
 }
 
+/// First few bvids of a published tab, for the log line the owner reads:
+/// `fav folder=… tab=… bvids=…`.
+fn fav_bvid_summary(cards: &[bilibili::FeedVideo]) -> String {
+    let shown: Vec<&str> = cards.iter().take(4).map(|video| video.bvid.as_str()).collect();
+    if shown.is_empty() {
+        "-".to_string()
+    } else if cards.len() > shown.len() {
+        format!("{}+{}", shown.join(","), cards.len() - shown.len())
+    } else {
+        shown.join(",")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn fav_log_tab(
+    mode: FavMode,
     tab: i32,
     folder: Option<i64>,
     cards: usize,
+    bvids: &str,
     real: usize,
     aspect: (f32, f32, f32),
     ms: u128,
@@ -18530,7 +23429,8 @@ fn fav_log_tab(
         .map(|id| id.to_string())
         .unwrap_or_else(|| "-".to_string());
     crate::debug_log(&format!(
-        "fav view tab={tab} folder={folder} cards={cards} real_aspect={real}/{cards} sources={sources} ms={ms} hit={} aspect={:.3}/{:.3}/{:.3}",
+        "fav folder={folder} tab={tab} mode={} cards={cards} bvids={bvids} real_aspect={real}/{cards} sources={sources} ms={ms} hit={} aspect={:.3}/{:.3}/{:.3}",
+        mode.label(),
         u8::from(hit),
         aspect.0,
         aspect.1,
@@ -18561,7 +23461,7 @@ fn fav_spawn_covers(
     if pending.is_empty() {
         return;
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = bilibili::shared_runtime() else {
             return;
         };
@@ -18599,16 +23499,18 @@ fn fav_spawn_covers(
             total,
             began.elapsed().as_millis()
         ));
-    });
+    }));
 }
 
-/// Load one tab (respecting both caches) and publish it. Must run on the UI
-/// thread: it reads the folder list, checks the cache and touches the model.
+/// Load one `(mode, tab)` pair (respecting both caches) and publish it. Must run
+/// on the UI thread: it reads the folder list, checks the cache and touches the
+/// model.
 fn fav_load_tab(
     weak: Weak<AppWindow>,
     session_slot: SessionSlot,
     view: Arc<Mutex<FavViewState>>,
     tab: i32,
+    mode: FavMode,
 ) {
     let Some(ui) = weak.upgrade() else {
         return;
@@ -18624,6 +23526,7 @@ fn fav_load_tab(
             tab
         };
         state.tab = tab;
+        state.mode = mode;
         state.loading = true;
         let my = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
         (
@@ -18642,23 +23545,32 @@ fn fav_load_tab(
         folders.get((tab - 1) as usize).cloned()
     };
     if tab > 0 && folder.is_none() {
-        fav_publish_empty(&ui, &view, tab);
+        fav_publish_empty(&ui, &view, mode, tab);
         crate::debug_log("fav view empty reason=no_folders");
         return;
     }
 
     let key: Vec<i64> = folders.iter().map(|folder| folder.id).collect();
-    let cached = match &folder {
-        Some(folder) => fav_folder_cached(folder.id),
-        None => fav_mixed_cached(&key),
-    };
+    let folder_id = folder.as_ref().map(|folder| folder.id);
+    let cached = fav_cached(mode, folder_id, &key);
     if let Some(entry) = cached {
         let cards = entry.cards;
         let total = cards.len();
-        let folder_id = folder.as_ref().map(|folder| folder.id);
-        let (real, pending, aspect) = fav_publish(&ui, &view, tab, cards);
-        fav_log_tab(tab, folder_id, total, real, aspect, 0, true, entry.sources);
-        if folder.is_none() {
+        let bvids = fav_bvid_summary(&cards);
+        let (real, pending, aspect) = fav_publish(&ui, &view, mode, tab, cards);
+        fav_log_tab(
+            mode,
+            tab,
+            folder_id,
+            total,
+            &bvids,
+            real,
+            aspect,
+            0,
+            true,
+            entry.sources,
+        );
+        if mode == FavMode::Stream && folder.is_none() {
             fav_log_mix(total, real, entry.sources, 0, true);
         }
         fav_spawn_covers(
@@ -18676,40 +23588,36 @@ fn fav_load_tab(
     // Cache miss: clear first, so no row from the previous tab survives.
     fav_clear_cards(&ui, &view);
     let Some(session) = active_session(&session_slot) else {
-        fav_publish_empty(&ui, &view, tab);
+        fav_publish_empty(&ui, &view, mode, tab);
         crate::debug_log("fav view empty reason=error:no session");
         return;
     };
     let key_c = key;
+    let folders_c = folders;
     let folder_c = folder.clone();
     let weak_w = weak.clone();
     let view_w = view.clone();
     let generation_w = generation.clone();
     let store_w = store.clone();
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = bilibili::shared_runtime() else {
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak_w.upgrade() {
-                    fav_publish_empty(&ui, &view_w, tab);
+                    fav_publish_empty(&ui, &view_w, mode, tab);
                 }
             });
             return;
         };
         let began = Instant::now();
-        let (cards, sources, error) = if let Some(folder) = folder_c.as_ref() {
-            match runtime.block_on(fav_build_folder(&session, folder.id)) {
-                Ok(cards) => (cards, 1usize, None),
-                Err(err) => (Vec::new(), 0usize, Some(format!("{err:#}"))),
-            }
-        } else {
-            runtime.block_on(fav_build_mixed(&session, &folders))
-        };
+        let (cards, sources, error) = runtime.block_on(fav_build_tab(
+            &session,
+            &folders_c,
+            mode,
+            folder_c.as_ref(),
+        ));
         let ms = began.elapsed().as_millis();
         if !cards.is_empty() {
-            match folder_c.as_ref() {
-                Some(folder) => fav_folder_store(folder.id, &cards),
-                None => fav_mixed_store(key_c, &cards, sources),
-            }
+            fav_store(mode, folder_c.as_ref().map(|folder| folder.id), key_c, &cards, sources);
         }
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = weak_w.upgrade() else {
@@ -18718,26 +23626,42 @@ fn fav_load_tab(
             if generation_w.load(Ordering::SeqCst) != my {
                 return;
             }
-            if view_w.lock().map(|state| state.tab).unwrap_or(-1) != tab {
+            let current = view_w.lock().map(|state| (state.mode, state.tab)).unwrap_or((
+                FavMode::Stream,
+                -1,
+            ));
+            if current != (mode, tab) {
                 return;
             }
             if cards.is_empty() {
-                fav_publish_empty(&ui, &view_w, tab);
+                fav_publish_empty(&ui, &view_w, mode, tab);
                 match &error {
                     Some(error) => {
                         crate::debug_log(&format!("fav view empty reason=error:{error}"))
                     }
                     None => crate::debug_log(&format!(
-                        "fav view tab={tab} cards=0 ms={ms} hit=0"
+                        "fav view mode={} tab={tab} cards=0 ms={ms} hit=0",
+                        mode.label()
                     )),
                 }
                 return;
             }
             let total = cards.len();
-            let folder_id = folder_c.as_ref().map(|folder| folder.id);
-            let (real, pending, aspect) = fav_publish(&ui, &view_w, tab, cards);
-            fav_log_tab(tab, folder_id, total, real, aspect, ms, false, sources);
-            if folder_c.is_none() {
+            let bvids = fav_bvid_summary(&cards);
+            let (real, pending, aspect) = fav_publish(&ui, &view_w, mode, tab, cards);
+            fav_log_tab(
+                mode,
+                tab,
+                folder_c.as_ref().map(|folder| folder.id),
+                total,
+                &bvids,
+                real,
+                aspect,
+                ms,
+                false,
+                sources,
+            );
+            if mode == FavMode::Stream && folder_c.is_none() {
                 fav_log_mix(total, real, sources, ms, false);
             }
             fav_spawn_covers(
@@ -18750,7 +23674,7 @@ fn fav_load_tab(
                 pending,
             );
         });
-    });
+    }));
 }
 
 /// UI thread: fetch the folders (10 min cached in the data layer), publish the
@@ -18810,6 +23734,17 @@ fn fav_fetch_folders(
     });
 }
 
+/// Which of the two folder-scoped 收藏 tabs is on screen. `view_mode` is the
+/// Rust-owned routing truth: 3 is the library route (收藏夹), 0 + home_tab 5 is
+/// 推荐流 (see `open_collection` in `ui/app.slint`).
+fn fav_page_mode(ui: &AppWindow) -> FavMode {
+    if ui.get_view_mode() == 3 {
+        FavMode::Library
+    } else {
+        FavMode::Stream
+    }
+}
+
 /// UI thread: publish the folder list (and its strip) and reload when the set
 /// changed or the shown tab is not the requested one.
 fn fav_apply_folders(
@@ -18851,36 +23786,47 @@ fn fav_apply_folders(
     };
 
     fav_publish_tabs(&ui, &folders);
+    // One status line for the page (both tabs read it in the empty state).
+    ui.set_fav_list_status(
+        match &error {
+            Some(err) => format!("收藏夹加载失败：{err}"),
+            None => String::new(),
+        }
+        .into(),
+    );
     if error.is_none() {
         crate::debug_log(&format!("fav view folders n={}", folders.len()));
     }
+    let mode = fav_page_mode(&ui);
     if folders.is_empty() {
-        fav_publish_empty(&ui, view, tab);
+        fav_publish_empty(&ui, view, mode, tab);
         match &error {
             Some(error) => crate::debug_log(&format!("fav view empty reason=error:{error}")),
             None => crate::debug_log("fav view empty reason=no_folders"),
         }
         return;
     }
-    if changed || published != Some(tab) {
-        fav_load_tab(weak.clone(), session_slot.clone(), view.clone(), tab);
+    if changed || published != Some((mode, tab)) {
+        fav_load_tab(weak.clone(), session_slot.clone(), view.clone(), tab, mode);
     }
 }
 
-/// Enter 收藏推荐: publish the known strip, load the tab already selected and
-/// refresh the folders in the background.
+/// Enter the 收藏 page (either tab): publish the known strip, load the selected
+/// folder in the current tab's mode and refresh the folders in the background.
 fn fav_start(weak: Weak<AppWindow>, session_slot: SessionSlot, view: Arc<Mutex<FavViewState>>) {
     let (folders, tab, published) = match view.lock() {
         Ok(state) => (state.folders.clone(), state.tab, state.published),
         Err(_) => return,
     };
-    if !folders.is_empty() {
-        if let Some(ui) = weak.upgrade() {
+    let mode = weak
+        .upgrade()
+        .map(|ui| {
             fav_publish_tabs(&ui, &folders);
-        }
-        if published != Some(tab) {
-            fav_load_tab(weak.clone(), session_slot.clone(), view.clone(), tab);
-        }
+            fav_page_mode(&ui)
+        })
+        .unwrap_or(FavMode::Stream);
+    if !folders.is_empty() && published != Some((mode, tab)) {
+        fav_load_tab(weak.clone(), session_slot.clone(), view.clone(), tab, mode);
     }
     fav_fetch_folders(weak, session_slot, view);
 }
@@ -18949,7 +23895,7 @@ fn fav_test_drive_and_wait(
         return false;
     }
     fav_wait_for(view, Duration::from_secs(180), |state| {
-        !state.loading && state.published == Some(tab)
+        !state.loading && state.published.map(|(_, tab)| tab) == Some(tab)
     })
 }
 
@@ -19074,7 +24020,7 @@ fn load_folder_page(
         ui.set_folder_current_page(page as i32);
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -19182,7 +24128,7 @@ fn load_folder_page(
             )
             .await;
         });
-    });
+    }));
 }
 
 /// Load one page of the watch history and (append to) the card list.
@@ -19210,7 +24156,7 @@ fn load_history(
         publish_refresh(&ui, true, 0.0);
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -19369,7 +24315,7 @@ fn load_history(
             )
             .await;
         });
-    });
+    }));
 }
 
 fn load_toview(
@@ -19386,7 +24332,7 @@ fn load_toview(
         ui.set_toview_status(String::new().into());
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -19492,7 +24438,7 @@ fn load_toview(
             )
             .await;
         });
-    });
+    }));
 }
 
 /// Run one search query on a worker thread and push the rows to the UI.
@@ -19522,7 +24468,7 @@ fn run_search(
         update_page_bar(&ui);
     }
 
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -19698,7 +24644,7 @@ fn run_search(
             )
             .await;
         });
-    });
+    }));
 }
 
 /// Open the UP page for a search 用户 row.
@@ -19805,7 +24751,7 @@ fn open_detail(
         ui.set_detail_selected_part(0);
     }
 
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -19857,7 +24803,7 @@ fn open_detail(
                 }
             });
         });
-    });
+    }));
 }
 
 fn format_view(view: u64) -> String {
@@ -20036,6 +24982,932 @@ fn key_map_model(keys: &[u32]) -> ModelRc<i32> {
     ModelRc::from(std::rc::Rc::new(VecModel::from(rows)))
 }
 
+/// 养鱼 UI-side state: the engine plus the gates that keep a pushed snapshot
+/// from rebuilding Slint models more than twice a second.
+struct FishUi {
+    engine: Option<Arc<fish::FishEngine>>,
+    /// `(bvid, at, sort, filter)` of the verdict list currently in the model.
+    last_verdict: RefCell<Option<(String, i64, i32, i32)>>,
+    /// When the stats model was last rebuilt.
+    last_stats: RefCell<Option<Instant>>,
+    /// `FishEngine::open` failed: the page opens in its error state.
+    open_error: RefCell<bool>,
+    /// `(has_key, masked)` mirror of `prefs.deepseek_key`.
+    key_state: RefCell<(bool, String)>,
+    /// Cover URLs already attempted (a failed fetch must not retry forever).
+    tried_covers: RefCell<HashSet<String>>,
+    /// The feed toolbar's current query, owned by Rust because it rebuilds the
+    /// model; the UI mirrors it in `fish_sort` / `fish_filter`.
+    feed_sort: Cell<i32>,
+    feed_filter: Cell<i32>,
+    /// bvids opened from the 推荐流 feed: "adopted" for the fish's growth. Every
+    /// bvid counts once per session, so re-opening a card does not inflate it.
+    adopted: RefCell<HashSet<String>>,
+    /// The home feed the app already holds. A verdict written by an older build
+    /// can carry `cover = ''`; the feed's own `pic` for that bvid is the first
+    /// fallback before the card's tinted glyph block.
+    feed_store: Arc<Mutex<Vec<bilibili::FeedVideo>>>,
+}
+
+/// The parts of the 鱼缸 configuration the auto-feed timer needs, kept on the UI
+/// thread so a 20s tick never reads `settings.json` from disk. `last_day` is the
+/// local day-of-year of the last automatic run: one run per day, and turning
+/// auto-feed on never fires the same day's already-passed slot.
+struct FishAuto {
+    enabled: bool,
+    auto: bool,
+    time_minutes: u32,
+    sources: u32,
+    last_day: Option<u32>,
+}
+
+impl FishUi {
+    fn error_text(&self) -> String {
+        if *self.open_error.borrow() {
+            "fish.db 打不开（检查目录权限）".to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn fish_state_code(state: &fish::FishState) -> i32 {
+    match state {
+        fish::FishState::Idle => 0,
+        fish::FishState::NeedsKey => 1,
+        fish::FishState::Running => 2,
+        fish::FishState::Paused => 3,
+        fish::FishState::Error(_) => 4,
+    }
+}
+
+/// Local wall clock as `(minutes since midnight, day key)`.
+///
+/// `GetLocalTime` is the only local-date API this binary needs, and a
+/// `month * 32 + day` key is unique within a year - enough for "one automatic
+/// feed per day" without a calendar dependency.
+#[repr(C)]
+struct WinLocalTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLocalTime(time: *mut WinLocalTime);
+}
+
+fn local_clock() -> (u32, u32) {
+    let mut time = WinLocalTime {
+        year: 0,
+        month: 1,
+        day_of_week: 0,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    unsafe { GetLocalTime(&mut time) };
+    (
+        time.hour as u32 * 60 + time.minute as u32,
+        time.month as u32 * 32 + time.day as u32,
+    )
+}
+
+fn local_day_of_year() -> u32 {
+    local_clock().1
+}
+
+/// QA (`BILI_F136_TEST`): the capture/measurement pass for the 养鱼 page.
+///
+/// Every state change goes through the page's real callbacks (tab, preset,
+/// instruction save, refresh); the UI-only writes are the master switch used to
+/// photograph the ON state and the empty feed fixture. The instruction and both
+/// switches are restored before the timer stops, so a run leaves settings.json
+/// as it found it.
+fn start_f136_test(weak: Weak<AppWindow>, session_slot: SessionSlot, delay_ms: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        let session = active_session(&session_slot);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if let Some(session) = session {
+                FISH_SESSION.with(|slot| *slot.borrow_mut() = Some(session));
+            }
+            ui.set_fish_qa(true);
+            ui.invoke_fish_open();
+            let initial_enabled = ui.get_fish_enabled();
+            let initial_autofeed = ui.get_fish_autofeed();
+            let initial_instruction = ui.get_fish_instruction_draft().to_string();
+            let initial_tab = ui.get_fish_tab();
+            // The tank screenshot should show the ON state; this is a property
+            // write, NOT the switch callback, so settings.json is untouched.
+            ui.set_fish_enabled(true);
+            crate::debug_log(&format!(
+                "f136 start logged_in={} tab={} instruction_len={} enabled={} autofeed={} recipes={}",
+                ui.get_logged_in(),
+                initial_tab,
+                initial_instruction.chars().count(),
+                initial_enabled,
+                initial_autofeed,
+                ui.get_fish_recipes().row_count()
+            ));
+            // Second recipe through the REAL callback: logs `fish preset id=`
+            // and `fish instruction len=`, and makes the active card provable.
+            let recipes = ui.get_fish_recipes();
+            let bait = (0..recipes.row_count())
+                .filter_map(|index| recipes.row_data(index))
+                .find(|row| row.id.as_str() == "bait");
+            if let Some(row) = bait {
+                ui.invoke_fish_apply_preset(row.id.clone());
+            }
+
+            let timer = Rc::new(slint::Timer::default());
+            F136_TIMER.with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = Some(timer.clone());
+                }
+            });
+            let phase = Rc::new(Cell::new(0u32));
+            // Two extra ticks (~1.8 s) before the first shot so the one-shot
+            // cover fetches started by the first feed build have landed.
+            let warm = Rc::new(Cell::new(0u32));
+            let weak_ui = ui.as_weak();
+            let timer_held = timer.clone();
+            let initial_instruction = Rc::new(initial_instruction);
+            let initial_enabled = Rc::new(initial_enabled);
+            let initial_autofeed = Rc::new(initial_autofeed);
+            let warm_tick = warm.clone();
+            timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(900),
+                move || {
+                    let Some(ui) = weak_ui.upgrade() else {
+                        timer_held.stop();
+                        return;
+                    };
+                    let step = phase.get();
+                    phase.set(step + 1);
+                    match step {
+                        0 => {
+                            if warm_tick.get() < 4 {
+                                warm_tick.set(warm_tick.get() + 1);
+                                phase.set(0);
+                            } else {
+                                f136_measure(&ui);
+                                f136_capture(&ui, "f136_fish_feed");
+                            }
+                        }
+                        1 => {
+                            crate::debug_log(&format!(
+                                "f136 feed scroll_before={:.1}",
+                                ui.get_qa_fish_feed_scroll()
+                            ));
+                            let (x, y) = f136_feed_point(&ui);
+                            f136_wheel(&ui, x, y, -220.0, 4);
+                        }
+                        2 => {
+                            crate::debug_log(&format!(
+                                "f136 feed scroll_after_wheel={:.1}",
+                                ui.get_qa_fish_feed_scroll()
+                            ));
+                            ui.set_fish_tab(1);
+                            ui.invoke_fish_tab_changed(1);
+                        }
+                        3 => {
+                            f136_capture(&ui, "f136_fish_tank");
+                        }
+                        4 => {
+                            ui.set_fish_tab(0);
+                            ui.invoke_fish_tab_changed(0);
+                        }
+                        5 => {
+                            crate::debug_log(&format!(
+                                "f136 feed scroll_restored={:.1}",
+                                ui.get_qa_fish_feed_scroll()
+                            ));
+                            crate::debug_log(&format!(
+                                "f136 recipe_retained {}",
+                                f136_recipe_state(&ui)
+                            ));
+                            ui.set_fish_tab(1);
+                            ui.invoke_fish_tab_changed(1);
+                            let (x, y) = f136_feed_point(&ui);
+                            f136_wheel(&ui, x, y + 250.0, -260.0, 5);
+                        }
+                        6 => {
+                            crate::debug_log(&format!(
+                                "f136 tank scroll={:.1}",
+                                ui.get_qa_fish_tank_scroll()
+                            ));
+                            f136_capture(&ui, "f136_recipes");
+                            crate::debug_log(&format!(
+                                "f136 recipes_active {}",
+                                f136_recipe_state(&ui)
+                            ));
+                        }
+                        7 => {
+                            ui.invoke_fish_save_instruction(
+                                "只看有没有实测数据；没有就直说，别替它圆场。".into(),
+                            );
+                        }
+                        8 => {
+                            f136_capture(&ui, "f136_recipes_edited");
+                            crate::debug_log(&format!(
+                                "f136 recipes_edited {}",
+                                f136_recipe_state(&ui)
+                            ));
+                        }
+                        9 => {
+                            ui.set_fish_tab(0);
+                            ui.invoke_fish_tab_changed(0);
+                            let empty: Vec<FishRow> = Vec::new();
+                            ui.set_fish_rows(ModelRc::from(std::rc::Rc::new(VecModel::from(
+                                empty,
+                            ))));
+                        }
+                        10 => {
+                            crate::debug_log(&format!(
+                                "f136 empty rows={}",
+                                ui.get_fish_rows().row_count()
+                            ));
+                            f136_capture(&ui, "f136_empty");
+                        }
+                        11 => {
+                            ui.invoke_fish_refresh();
+                            ui.set_fish_filter(2);
+                            ui.invoke_fish_feed_query(0, 2);
+                        }
+                        12 => {
+                            crate::debug_log(&format!(
+                                "f136 feed_skip rows={} filter={}",
+                                ui.get_fish_rows().row_count(),
+                                ui.get_fish_filter()
+                            ));
+                            f136_capture(&ui, "f136_fish_feed_skip");
+                            ui.set_fish_filter(0);
+                            ui.invoke_fish_feed_query(0, 0);
+                        }
+                        13 => {
+                            ui.invoke_fish_save_instruction(initial_instruction.as_str().into());
+                            ui.set_fish_enabled(*initial_enabled);
+                            ui.set_fish_autofeed(*initial_autofeed);
+                            ui.set_fish_qa(false);
+                            crate::debug_log("f136 done");
+                            timer_held.stop();
+                        }
+                        _ => timer_held.stop(),
+                    }
+                },
+            );
+        });
+    });
+}
+
+/// One run of the feed's wheel: Slint's own pointer-scrolled event, three to
+/// five notches, exactly like a wheel over the list.
+fn f136_wheel(ui: &AppWindow, x: f32, y: f32, delta: f32, count: usize) {
+    for _ in 0..count {
+        ui.window().dispatch_event(
+            slint::platform::WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(x, y),
+                delta_x: 0.0,
+                delta_y: delta,
+            },
+        );
+    }
+}
+
+/// A point inside the feed/tank list, derived from the measured tab origin.
+fn f136_feed_point(ui: &AppWindow) -> (f32, f32) {
+    (
+        (ui.get_qa_fish_tab0_x() + 300.0).max(24.0),
+        (ui.get_qa_fish_tab_y() + 150.0).max(24.0),
+    )
+}
+
+fn f136_capture(ui: &AppWindow, tag: &str) {
+    let path = qa_capture_path(tag);
+    let size = capture_window_png(&ui.window(), &path);
+    crate::debug_log(&format!("f136 capture tag={tag} size={size:?}"));
+}
+
+/// The active recipe ids and the draft length, for the retention/clearing logs.
+fn f136_recipe_state(ui: &AppWindow) -> String {
+    let recipes = ui.get_fish_recipes();
+    let mut active = Vec::new();
+    for index in 0..recipes.row_count() {
+        if let Some(row) = recipes.row_data(index) {
+            if row.active {
+                active.push(row.id.to_string());
+            }
+        }
+    }
+    let draft: String = ui
+        .get_fish_instruction_draft()
+        .chars()
+        .take(12)
+        .collect();
+    format!(
+        "active={:?} draft_len={} draft_head={draft:?}",
+        active,
+        ui.get_fish_instruction_draft().chars().count()
+    )
+}
+
+/// Log the real laid-out geometry + the tagline's contrast. The numbers are read
+/// from the window's `qa_fish_*` out properties, which the page fills from its
+/// live layout, not from constants duplicated here.
+fn f136_measure(ui: &AppWindow) {
+    crate::debug_log(&format!(
+        "f136 measure tabs tab0_x={:.1} tab0_w={:.1} tab1_x={:.1} tab1_w={:.1} tab_y={:.1}",
+        ui.get_qa_fish_tab0_x(),
+        ui.get_qa_fish_tab0_w(),
+        ui.get_qa_fish_tab1_x(),
+        ui.get_qa_fish_tab1_w(),
+        ui.get_qa_fish_tab_y()
+    ));
+    crate::debug_log(&format!(
+        "f136 measure feed card_w={:.1} gap={:.1} cover_h={:.1} ring={:.1}",
+        ui.get_qa_fish_card_w(),
+        ui.get_qa_fish_card_gap(),
+        ui.get_qa_fish_cover_h(),
+        ui.get_qa_fish_ring()
+    ));
+    crate::debug_log(&format!(
+        "f136 measure config row_h={:.1} recipe_w={:.1} recipe_h={:.1} recipe_gap={:.1}",
+        ui.get_qa_fish_config_row(),
+        ui.get_qa_fish_recipe_w(),
+        ui.get_qa_fish_recipe_h(),
+        ui.get_qa_fish_recipe_gap()
+    ));
+    let theme = ui.global::<AppTheme>();
+    let soft = theme.get_text_soft();
+    let card = composite_over(theme.get_card(), theme.get_bg());
+    let glass = composite_over(theme.get_glass_tint(), theme.get_bg());
+    crate::debug_log(&format!(
+        "f136 contrast tagline ink=#{:02x}{:02x}{:02x} on_card=#{:02x}{:02x}{:02x} ratio={:.2}:1 on_glass=#{:02x}{:02x}{:02x} ratio={:.2}:1",
+        soft.red(),
+        soft.green(),
+        soft.blue(),
+        card.red(),
+        card.green(),
+        card.blue(),
+        contrast_ratio(soft, card),
+        glass.red(),
+        glass.green(),
+        glass.blue(),
+        contrast_ratio(soft, glass)
+    ));
+}
+
+/// Alpha-composite `fg` over `bg` (both sRGB bytes); used only for the log.
+fn composite_over(fg: slint::Color, bg: slint::Color) -> slint::Color {
+    let alpha = fg.alpha() as f32 / 255.0;
+    let mix = |front: u8, back: u8| -> u8 {
+        (front as f32 * alpha + back as f32 * (1.0 - alpha)).round() as u8
+    };
+    slint::Color::from_rgb_u8(
+        mix(fg.red(), bg.red()),
+        mix(fg.green(), bg.green()),
+        mix(fg.blue(), bg.blue()),
+    )
+}
+
+/// WCAG 2.x relative-luminance contrast ratio, for the tagline measurement.
+fn contrast_ratio(a: slint::Color, b: slint::Color) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let s = value as f32 / 255.0;
+        if s <= 0.039_28 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    fn luminance(color: slint::Color) -> f32 {
+        0.2126 * channel(color.red())
+            + 0.7152 * channel(color.green())
+            + 0.0722 * channel(color.blue())
+    }
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// Apply one engine snapshot to the 养鱼 page.
+///
+/// Scalars are cheap and always written; the two models are gated:
+/// * verdict rows only when `(bvid, at)` of the newest verdict changed, so a
+///   token-count update never rebuilds the 8 rows;
+/// * stats (histogram + tag chips) at most twice a second.
+///
+/// `force` bypasses both gates (page open, key/instruction save, refresh).
+fn apply_fish(ui: &AppWindow, fish: &FishUi, snap: fish::FishSnapshot, force: bool) {
+    ui.set_fish_state(fish_state_code(&snap.state));
+    ui.set_fish_queued(snap.queued as i32);
+    ui.set_fish_done(snap.done as i32);
+    ui.set_fish_errors(snap.errors as i32);
+    ui.set_fish_now(
+        snap.current
+            .as_ref()
+            .map(|(_, title)| SharedString::from(title.clone()))
+            .unwrap_or_default(),
+    );
+    ui.set_fish_tokens_in(snap.tokens_in.min(i32::MAX as u64) as i32);
+    ui.set_fish_tokens_out(snap.tokens_out.min(i32::MAX as u64) as i32);
+    ui.set_fish_error_text(fish.error_text().into());
+    if let fish::FishState::Error(text) = &snap.state {
+        ui.set_fish_error_text(text.clone().into());
+    }
+    ui.set_fish_last_line(
+        snap.last
+            .as_ref()
+            .map(|last| SharedString::from(last.one_line.clone()))
+            .unwrap_or_default(),
+    );
+    let (has_key, masked) = fish.key_state.borrow().clone();
+    ui.set_fish_has_key(has_key);
+    ui.set_fish_key_masked(masked.as_str().into());
+
+    let Some(engine) = fish.engine.as_ref() else {
+        publish_fish_recipes(ui, "");
+        return;
+    };
+
+    // The feed model is rebuilt when the newest verdict changes OR when the
+    // toolbar's query changes; a token-count tick never rebuilds 64 cards.
+    let sort = fish.feed_sort.get();
+    let filter = fish.feed_filter.get();
+    let key = snap
+        .last
+        .as_ref()
+        .map(|last| (last.bvid.clone(), last.at, sort, filter));
+    if force || key != *fish.last_verdict.borrow() {
+        *fish.last_verdict.borrow_mut() = key;
+        publish_fish_feed(ui, fish, engine);
+    }
+
+    let stats_due = force
+        || fish
+            .last_stats
+            .borrow()
+            .map_or(true, |at| at.elapsed() >= Duration::from_millis(500));
+    if stats_due {
+        *fish.last_stats.borrow_mut() = Some(Instant::now());
+        if let Ok(stats) = engine.stats(30) {
+            ui.set_fish_hist(ModelRc::from(std::rc::Rc::new(VecModel::from(
+                stats
+                    .score_histogram
+                    .iter()
+                    .map(|n| *n as i32)
+                    .collect::<Vec<_>>(),
+            ))));
+            ui.set_fish_tags(ModelRc::from(std::rc::Rc::new(VecModel::from(
+                stats
+                    .top_tags
+                    .iter()
+                    .take(8)
+                    .map(|(tag, _)| SharedString::from(tag.clone()))
+                    .collect::<Vec<_>>(),
+            ))));
+            ui.set_fish_recommend(stats.recommend as i32);
+            ui.set_fish_skip(stats.skip as i32);
+            ui.set_fish_maybe(stats.maybe as i32);
+            // Growth = adopted verdicts: the historical 看 count plus the cards
+            // the owner opened from the feed this session (deduped by bvid).
+            ui.set_fish_adopted(
+                (stats.recommend as i32).saturating_add(fish.adopted.borrow().len() as i32),
+            );
+        }
+    }
+
+    let instruction = engine.instruction();
+    if force || ui.get_fish_instruction().as_str() != instruction {
+        ui.set_fish_instruction(instruction.as_str().into());
+        // The instruction field follows the saved value (a fresh page, a preset
+        // click or a save). Unsaved typing is never overwritten by a mere
+        // snapshot tick.
+        if force {
+            ui.set_fish_instruction_draft(instruction.as_str().into());
+        }
+        publish_fish_recipes(ui, &instruction);
+    }
+}
+
+/// Rebuild the 推荐流 model for the current sort/filter.
+///
+/// The 64 newest verdicts are the whole feed window: sorting happens in Rust
+/// (Slint has no sort), and the same pass starts the one-shot cover fetches for
+/// rows that just entered the model. `最值得看` puts 看 first, then score;
+/// `评分` is the raw score; `最新` is publish time.
+fn publish_fish_feed(ui: &AppWindow, fish: &FishUi, engine: &fish::FishEngine) {
+    let sort = fish.feed_sort.get();
+    let filter = fish.feed_filter.get();
+    let mut verdicts = engine.verdicts(64).unwrap_or_default();
+    verdicts.retain(|verdict| match filter {
+        1 => verdict.verdict.trim() == "看",
+        2 => verdict.verdict.trim() == "不看",
+        3 => !matches!(verdict.verdict.trim(), "看" | "不看"),
+        _ => true,
+    });
+    let rank = |verdict: &fish::VerdictView| match verdict.verdict.trim() {
+        "看" => 2,
+        "也许" => 1,
+        _ => 0,
+    };
+    match sort {
+        0 => verdicts.sort_by(|a, b| {
+            rank(b)
+                .cmp(&rank(a))
+                .then_with(|| b.score.total_cmp(&a.score))
+                .then_with(|| b.at.cmp(&a.at))
+        }),
+        1 => verdicts.sort_by(|a, b| b.at.cmp(&a.at)),
+        _ => verdicts.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| b.at.cmp(&a.at))
+        }),
+    }
+    // Older rows can have an empty cover in `fish.db`. The in-memory home feed
+    // is the first fallback: it already holds the same bvid's `pic` URL, so a
+    // verdict fished before covers were stored still gets a real thumbnail.
+    let feed_covers: std::collections::HashMap<String, String> = fish
+        .feed_store
+        .lock()
+        .map(|feed| {
+            feed.iter()
+                .filter(|video| !video.pic.trim().is_empty())
+                .map(|video| (video.bvid.clone(), video.pic.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut cover_urls: Vec<String> = Vec::with_capacity(verdicts.len());
+    let mut fallback = 0usize;
+    for verdict in &verdicts {
+        let url = if !verdict.cover.trim().is_empty() {
+            verdict.cover.clone()
+        } else if let Some(pic) = feed_covers.get(&verdict.bvid) {
+            fallback += 1;
+            pic.clone()
+        } else {
+            String::new()
+        };
+        cover_urls.push(url);
+    }
+    let rows: Vec<FishRow> = verdicts
+        .iter()
+        .zip(cover_urls.iter())
+        .map(|(verdict, cover)| fish_feed_row(verdict, cover))
+        .collect();
+    ui.set_fish_rows(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
+    let feed_hits = verdicts
+        .iter()
+        .filter(|verdict| feed_covers.contains_key(&verdict.bvid))
+        .count();
+    crate::debug_log(&format!(
+        "fish feed sort={sort} filter={filter} rows={} covers={} feed_hits={feed_hits} feed_fallback={fallback}",
+        verdicts.len(),
+        cover_urls.iter().filter(|url| !url.is_empty()).count()
+    ));
+    // Covers: the same fetch path the feed uses, one attempt per URL. A landing
+    // cover republishes the rows once (see `fish_fetch_cover`). The attempt is
+    // only recorded there, AFTER a session exists: a startup publish (before
+    // login) must never poison the list for the page's real open. `on_fish_open`
+    // refreshes FISH_SESSION first, so the page's open is what makes these run.
+    for url in &cover_urls {
+        if url.is_empty() {
+            continue;
+        }
+        fish_fetch_cover(ui.as_weak(), url.clone());
+    }
+}
+
+/// One engine verdict as a 推荐流 card. `cover_url` is `verdict.cover` or the
+/// home feed's `pic` fallback (see `publish_fish_feed`).
+fn fish_feed_row(verdict: &fish::VerdictView, cover_url: &str) -> FishRow {
+    let tag_line = verdict
+        .tags
+        .iter()
+        .take(2)
+        .map(|tag| format!("#{tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    FishRow {
+        bvid: verdict.bvid.as_str().into(),
+        title: verdict.title.as_str().into(),
+        up_name: verdict.up_name.as_str().into(),
+        cover: cached_cover(cover_url),
+        score: verdict.score as f32,
+        score_text: if verdict.score >= 10.0 {
+            "10".into()
+        } else if verdict.score <= 0.0 {
+            "—".into()
+        } else {
+            format!("{:.1}", verdict.score).into()
+        },
+        verdict: verdict.verdict.as_str().into(),
+        one_line: verdict.one_line.as_str().into(),
+        reason1: verdict
+            .reasons
+            .first()
+            .map(|reason| SharedString::from(reason.as_str()))
+            .unwrap_or_default(),
+        reason2: verdict
+            .reasons
+            .get(1)
+            .map(|reason| SharedString::from(reason.as_str()))
+            .unwrap_or_default(),
+        // The old chip fields are kept for the model shape, but the rebuilt
+        // card reads `tag_line` (footer) instead of four pills.
+        tag1: verdict
+            .tags
+            .first()
+            .map(|tag| SharedString::from(tag.as_str()))
+            .unwrap_or_default(),
+        tag2: verdict
+            .tags
+            .get(1)
+            .map(|tag| SharedString::from(tag.as_str()))
+            .unwrap_or_default(),
+        tag3: verdict
+            .tags
+            .get(2)
+            .map(|tag| SharedString::from(tag.as_str()))
+            .unwrap_or_default(),
+        tag4: verdict
+            .tags
+            .get(3)
+            .map(|tag| SharedString::from(tag.as_str()))
+            .unwrap_or_default(),
+        age: fish_age_text(verdict.at).into(),
+        time_text: fish_clock_text(verdict.at).into(),
+        tag_line: tag_line.into(),
+        up_glyph: verdict
+            .up_name
+            .chars()
+            .next()
+            .map(|glyph| SharedString::from(glyph.to_string()))
+            .unwrap_or_default(),
+    }
+}
+
+/// The verdict's local wall clock as `HH:MM`, for the card footer's
+/// `12:00 起看`. `at` is stored in Unix seconds; the offset comes from the two
+/// clocks the process already reads (UTC epoch vs local `GetLocalTime`), so no
+/// timezone dependency is pulled in for one line.
+fn fish_clock_text(at: i64) -> String {
+    if at <= 0 {
+        return String::new();
+    }
+    let now_utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    let (local_minutes, _) = local_clock();
+    let utc_minutes = (now_utc.rem_euclid(86_400)) / 60;
+    let local = (at + (local_minutes as i64 - utc_minutes) * 60).rem_euclid(86_400);
+    format!("{:02}:{:02}", local / 3_600, (local % 3_600) / 60)
+}
+
+/// A relative publish age for a feed card ("3 小时前"). The card never runs a
+/// clock: the age is formatted once per model rebuild.
+fn fish_age_text(at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    let seconds = now.saturating_sub(at).max(0);
+    if seconds < 60 {
+        "刚刚".to_string()
+    } else if seconds < 3_600 {
+        format!("{} 分钟前", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{} 小时前", seconds / 3_600)
+    } else if seconds < 86_400 * 30 {
+        format!("{} 天前", seconds / 86_400)
+    } else {
+        format!("{} 个月前", seconds / (86_400 * 30))
+    }
+}
+
+/// Publish the 食谱 grid. `active` is the backend's exact-body match, so an
+/// edited instruction highlights nothing; the UI still clears it on the first
+/// keystroke (see `fish_instruction_dirty`).
+fn publish_fish_recipes(ui: &AppWindow, instruction: &str) {
+    let active = fish::active_preset(instruction).map(|preset| preset.id);
+    let rows: Vec<RecipeRow> = fish::presets()
+        .iter()
+        .map(|preset| RecipeRow {
+            id: preset.id.into(),
+            name: preset.name.into(),
+            tagline: preset.tagline.into(),
+            active: active == Some(preset.id),
+        })
+        .collect();
+    ui.set_fish_recipes(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
+}
+
+/// Save an instruction through the ONE path: the engine (which persists and
+/// hashes it into the next prompt), the draft field, then a forced republish so
+/// the recipe highlight follows immediately. Used by both the free-text save and
+/// `fish_apply_preset`.
+fn fish_save_instruction_text(ui: &AppWindow, fish: &FishUi, text: &str) {
+    if let Some(engine) = fish.engine.as_ref() {
+        engine.set_instruction(text);
+        crate::debug_log(&format!(
+            "fish instruction len={}",
+            text.chars().count()
+        ));
+    }
+    ui.set_fish_instruction_draft(text.into());
+    if let Some(engine) = fish.engine.as_ref() {
+        apply_fish(ui, fish, engine.snapshot(), true);
+    }
+}
+
+/// Fetch one 养鱼 row cover through the app's normal thumb path and republish
+/// the dashboard when it lands. One attempt per URL (see `tried_covers`).
+fn fish_fetch_cover(weak: Weak<AppWindow>, url: String) {
+    if url.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = cover_cache().lock() {
+        if cache.get(&url).is_some() {
+            return;
+        }
+    }
+    let Some(session) = FISH_SESSION.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    // Record the attempt only once there is a session: a pre-login publish must
+    // not mark every cover tried and leave the feed blank for the whole run.
+    let Some(fish) = FISH_UI.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    if !fish.tried_covers.borrow_mut().insert(url.clone()) {
+        return;
+    }
+    crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
+        let Some(runtime) = bilibili::shared_runtime() else {
+            return;
+        };
+        let Ok(pixels) = runtime.block_on(session.fetch_thumb(&url)) else {
+            crate::debug_log(&format!("fish cover failed url={url}"));
+            return;
+        };
+        if let Ok(mut cache) = cover_cache().lock() {
+            cache.put(&url, Arc::new(pixels));
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if let Some(fish) = FISH_UI.with(|slot| slot.borrow().clone()) {
+                let snap = fish
+                    .engine
+                    .as_ref()
+                    .map(|engine| engine.snapshot())
+                    .unwrap_or_default();
+                apply_fish(&ui, &fish, snap, true);
+            }
+        });
+    }));
+}
+
+/// Fetch the saved account's face for the login chooser.
+///
+/// The face is a public CDN image, so this needs no session and runs long
+/// before the auto-login call finishes. One attempt per launch; a failure just
+/// leaves the circular placeholder (the account's name glyph) in place.
+fn load_saved_avatar(weak: Weak<AppWindow>, url: String) {
+    crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
+        let Some(rt) = bilibili::shared_runtime() else {
+            return;
+        };
+        let fetched = rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(12))
+                .build()
+                .ok()?;
+            let bytes = client
+                .get(&url)
+                .header(
+                    reqwest::header::USER_AGENT,
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                )
+                .header(reqwest::header::REFERER, "https://www.bilibili.com/")
+                .send()
+                .await
+                .ok()?
+                .bytes()
+                .await
+                .ok()?;
+            let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let (width, height) = decoded.dimensions();
+            Some((decoded.into_raw(), width, height))
+        });
+        let Some((bytes, width, height)) = fetched else {
+            crate::debug_log("saved avatar fetch failed");
+            return;
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
+            buffer.make_mut_bytes().copy_from_slice(&bytes);
+            ui.set_saved_account_avatar(Image::from_rgba8(buffer));
+        });
+    }));
+}
+
+/// A cover for `url` when it is already decoded; a tinted block otherwise.
+fn cached_cover(url: &str) -> Image {
+    if url.is_empty() {
+        return Image::default();
+    }
+    match cover_cache().lock() {
+        Ok(mut cache) => cache
+            .get(url)
+            .map(|pixels| to_thumb_shared(&pixels))
+            .unwrap_or_default(),
+        Err(_) => Image::default(),
+    }
+}
+
+thread_local! {
+    /// The dashboard state, reachable from the engine's hook (which may only
+    /// capture `Send` data) and from every callback.
+    static FISH_UI: RefCell<Option<Rc<FishUi>>> = const { RefCell::new(None) };
+    /// The auto-feed timer and the f136 QA timer are kept alive here for the
+    /// process lifetime (dropping a `slint::Timer` stops it).
+    static FISH_AUTO_TIMER: RefCell<Option<Rc<slint::Timer>>> = const { RefCell::new(None) };
+    static F136_TIMER: RefCell<Option<Rc<slint::Timer>>> = const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// The active session and the player state, so a dashboard row click can
+    /// reach the normal player path from a background resolve.
+    static FISH_SESSION: RefCell<Option<Arc<bilibili::Session>>> = const { RefCell::new(None) };
+    static FISH_PLAYER: RefCell<Option<Rc<PlayerState>>> = const { RefCell::new(None) };
+}
+
+/// Resolve `bvid` and open the player for it (the same `open_player_for` the
+/// feed/detail paths use). The network lookup runs off the UI thread; only the
+/// `Weak`, the `SessionSlot` and plain values cross the thread boundary.
+fn open_fish_video(weak: Weak<AppWindow>, bvid: String) {
+    let session_slot: SessionSlot = {
+        let session = FISH_SESSION.with(|slot| slot.borrow().clone());
+        match session {
+            Some(session) => Arc::new(Mutex::new(Some(session))),
+            None => {
+                crate::debug_log(&format!("fish open bvid={bvid} no-session"));
+                return;
+            }
+        }
+    };
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
+        let Some(runtime) = bilibili::shared_runtime() else {
+            return;
+        };
+        let Some(session) = active_session(&session_slot) else {
+            return;
+        };
+        match runtime.block_on(session.video_view(&bvid)) {
+            Ok(detail) => {
+                let cid = if detail.cid > 0 {
+                    detail.cid as u64
+                } else {
+                    detail.pages.first().map(|page| page.cid as u64).unwrap_or(0)
+                };
+                let title = detail.title.clone();
+                let aid = detail.aid;
+                crate::debug_log(&format!(
+                    "fish open resolved bvid={bvid} cid={cid} title_len={}",
+                    title.len()
+                ));
+                let _ = weak.upgrade_in_event_loop(move |_ui| {
+                    let (Some(player_state), Some(store)) = (
+                        FISH_PLAYER.with(|cell| cell.borrow().clone()),
+                        FISH_SETTINGS.with(|cell| cell.borrow().clone()),
+                    ) else {
+                        return;
+                    };
+                    open_player_for(&session_slot, &player_state, &store, bvid, cid, title, aid);
+                });
+            }
+            Err(err) => crate::debug_log(&format!("fish open bvid={bvid} err={err}")),
+        }
+    }));
+}
+
+thread_local! {
+    /// `settings_store` for the dashboard's row click.
+    static FISH_SETTINGS: RefCell<Option<Arc<Mutex<settings::Settings>>>> =
+        const { RefCell::new(None) };
+}
+
 /// Push a preferences snapshot into the settings panel's bound properties.
 fn publish_settings(ui: &AppWindow, snapshot: &settings::Settings) {
     ui.set_set_quality(snapshot.player_quality as i32);
@@ -20052,16 +25924,19 @@ fn publish_settings(ui: &AppWindow, snapshot: &settings::Settings) {
     ui.set_set_ai_on(snapshot.ai_on);
     ui.set_set_ai_level(snapshot.ai_level as i32);
     ui.set_set_theme(snapshot.theme as i32);
-    // The two frosted-glass sliders live on the theme global (they drive the
-    // window tint's alpha and the blur loop), not on a settings-panel property.
+    // The transparency slider lives on the theme global (it drives the window
+    // tint's alpha), not on a settings-panel property.
     ui.global::<AppTheme>()
         .set_glass_transparency(snapshot.glass_transparency);
-    ui.global::<AppTheme>().set_glass_blur(snapshot.glass_blur);
+    ui.global::<AppTheme>()
+        .set_backdrop_blur(snapshot.backdrop_blur as i32);
     // The cards-per-page setting is Rust-driven: the UI only reports menu
     // changes (`page_size_changed`), so every publish pushes the stored value
     // into the paging property.
     ui.set_list_page_size(snapshot.page_size as i32);
     ui.set_set_autostart(snapshot.autostart);
+    // 优化: 下载连接数, the prefetch proxy's parallel fetcher count.
+    ui.set_set_prefetch_connections(snapshot.prefetch_connections as i32);
     // 关闭主窗口的行为 (0 = 最小化到任务栏, 1 = 隐藏到系统托盘, 2 = 直接退出),
     // so the panel opens on the stored value.
     ui.set_set_close_action(snapshot.close_action as i32);
@@ -20183,7 +26058,7 @@ fn load_dynamic(
         ui.set_dynamic_status(String::new().into());
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -20373,7 +26248,7 @@ fn load_dynamic(
             ));
             flush_missing(&weak, &sync, covers.saturating_sub(delivered));
         });
-    });
+    }));
 }
 
 /// Refresh the 消息 unread badge.
@@ -20384,7 +26259,7 @@ fn load_unread(
     let Some(session) = active_session(&session_slot) else {
         return;
     };
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -20400,7 +26275,7 @@ fn load_unread(
                 }
             });
         });
-    });
+    }));
 }
 
 /// Load one 回复我的 / @我的 / 收到的赞 list.
@@ -20422,7 +26297,7 @@ fn load_msg_list(
         ui.set_msg_status(String::new().into());
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -20496,7 +26371,7 @@ fn load_msg_list(
                 }
             });
         });
-    });
+    }));
 }
 
 /// Load the 私信 session list (names resolved via `space_info`).
@@ -20513,7 +26388,7 @@ fn load_sessions(
         ui.set_msg_status(String::new().into());
         update_page_bar(&ui);
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -20608,7 +26483,7 @@ fn load_sessions(
                 }
             });
         });
-    });
+    }));
 }
 
 /// Load one 私信 session's messages (read-only).
@@ -20624,7 +26499,7 @@ fn load_dm_messages(
         ui.set_dm_loading(true);
         ui.set_dm_status(String::new().into());
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -20667,7 +26542,7 @@ fn load_dm_messages(
                 }
             });
         });
-    });
+    }));
 }
 
 /// Load one page of the active account's 关注 / 粉丝 list.
@@ -20691,7 +26566,7 @@ fn load_relation(
         ui.set_relation_loading(true);
         ui.set_relation_status(String::new().into());
     }
-    std::thread::spawn(move || {
+    crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
         let Some(runtime) = crate::bilibili::shared_runtime() else {
             return;
         };
@@ -20769,7 +26644,7 @@ fn load_relation(
                 }
             });
         });
-    });
+    }));
 }
 
 fn to_i32(value: i64) -> i32 {
@@ -21189,18 +27064,51 @@ mod fav_view_tests {
 
     #[test]
     fn mix_key_changes_invalidate_the_cached_stream() {
-        // The cache is process-wide; use ids no other test touches and clear
-        // the mixed entry afterwards so ordering cannot leak between tests.
+        // The cache is process-wide; use ids no other test touches and clear the
+        // entries afterwards so ordering cannot leak between tests.
         let key = vec![-9001, -9002];
-        fav_mixed_store(key.clone(), &[video("BV1")], 2);
-        assert!(fav_mixed_cached(&key).is_some());
-        assert!(fav_mixed_cached(&[-9001]).is_none());
-        let hit = fav_mixed_cached(&key);
+        fav_store(FavMode::Stream, None, key.clone(), &[video("BV1")], 2);
+        assert!(fav_cached(FavMode::Stream, None, &key).is_some());
+        assert!(fav_cached(FavMode::Stream, None, &[-9001]).is_none());
+        let hit = fav_cached(FavMode::Stream, None, &key);
         assert_eq!(hit.map(|entry| entry.sources), Some(2));
+
+        // The two 收藏 tabs build different cards from the same folder (the
+        // 推荐流 feed seeded by it vs its plain 收藏夹 listing), so one mode's
+        // entry must never answer the other's lookup.
+        let folder = -9003i64;
+        fav_store(
+            FavMode::Stream,
+            Some(folder),
+            Vec::new(),
+            &[video("BVstream")],
+            1,
+        );
+        assert!(fav_cached(FavMode::Library, Some(folder), &[]).is_none());
+        fav_store(
+            FavMode::Library,
+            Some(folder),
+            Vec::new(),
+            &[video("BVlibrary")],
+            1,
+        );
+        let stream = fav_cached(FavMode::Stream, Some(folder), &[]);
+        let library = fav_cached(FavMode::Library, Some(folder), &[]);
+        assert_eq!(
+            stream.map(|entry| entry.cards[0].bvid.clone()),
+            Some("BVstream".to_string())
+        );
+        assert_eq!(
+            library.map(|entry| entry.cards[0].bvid.clone()),
+            Some("BVlibrary".to_string())
+        );
+
         if let Ok(mut guard) = fav_view_cache().lock() {
-            guard.mixed = None;
-            guard.mix_key.clear();
-            guard.folders.remove(&-9001);
+            guard.stream.all = None;
+            guard.stream.key.clear();
+            guard.stream.folders.remove(&-9001);
+            guard.stream.folders.remove(&folder);
+            guard.library.folders.remove(&folder);
         }
     }
 }
@@ -21335,5 +27243,388 @@ mod chrome_idle_tests {
         // Back inside without moving the cursor: entering is activity.
         assert!(idle.poll(Some((900, 900)), true, false, at(base, 3_200)));
         assert!(!idle.hidden);
+    }
+}
+
+/// The 画质 menu merge: locked 大会员 tiers are rows that resolve to no stream.
+#[cfg(test)]
+mod quality_menu_tests {
+    use super::{build_quality_menu, LockedNotice, QualityMenuItem};
+    use crate::bilibili::QualityTier;
+    use crate::player::QualitySpec;
+
+    fn spec(qn: i64, codecid: i64, bandwidth: u64, label: &str) -> QualitySpec {
+        QualitySpec {
+            qn,
+            codecid,
+            bandwidth,
+            label: label.to_string(),
+            detail: format!("{qn}x{codecid} · {bandwidth}bps"),
+            badge: String::new(),
+        }
+    }
+
+    fn tier(qn: i64, locked: bool) -> QualityTier {
+        QualityTier {
+            qn,
+            label: format!("tier-{qn}"),
+            detail: format!("{qn} detail"),
+            locked,
+        }
+    }
+
+    #[test]
+    fn locked_tiers_are_rows_without_a_stream() {
+        let specs = vec![
+            spec(80, 7, 3_252_336, "1080P"),
+            spec(80, 12, 2_070_001, "1080P"),
+            spec(64, 7, 1_301_438, "720P"),
+        ];
+        let tiers = vec![
+            tier(125, true),
+            tier(120, true),
+            tier(116, true),
+            tier(80, false),
+            tier(64, false),
+        ];
+        let items: Vec<QualityMenuItem> =
+            build_quality_menu(&specs, &tiers, Some((80, 7, 3_252_336)));
+        assert_eq!(
+            items.iter().map(|item| item.row.qn).collect::<Vec<_>>(),
+            vec![125, 120, 116, 80, 80, 64],
+            "locked tiers first, then the catalogue's own order"
+        );
+        assert_eq!(items[0].row.badge.as_str(), "大会员");
+        assert!(items[0].row.locked);
+        assert!(
+            items[0].spec.is_none(),
+            "a locked row never resolves to a stream"
+        );
+        assert_eq!(items[3].spec, Some(0));
+        assert!(items[3].row.current, "the exact stream is marked");
+        assert!(!items[3].row.locked);
+        // A tier that already has stream rows is not duplicated as locked.
+        assert_eq!(items.iter().filter(|item| item.row.qn == 80).count(), 2);
+    }
+
+    /// Two clicks on a locked row in one open explain themselves once; a fresh
+    /// open re-arms the explanation.
+    #[test]
+    fn locked_notice_shows_once_per_menu_open() {
+        let mut notice = LockedNotice::default();
+        assert!(notice.take(), "the first locked pick explains itself");
+        assert!(!notice.take(), "the second pick in the same open is silent");
+        assert!(!notice.take());
+        notice.opened();
+        assert!(notice.take(), "reopening the menu re-arms the toast");
+        assert!(!notice.take());
+    }
+}
+
+#[cfg(test)]
+mod danmaku_lane_tests {
+    use super::*;
+
+    fn scroll(progress_ms: u32, text: &str, dmid: &str) -> crate::danmaku::Danmaku {
+        crate::danmaku::Danmaku {
+            progress_ms,
+            mode: 1,
+            fontsize: 25,
+            color: 0xffffff,
+            text: text.to_string(),
+            mid_hash: String::new(),
+            dmid: dmid.to_string(),
+        }
+    }
+
+    fn track(items: Vec<crate::danmaku::Danmaku>) -> player::DanmakuTrack {
+        let track = player::DanmakuTrack::new();
+        track.set_items(items);
+        track
+    }
+
+    fn lane() -> DanmakuLayer {
+        let model = Rc::new(VecModel::<DanmakuItem>::from(Vec::<DanmakuItem>::new()));
+        DanmakuLayer::new(Weak::default(), model, 120)
+    }
+
+    fn lane_x(layer: &DanmakuLayer, index: usize) -> f32 {
+        layer.inner.borrow().rows[index].item.x
+    }
+
+    /// The rate follows the display and is capped at 120; the A/B override wins.
+    #[test]
+    fn frame_rate_caps_at_120_and_honours_the_override() {
+        assert_eq!(danmaku_frame_hz_for(60, None), (60, "display"));
+        assert_eq!(danmaku_frame_hz_for(120, None), (120, "display"));
+        assert_eq!(danmaku_frame_hz_for(144, None), (120, "display"));
+        assert_eq!(danmaku_frame_hz_for(240, None), (120, "display"));
+        // A display that reports "hardware default" is not asked for 1 Hz.
+        assert_eq!(danmaku_frame_hz_for(0, None), (30, "display"));
+        assert_eq!(danmaku_frame_hz_for(59, None), (59, "display"));
+        // The A/B override is exact, even on a 60 Hz panel.
+        assert_eq!(danmaku_frame_hz_for(60, Some("120")), (120, "env"));
+        assert_eq!(danmaku_frame_hz_for(120, Some("30")), (30, "env"));
+        assert_eq!(danmaku_frame_hz_for(120, Some(" 60 ")), (60, "env"));
+        // Anything else falls back to the display.
+        assert_eq!(danmaku_frame_hz_for(120, Some("144")), (120, "display"));
+        assert_eq!(danmaku_frame_hz_for(120, Some("fast")), (120, "display"));
+    }
+
+    /// 120 Hz is 8.333 ms, which Slint cannot express: the wake is 8 ms and the
+    /// exact-rate gate drops the surplus.
+    #[test]
+    fn timer_wakes_are_whole_milliseconds() {
+        assert_eq!(danmaku_wake_ms(120), 8);
+        assert_eq!(danmaku_wake_ms(60), 16);
+        assert_eq!(danmaku_wake_ms(30), 33);
+        assert!((danmaku_frame_interval_ms(120) - 8.333_333).abs() < 0.001);
+        assert!((danmaku_frame_interval_ms(60) - 16.666_668).abs() < 0.001);
+    }
+
+    /// 2.5 ms averaged over 2 s, three windows in a row, drops once.
+    #[test]
+    fn budget_guard_drops_after_three_bad_windows() {
+        let start = Instant::now();
+        // One sample inside the window and the one that closes it: every window
+        // then reports exactly `cost`.
+        fn window(
+            guard: &mut BudgetGuard,
+            start: Instant,
+            step: u32,
+            cost: u64,
+        ) -> Option<BudgetWindow> {
+            let span = DANMAKU_BUDGET_WINDOW;
+            let seed = Duration::from_millis(1);
+            if step == 1 {
+                guard.sample(start + seed, cost);
+            } else {
+                guard.sample(start + span * (step - 1) + seed, cost);
+            }
+            guard.sample(start + span * step, cost)
+        }
+        // Two bad windows, then a good one: the streak resets.
+        let mut guard = BudgetGuard::new(start);
+        assert!(!window(&mut guard, start, 1, 9_000).unwrap().drop);
+        assert!(!window(&mut guard, start, 2, 9_000).unwrap().drop);
+        assert!(!window(&mut guard, start, 3, 400).unwrap().drop);
+        assert!(!window(&mut guard, start, 4, 9_000).unwrap().drop);
+        // Three in a row drops, and only once.
+        let mut guard = BudgetGuard::new(start);
+        for step in 1..=3u32 {
+            let report = window(&mut guard, start, step, 9_000).unwrap();
+            assert_eq!(report.drop, step == 3);
+        }
+        assert!(
+            !window(&mut guard, start, 4, 9_000).unwrap().drop,
+            "the valve drops once and latches"
+        );
+        // 2.4 ms is inside the budget.
+        let mut guard = BudgetGuard::new(start);
+        for step in 1..=6u32 {
+            let report = window(&mut guard, start, step, 2_400).unwrap();
+            assert!(!report.drop);
+            assert_eq!(report.avg_us, 2_400);
+        }
+        // A window with no ticks at all (the lane was frozen) is not judged.
+        let mut guard = BudgetGuard::new(start);
+        let idle = guard.sample(start + DANMAKU_BUDGET_WINDOW * 3, 9_000);
+        assert!(idle.is_none(), "an idle window has no average");
+    }
+
+    /// The lane's x must be the engine's x: same formula, same operand order.
+    #[test]
+    fn fast_lane_matches_the_engine_pixel_for_pixel() {
+        let filter = player::DanmakuFilter::default();
+        let base = Instant::now();
+        let scroll_track = track(vec![scroll(1_000, "这是一条滚动弹幕 danmaku", "d1")]);
+        let scroll_lane = lane();
+        let published = scroll_track.compute(1_050, 20.0, &filter);
+        assert_eq!(published.len(), 1);
+        let engine_at_publish = published[0].x;
+        scroll_lane.publish(1_050.0, published, 1.0, 100, true, base);
+        // The lane starts exactly where the engine put the comment ...
+        assert_eq!(lane_x(&scroll_lane, 0), engine_at_publish);
+        // ... and 40 ms later it is within a pixel of the engine there.
+        scroll_lane.tick(base + Duration::from_millis(40));
+        let engine_later = scroll_track.compute(1_090, 20.0, &filter)[0].x;
+        assert!(
+            (lane_x(&scroll_lane, 0) - engine_later).abs() <= 1.0,
+            "lane {} vs engine {engine_later}",
+            lane_x(&scroll_lane, 0)
+        );
+        // A 顶部 comment (mode 5) never moves, however many frames pass.
+        let top_track = track(vec![crate::danmaku::Danmaku {
+            mode: 5,
+            ..scroll(1_000, "顶部弹幕", "d2")
+        }]);
+        let top_lane = lane();
+        let top = top_track.compute(1_050, 20.0, &filter);
+        assert_eq!(top.len(), 1);
+        top_lane.publish(1_050.0, top, 1.0, 100, true, base);
+        let fixed_x = lane_x(&top_lane, 0);
+        for step in 1..=10u64 {
+            top_lane.tick(base + Duration::from_millis(step * 40));
+        }
+        assert_eq!(lane_x(&top_lane, 0), fixed_x);
+    }
+
+    /// A 200 ms stall may move the comments 100 ms, then catches up - it never
+    /// teleports, and the media time it lands on is exact.
+    #[test]
+    fn stall_is_capped_and_then_caught_up() {
+        let filter = player::DanmakuFilter::default();
+        let base = Instant::now();
+        let track = track(vec![scroll(0, "卡顿测试", "d1")]);
+        let lane = lane();
+        lane.publish(
+            1_000.0,
+            track.compute(1_000, 20.0, &filter),
+            1.0,
+            100,
+            true,
+            base,
+        );
+        // Frame at +250 ms: 250 ms of media time, but only 100 ms of travel.
+        lane.tick(base + Duration::from_millis(250));
+        assert!((lane.inner.borrow().t_ms - 1_100.0).abs() < 0.01);
+        let at_1100 = track.compute(1_100, 20.0, &filter)[0].x;
+        assert!((lane_x(&lane, 0) - at_1100).abs() <= 1.0);
+        // ... and it does not stop there: the next frames close the gap.
+        lane.tick(base + Duration::from_millis(300));
+        assert!((lane.inner.borrow().t_ms - 1_200.0).abs() < 0.01);
+        // 150 ms behind at this point, so one more capped step only reaches
+        // 1_300 - the lane never jumps the whole distance in one frame.
+        lane.tick(base + Duration::from_millis(350));
+        assert!((lane.inner.borrow().t_ms - 1_300.0).abs() < 0.01);
+        // ... and the frame after that is back on the media clock.
+        lane.tick(base + Duration::from_millis(360));
+        assert!((lane.inner.borrow().t_ms - 1_360.0).abs() < 0.01);
+        let at_1360 = track.compute(1_360, 20.0, &filter)[0].x;
+        assert!((lane_x(&lane, 0) - at_1360).abs() <= 1.0);
+    }
+
+    /// The clock is `anchor + wall`, not an accumulation: a tick that arrives
+    /// late lands on the media time it should, without a per-tick remainder.
+    #[test]
+    fn motion_is_time_based_not_accumulated() {
+        let filter = player::DanmakuFilter::default();
+        let base = Instant::now();
+        let track = track(vec![scroll(0, "时间基准", "d1")]);
+        let lane = lane();
+        lane.publish(
+            1_000.0,
+            track.compute(1_000, 20.0, &filter),
+            1.0,
+            100,
+            true,
+            base,
+        );
+        // Irregular gaps (all longer than the 8.33 ms interval, so the gate does
+        // not interfere): the media time is always exactly the anchor plus the
+        // wall time, not the sum of nominal intervals.
+        for gap in [9u64, 22, 47, 58, 98, 114, 139] {
+            lane.tick(base + Duration::from_millis(gap));
+            let want = 1_000.0 + gap as f32;
+            assert!((lane.inner.borrow().t_ms - want).abs() < 0.01, "gap {gap}");
+        }
+    }
+
+    /// A publish reconciles by dmid: survivors keep their motion, new rows are
+    /// appended, gone rows removed.
+    #[test]
+    fn publish_diffs_the_model_by_dmid() {
+        let filter = player::DanmakuFilter::default();
+        let base = Instant::now();
+        let items = |dmids: &[&str]| {
+            let raw: Vec<crate::danmaku::Danmaku> = dmids
+                .iter()
+                .map(|dmid| scroll(0, "弹幕", dmid))
+                .collect();
+            track(raw).compute(10, 20.0, &filter)
+        };
+        let lane = lane();
+        let first = lane.publish(10.0, items(&["a", "b"]), 1.0, 100, true, base);
+        assert_eq!((first.inserted, first.removed, first.visible), (2, 0, 2));
+        // "b" survives, "a" leaves, "c" arrives.
+        let second = lane.publish(
+            1_000.0,
+            items(&["b", "c"]),
+            1.0,
+            100,
+            true,
+            base + Duration::from_millis(33),
+        );
+        assert_eq!(second.inserted, 1);
+        assert_eq!(second.removed, 1);
+        assert_eq!(second.visible, 2);
+        let dmids: Vec<String> = lane
+            .inner
+            .borrow()
+            .rows
+            .iter()
+            .map(|row| row.item.dmid.to_string())
+            .collect();
+        assert_eq!(dmids, vec!["b".to_string(), "c".to_string()]);
+        // A seek is a resync: the clock snaps instead of crawling.
+        assert!((lane.inner.borrow().t_ms - 1_000.0).abs() < 0.01);
+    }
+
+    /// Paused / buffering / 弹幕 off freezes the clock; the next publish resumes.
+    #[test]
+    fn frozen_lane_does_not_advance() {
+        let filter = player::DanmakuFilter::default();
+        let base = Instant::now();
+        let track = track(vec![scroll(0, "暂停", "d1")]);
+        let lane = lane();
+        lane.publish(
+            1_000.0,
+            track.compute(1_000, 20.0, &filter),
+            1.0,
+            100,
+            true,
+            base,
+        );
+        lane.tick(base + Duration::from_millis(40));
+        let moved = lane.inner.borrow().t_ms;
+        lane.freeze();
+        lane.tick(base + Duration::from_millis(400));
+        assert_eq!(lane.inner.borrow().t_ms, moved, "a frozen lane is still");
+        // Resume: the anchor is fresh, so the comments pick up from the media
+        // clock instead of jumping by the pause length.
+        lane.publish(
+            1_040.0,
+            track.compute(1_040, 20.0, &filter),
+            1.0,
+            100,
+            true,
+            base + Duration::from_millis(400),
+        );
+        lane.tick(base + Duration::from_millis(410));
+        assert!((lane.inner.borrow().t_ms - 1_050.0).abs() < 0.01);
+    }
+
+    /// The lane writes the row it moves, and the model row matches the lane.
+    #[test]
+    fn moved_rows_are_written_to_the_model() {
+        let filter = player::DanmakuFilter::default();
+        let base = Instant::now();
+        let track = track(vec![scroll(0, "移动", "a")]);
+        let model = Rc::new(VecModel::<DanmakuItem>::from(Vec::<DanmakuItem>::new()));
+        let lane = DanmakuLayer::new(Weak::default(), model.clone(), 120);
+        lane.publish(
+            1_000.0,
+            track.compute(1_000, 20.0, &filter),
+            1.0,
+            100,
+            true,
+            base,
+        );
+        assert_eq!(model.row_count(), 1);
+        let before = model.row_data(0).unwrap().x;
+        lane.tick(base + Duration::from_millis(9));
+        let after = model.row_data(0).unwrap().x;
+        assert!(after != before, "the comment moved");
+        assert_eq!(after, lane_x(&lane, 0));
     }
 }

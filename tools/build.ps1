@@ -17,6 +17,37 @@
 # of fighting over cargo's own lock, and a waiter prints how long it waited so
 # the coordination cost is visible instead of silent.
 #
+# Measured profile (6C/12T, `-j 8`, lld-link, warm dependency graph), release
+# build of this crate after `touch src/main.rs` -- i.e. the edit/verify cycle:
+#
+#   phase breakdown of one default release build      wall      share
+#   ---------------------------------------------------------------
+#   Slint build script (build.rs -> app.rs)            0 s      0 %   (does not re-run on .rs edits)
+#   one rustc invocation, LLVM codegen                ~4m15s    79 %
+#   front end (parse/expand/typeck of 23 MB app.rs)   ~0m53s    17 %   (this is what `cargo check` costs)
+#   lld-link                                           1 s      0.4 %
+#
+#   `touch src/main.rs && cargo build --release`:
+#   before [profile.release.package.o11a1] incremental = true  4m18s - 5m35s
+#   after   (steady state, cache warm)                         0m30s - 0m50s
+#   `cargo check --release`, same touch, after                 ~0m16s
+#   `touch ui/app.slint` + build (real edit, app.rs changes)   ~4m - 5m
+#
+# Consequences for this script:
+#   - The first build after Cargo.toml/build.rs changed, or after the target
+#     dir was cleaned, pays a full rebuild to write the incremental cache
+#     (~3.5 GB under target/release/incremental). Do not read that number as a
+#     regression.
+#   - A real ui/app.slint edit invalidates the whole generated module, so
+#     incremental cannot help there: UI iterations still cost minutes. Iterate
+#     on Rust with the numbers above and batch UI changes.
+#   - Numbers move by +-30 % when other projects build at the same time (SMT
+#     sharing inflates both wall and CPU time), which is exactly why the gate
+#     below exists; quote timings only from gated builds.
+#   - `-j` does not change the cost of rebuilding this crate: it is one rustc
+#     unit and its codegen threads come from the core count, not from -j. -j
+#     matters for a cold dependency build, so it is still threaded through.
+#
 # Usage:
 #   powershell -File tools/build.ps1 -Mode check
 #   powershell -File tools/build.ps1 -Mode build
@@ -106,11 +137,14 @@ try {
     foreach ($step in $modes) {
         $started = [Diagnostics.Stopwatch]::StartNew()
         Write-Gate "cargo $step (release) jobs=$(if ($Jobs -gt 0) { $Jobs } else { 'auto' }) ..."
-        if ($Jobs -gt 0) {
-            & $cargo $step --release -j $Jobs 2>&1 | ForEach-Object { Write-Host $_ }
-        } else {
-            & $cargo $step --release 2>&1 | ForEach-Object { Write-Host $_ }
-        }
+        # cargo prints progress ("Compiling ...", "Finished ...") on stderr. In
+        # PowerShell 5.1 a native command's stderr becomes an ErrorRecord, and
+        # with $ErrorActionPreference = 'Stop' the very first line would abort
+        # the script (exit 1, no "exit=" line in the gate log). Merge the two
+        # streams inside cmd.exe so PowerShell only ever sees stdout text; the
+        # exit code still comes from cargo via cmd.exe.
+        $argLine = "$step --release" + $(if ($Jobs -gt 0) { " -j $Jobs" } else { '' })
+        & cmd /d /c "`"$cargo`" $argLine 2>&1" | ForEach-Object { Write-Host $_ }
         $lastExit = $LASTEXITCODE
         Write-Gate ("cargo {0} exit={1} elapsed={2:N1}s" -f $step, $lastExit, $started.Elapsed.TotalSeconds)
         if ($lastExit -ne 0) { break }

@@ -6,19 +6,71 @@
 //! between ffmpeg and the CDN:
 //!
 //! * ffmpeg reads the local URL; every `Range: bytes=N-` it sends is served
-//!   from a read-ahead window that [`PrefetchConfig::connections`] tasks fill
-//!   with `Range` requests spread round-robin over [`PrefetchConfig::hosts`].
+//!   from a read-ahead window that up to [`PrefetchConfig::connections`]
+//!   (default 16, max 32, `0` = auto) worker tasks fill.
 //! * the engine counts exactly how many bytes it pulled from upstream, per
-//!   host and per second, which is what the profiler panel shows.
+//!   host, per worker and per second, which is what the profiler panel shows.
 //!
-//! Once the first bytes have reached the client, a separate background task
-//! warms [`PrefetchConfig::warm_points`] evenly spaced positions of the file
-//! (`i / count` of the total length) into a bounded **point cache**. A request
-//! whose offset falls inside a cached point is answered from memory at once;
-//! anything else still resets the read-ahead window exactly as before. The
-//! warm task fetches one small chunk per point (4 MiB, or `total / count` when
-//! the file is small), never more than two requests in flight, so it cannot
-//! starve playback; the whole point cache is capped at 80 MiB.
+//! **Whole-file, priority-ordered scheduling, bounded by a media horizon.**
+//! The queue covers the file in [`PrefetchConfig::chunk_bytes`] chunks, but
+//! only up to [`PLAYBACK_AHEAD_SECONDS`] of media beyond the playhead: fetching
+//! further would download video the playhead cannot reach for minutes (the
+//! whole file, at sixteen TLS connections), which costs cores and bandwidth for
+//! nothing visible. A worker that finishes picks, in order: (1) the chunk(s)
+//! the client reads now and the next [`HOT_AHEAD_SECONDS`] of playback, (2) a
+//! range that failed its retry route, (3) the seek warm points, (4) the rest of
+//! the horizon. For a file above 64 MiB the claimable bytes are split into one
+//! part per connection; an exhausted part steals sub-chunks from the largest
+//! remaining part, so no worker sits idle while claimable bytes exist.
+//!
+//! **The speculative queue is rate limited.** Warm points and the rest of the
+//! horizon share one token bucket refilled at [`WARM_RATE_FACTOR`]× (while
+//! points are pending) or [`SPECULATIVE_RATE_FACTOR`]× the stream bitrate —
+//! `total / duration`, or the session-average serve rate when the caller does
+//! not know the duration. Playback bytes are never limited. Before this cap the
+//! proxy pulled 20 MB/s (66 MB/s on a fast link) across sixteen connections for
+//! thirty seconds right after open, which measured 2.5–3.2 cores of the whole
+//! process.
+//!
+//! **The serve path has absolute priority over speculation.** A rate-limited
+//! queue still lets a speculative burst own every connection at the moment the
+//! client needs a byte: measured `serve wait pos=3670016 waited_ms=6029` while
+//! 117 MB of seek points were being fetched. Now a miss in the serve path opens
+//! a *serve wait* ([`Engine::open_serve_wait`]): while it is open no worker may
+//! claim a `Warm` or `Rest` chunk, and every speculative claim already in
+//! flight is cancelled at its next network read so its slot can take the
+//! missing hot chunk. The speculative queue resumes the moment the bytes land
+//! (or the body ends) — this changes *priority*, never throughput or the
+//! [`PLAYBACK_AHEAD_SECONDS`] horizon.
+//!
+//! The wait is instrumented and bounded. Once per second it logs
+//! `serve wait pos=… waited_ms=… hot_inflight=… warm_inflight=… rest_inflight=…`,
+//! and it closes with `serve wait end pos=… waited_ms=… reason=available` when
+//! bytes land or `reason=timeout` when the body ends without them. The wait also
+//! registers its **exact offset** as an urgent claim, so the next worker starts
+//! its range at the blocked byte instead of at the chunk boundary — on a 4 MiB
+//! chunk that prefix is seconds of media the client cannot use yet. A hot claim
+//! that covers the missing offset but has produced no byte for [`HOT_STUCK_MS`]
+//! is logged as `hot stuck … switching host`, marked slow (the existing
+//! one-shot retry), its route degraded, and a duplicate raced on another mirror
+//! — the same per-host retry/race path as the five-second health watchdog, only
+//! 4.5 s earlier.
+//!
+//! [`PrefetchConfig::warm_points`] evenly spaced positions (`i / count` of the
+//! total) go through the same worker pool into a bounded **point cache**
+//! (80 MiB). A request whose offset is in a cached point or in the buffered
+//! window is answered from memory — a seek to either never goes upstream. The
+//! window (32 MiB by default, up to 256 MiB, and never more than
+//! [`PLAYBACK_AHEAD_SECONDS`] of media) is the only retained data: chunks
+//! outside it are counted, persisted, then discarded, so the queue can cover
+//! the horizon without growing the process.
+//!
+//! **Per-worker health.** Throughput is measured over a five-second window.
+//! Zero bytes for 5 s (or below 20 % of the median worker for 15 s) marks a
+//! worker slow: its request is cancelled, its route is degraded for a cooldown,
+//! and the same range is retried once on another mirror. If an idle worker
+//! exists, a duplicate request for the slow range races on a different host and
+//! the first finisher wins (`worker race … winner=…`).
 //!
 //! **The newest request always wins.** ffmpeg stops reading an open-ended
 //! `bytes=N-` response as soon as it seeks, and opens a second connection for
@@ -42,14 +94,50 @@
 //! forwarded unchanged to the chosen mirror host (Bilibili signatures do not
 //! cover the host); URLs under `/v1/resource` keep their original host.
 //!
+//! **The session cache file is the truth for "downloaded".** Every fetched byte
+//! is also written to a sparse per-session file
+//! (`%LOCALAPPDATA%\o11a1\cache\<key>.part`, capped at [`CACHE_CAP_BYTES`]) and
+//! tracked as an exact list of present ranges. [`PrefetchHandle::cached_ranges`]
+//! — and therefore the 下载分布 panel, which reads
+//! [`PrefetchStats::downloaded`] — reports the *file*, not the 32 MiB memory
+//! window. The window is a hot cache in front of it, so a seek, a window trim or
+//! the whole-file queue passing a region can no longer make the map forget bytes
+//! that still exist locally.
+//! Serving order is memory → disk → upstream; a disk hit never goes upstream.
+//!
+//! **The advertised length is authoritative.** A ranged GET that stops before
+//! its end is a truncated range, never a shorter file: the chunk goes back to
+//! the queue (and is retired only after [`SHORT_BODY_LIMIT`] attempts). It used
+//! to rewrite the total, which made the serving body close at that offset —
+//! ffmpeg's `Stream ends prematurely at N, should be M` — and the player then
+//! ran its "playback ended" path mid-video. The same rule applies to a mirror
+//! that fails: one transient body error cools the route down
+//! ([`HOST_FAILURE_LIMIT`] consecutive errors retire it) instead of ending the
+//! only stream the user has.
+//!
 //! Shutdown is drop-based: dropping [`PrefetchHandle`] signals every task,
-//! aborts any connection that is still streaming, and closes the listener.
+//! aborts any connection that is still streaming, closes the listener, and
+//! deletes the session cache file.
+//!
+//! **Playlist preload.** [`PrefetchHandle::preload`] (URLs) and
+//! [`PrefetchHandle::preload_keys`] (`(cache key, URL)` pairs) fetch the tracks
+//! that follow the current one into their own cache files, in playlist order, at
+//! background priority: one sequential range reader that yields between chunks
+//! and stops on [`PrefetchHandle::cancel_preload`], on drop, or at
+//! [`CACHE_CAP_BYTES`]. Nothing is wired into `main.rs` on purpose — the UI
+//! session owns that file; the exact call site is documented on
+//! `PlaybackControl::preload_playlist` in `player.rs`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::os::windows::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -65,8 +153,9 @@ use tokio::task::{JoinHandle, JoinSet};
 pub const DEFAULT_READ_AHEAD_BYTES: u64 = 32 << 20;
 /// Default size of one upstream range request (4 MiB).
 pub const DEFAULT_CHUNK_BYTES: u64 = 4 << 20;
-/// Default number of parallel upstream fetchers.
-pub const DEFAULT_CONNECTIONS: usize = 4;
+/// Default number of parallel upstream fetchers. `0` in a config means this
+/// value (see [`PrefetchConfig::normalized`]).
+pub const DEFAULT_CONNECTIONS: usize = 16;
 /// Default bytes cached per warmed seek point (4 MiB).
 pub const DEFAULT_POINT_BYTES: u64 = 4 << 20;
 /// Hard cap on the whole point cache (80 MiB). `count * chunk` is clamped to
@@ -79,11 +168,72 @@ pub const MAX_WARM_POINTS: usize = 20;
 /// list (and a 128 MiB window of 256 KiB chunks still costs one small vector).
 pub const MAX_DOWNLOADED_RANGES: usize = 64;
 
+/// Granularity of the test fixtures for the presence map (a network read and a
+/// media block are both around this size); the map itself is exact.
+#[cfg(test)]
+const CACHE_BLOCK_BYTES: u64 = 256 << 10;
+/// Hard cap on one session cache file: 2 GiB. Past it the file simply stops
+/// growing (one `cache cap reached` line) and the memory path keeps working.
+pub const CACHE_CAP_BYTES: u64 = 2 << 30;
+
+// ---------------------------------------------------------------------------
+// The one disk writer
+//
+// Every fetch worker used to call into `DiskCache` itself: one mutex, one
+// `seek_write` per network read, sixteen threads, random offsets, one file. On
+// an NVMe box that is invisible; on a machine whose filesystem serialises
+// positional writes (or where a filter driver sits in the path) it is the
+// "everything freezes while a video plays" report.
+//
+// Now a session has exactly **one** thread that touches the file. Workers send
+// `(offset, bytes)` on a bounded channel and never wait for the disk:
+// - a full queue drops the block (the map only records successful writes, so a
+//   dropped block simply reads as "not cached");
+// - the writer merges adjacent blocks that arrive close together into one run
+//   (up to [`DISK_MERGE_MAX`]), so the file is written in large, mostly
+//   sequential calls instead of many small interleaved ones;
+// - `set_len` and file creation stay on the writer (creation happens once, when
+//   the session opens, before any worker exists).
+// ---------------------------------------------------------------------------
+
+/// Blocks a queue may hold before workers drop theirs. 64 × one read (tens of
+/// KiB) is a few MiB of slack: deep enough that a burst never drops, shallow
+/// enough that a stuck disk cannot grow the process.
+const DISK_QUEUE_DEPTH: usize = 64;
+/// Largest single write the coalescer issues (4 MiB).
+const DISK_MERGE_MAX: usize = 4 << 20;
+/// Bytes the coalescer may hold across all open runs. Bounds the writer's own
+/// memory: it can never grow with the cache file.
+const DISK_BUFFER_BUDGET: usize = 8 << 20;
+/// Open runs kept at once. Each in-flight upstream range owns one.
+const DISK_RUNS_MAX: usize = 8;
+/// A run that stopped growing this long is flushed; it is what turns a stream
+/// of network reads into one large write without waiting for the range to end.
+const DISK_RUN_IDLE: Duration = Duration::from_millis(20);
+/// How often the writer logs its own call pattern (calls/s, average call size).
+const DISK_WRITER_TRACE: Duration = Duration::from_secs(5);
+
 const MIN_READ_AHEAD_BYTES: u64 = 8 << 20;
-const MAX_READ_AHEAD_BYTES: u64 = 128 << 20;
+const MAX_READ_AHEAD_BYTES: u64 = 256 << 20;
 const MIN_CHUNK_BYTES: u64 = 256 << 10;
 const MAX_CHUNK_BYTES: u64 = 16 << 20;
-const MAX_CONNECTIONS: usize = 6;
+/// Connections a config may ask for (`0` = auto).
+const MAX_CONNECTIONS: usize = 32;
+/// Files larger than this get the dynamic split of the remaining bytes across
+/// the configured connections (whole-file scheduling).
+const DYNAMIC_SPLIT_THRESHOLD: u64 = 64 << 20;
+/// Health window over which a worker's throughput is measured.
+const HEALTH_WINDOW: Duration = Duration::from_secs(5);
+/// Zero bytes for this long marks a worker slow.
+const HEALTH_SLOW_AFTER: Duration = Duration::from_secs(5);
+/// Below 20 % of the median worker for this long marks a worker slow.
+const HEALTH_LOW_AFTER: Duration = Duration::from_secs(15);
+/// Poll interval of the per-worker health watchdog.
+const HEALTH_POLL: Duration = Duration::from_millis(1000);
+/// How often a worker above the live connection count checks whether the pool
+/// was raised again (cheap: no state lock while it waits).
+const IDLE_CONNECTION_POLL: Duration = Duration::from_millis(20);
+/// A worker learns that more connections were asked for at this interval.
 
 /// How often the accept loop and the workers re-check the shutdown flag /
 /// for newly available window space.
@@ -100,6 +250,20 @@ const WRITE_POLL: Duration = Duration::from_millis(20);
 /// is stuck outside its own write path; normally the preempting token releases
 /// it within [`WRITE_POLL`].
 const SERVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A serve wait must not outlast this while the network is healthy. Past it the
+/// wait is escalated: every speculative fetch is cancelled and the hot range's
+/// route is cancelled and raced (see [`Engine::enforce_serve_priority`]).
+///
+/// This is an SLO, not a hard abort: the body keeps waiting (closing it would
+/// end playback), but the log names the breach and the scheduler moves the bytes.
+const SERVE_WAIT_BUDGET_MS: u64 = 1500;
+/// A hot chunk that has produced no byte for this long while a serve wait is
+/// open is stuck. It is cancelled and re-routed now instead of waiting for the
+/// five-second [`HEALTH_SLOW_AFTER`] timer, which is thirty times a frame.
+const HOT_STUCK_MS: u64 = 500;
+/// How often, while a serve wait is open, the scheduler enforces hot priority
+/// (preempt speculative claims, watchdog a silent hot range).
+const SERVE_WAIT_ENFORCE_POLL: Duration = Duration::from_millis(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the first client request waits for the first upstream response
 /// headers (which carry the total length) before failing with a `504`.
@@ -109,35 +273,123 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// One second of traffic history is what `bytes_per_sec` averages over.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
-/// Quiet time after the first served byte before warming starts, so the first
-/// response (and the reader's initial burst) is never slowed by it.
-const WARM_DELAY: Duration = Duration::from_millis(1500);
-/// Pause between two warmed points; one sequential small fetch at a time.
-const WARM_POINT_PAUSE: Duration = Duration::from_millis(150);
-/// How long to keep waiting for a client to read its first bytes before giving
-/// up on warming (a proxy nobody plays wastes no traffic).
-const WARM_START_TIMEOUT: Duration = Duration::from_secs(60);
-/// Slow poll of the shared state while waiting for a safe moment to warm.
-const WARM_POLL: Duration = Duration::from_millis(50);
-/// How long the read-ahead window may stay starved before warming proceeds
-/// anyway (a paused reader leaves the window full, so this only covers EOF and
-/// a client that stopped reading).
-const WARM_STARVED_MS: Duration = Duration::from_millis(750);
+/// Read-ahead a session starts with (see [`STARTUP_WINDOW`]); the configured
+/// window (32 MiB by default) takes over once frames are flowing.
+///
+/// 2 MiB is ~5 s of a 3.3 Mbps stream and several times what the pre-roll gate
+/// waits for, so the first frame never waits on it — but it is a quarter of the
+/// I/O, TLS and disk work the old 8 MiB window did while the app was still
+/// opening (measured 0.6–0.9 cores for the first seconds on a slow CDN).
+pub const STARTUP_READ_AHEAD_BYTES: u64 = 2 << 20;
+/// Connections a gated session starts with. Sixteen parallel TLS streams
+/// filling the first window cost 0.7–0.9 cores for several seconds on a slow
+/// CDN (measured with the per-thread trace), all of it before a single frame is
+/// on screen. Four is enough to fill the startup window in well under the gate's
+/// budget; the configured count takes over with the wider window.
+const STARTUP_CONNECTIONS: usize = 4;
+/// Background (speculative) workers allowed while the session is young. The
+/// whole-file prefetch is a convenience; at sixteen parallel streams it pulled
+/// 12→50 MB in four seconds (5.1 cores of the 6-core box) exactly while the
+/// player was opening — the owner's "all cores spike / the system drops to
+/// 10 fps". Two workers keep the file filling without owning the machine, and
+/// the full pool takes over after [`BACKGROUND_RAMP`].
+const STARTUP_BACKGROUND_WORKERS: usize = 2;
+/// How long the reduced background pool lasts. The hot window and the seek
+/// points are unaffected (they are what playback needs).
+const BACKGROUND_RAMP: Duration = Duration::from_secs(12);
+/// How long a session keeps the smaller [`STARTUP_READ_AHEAD_BYTES`] window
+/// before the configured value takes over, together with the configured
+/// connection count.
+const STARTUP_WINDOW: Duration = Duration::from_secs(3);
+/// Upper bound on waiting for the first client byte before the window is
+/// widened anyway (a proxy with no reader must not stay small forever).
+const STARTUP_WINDOW_MAX: Duration = Duration::from_secs(15);
+/// Poll interval of the startup-gate task.
+const STARTUP_POLL: Duration = Duration::from_millis(100);
+
+/// Media seconds of read-ahead the proxy may hold ahead of the playhead.
+///
+/// The configured window (`read_ahead_bytes`, 32 MiB by default, up to 256)
+/// stays the hard memory bound, but it is also clamped to this many seconds of
+/// the stream: a 400 kbit/s 720P stream would otherwise buffer ten minutes of
+/// video, and every byte of it is memory, disk write and trim work. 90 s is
+/// what the owner asked for and is far more than a seek inside the window
+/// needs.
+pub const PLAYBACK_AHEAD_SECONDS: u64 = 90;
+/// Media seconds of read-ahead the hot path keeps in flight. The rest of the
+/// window is filled by the background queue at the speculative rate below.
+const HOT_AHEAD_SECONDS: u64 = 12;
+/// Speculative (whole-file) bytes per second, as a multiple of the measured
+/// media bitrate once the window holds its comfort level. The whole-file queue
+/// exists so a later seek is instant — it is not worth a core: at 2× the
+/// bitrate it still outruns playback and finishes the file, but it no longer
+/// pulls 20 MB/s across sixteen TLS connections for 30 s (2.5–3 cores).
+const SPECULATIVE_RATE_FACTOR: u64 = 2;
+/// Refill factor while seek points are still being warmed: 6× the bitrate.
+/// The whole warm plan is a few dozen MiB, and at this rate it is one or two
+/// streams instead of sixteen racing the decoder.
+const WARM_RATE_FACTOR: u64 = 6;
+/// Burst of the speculative token bucket: two chunks, so a whole-file fetch can
+/// still start (and a single-chunk file is never blocked).
+const SPECULATIVE_BURST_CHUNKS: u64 = 2;
+/// How many short upstream bodies one chunk may produce before it is retired.
+/// A mirror that keeps truncating the same range must not loop forever; the
+/// serve path then reports the range as unavailable instead of silently
+/// claiming EOF.
+const SHORT_BODY_LIMIT: u32 = 4;
+/// Consecutive failed range attempts before a mirror is retired for the
+/// session. Below it the route only cools down (1 s, then 2 s, 3 s): a single
+/// `error decoding response body` on the one configured host used to end
+/// playback, because the range it held was the one the client was reading.
+const HOST_FAILURE_LIMIT: u32 = 3;
+/// Attempts one range gets, across hosts and identical retries, before it is
+/// retired. A body that dies mid-range is normally transient (a CDN edge
+/// resetting one connection), and the retry resumes exactly at `cursor`.
+const RANGE_ATTEMPTS: u32 = 3;
+/// Pause before retrying the same range on the same route when no other host
+/// is available.
+const RETRY_BACKOFF: Duration = Duration::from_millis(300);
+/// Bounds of the fallback bitrate estimate when the caller supplied no duration
+/// (128 kbit/s .. 16 Mbit/s). Inside them the session average is used as is.
+const FALLBACK_BITRATE_MIN: u64 = 16 * 1024;
+const FALLBACK_BITRATE_MAX: u64 = 2 << 20;
+/// Wait of a worker with nothing to claim. Nothing is due for it: the hot
+/// window is filled, the token bucket is empty and no seek point is pending.
+/// Two milliseconds of polling × sixteen workers was 8 000 state-lock wakeups
+/// per second of pure overhead.
+const IDLE_WAIT: Duration = Duration::from_millis(15);
 
 // ---------------------------------------------------------------------------
 // Public configuration and stats
 // ---------------------------------------------------------------------------
 
+/// `BILI_STARTUP_GATE=0` restores the pre-gate schedule: the read-ahead window
+/// is the configured size from the first byte, the connection count is the
+/// configured one, feed background work runs while a player is open, and seek
+/// points are warmed as soon as the first byte is served. Only the
+/// before/after QA runs use it; the gate is on by default.
+pub fn startup_gate_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BILI_STARTUP_GATE")
+            .map(|value| value.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Tuning for one proxy instance. [`PrefetchConfig::normalized`] clamps every
 /// field, so callers may pass anything.
 #[derive(Clone, Debug)]
 pub struct PrefetchConfig {
-    /// Bytes to keep buffered beyond the read cursor (8..=128 MiB).
+    /// Bytes to keep buffered beyond the read cursor (8..=256 MiB). This is
+    /// the whole memory bound of the window: speculative whole-file bytes that
+    /// fall outside it are counted but not retained.
     pub read_ahead_bytes: u64,
     /// Size of one upstream range request (256 KiB..=16 MiB, at most the
     /// read-ahead window).
     pub chunk_bytes: u64,
-    /// Parallel upstream fetchers (1..=6).
+    /// Parallel upstream fetchers (1..=32, `0` = [`DEFAULT_CONNECTIONS`]).
+    /// Every one of them may be in flight at the same time.
     pub connections: usize,
     /// Seek positions warmed in the background once playback started
     /// (0 = no warming, 1..=[`MAX_WARM_POINTS`]). Each point caches at most
@@ -150,6 +402,18 @@ pub struct PrefetchConfig {
     /// Mirror hosts, best first. Each entry is a bare host (`host:port`) or a
     /// full URL; only the origin is used. Empty = the URL's own host.
     pub hosts: Vec<String>,
+    /// Name of this session's cache file (without the `.part` suffix). The
+    /// player passes `<bvid>-<cid>-<quality>`; `None` names the file after the
+    /// media URL's own path, which is what [`cache_key_from_url`] returns. The
+    /// file lives in `%LOCALAPPDATA%\o11a1\cache` (temporary directory when
+    /// that variable is missing).
+    pub cache_key: Option<String>,
+    /// Duration of the media in milliseconds, when the caller knows it. With
+    /// the total length this gives the exact bitrate, which sets the read-ahead
+    /// horizon ([`PLAYBACK_AHEAD_SECONDS`]) and the speculative rate cap
+    /// ([`SPECULATIVE_RATE_FACTOR`]). `None` falls back to the rate the client
+    /// actually pulls.
+    pub media_duration_ms: Option<u64>,
 }
 
 impl Default for PrefetchConfig {
@@ -161,10 +425,11 @@ impl Default for PrefetchConfig {
             warm_points: crate::settings::default_seek_points() as usize,
             point_bytes: DEFAULT_POINT_BYTES,
             hosts: Vec::new(),
+            cache_key: None,
+            media_duration_ms: None,
         }
     }
 }
-
 impl PrefetchConfig {
     /// Clamp every field into its supported range. Blank host entries are
     /// dropped.
@@ -176,7 +441,11 @@ impl PrefetchConfig {
             .chunk_bytes
             .clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES)
             .min(self.read_ahead_bytes);
-        self.connections = self.connections.clamp(1, MAX_CONNECTIONS);
+        self.connections = if self.connections == 0 {
+            DEFAULT_CONNECTIONS
+        } else {
+            self.connections.clamp(1, MAX_CONNECTIONS)
+        };
         self.warm_points = self.warm_points.min(MAX_WARM_POINTS);
         self.point_bytes = self
             .point_bytes
@@ -206,10 +475,14 @@ pub struct WorkerStat {
     /// Exclusive end of that range (`start + chunk`, clamped to the file
     /// length when the total is already known at claim time).
     pub end: u64,
-    /// `false` while the worker waits for window space (or after it stopped).
+    /// `false` while the worker waits for work (or after it stopped).
     pub busy: bool,
     /// Bytes this worker has fetched since the proxy started.
     pub bytes: u64,
+    /// Throughput over the last five seconds, bytes/s.
+    pub bps: u64,
+    /// The health watchdog marked this worker slow (zero/low throughput).
+    pub slow: bool,
 }
 
 /// Byte accounting for the profiler panel.
@@ -265,19 +538,212 @@ pub struct PrefetchStats {
     pub active_workers: u32,
     /// `[start, end)` ranges currently held by the warm point cache.
     pub point_cache: Vec<(u64, u64)>,
+    /// Requests answered (at least partly) from the session cache file, counted
+    /// once per disk-served block.
+    pub disk_hits: u64,
+    /// Bytes written to the client out of the session cache file.
+    pub disk_bytes: u64,
+    /// Bytes the session cache file holds (present blocks, clamped to the known
+    /// length). Equal to the sum of [`PrefetchStats::downloaded`] when the disk
+    /// is the only source; the memory window can only add bytes the file could
+    /// not persist (cache cap, no cache file).
+    pub cache_bytes: u64,
+    /// The session cache file is at [`CACHE_CAP_BYTES`]; nothing further is
+    /// persisted (memory serving continues).
+    pub cache_capped: bool,
+    /// Whole-file chunks not fetched yet (the global scheduling queue).
+    pub queue_chunks: u64,
+    /// Bytes those chunks represent (whole-file scheduling, not the window).
+    pub queue_bytes: u64,
+    /// Upstream bytes by scheduling class: the client's hot window, the seek
+    /// warm points, the speculative whole-file queue, and retries (a requeued
+    /// or raced range). The split proves speculative work keeps its share while
+    /// nothing waits, and loses it to the hot window while a body waits.
+    pub bytes_hot: u64,
+    pub bytes_warm: u64,
+    pub bytes_rest: u64,
+    pub bytes_retry: u64,
+}
+
+/// One chunk of a playlist preload (2 MiB): large enough that the CDN round
+/// trip is amortised, small enough that a cancel is noticed quickly.
+#[allow(dead_code)] // public API: the UI session wires `Preload` next
+const PRELOAD_CHUNK_BYTES: u64 = 2 << 20;
+/// Gap between two preload chunks: the preload is one sequential reader that
+/// deliberately leaves the link to playback.
+#[allow(dead_code)] // public API: the UI session wires `Preload` next
+const PRELOAD_YIELD: Duration = Duration::from_millis(40);
+
+/// Fetch one URL completely into its own session cache file, at background
+/// priority. `stop` is checked between network chunks; `progress` is updated as
+/// bytes land so a caller can show the preload.
+#[allow(dead_code)] // reached only through `PrefetchHandle::preload`
+async fn preload_one(
+    engine: &Engine,
+    key: &str,
+    url: &str,
+    stop: &AtomicBool,
+    progress: &PreloadProgressShared,
+) {
+    let started = Instant::now();
+    if let Ok(mut current) = progress.current.lock() {
+        *current = key.to_string();
+    }
+    let mut disk = DiskCache::open(key);
+    if !disk.present() {
+        crate::debug_log(&format!("preload file key={key} skipped=no-file"));
+        return;
+    }
+    let mut offset = disk.first_hole();
+    let mut total = disk.len();
+    let mut fetched = 0u64;
+    let mut failures = 0u32;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if total > 0 && offset >= total {
+            break;
+        }
+        let end = offset.saturating_add(PRELOAD_CHUNK_BYTES);
+        let last = if total > 0 { end.min(total - 1) } else { end - 1 };
+        let range = format!("bytes={offset}-{last}");
+        let request = engine
+            .client
+            .get(url)
+            .header(RANGE, range.clone())
+            .send();
+        let response = match tokio::time::timeout(CHUNK_TIMEOUT, request).await {
+            Ok(Ok(response)) => Some(response),
+            Ok(Err(error)) => {
+                crate::debug_log(&format!("preload retry key={key} err={error}"));
+                None
+            }
+            Err(_) => {
+                crate::debug_log(&format!("preload retry key={key} err=timeout"));
+                None
+            }
+        };
+        let Some(mut response) = response else {
+            failures += 1;
+            if failures >= 3 {
+                crate::debug_log(&format!("preload file key={key} failed attempts={failures}"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+        if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            if total == 0 {
+                disk.adopt_len(offset);
+            }
+            break;
+        }
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            crate::debug_log(&format!(
+                "preload file key={key} failed status={}",
+                response.status().as_u16()
+            ));
+            break;
+        }
+        if total == 0 {
+            if let Some(learned) = content_range_total(response.headers()) {
+                disk.adopt_len(learned);
+                total = learned;
+                progress
+                    .bytes_total
+                    .fetch_add(learned, Ordering::SeqCst);
+            }
+        }
+        let mut body = 0u64;
+        while let Some(chunk) = match tokio::time::timeout(CHUNK_TIMEOUT, response.chunk()).await {
+            Ok(Ok(chunk)) => chunk,
+            _ => None,
+        } {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            disk.write(offset, &chunk);
+            offset += chunk.len() as u64;
+            body += chunk.len() as u64;
+            fetched += chunk.len() as u64;
+            progress.bytes_done.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+            if total > 0 && offset >= total {
+                break;
+            }
+            if body >= PRELOAD_CHUNK_BYTES {
+                break;
+            }
+        }
+        if body == 0 {
+            if total == 0 {
+                // A short open-ended body is the only EOF hint available.
+                disk.adopt_len(offset);
+                total = offset;
+            }
+            break;
+        }
+        tokio::time::sleep(PRELOAD_YIELD).await;
+    }
+    let complete = total > 0 && offset >= total;
+    if complete {
+        // Flush, then the sidecar: the map may only name bytes that are already
+        // in the file (this file is meant to outlive its writer, unlike a
+        // session file).
+        disk.flush_and_save_map();
+    }
+    if let Ok(mut current) = progress.current.lock() {
+        current.clear();
+    }
+    if disk.capped {
+        crate::debug_log(&format!("preload file key={key} capped bytes={offset}"));
+    }
+    crate::debug_log(&format!(
+        "preload file key={key} bytes={fetched} have={offset} total={total} complete={} ms={}",
+        u8::from(complete),
+        started.elapsed().as_millis()
+    ));
+    drop(disk);
 }
 
 /// Handle to a running proxy. Dropping it shuts the server down.
 pub struct PrefetchHandle {
     /// `http://127.0.0.1:<port><path>?<original query>`.
     pub local_url: String,
-    /// Published stats; refreshed on every upstream read. [`PrefetchHandle::snapshot`]
-    /// additionally recomputes `bytes_per_sec` so it decays while idle.
-    pub stats: Arc<Mutex<PrefetchStats>>,
     shared: Arc<Engine>,
     shutdown: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
+    /// Playlist whole-file preloads (see [`PrefetchHandle::preload`]).
+    #[allow(dead_code)] // public API: written by `preload_keys`
+    preload: Mutex<Option<PreloadJob>>,
     runtime: &'static tokio::runtime::Runtime,
+}
+
+/// One running playlist preload: a single background task plus the flag that
+/// stops it. Kept together so `cancel_preload` can wait for the task to notice.
+struct PreloadJob {
+    #[allow(dead_code)] // public API: read by `cancel_preload`
+    stop: Arc<AtomicBool>,
+    #[allow(dead_code)] // public API: aborted by `cancel_preload`
+    task: JoinHandle<()>,
+    #[allow(dead_code)] // public API: read by `preload_progress`
+    progress: Arc<PreloadProgressShared>,
+}
+
+#[derive(Debug, Default)]
+struct PreloadProgressShared {
+    #[allow(dead_code)]
+    files_total: AtomicU64,
+    #[allow(dead_code)]
+    files_done: AtomicU64,
+    #[allow(dead_code)]
+    bytes_done: AtomicU64,
+    #[allow(dead_code)]
+    bytes_total: AtomicU64,
+    /// Cache key of the file being fetched right now, so a cancel can delete the
+    /// partial file instead of leaving it behind.
+    #[allow(dead_code)]
+    current: Mutex<String>,
 }
 
 impl PrefetchHandle {
@@ -287,19 +753,362 @@ impl PrefetchHandle {
         self.shared.snapshot()
     }
 
+    /// Change the number of upstream connections while the proxy runs
+    /// (clamped to `1..=32`; `0` selects the default). Increasing it wakes
+    /// workers that were waiting out of the queue, decreasing it lets the
+    /// highest-numbered ones finish their range and then idle.
+    #[allow(dead_code)] // public API: the player wiring changes this live
+    pub fn set_connections(&self, n: u32) {
+        let count = if n == 0 {
+            DEFAULT_CONNECTIONS
+        } else {
+            (n as usize).clamp(1, MAX_CONNECTIONS)
+        };
+        self.shared
+            .desired_connections
+            .store(count as u64, Ordering::SeqCst);
+        crate::debug_log(&format!("prefetch connections={count} live"));
+    }
+
+    /// Merged, sorted `[start, end)` ranges currently held in memory: the
+    /// read-ahead window plus the seek point cache.
+    #[allow(dead_code)] // public API for the caller's seek hit test
+    pub fn cached_ranges(&self) -> Vec<(u64, u64)> {
+        self.shared.cached_ranges()
+    }
+
+    /// Contiguous bytes available from `offset` in the merged cached ranges
+    /// (0 when the offset is not cached). This is what tells the caller
+    /// whether a seek can be answered without any upstream request: memory
+    /// window, warm points and the session cache file all count.
+    #[allow(dead_code)] // public API for the caller's seek hit test
+    pub fn cached_bytes_at(&self, offset: u64) -> u64 {
+        self.shared.cached_bytes_at(offset)
+    }
+
+    /// Path of this session's cache file, when the session really has one.
+    ///
+    /// The file is a sparse, exactly-sized copy of the media: every byte the
+    /// proxy fetched is in it. The player hands this path to ffmpeg instead of
+    /// the loopback URL for a seek that is already downloaded, which skips the
+    /// HTTP round trip and the demuxer's byte-range search entirely.
+    pub fn cache_path(&self) -> Option<PathBuf> {
+        self.shared.cache_path()
+    }
+
+    /// Fetch ahead from `offset` **before** any client asks for it, into the
+    /// bounded seek-point cache.
+    ///
+    /// The bytes land in the point cache rather than the read-ahead window, and
+    /// that is the whole point: a point is served by `point_hit` *before* the
+    /// response lock and without moving the read cursor, so a pre-warmed seek
+    /// neither waits behind the body a client is still reading nor pushes that
+    /// client's window away. The pre-warm is also not rate limited (unlike
+    /// scheduled seek points): it is urgent work for a seek that is happening.
+    ///
+    /// `bytes` is clamped to the point-cache budget, and to the end of the
+    /// media. `true` means the region was already covered (memory window, point
+    /// cache or the session cache file) and no task was queued.
+    #[allow(dead_code)] // public API for the seek shadow's audio pre-warm
+    pub fn prime_at(&self, offset: u64, bytes: u64) -> bool {
+        let mut state = match self.shared.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(total) = state.total else {
+            // No length yet: the byte offset of a timestamp is meaningless
+            // without it. The client's own request primes the window instead.
+            drop(state);
+            crate::debug_log(&format!("prefetch prime offset={offset} deferred reason=no-total"));
+            return false;
+        };
+        if offset >= total {
+            return true;
+        }
+        if state.points.lookup(offset).is_some()
+            || chunks_cover(&state.chunks, offset)
+            || self.shared.disk_covers(offset)
+        {
+            drop(state);
+            crate::debug_log(&format!(
+                "prefetch prime offset={offset} covered=1 after_ms={}",
+                self.shared.started.elapsed().as_millis()
+            ));
+            return true;
+        }
+        // The client's read window owns the cursor; the automatic seek-point
+        // plan (if this session has one) still comes first.
+        if !state.warm_plan_started {
+            build_warm_plan(
+                &mut state,
+                self.shared.config.chunk_bytes,
+                self.shared.config.point_bytes,
+                self.shared.config.warm_points,
+                total,
+            );
+        }
+        let chunk = self.shared.config.chunk_bytes.max(1);
+        let start = chunk_start(offset, chunk);
+        let per_point = point_chunk_bytes(total, 1, DEFAULT_POINT_BYTES).max(1);
+        let span = bytes.clamp(1, per_point);
+        let end = total.min(start.saturating_add(span));
+        if state.warm_plan.iter().any(|task| task.start == start) {
+            drop(state);
+            return false;
+        }
+        state.warm_plan.push(WarmTask {
+            point: start,
+            start,
+            end,
+            done: false,
+            claimed: false,
+            urgent: true,
+        });
+        state.warm_plan_started = true;
+        state.warm_points_total = state.warm_plan.len().min(MAX_WARM_POINTS) as u32;
+        drop(state);
+        crate::debug_log(&format!(
+            "prefetch prime offset={offset} start={start} end={end} bytes={} after_ms={}",
+            end - start,
+            self.shared.started.elapsed().as_millis()
+        ));
+        false
+    }
+
+    /// Path of the cache file **when it holds at least `need` contiguous bytes
+    /// at `offset`** — the honest test for "can ffmpeg play this locally
+    /// without hitting a hole". `None` keeps the proxy path.
+    pub fn cache_path_for(&self, offset: u64, need: u64) -> Option<PathBuf> {
+        self.shared.cache_path_for(offset, need)
+    }
+
+    /// Merged, sorted `[start, end)` ranges the session cache file holds — the
+    /// disk map, *without* the memory window. This is the map the 下载分布
+    /// panel draws and the one a seek must not change.
+    pub fn disk_ranges(&self) -> Vec<(u64, u64)> {
+        self.shared.disk_ranges()
+    }
+
+    /// `(contiguous bytes at `offset` on disk, range count, total on-disk bytes)`.
+    ///
+    /// The seek cache decision reads exactly this: a target counts as cached
+    /// only when the disk map really holds the bytes, never because a warm point
+    /// is *near* the offset or because the read-ahead window happens to be big.
+    pub fn disk_cover(&self, offset: u64) -> (u64, usize, u64) {
+        self.shared.disk_cover(offset)
+    }
+
+
+    /// Preload the tracks of a playlist, in playlist order, at **background**
+    /// priority.
+    ///
+    /// Each URL is fetched completely into its own session cache file, one
+    /// connection at a time, in the given order, so the film after the current
+    /// one is already on disk when the player opens it (the first frame then
+    /// comes from the local file, and a seek anywhere is instant). Nothing here
+    /// touches the proxy's read-ahead window or its worker pool: the preload is
+    /// one sequential range reader that yields between chunks, and it stops the
+    /// moment [`PrefetchHandle::cancel_preload`] is called, the handle is
+    /// dropped, or the URL's cache file reaches [`CACHE_CAP_BYTES`].
+    ///
+    /// Keys come from [`cache_key_from_url`]. The player names its file
+    /// `<bvid>-<cid>-<quality>.part`; to preload *exactly* that file use
+    /// [`PrefetchHandle::preload_keys`]. The live session's own key is skipped,
+    /// so a preload can never truncate the file a decoder is reading.
+    ///
+    /// Returns the number of URLs enqueued (`0` when nothing was started).
+    #[allow(dead_code)] // public API: the UI session calls this next
+    pub fn preload(&self, order: &[String]) -> usize {
+        let pairs: Vec<(String, String)> = order
+            .iter()
+            .map(|url| (cache_key_from_url(url), url.clone()))
+            .collect();
+        self.preload_keys(&pairs)
+    }
+
+    /// Same as [`PrefetchHandle::preload`], with an explicit cache key per URL
+    /// (`(key, url)`), so a preload can fill the file a later player will open:
+    /// the player passes `<bvid>-<cid>-<quality>`.
+    #[allow(dead_code)] // public API: the UI session calls this next
+    pub fn preload_keys(&self, order: &[(String, String)]) -> usize {
+        self.cancel_preload();
+        let live = self.shared.cache_key.clone();
+        let mut queue: Vec<(String, String)> = Vec::with_capacity(order.len());
+        for (key, url) in order {
+            if url.trim().is_empty() {
+                continue;
+            }
+            let key = cache_key_name(key);
+            if key == live {
+                crate::debug_log(&format!("preload skip key={key} reason=live-session"));
+                continue;
+            }
+            queue.push((key, url.clone()));
+        }
+        if queue.is_empty() {
+            return 0;
+        }
+        let progress = Arc::new(PreloadProgressShared::default());
+        progress
+            .files_total
+            .store(queue.len() as u64, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared = self.shared.clone();
+        let task_stop = stop.clone();
+        let task_progress = progress.clone();
+        crate::debug_log(&format!(
+            "preload start files={} keys={}",
+            queue.len(),
+            queue
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let task = self.runtime.spawn(async move {
+            for (key, url) in queue {
+                if task_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                preload_one(&shared, &key, &url, &task_stop, &task_progress).await;
+                if task_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                task_progress.files_done.fetch_add(1, Ordering::SeqCst);
+            }
+            crate::debug_log(&format!(
+                "preload done files={}/{} bytes={} cancelled={}",
+                task_progress.files_done.load(Ordering::SeqCst),
+                task_progress.files_total.load(Ordering::SeqCst),
+                task_progress.bytes_done.load(Ordering::SeqCst),
+                u8::from(task_stop.load(Ordering::SeqCst)),
+            ));
+        });
+        let mut slot = match self.preload.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(PreloadJob {
+            stop,
+            task,
+            progress,
+        });
+        order.len()
+    }
+
+    /// Current preload progress. `(files_total, files_done, bytes_done,
+    /// bytes_total)`; all zero when nothing is preloading.
+    #[allow(dead_code)] // public API: the UI session can show this next
+    pub fn preload_progress(&self) -> (u32, u32, u64, u64) {
+        let slot = match self.preload.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(job) = slot.as_ref() else {
+            return (0, 0, 0, 0);
+        };
+        (
+            job.progress.files_total.load(Ordering::SeqCst) as u32,
+            job.progress.files_done.load(Ordering::SeqCst) as u32,
+            job.progress.bytes_done.load(Ordering::SeqCst),
+            job.progress.bytes_total.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Stop the playlist preload (no-op when none is running). Returns whether
+    /// one was running. The task is signalled, not awaited: it holds the file
+    /// for at most one chunk (`PRELOAD_CHUNK_BYTES`) and then removes it.
+    #[allow(dead_code)] // public API: the UI session calls this next
+    pub fn cancel_preload(&self) -> bool {
+        let job = {
+            let mut slot = match self.preload.lock() {
+                Ok(slot) => slot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            slot.take()
+        };
+        let Some(job) = job else {
+            return false;
+        };
+        job.stop.store(true, Ordering::SeqCst);
+        job.task.abort();
+        // A cancelled preload leaves a partial file: delete it, so the cache
+        // directory never grows unfinished entries nobody will resume.
+        let partial = match job.progress.current.lock() {
+            Ok(key) => key.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if !partial.is_empty() {
+            let dir = cache_dir();
+            let name = cache_key_name(&partial);
+            let _ = std::fs::remove_file(dir.join(format!("{name}.part")));
+            let _ = std::fs::remove_file(dir.join(format!("{name}.map")));
+            crate::debug_log(&format!("preload cancel removed key={name}"));
+        }
+        crate::debug_log(&format!(
+            "preload cancel files_done={} bytes={}",
+            job.progress.files_done.load(Ordering::SeqCst),
+            job.progress.bytes_done.load(Ordering::SeqCst)
+        ));
+        true
+    }
+
+    /// `(id, host, slow, bytes_per_sec)` per live worker, in id order.
+    #[allow(dead_code)] // public API: the player/profiler reads it live
+    pub fn worker_health(&self) -> Vec<(u32, String, bool, u64)> {
+        let mut state = match self.shared.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let live = self.shared.desired_connections();
+        let mut health = Vec::with_capacity(live);
+        for (id, slot) in state.workers.iter_mut().take(live).enumerate() {
+            slot.bps = window_rate(&mut slot.samples, now, HEALTH_WINDOW);
+            health.push((id as u32, slot.host.clone(), slot.slow, slot.bps));
+        }
+        health
+    }
+
+    /// Hold (`true`) or release the proxy's **background** work.
+    ///
+    /// Held, the workers fetch only the client's hot window: seek points and
+    /// the speculative whole-file parts wait. Playback itself — the read-ahead
+    /// window and any points that already landed — is untouched, so this can
+    /// never stall the picture. The
+    /// player holds it while the first frames are still arriving and during a
+    /// stall/buffering episode, then releases it once playback has been healthy
+    /// long enough. The proxy starts un-held, so standalone users of
+    /// [`spawn`] (the live QA tests) keep the old schedule.
+    pub fn set_background_paused(&self, paused: bool) {
+        self.shared
+            .background_paused
+            .store(paused, Ordering::SeqCst);
+    }
+
     /// Stop the server and every fetch task, then wait (bounded) until the
     /// listener is closed. Safe to call more than once.
+    ///
+    /// The session cache file is deleted here (player close, new video, quality
+    /// switch): no `.part` file outlives its session.
     ///
     /// Must be called from a synchronous thread; inside a Tokio runtime this
     /// falls back to aborting the server task because nested `block_on`
     /// panics.
     pub fn shutdown(&mut self) {
+        self.cancel_preload();
         self.shutdown.store(true, Ordering::SeqCst);
+        // Give the worker ids back to the pool first: from here on no thread
+        // picks a range for this session, even if the server task is aborted
+        // rather than joined below.
+        unbind_slots(&self.shared);
         let Some(mut task) = self.server.take() else {
+            self.remove_cache();
             return;
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             task.abort();
+            self.remove_cache();
             return;
         }
         let _ = self.runtime.block_on(async {
@@ -311,6 +1120,25 @@ impl PrefetchHandle {
                 let _ = (&mut task).await;
             }
         });
+        self.remove_cache();
+    }
+
+    /// Close and delete the session cache file, logging one `cache removed`
+    /// line. Idempotent: a second call finds no file.
+    ///
+    /// The writer is drained and joined **before** the file is touched: every
+    /// queued block lands, the handle closes, and only then the file (and its
+    /// map) is deleted, so no late write can resurrect or truncate it.
+    fn remove_cache(&mut self) {
+        let writer = match self.shared.writer.lock() {
+            Ok(mut writer) => writer.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        drop(writer);
+        match self.shared.disk.lock() {
+            Ok(mut disk) => disk.remove(),
+            Err(poisoned) => poisoned.into_inner().remove(),
+        }
     }
 }
 
@@ -376,10 +1204,29 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
             .collect(),
         ..PrefetchStats::default()
     }));
+    // Startup gate: a session begins with a smaller window and fewer fetchers,
+    // so the first frames are not queued behind 32 MiB of speculative ranges.
+    let gate = startup_gate_enabled();
+    let startup_read_ahead = if gate {
+        config.read_ahead_bytes.min(STARTUP_READ_AHEAD_BYTES)
+    } else {
+        u64::MAX
+    };
+    let cache_key = config
+        .cache_key
+        .clone()
+        .unwrap_or_else(|| cache_key_from_url(url));
+    // The single writer, created before any fetch task exists: from here on no
+    // worker touches the file.
+    let disk = Arc::new(Mutex::new(DiskCache::open(&cache_key)));
+    let writer = DiskWriter::spawn(disk.clone());
     let shared = Arc::new(Engine {
         config: config.clone(),
         target: target.clone(),
         client,
+        cache_key: cache_key_name(&cache_key),
+        disk,
+        writer: Mutex::new(writer),
         state: Mutex::new(State {
             base: 0,
             cursor: 0,
@@ -387,6 +1234,17 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
             chunks: BTreeMap::new(),
             inflight: BTreeSet::new(),
             dead: BTreeSet::new(),
+            done: BTreeSet::new(),
+            parts: Vec::new(),
+            parts_built: false,
+            requeued: BTreeSet::new(),
+            short_bodies: BTreeMap::new(),
+            warm_plan: Vec::new(),
+            warm_plan_started: false,
+            serve_samples: VecDeque::new(),
+            races: VecDeque::new(),
+            urgent: VecDeque::new(),
+            race_tokens: BTreeMap::new(),
             total: None,
             fatal: None,
             content_type: None,
@@ -395,8 +1253,10 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
                 .map(|spec| Host {
                     label: spec.label,
                     origin: spec.origin,
+                    failures: 0,
                     failed: false,
                     bytes: 0,
+                    degraded_until: None,
                 })
                 .collect(),
             next_host: 0,
@@ -404,21 +1264,54 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
             bytes_fetched: 0,
             failed_ranges: 0,
             served: 0,
+            serve_bps: 0,
+            first_serve: None,
+            // One burst so the first speculative chunk can start immediately;
+            // the bucket then holds the queue at `speculative_rate`.
+            spec_tokens: DEFAULT_CHUNK_BYTES.saturating_mul(SPECULATIVE_BURST_CHUNKS),
+            spec_at: Instant::now(),
+            spec_bytes: 0,
             read_ahead: 0,
             points: PointCache::default(),
             warm_points_total: 0,
             warm_points_done: 0,
             warm_chunk: 0,
             warm_bytes: 0,
+            hot_bytes: 0,
+            warm_fetch_bytes: 0,
+            rest_bytes: 0,
+            retry_bytes: 0,
             point_hits: 0,
             point_served: 0,
-            workers: (0..config.connections)
+            disk_hits: 0,
+            disk_served: 0,
+            workers: (0..MAX_CONNECTIONS)
                 .map(|_| WorkerSlot::default())
                 .collect(),
         }),
         stats: stats.clone(),
         serving: AtomicBool::new(false),
         serve_epoch: AtomicU64::new(0),
+        read_ahead_cap: AtomicU64::new(startup_read_ahead),
+        background_paused: AtomicBool::new(false),
+        // Gated sessions ramp: a few fetchers while the first window fills,
+        // every configured worker once frames are flowing.
+        desired_connections: AtomicU64::new(if gate {
+            config.connections.min(STARTUP_CONNECTIONS) as u64
+        } else {
+            config.connections as u64
+        }),
+        configured_connections: config.connections as u64,
+        background_workers: AtomicU64::new(if gate {
+            STARTUP_BACKGROUND_WORKERS as u64
+        } else {
+            0
+        }),
+        worker_cancel: (0..MAX_CONNECTIONS).map(|_| AtomicU64::new(0)).collect(),
+        media_bps: AtomicU64::new(0),
+        serve_wait_pos: AtomicU64::new(u64::MAX),
+        serve_wait_since_ms: AtomicU64::new(0),
+        serve_wait_escalations: AtomicU64::new(0),
         started: Instant::now(),
     });
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -435,7 +1328,7 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
         }
     );
     crate::debug_log(&format!(
-        "prefetch spawn port={} read_ahead={} chunk={} connections={} warm_points={} point_bytes={} hosts={} startup=first-chunk",
+        "prefetch spawn port={} read_ahead={} chunk={} connections={} warm_points={} point_bytes={} hosts={} startup=first-chunk gate={} read_ahead_start={} connections_start={}",
         addr.port(),
         config.read_ahead_bytes,
         config.chunk_bytes,
@@ -451,15 +1344,18 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
                 .map(|host| host.label.as_str())
                 .collect::<Vec<_>>()
                 .join(","))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        if gate { "on" } else { "off" },
+        shared.read_ahead_window(),
+        shared.desired_connections.load(Ordering::SeqCst),
     ));
 
     Ok(PrefetchHandle {
         local_url,
-        stats,
         shared,
         shutdown,
         server: Some(server),
+        preload: Mutex::new(None),
         runtime,
     })
 }
@@ -817,6 +1713,7 @@ fn chunks_cover(chunks: &BTreeMap<u64, Vec<u8>>, pos: u64) -> bool {
 /// Chunk starts are aligned to `base + k*chunk`. A candidate is skipped when a
 /// buffered chunk covers it, when a fetch for it is in flight, or when it is
 /// known dead. Returns `None` when the window is full or the file ended.
+#[cfg(test)] // legacy window arithmetic kept for the range-selection tests
 fn next_chunk_offset(
     base: u64,
     cursor: u64,
@@ -857,6 +1754,7 @@ fn next_chunk_offset(
 
 /// Bytes buffered beyond the cursor. Every stored chunk starts at or after the
 /// cursor by construction.
+#[cfg(test)] // unit-test helper; the runtime path never calls it
 fn buffered_bytes(chunks: &BTreeMap<u64, Vec<u8>>) -> u64 {
     chunks.values().map(|data| data.len() as u64).sum()
 }
@@ -915,9 +1813,1056 @@ fn point_ranges(points: &PointCache) -> Vec<(u64, u64)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Disk-backed session cache
+// ---------------------------------------------------------------------------
+
+/// Directory of the session cache files: `%LOCALAPPDATA%\o11a1\cache`, or the
+/// temporary directory when the variable is missing (a stripped environment).
+fn cache_dir() -> PathBuf {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(base) if !base.is_empty() => PathBuf::from(base).join("o11a1").join("cache"),
+        _ => std::env::temp_dir().join("o11a1-cache"),
+    }
+}
+
+/// `BILI_DISK_CACHE=0` (or `false`/`no`/`off`) turns the session cache file off
+/// completely: the session runs memory-only, so the owner can A/B the disk path
+/// in one launch without rebuilding. Anything else (including unset) keeps it
+/// on; a blank value is "on".
+fn disk_cache_enabled() -> bool {
+    match std::env::var("BILI_DISK_CACHE") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Replace everything that is not safe in a file name, so a cache key can be a
+/// URL path or `<bvid>-<cid>-<quality>`.
+fn cache_key_name(key: &str) -> String {
+    let mut name: String = key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    name = name.trim_matches('-').to_string();
+    while name.contains("--") {
+        name = name.replace("--", "-");
+    }
+    if name.is_empty() {
+        name.push_str("media");
+    }
+    name.truncate(96);
+    name
+}
+
+/// Cache key derived from a media URL, for callers that have no `<bvid>-<cid>-
+/// <quality>` triple (see [`PrefetchHandle::preload`]).
+///
+/// Bilibili DASH paths look like
+/// `/upgcxcode/17/88/<cid>/<cid>-1-<stream>.m4s`, so the cid (the first long
+/// numeric directory) plus the stream id make a stable, human-readable key that
+/// does not depend on the expiring query string.
+pub fn cache_key_from_url(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let cid = segments
+        .iter()
+        .rev()
+        .skip(1)
+        .find(|part| part.len() >= 6 && part.chars().all(|ch| ch.is_ascii_digit()))
+        .copied()
+        .unwrap_or("media");
+    let stream = segments
+        .last()
+        .copied()
+        .unwrap_or("media")
+        .trim_end_matches(".m4s")
+        .trim_end_matches(".mp4");
+    cache_key_name(&format!("{cid}-{stream}"))
+}
+
+/// Delete session cache files left behind by a process that was killed instead
+/// of closed (a crash, a debugger stop, `taskkill`): a `.part` **without** its
+/// `.map` sidecar is an unfinished *session* file, never a preloaded one, and a
+/// killed process cannot run its own `cache removed`.
+///
+/// Only files older than [`ORPHAN_AGE`] are touched, so a second player that is
+/// starting up right now cannot have its file swept.
+fn sweep_orphans(dir: &std::path::Path) {
+    const ORPHAN_AGE: Duration = Duration::from_secs(600);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut removed = 0u32;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("part") {
+            continue;
+        }
+        if path.with_extension("map").exists() {
+            // A preloaded file: keep it, it is meant to outlive its writer.
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= ORPHAN_AGE);
+        if old && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    if removed > 0 {
+        crate::debug_log(&format!(
+            "cache swept orphans={removed} allocated_bytes={bytes}"
+        ));
+    }
+}
+
+/// One session's sparse cache file plus the exact list of ranges that are
+/// really in it.
+///
+/// Presence is a merged `BTreeMap<start, end>` of written ranges: a write of
+/// `[from, to)` is inserted and coalesced with its neighbours, so the map is
+/// always the exact byte set the file holds. That is what the 下载分布 panel
+/// draws, what a seek hit test consults, and what the local-file decode trusts —
+/// a range in this map is a range that can be read without touching the network.
+///
+/// An earlier bitmap of 256 KiB blocks looked cheaper, but network reads are not
+/// block-aligned: a unit that straddled two reads was never marked, so a fully
+/// downloaded file could report an empty map (measured on an 8 MiB file). The
+/// interval map has no such edge, and for a 2 GiB file it stays at the number of
+/// holes — a handful — because consecutive ranges coalesce as they fill.
+struct DiskCache {
+    /// `<dir>/<key>.part`; kept for the removal log and for the reader.
+    path: PathBuf,
+    /// `None` when the file could not be created, when the environment turned
+    /// disk caching off: the session is memory-only.
+    ///
+    /// Shared with the writer thread through an `Arc`: Windows positioned I/O
+    /// (`seek_read`/`seek_write`) does not use the handle's file pointer, so one
+    /// handle serves both the reader and the single writer.
+    file: Option<Arc<File>>,
+    /// Complete media length once known (`set_len`), else the highest byte
+    /// written so far.
+    len: u64,
+    /// Present ranges, merged, keyed by start.
+    present: BTreeMap<u64, u64>,
+    /// The file reached [`CACHE_CAP_BYTES`]; nothing further is persisted.
+    capped: bool,
+    cap_logged: bool,
+    /// Bytes the file itself has taken (diagnostics, `cache removed` line).
+    written: u64,
+    /// `cache key`, for the log lines.
+    label: String,
+}
+
+impl DiskCache {
+    /// Create (or truncate) the cache file for `label`.
+    fn open(label: &str) -> Self {
+        Self::open_at(cache_dir(), label)
+    }
+
+    /// [`DiskCache::open`] in an explicit directory (the tests).
+    fn open_at(dir: PathBuf, label: &str) -> Self {
+        let name = cache_key_name(label);
+        if !disk_cache_enabled() {
+            // `BILI_DISK_CACHE=0`: no directory, no file, no sweep. Nothing in
+            // the session is ever persisted, so the owner can A/B the disk path
+            // in one launch.
+            crate::debug_log(&format!("cache open key={name} path=- mode=memory reason=env"));
+            return Self::memory_only(name);
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        sweep_orphans(&dir);
+        let path = dir.join(format!("{name}.part"));
+        // A preloaded file (and its map) is reused instead of truncated: that
+        // is the whole point of `PrefetchHandle::preload`.
+        let reuse = path.exists() && dir.join(format!("{name}.map")).exists();
+        let created = if reuse {
+            File::options().read(true).write(true).open(&path)
+        } else {
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+        };
+        let (file, error) = match created {
+            Ok(file) => (Some(Arc::new(file)), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let mut cache = Self {
+            path,
+            file,
+            len: 0,
+            present: BTreeMap::new(),
+            capped: false,
+            cap_logged: false,
+            written: 0,
+            label: name.clone(),
+        };
+        let reused = reuse && cache.load_map();
+        if !reused && reuse {
+            // A stale map (or an unreadable one) cannot describe the file:
+            // start over instead of trusting it.
+            let _ = std::fs::remove_file(&cache.path);
+            cache.file = None;
+            if let Ok(file) = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&cache.path)
+            {
+                cache.file = Some(Arc::new(file));
+            }
+        }
+        let log = match &error {
+            None => format!(
+                "cache open key={name} path={} mode=disk reused={}",
+                cache.path.display(),
+                u8::from(reused)
+            ),
+            Some(error) => format!(
+                "cache open key={name} path={} mode=memory err={error}",
+                cache.path.display()
+            ),
+        };
+        crate::debug_log(&log);
+        cache
+    }
+
+    /// A cache with no file: memory-only by configuration, or the fallback when
+    /// the environment has no writable directory.
+    fn memory_only(label: String) -> Self {
+        Self {
+            path: PathBuf::new(),
+            file: None,
+            len: 0,
+            present: BTreeMap::new(),
+            capped: false,
+            cap_logged: false,
+            written: 0,
+            label,
+        }
+    }
+
+    /// A cache that never touches the disk (unit tests, and the fallback when
+    /// the environment has no writable directory).
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self::memory_only("test".to_string())
+    }
+
+    fn present(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Byte length of the file (the complete media length once known).
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Adopt the complete media length learned from an upstream response:
+    /// `set_len(total)` makes the file a sparse file of exactly the right size,
+    /// which is what lets ffmpeg read it as media.
+    fn ensure_len(&mut self, file: Option<&File>, total: u64) {
+        if total == 0 || self.len == total {
+            return;
+        }
+        self.len = total;
+        if let Some(file) = file {
+            let _ = file.set_len(total.min(CACHE_CAP_BYTES));
+        }
+        // Nothing outside the media exists any more.
+        self.present.retain(|_, end| {
+            *end = (*end).min(total);
+            *end > 0
+        });
+    }
+
+    /// [`DiskCache::ensure_len`] through this cache's own handle: the map and
+    /// the file are updated together (preload path and memory-only engines).
+    fn adopt_len(&mut self, total: u64) {
+        let file = self.file.clone();
+        self.ensure_len(file.as_deref(), total);
+    }
+
+    /// Persist one fetched range through this cache's own handle (the preload
+    /// task and the unit tests; the engine's fetch workers go through
+    /// [`DiskWriter`] instead).
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        let Some(file) = self.file.clone() else {
+            return;
+        };
+        self.write_with(&file, offset, data);
+    }
+
+    /// Persist one fetched range through `file` and record its presence.
+    ///
+    /// The caller holds the unique right to write this range (the writer thread
+    /// is the only writer in an engine), so `present` is only extended after the
+    /// bytes really landed: a range in the map is a range that can be read.
+    fn write_with(&mut self, file: &File, offset: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let end = offset.saturating_add(data.len() as u64);
+        if end > CACHE_CAP_BYTES {
+            if !self.cap_logged {
+                self.cap_logged = true;
+                crate::debug_log(&format!(
+                    "cache cap reached key={} cap={} at={end}",
+                    self.label, CACHE_CAP_BYTES
+                ));
+            }
+            self.capped = true;
+            return;
+        }
+        if self.len == 0 {
+            // No `Content-Range` ever stated the length: grow to fit so the
+            // first bytes are still usable, and let `ensure_len` correct it.
+            self.len = end;
+        }
+        if offset >= self.len {
+            return;
+        }
+        let to = end.min(self.len);
+        let bytes = &data[..(to - offset) as usize];
+        let mut done = 0usize;
+        while done < bytes.len() {
+            match file.seek_write(&bytes[done..], offset + done as u64) {
+                Ok(0) => break,
+                Ok(written) => done += written,
+                Err(_) => break,
+            }
+        }
+        self.written = self.written.saturating_add(done as u64);
+        self.insert(offset, to);
+    }
+
+    /// Add `[from, to)` to the present set, coalescing with its neighbours so
+    /// the map always holds the minimum number of exact ranges.
+    fn insert(&mut self, from: u64, to: u64) {
+        if to <= from {
+            return;
+        }
+        let mut start = from;
+        let mut end = to;
+        // Every range that starts at or before `to` may touch this one
+        // (`key <= to` covers the adjacency case `previous.end == from`).
+        let touched: Vec<u64> = self
+            .present
+            .range(..=to)
+            .filter(|(_, range_end)| **range_end >= from)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in touched {
+            if let Some(range_end) = self.present.remove(&key) {
+                start = start.min(key);
+                end = end.max(range_end);
+            }
+        }
+        self.present.insert(start, end);
+    }
+
+    /// Whether `[start, end)` is wholly present.
+    fn covers_range(&self, start: u64, end: u64) -> bool {
+        if end <= start {
+            return false;
+        }
+        self.end_at(start) >= end
+    }
+
+    /// End of the contiguous present run that contains `offset` (`0` when the
+    /// offset itself is not present).
+    fn end_at(&self, offset: u64) -> u64 {
+        self.present
+            .range(..=offset)
+            .next_back()
+            .filter(|(_, end)| **end > offset)
+            .map(|(_, end)| *end)
+            .unwrap_or(0)
+    }
+
+    /// Read up to `max_len` present bytes at `offset`. `None` when the offset is
+    /// not on disk; a short read at the end of the present run is still a hit.
+    fn read_at(&self, offset: u64, max_len: u64) -> Option<Vec<u8>> {
+        if max_len == 0 {
+            return None;
+        }
+        let end = self.end_at(offset);
+        if end <= offset {
+            return None;
+        }
+        let want = (end - offset).min(max_len) as usize;
+        let file = self.file.as_ref()?;
+        let mut buffer = vec![0u8; want];
+        let mut done = 0usize;
+        while done < buffer.len() {
+            match file.seek_read(&mut buffer[done..], offset + done as u64) {
+                Ok(0) => break,
+                Ok(read) => done += read,
+                Err(_) => break,
+            }
+        }
+        if done == 0 {
+            return None;
+        }
+        buffer.truncate(done);
+        Some(buffer)
+    }
+
+    /// The present ranges, in offset order (already merged).
+    fn ranges(&mut self) -> Vec<(u64, u64)> {
+        self.present
+            .iter()
+            .map(|(start, end)| (*start, *end))
+            .collect()
+    }
+
+    /// `(contiguous run starting at `offset`, range count, total present bytes)`
+    /// from the disk map, in one pass under the caller's lock.
+    fn cover(&mut self, offset: u64) -> (u64, usize, u64) {
+        let run = self.end_at(offset).saturating_sub(offset);
+        let mut ranges = 0usize;
+        let mut bytes = 0u64;
+        for (start, end) in self.present.iter() {
+            ranges += 1;
+            bytes = bytes.saturating_add(end.saturating_sub(*start));
+        }
+        (run, ranges, bytes)
+    }
+
+    /// Total present bytes.
+    fn bytes(&mut self) -> u64 {
+        self.present
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .sum()
+    }
+
+    /// First byte of the first hole in `[0, len)` (`len` when complete).
+    #[allow(dead_code)] // used by the playlist preload
+    fn first_hole(&self) -> u64 {
+        if self.len == 0 {
+            return 0;
+        }
+        let mut at = 0u64;
+        for (start, end) in &self.present {
+            if *start > at {
+                return at;
+            }
+            at = at.max(*end);
+            if at >= self.len {
+                return self.len;
+            }
+        }
+        at.min(self.len)
+    }
+
+    /// Sidecar map path: the present ranges next to the `.part` file, so a
+    /// preloaded file can be adopted by the next player instead of truncated.
+    fn map_path(&self) -> PathBuf {
+        self.path.with_extension("map")
+    }
+
+    /// Persist the present ranges next to the file (`O11A1MAP` + length + ranges).
+    #[allow(dead_code)] // used by the playlist preload
+    fn save_map(&self) -> bool {
+        if self.path.as_os_str().is_empty() || self.len == 0 {
+            return false;
+        }
+        let mut bytes = Vec::with_capacity(24 + self.present.len() * 16);
+        bytes.extend_from_slice(b"O11A1MAP");
+        bytes.extend_from_slice(&self.len.to_le_bytes());
+        bytes.extend_from_slice(&(self.present.len() as u64).to_le_bytes());
+        for (start, end) in &self.present {
+            bytes.extend_from_slice(&start.to_le_bytes());
+            bytes.extend_from_slice(&end.to_le_bytes());
+        }
+        std::fs::write(self.map_path(), bytes).is_ok()
+    }
+
+    /// Flush the file, then write the `.map` sidecar. A sidecar must never
+    /// describe bytes that are still in a buffer somewhere, so the two steps
+    /// have a fixed order: `flush`/`sync_all` first, map second. Used by the
+    /// playlist preload, whose file is meant to outlive its writer.
+    #[allow(dead_code)] // used by the playlist preload
+    fn flush_and_save_map(&self) -> bool {
+        if let Some(file) = self.file.as_ref() {
+            // `&File` is enough: `Write` is implemented for `&File`.
+            let _ = (&**file).flush();
+            // The preload file is adopted by the *next* process, so its bytes
+            // really have to reach the device before the sidecar names them.
+            let _ = file.sync_all();
+        }
+        self.save_map()
+    }
+
+    /// Adopt a previously saved map. Returns `false` when the sidecar is
+    /// missing, malformed, or does not fit this file length.
+    fn load_map(&mut self) -> bool {        let Ok(bytes) = std::fs::read(self.map_path()) else {
+            return false;
+        };
+        if bytes.len() < 24 || &bytes[..8] != b"O11A1MAP" {
+            return false;
+        }
+        let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default());
+        let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or_default()) as usize;
+        if len == 0 || count > 1 << 20 || bytes.len() < 24 + count * 16 {
+            return false;
+        }
+        let mut present = BTreeMap::new();
+        for index in 0..count {
+            let at = 24 + index * 16;
+            let start = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default());
+            let end = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap_or_default());
+            if end > start && end <= len {
+                present.insert(start, end);
+            }
+        }
+        self.len = len;
+        self.present = present;
+        true
+    }
+
+    /// Close the file and delete it, logging one `cache removed` line. Windows
+    /// deletes a file that is still open by a *shared* reader (ffmpeg holding
+    /// the decoded file, for instance) only when the last handle closes, so the
+    /// removal is retried for a short, bounded while.
+    fn remove(&mut self) {
+        let bytes = self.bytes();
+        let path = self.path.clone();
+        let map = self.map_path();
+        let written = self.written;
+        self.file = None;
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        let _ = std::fs::remove_file(&map);
+        // The retry loop can sleep up to two seconds while ffmpeg still holds
+        // the file. That belongs on the pool as speculative (Low) work, never
+        // on a thread created just for one close.
+        crate::netpool::submit(
+            crate::netpool::Prio::Low,
+            Box::new(move || {
+                for _ in 0..40 {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            crate::debug_log(&format!(
+                                "cache removed path={} bytes={bytes} written={written}",
+                                path.display()
+                            ));
+                            return;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            crate::debug_log(&format!(
+                                "cache removed path={} bytes={bytes} written={written}",
+                                path.display()
+                            ));
+                            return;
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                    }
+                }
+                crate::debug_log(&format!(
+                    "cache remove failed path={} bytes={bytes} reason=held",
+                    path.display()
+                ));
+            }),
+        );
+    }
+}
+
+/// One block a fetch worker wants persisted.
+struct WriteJob {
+    offset: u64,
+    data: Arc<[u8]>,
+}
+
+/// What the writer is asked to do. Ordered: `EnsureLen` queued before a block is
+/// processed before that block, so `set_len` can never lose bytes to the clamp.
+enum WriterMsg {
+    /// Persist these bytes at this offset.
+    Write(WriteJob),
+    /// `set_len(total)`: the media length was learned from an upstream response.
+    EnsureLen(u64),
+    /// Drain the queue, flush, and stop.
+    Stop,
+}
+
+/// Blocks waiting for *some* writer, process-wide (the stall line's `disk_q=`).
+static DISK_QUEUE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Blocks a worker dropped because the queue was full (they are simply not
+/// cached; the map only ever records written bytes).
+static DISK_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many blocks are queued for the disk right now (all sessions).
+pub fn disk_queue_depth() -> u64 {
+    DISK_QUEUE_TOTAL.load(Ordering::Relaxed)
+}
+
+/// The single thread that owns every mutation of one session's cache file.
+///
+/// Workers call [`DiskWriter::write`], which is a `try_send` on a bounded
+/// channel: a full queue drops the block, and since presence is only recorded
+/// after a successful write, a dropped block simply reads as "not cached" - no
+/// worker ever waits for the disk.
+struct DiskWriter {
+    tx: Option<SyncSender<WriterMsg>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DiskWriter {
+    /// Start the writer for `disk`. `None` when the session has no file
+    /// (memory-only): there is nothing to write and no thread to keep.
+    fn spawn(disk: Arc<Mutex<DiskCache>>) -> Option<Self> {
+        let (file, label) = match disk.lock() {
+            Ok(disk) => (disk.file.clone(), disk.label.clone()),
+            Err(poisoned) => {
+                let disk = poisoned.into_inner();
+                (disk.file.clone(), disk.label.clone())
+            }
+        };
+        let file = file?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(DISK_QUEUE_DEPTH);
+        let thread_label = label.clone();
+        let handle = std::thread::Builder::new()
+            .name("cache-writer".to_string())
+            .spawn(move || {
+                crate::player::note_thread_role("disk-writer");
+                writer_loop(rx, &disk, &file, &thread_label);
+            })
+            .ok()?;
+        crate::debug_log(&format!("cache writer start key={label}"));
+        Some(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+
+    /// Queue one block. Never blocks: a full queue drops the block.
+    fn write(&self, offset: u64, data: Arc<[u8]>) {
+        if data.is_empty() {
+            return;
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        match tx.try_send(WriterMsg::Write(WriteJob { offset, data })) {
+            Ok(()) => {
+                DISK_QUEUE_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                DISK_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Queue a `set_len` (rare: once per session, when the length is learned).
+    /// The length itself is already in the map (the caller applied it), so the
+    /// only thing left here is the file's sparse sizing. `false` means the
+    /// queue was full or the writer is gone: the caller sizes the file itself.
+    fn ensure_len(&self, total: u64) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        match tx.try_send(WriterMsg::EnsureLen(total)) {
+            Ok(()) => {
+                DISK_QUEUE_TOTAL.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => false,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Drain, flush and join. Idempotent; the file handle closes with the thread.
+    fn shutdown(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            // `Stop` goes through the same queue as the blocks, so everything
+            // queued before it is written and flushed before the join returns.
+            let _ = tx.send(WriterMsg::Stop);
+            DISK_QUEUE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for DiskWriter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// One contiguous span being accumulated into a single write.
+struct OpenRun {
+    start: u64,
+    bytes: Vec<u8>,
+    last: Instant,
+}
+
+impl OpenRun {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.bytes.len() as u64)
+    }
+
+    /// Extend this run with `data` at `offset`. The caller guarantees the block
+    /// is adjacent to or overlapping the run, so the result stays contiguous;
+    /// bytes that arrive twice (a retried block) take the newest value.
+    fn absorb(&mut self, mut offset: u64, mut data: &[u8]) {
+        loop {
+            if offset < self.start {
+                let head = ((self.start - offset) as usize).min(data.len());
+                let mut merged = Vec::with_capacity(head + self.bytes.len());
+                merged.extend_from_slice(&data[..head]);
+                merged.append(&mut self.bytes);
+                self.bytes = merged;
+                self.start = offset;
+                if head == data.len() {
+                    return;
+                }
+                data = &data[head..];
+                offset = self.start + head as u64;
+                continue;
+            }
+            let at = (offset - self.start) as usize;
+            if at >= self.bytes.len() {
+                self.bytes.extend_from_slice(data);
+                return;
+            }
+            let tail = self.bytes.len() - at;
+            let overlap = tail.min(data.len());
+            self.bytes[at..at + overlap].copy_from_slice(&data[..overlap]);
+            if data.len() > overlap {
+                self.bytes.extend_from_slice(&data[overlap..]);
+            }
+            return;
+        }
+    }
+}
+
+/// The writer thread: merge what arrives into large sequential writes.
+///
+/// - A block adjacent to an open run is appended to it (one `memcpy`, no syscall)
+///   until the run reaches [`DISK_MERGE_MAX`], then the run is written.
+/// - A run that stops growing for [`DISK_RUN_IDLE`] is written; that is what
+///   keeps latency bounded without waiting for a range's last byte.
+/// - At most [`DISK_RUNS_MAX`] runs and [`DISK_BUFFER_BUDGET`] bytes are held;
+///   past either limit the smallest / oldest run is written, and runs are
+///   written in offset order so the file fills mostly front to back.
+fn writer_loop(
+    rx: std::sync::mpsc::Receiver<WriterMsg>,
+    disk: &Mutex<DiskCache>,
+    file: &File,
+    label: &str,
+) {
+    let started = Instant::now();
+    let mut runs: Vec<OpenRun> = Vec::new();
+    let mut stats = WriterStats::new(started);
+    loop {
+        // Wait for the next block, or for the oldest open run to go idle.
+        let now = Instant::now();
+        let next_flush = runs
+            .iter()
+            .map(|run| run.last + DISK_RUN_IDLE)
+            .min()
+            .unwrap_or(now + DISK_WRITER_TRACE);
+        let wait = next_flush.saturating_duration_since(now);
+        let msg = match rx.recv_timeout(wait) {
+            Ok(msg) => Some(msg),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                flush_all(runs, disk, file, &mut stats);
+                stats.log(label, started, true);
+                return;
+            }
+        };
+        let stop = match msg {
+            None => false,
+            Some(WriterMsg::Stop) => {
+                DISK_QUEUE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+                true
+            }
+            Some(WriterMsg::EnsureLen(total)) => {
+                DISK_QUEUE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+                apply_len(disk, file, total);
+                false
+            }
+            Some(WriterMsg::Write(job)) => {
+                DISK_QUEUE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+                stats.pieces = stats.pieces.saturating_add(1);
+                absorb(job, &mut runs, disk, file, &mut stats);
+                // Drain whatever else is already queued before paying for a
+                // write: a batch of small reads becomes one large call. Bounded,
+                // so a queue that refills as fast as we drain it can never delay
+                // flushing a run past its idle deadline.
+                for _ in 0..DISK_QUEUE_DEPTH * 2 {
+                    let Ok(next) = rx.try_recv() else { break };
+                    match next {
+                        WriterMsg::Write(job) => {
+                            DISK_QUEUE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+                            stats.pieces = stats.pieces.saturating_add(1);
+                            absorb(job, &mut runs, disk, file, &mut stats);
+                        }
+                        WriterMsg::EnsureLen(total) => {
+                            DISK_QUEUE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+                            apply_len(disk, file, total);
+                        }
+                        WriterMsg::Stop => {
+                            DISK_QUEUE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+                            flush_all(runs, disk, file, &mut stats);
+                            stats.log(label, started, true);
+                            return;
+                        }
+                    }
+                }
+                false
+            }
+        };
+        // Write the runs that are full, idle, or over the retainer's budget.
+        flush_ready(&mut runs, disk, file, &mut stats);
+        if stop {
+            flush_all(runs, disk, file, &mut stats);
+            stats.log(label, started, true);
+            return;
+        }
+        stats.log(label, started, false);
+    }
+}
+
+/// `set_len` on the writer thread, under the map lock so the length the readers
+/// see and the length of the file never disagree.
+fn apply_len(disk: &Mutex<DiskCache>, file: &File, total: u64) {
+    match disk.lock() {
+        Ok(mut disk) => disk.ensure_len(Some(file), total),
+        Err(poisoned) => poisoned.into_inner().ensure_len(Some(file), total),
+    }
+}
+
+/// Append `job` to the run it continues, or open a new one.
+fn absorb(
+    job: WriteJob,
+    runs: &mut Vec<OpenRun>,
+    disk: &Mutex<DiskCache>,
+    file: &File,
+    stats: &mut WriterStats,
+) {
+    let WriteJob { offset, data } = job;
+    let now = Instant::now();
+    let end = offset.saturating_add(data.len() as u64);
+    for (index, run) in runs.iter_mut().enumerate() {
+        // Overlap or adjacency both extend the run: the writer never issues two
+        // calls for bytes it could have written together.
+        if offset <= run.end() && end >= run.start {
+            run.absorb(offset, &data);
+            run.last = now;
+            if run.bytes.len() >= DISK_MERGE_MAX {
+                let mut run = runs.remove(index);
+                // A block that would push the run past the cap is split, so one
+                // call is never larger than [`DISK_MERGE_MAX`].
+                if run.bytes.len() > DISK_MERGE_MAX {
+                    let tail = run.bytes.split_off(DISK_MERGE_MAX);
+                    let tail_start = run.end();
+                    runs.push(OpenRun {
+                        start: tail_start,
+                        bytes: tail,
+                        last: now,
+                    });
+                }
+                write_run(run, disk, file, stats);
+                if runs.len() > DISK_RUNS_MAX {
+                    flush_oldest(runs, disk, file, stats);
+                }
+            }
+            return;
+        }
+    }
+    let mut run = OpenRun {
+        start: offset,
+        bytes: Vec::with_capacity(data.len().min(DISK_MERGE_MAX)),
+        last: now,
+    };
+    run.bytes.extend_from_slice(&data);
+    runs.push(run);
+    if runs.len() > DISK_RUNS_MAX {
+        flush_oldest(runs, disk, file, stats);
+    }
+}
+
+/// Write every run that is full, idle, or no longer fits the budget.
+fn flush_ready(
+    runs: &mut Vec<OpenRun>,
+    disk: &Mutex<DiskCache>,
+    file: &File,
+    stats: &mut WriterStats,
+) {
+    let now = Instant::now();
+    loop {
+        let over_budget = runs.iter().map(|run| run.bytes.len()).sum::<usize>() > DISK_BUFFER_BUDGET;
+        let victim = runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| {
+                run.bytes.len() >= DISK_MERGE_MAX || now.duration_since(run.last) >= DISK_RUN_IDLE
+            })
+            .map(|(index, _)| index)
+            .next();
+        if let Some(index) = victim {
+            let run = runs.remove(index);
+            write_run(run, disk, file, stats);
+            continue;
+        }
+        if over_budget {
+            flush_oldest(runs, disk, file, stats);
+            continue;
+        }
+        return;
+    }
+}
+
+/// Write the run that has been waiting longest (largest first on a tie).
+fn flush_oldest(
+    runs: &mut Vec<OpenRun>,
+    disk: &Mutex<DiskCache>,
+    file: &File,
+    stats: &mut WriterStats,
+) {
+    let Some(index) = runs
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, run)| (run.last, std::cmp::Reverse(run.bytes.len())))
+        .map(|(index, _)| index)
+    else {
+        return;
+    };
+    let run = runs.remove(index);
+    write_run(run, disk, file, stats);
+}
+
+fn flush_all(
+    runs: Vec<OpenRun>,
+    disk: &Mutex<DiskCache>,
+    file: &File,
+    stats: &mut WriterStats,
+) {
+    let mut ordered = runs;
+    // Ascending offset: the file fills front to back even after a burst.
+    ordered.sort_by_key(|run| run.start);
+    for run in ordered {
+        write_run(run, disk, file, stats);
+    }
+}
+
+/// Persist one merged run in a single call and record it in the map.
+fn write_run(run: OpenRun, disk: &Mutex<DiskCache>, file: &File, stats: &mut WriterStats) {
+    if run.bytes.is_empty() {
+        return;
+    }
+    let len = run.bytes.len() as u64;
+    crate::player::tag_here("prefetch:write");
+    match disk.lock() {
+        Ok(mut disk) => disk.write_with(file, run.start, &run.bytes),
+        Err(poisoned) => poisoned.into_inner().write_with(file, run.start, &run.bytes),
+    }
+    stats.calls = stats.calls.saturating_add(1);
+    stats.bytes = stats.bytes.saturating_add(len);
+    stats.max_call = stats.max_call.max(len);
+}
+
+/// Call pattern of the writer, logged every [`DISK_WRITER_TRACE`].
+struct WriterStats {
+    /// `seek_write` calls (each one is one merged run).
+    calls: u64,
+    /// Bytes those calls wrote.
+    bytes: u64,
+    /// Blocks received from workers (what the old per-worker path wrote one
+    /// call each).
+    pieces: u64,
+    /// Largest single call.
+    max_call: u64,
+    /// Snapshot at the previous log line, for the per-interval rates.
+    logged_calls: u64,
+    logged_bytes: u64,
+    logged_pieces: u64,
+    logged_at: Instant,
+}
+
+impl WriterStats {
+    fn new(started: Instant) -> Self {
+        Self {
+            calls: 0,
+            bytes: 0,
+            pieces: 0,
+            max_call: 0,
+            logged_calls: 0,
+            logged_bytes: 0,
+            logged_pieces: 0,
+            logged_at: started,
+        }
+    }
+
+    fn log(&mut self, label: &str, started: Instant, final_line: bool) {
+        if !final_line && self.logged_at.elapsed() < DISK_WRITER_TRACE {
+            return;
+        }
+        let span = self.logged_at.elapsed().as_secs_f64().max(1.0e-6);
+        let calls = self.calls.saturating_sub(self.logged_calls);
+        let bytes = self.bytes.saturating_sub(self.logged_bytes);
+        let pieces = self.pieces.saturating_sub(self.logged_pieces);
+        crate::debug_log(&format!(
+            "cache writer key={label} calls={} avg={} max={} pieces={} merged={:.1}x calls_s={:.1} pieces_s={:.1} bytes_s={} total_calls={} total_bytes={} dropped={} ms={} done={}",
+            calls,
+            format_size_div(bytes, calls),
+            format_bytes(self.max_call),
+            pieces,
+            pieces as f64 / calls.max(1) as f64,
+            calls as f64 / span,
+            pieces as f64 / span,
+            format_rate((bytes as f64 / span) as u64),
+            self.calls,
+            self.bytes,
+            DISK_DROPPED.load(Ordering::Relaxed),
+            started.elapsed().as_millis(),
+            u8::from(final_line)
+        ));
+        self.logged_calls = self.calls;
+        self.logged_bytes = self.bytes;
+        self.logged_pieces = self.pieces;
+        self.logged_at = Instant::now();
+    }
+}
+
+/// `691.2KiB` for an average call size; `-` when nothing was written.
+fn format_size_div(bytes: u64, count: u64) -> String {
+    if count == 0 {
+        return "-".to_string();
+    }
+    format_bytes(bytes / count)
+}
+
 /// `3.2 MB/s` for the QA stats line; counted bytes, so no `≈`.
-fn format_rate(bytes_per_sec: u64) -> String {
-    if bytes_per_sec >= 1_000_000 {
+fn format_rate(bytes_per_sec: u64) -> String {    if bytes_per_sec >= 1_000_000 {
         format!("{:.1}MB/s", bytes_per_sec as f64 / 1_000_000.0)
     } else if bytes_per_sec >= 1_000 {
         format!("{:.0}KB/s", bytes_per_sec as f64 / 1_000.0)
@@ -1053,27 +2998,59 @@ fn take_bounded(
     Some(data)
 }
 
-/// One-second sliding throughput. Traffic older than the window is dropped;
+/// Keep the buffered window inside `limit` bytes: drop bytes the cursor left
+/// behind, then evict the farthest chunk until the bound holds. The remaining
+/// data stays contiguous around the cursor, so a small seek forward inside the
+/// window is still instant.
+fn trim_window(state: &mut State, limit: u64) {
+    let limit = limit.max(1);
+    let cursor = state.cursor;
+    state.chunks.retain(|start, data| {
+        let end = start.saturating_add(data.len() as u64);
+        end > cursor
+    });
+    state.read_ahead = state.chunks.values().map(|data| data.len() as u64).sum();
+    while state.read_ahead > limit {
+        let Some((&key, _)) = state.chunks.iter().next_back() else {
+            state.read_ahead = 0;
+            break;
+        };
+        if let Some(data) = state.chunks.remove(&key) {
+            state.read_ahead = state.read_ahead.saturating_sub(data.len() as u64);
+        }
+    }
+}
+
+/// Sliding throughput over `window`. Traffic older than the window is dropped;
 /// the rate is extrapolated while the window is still filling and never
 /// divides by less than 250 ms (so the first chunk does not read as a spike).
-fn sliding_rate(samples: &mut VecDeque<(Instant, u64)>, now: Instant) -> u64 {
-    while samples.len() > 1 && now.duration_since(samples[0].0) > RATE_WINDOW {
+fn window_rate(
+    samples: &mut VecDeque<(Instant, u64)>,
+    now: Instant,
+    window: Duration,
+) -> u64 {
+    while samples.len() > 1 && now.duration_since(samples[0].0) > window {
         samples.pop_front();
     }
     let Some(&(first, _)) = samples.front() else {
         return 0;
     };
-    // A window that has seen no traffic for a full second reads as zero
+    // A window that has seen no traffic for the whole period reads as zero
     // instead of holding its last value forever.
-    if now.duration_since(samples.back().map_or(first, |(stamp, _)| *stamp)) > RATE_WINDOW {
+    if now.duration_since(samples.back().map_or(first, |(stamp, _)| *stamp)) > window {
         return 0;
     }
     let bytes: u64 = samples.iter().map(|(_, bytes)| *bytes).sum();
     let span = now
         .duration_since(first)
         .as_secs_f64()
-        .clamp(0.25, 1.0);
+        .clamp(0.25, window.as_secs_f64().max(0.25));
     (bytes as f64 / span).round() as u64
+}
+
+/// One-second sliding throughput (the profiler panel's aggregate rate).
+fn sliding_rate(samples: &mut VecDeque<(Instant, u64)>, now: Instant) -> u64 {
+    window_rate(samples, now, RATE_WINDOW)
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,11 +3061,19 @@ fn sliding_rate(samples: &mut VecDeque<(Instant, u64)>, now: Instant) -> u64 {
 struct Host {
     label: String,
     origin: String,
+    /// Consecutive failed range attempts. A single transient body error must
+    /// not poison the mirror: the host is cooled down, then tried again, and
+    /// the first stored byte clears the count. Only [`HOST_FAILURE_LIMIT`]
+    /// consecutive failures retire it for the session.
+    failures: u32,
     failed: bool,
     bytes: u64,
+    /// A route the health watchdog found slow is skipped by the round robin
+    /// until this instant, then tried again.
+    degraded_until: Option<Instant>,
 }
 
-/// Live state of one read-ahead worker, owned by the state lock so a snapshot
+/// Live state of one upstream worker, owned by the state lock so a snapshot
 /// sees the exact range each connection holds.
 #[derive(Clone, Debug, Default)]
 struct WorkerSlot {
@@ -1096,7 +3081,64 @@ struct WorkerSlot {
     start: u64,
     end: u64,
     busy: bool,
+    /// What the held range is for: the client's hot window, a warm point, the
+    /// speculative queue, or a retry. `None` before the first claim.
+    kind: Option<ChunkKind>,
     bytes: u64,
+    /// Throughput over the last [`HEALTH_WINDOW`], bytes/s.
+    bps: u64,
+    /// Set by the health watchdog; cleared by the first byte after a retry.
+    slow: bool,
+    /// When the current range was claimed (drives the health timers).
+    range_started: Option<Instant>,
+    /// Byte samples of the current range, for the health watchdog.
+    samples: VecDeque<(Instant, u64)>,
+}
+
+/// One contiguous byte part of the whole-file rest queue. A part is owned by a
+/// worker while the dynamic split is in force; `next` is the first sub-chunk
+/// of it that has not been handed out.
+#[derive(Clone, Debug)]
+struct Part {
+    end: u64,
+    next: u64,
+    owner: Option<usize>,
+}
+
+/// One seek point scheduled through the same worker pool. `point` is the
+/// configured `i/count` offset, `start`/`end` the chunk-aligned range that
+/// actually gets cached.
+#[derive(Clone, Debug)]
+struct WarmTask {
+    point: u64,
+    start: u64,
+    end: u64,
+    done: bool,
+    claimed: bool,
+    /// Queued by [`PrefetchHandle::prime_at`]: a seek is happening *now*, so the
+    /// task skips the speculative rate limit (a scheduled point can wait).
+    urgent: bool,
+}
+
+/// A duplicate request for a range a slow worker is still fetching.
+#[derive(Clone, Debug)]
+struct RaceRequest {
+    generation: u64,
+    start: u64,
+    end: u64,
+    slow_host: String,
+}
+
+/// What a worker is fetching: the client's read window, a seek warm point, a
+/// speculative whole-file chunk, a retry after a slow worker, or a duplicate
+/// race for a slow range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkKind {
+    Hot,
+    Warm,
+    Rest,
+    Requeue,
+    Race,
 }
 
 struct State {
@@ -1112,6 +3154,34 @@ struct State {
     inflight: BTreeSet<(u64, u64)>,
     /// `(generation, chunk start)` that failed on every attempted host.
     dead: BTreeSet<(u64, u64)>,
+    /// Chunk starts already fetched for this generation. Unlike `chunks`, this
+    /// survives memory eviction, so speculative bytes are never fetched twice.
+    done: BTreeSet<u64>,
+    /// Whole-file rest queue, split dynamically for long files.
+    parts: Vec<Part>,
+    /// Whether [`State::parts`] was built for the current file.
+    parts_built: bool,
+    /// Ranges that failed on their retry route and went back to the queue.
+    requeued: BTreeSet<u64>,
+    /// Per chunk start, how many times an upstream body stopped before the
+    /// requested end while the file length was already known. A chunk is only
+    /// retired after [`SHORT_BODY_LIMIT`] of them (see `complete_range`).
+    short_bodies: BTreeMap<u64, u32>,
+    /// Seek points scheduled through the worker pool.
+    warm_plan: Vec<WarmTask>,
+    /// Whether [`State::warm_plan`] was built (the total length was known).
+    warm_plan_started: bool,
+    /// Byte samples of what was served, for the "next two seconds" priority.
+    serve_samples: VecDeque<(Instant, u64)>,
+    /// Duplicate requests waiting for an idle worker.
+    races: VecDeque<RaceRequest>,
+    /// Offsets a response body is blocked on *right now* (a serve wait). The
+    /// next worker claims these exact bytes before the chunk-aligned hot scan:
+    /// a wait must not sit behind the chunk prefix on a slow-to-start route,
+    /// which is seconds of media on a 4 MiB chunk.
+    urgent: VecDeque<u64>,
+    /// One winner token per raced chunk start (first finisher wins).
+    race_tokens: BTreeMap<u64, Arc<AtomicBool>>,
     total: Option<u64>,
     fatal: Option<String>,
     content_type: Option<String>,
@@ -1121,6 +3191,17 @@ struct State {
     bytes_fetched: u64,
     failed_ranges: u64,
     served: u64,
+    /// One-second sliding rate of the bytes the client pulled (bytes/s). With
+    /// no duration to divide by, this is the media bitrate estimate the
+    /// speculative rate cap is built on.
+    serve_bps: u64,
+    /// First byte handed to the client, the epoch of the `serve_bps` average.
+    first_serve: Option<Instant>,
+    /// Token bucket for whole-file (speculative) fetching: bytes currently
+    /// available, when they were last refilled, and how many were spent.
+    spec_tokens: u64,
+    spec_at: Instant,
+    spec_bytes: u64,
     /// Buffered bytes beyond the cursor (mirrors `chunks`, kept incrementally).
     read_ahead: u64,
     /// Warm seek points fetched into memory, independent of the window.
@@ -1133,9 +3214,19 @@ struct State {
     warm_chunk: u64,
     /// Bytes put into the point cache so far (diagnostics only).
     warm_bytes: u64,
+    /// Upstream bytes by scheduling class (hot window / seek points / whole-file
+    /// queue / retries). Diagnostics: the split the priority rule is judged on.
+    hot_bytes: u64,
+    warm_fetch_bytes: u64,
+    rest_bytes: u64,
+    retry_bytes: u64,
     /// Requests served from the point cache, and bytes those served.
     point_hits: u64,
     point_served: u64,
+    /// Requests served (at least partly) from the session cache file, and the
+    /// bytes those served.
+    disk_hits: u64,
+    disk_served: u64,
     /// One slot per configured connection (`workers.len() == connections`).
     workers: Vec<WorkerSlot>,
 }
@@ -1144,7 +3235,18 @@ struct Engine {
     config: PrefetchConfig,
     target: Target,
     client: reqwest::Client,
+    /// Name of this session's cache file, so a preload can never touch the file
+    /// a decoder is reading.
+    #[allow(dead_code)] // read by `preload_keys`
+    cache_key: String,
     state: Mutex<State>,
+    /// The session cache file's read handle and its present ranges. Nothing on
+    /// this path writes the file: the single [`DiskWriter`] owns every mutation,
+    /// and a range appears here only after the writer's call returned.
+    disk: Arc<Mutex<DiskCache>>,
+    /// The session's one coalescing writer (`None` for a memory-only session or
+    /// after shutdown).
+    writer: Mutex<Option<DiskWriter>>,
     stats: Arc<Mutex<PrefetchStats>>,
     /// Serialises response handlers (the read cursor is shared).
     serving: AtomicBool,
@@ -1152,10 +3254,344 @@ struct Engine {
     /// it; a handler that sees a newer token stops, so a seek is never queued
     /// behind the open-ended response ffmpeg abandoned.
     serve_epoch: AtomicU64,
+    /// Startup gate: cap on the read-ahead window, raised to
+    /// [`PrefetchConfig::read_ahead_bytes`] once frames are flowing (or
+    /// `u64::MAX` when the gate is off, i.e. no cap beyond the config).
+    read_ahead_cap: AtomicU64,
+    /// Player-driven hold on background work (see
+    /// [`PrefetchHandle::set_background_paused`]). Held, workers fetch only the
+    /// client's hot window; seek points and speculative parts wait.
+    background_paused: AtomicBool,
+    /// Live connection count. `set_connections` raises/lowers it; workers with
+    /// an id at or above the current value stay out of the queue.
+    desired_connections: AtomicU64,
+    /// The configured count the startup ramp widens to (immutable).
+    configured_connections: u64,
+    /// Speculative (Warm/Rest) workers allowed right now; `0` = no cap. Set to
+    /// [`STARTUP_BACKGROUND_WORKERS`] for a gated session and cleared after
+    /// [`BACKGROUND_RAMP`].
+    background_workers: AtomicU64,
+    /// Per-worker cancellation tokens. The health watchdog bumps one to make a
+    /// slow worker drop its current request at the next network read.
+    worker_cancel: Vec<AtomicU64>,
+    /// Media bitrate in bytes per second (`total / duration`), `0` until both
+    /// are known. Sets the read-ahead horizon and the speculative rate cap;
+    /// lock-free so [`Engine::read_ahead_window`] can stay a pure load.
+    media_bps: AtomicU64,
+    /// Offset a response body is blocked on right now, `u64::MAX` when none.
+    /// While this is set the scheduler gives the client's hot window absolute
+    /// priority: speculative claims (Warm/Rest) are refused and the ones already
+    /// in flight are cancelled, so a worker frees up for the missing chunk.
+    serve_wait_pos: AtomicU64,
+    /// Millis since `started` when that wait began (its first miss).
+    serve_wait_since_ms: AtomicU64,
+    /// Budget overruns (`>=` [`SERVE_WAIT_BUDGET_MS`]) escalated in the open
+    /// wait span, logged once per span and reset when it closes.
+    serve_wait_escalations: AtomicU64,
     started: Instant,
 }
 
 impl Engine {
+    /// Bitrate of the stream in bytes per second, when the caller supplied the
+    /// duration and an upstream response supplied the length.
+    fn media_bps(&self) -> u64 {
+        self.media_bps.load(Ordering::Relaxed)
+    }
+
+    /// The bitrate estimate the scheduler runs on: the exact one when the
+    /// duration is known, otherwise the session-average rate the client pulls,
+    /// clamped to a plausible stream so a first-second burst cannot inflate
+    /// every horizon (and a stalled client cannot collapse them).
+    fn bitrate_for(&self, state: &State) -> u64 {
+        let exact = self.media_bps();
+        if exact > 0 {
+            return exact;
+        }
+        state
+            .serve_bps
+            .clamp(FALLBACK_BITRATE_MIN, FALLBACK_BITRATE_MAX)
+    }
+
+    /// Recompute the bitrate hint from `state.total` and the configured
+    /// duration. Called whenever the length is learned.
+    fn refresh_media_bps(&self, total: u64) {
+        let Some(ms) = self.config.media_duration_ms.filter(|ms| *ms > 0) else {
+            return;
+        };
+        if total == 0 {
+            return;
+        }
+        let bps = ((total as u128) * 1000 / (ms as u128)).min(u64::MAX as u128) as u64;
+        if bps > 0 {
+            self.media_bps.store(bps, Ordering::Relaxed);
+        }
+    }
+
+    /// Read-ahead window in force right now: the startup cap until the gate
+    /// opens, the configured window afterwards, and never more than
+    /// [`PLAYBACK_AHEAD_SECONDS`] of media. Always at least one chunk.
+    fn read_ahead_window(&self) -> u64 {
+        let configured = self
+            .config
+            .read_ahead_bytes
+            .min(self.read_ahead_cap.load(Ordering::Relaxed))
+            .max(self.config.chunk_bytes);
+        let bps = self.media_bps();
+        if bps == 0 {
+            return configured;
+        }
+        let horizon = bps
+            .saturating_mul(PLAYBACK_AHEAD_SECONDS)
+            .max(self.config.chunk_bytes.saturating_mul(2));
+        configured.min(horizon)
+    }
+
+    /// Live connection count (clamped 1..=[`MAX_CONNECTIONS`]).
+    fn desired_connections(&self) -> usize {
+        (self.desired_connections.load(Ordering::Relaxed) as usize).clamp(1, MAX_CONNECTIONS)
+    }
+
+    /// Whether background work may run now (seek points and the speculative
+    /// whole-file parts wait while it is held). Test-only: the runtime path
+    /// reads [`Engine::background_held`] directly.
+    #[cfg(test)]
+    fn background_allowed(&self) -> bool {
+        !self.background_held()
+    }
+
+    /// Whether the player holds background work right now.
+    fn background_held(&self) -> bool {
+        self.background_paused.load(Ordering::SeqCst)
+    }
+
+    /// Whether a response body is waiting for bytes right now. While it is,
+    /// only the client's hot window may be claimed (see [`pick_chunk`]).
+    fn serve_waiting(&self) -> bool {
+        self.serve_wait_pos.load(Ordering::Relaxed) != u64::MAX
+    }
+
+    /// Register that a response body is blocked at `pos`, and return how long
+    /// the (possibly already open) wait has lasted. The first miss opens the
+    /// span; it closes when bytes arrive or the body ends.
+    fn open_serve_wait(&self, pos: u64) -> u64 {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        if self.serve_wait_pos.swap(pos, Ordering::SeqCst) == u64::MAX {
+            self.serve_wait_since_ms.store(now_ms, Ordering::SeqCst);
+            self.serve_wait_escalations.store(0, Ordering::SeqCst);
+            return 0;
+        }
+        now_ms.saturating_sub(self.serve_wait_since_ms.load(Ordering::SeqCst))
+    }
+
+    /// Close the open serve wait. `reason=available` when bytes landed,
+    /// `reason=timeout` when the body ended without them (superseded, error,
+    /// EOF, shutdown). No-op when nothing is waiting.
+    fn close_serve_wait(&self, reason: &str) {
+        let pos = self.serve_wait_pos.swap(u64::MAX, Ordering::SeqCst);
+        if pos == u64::MAX {
+            return;
+        }
+        let since = self.serve_wait_since_ms.load(Ordering::SeqCst);
+        let waited = (self.started.elapsed().as_millis() as u64).saturating_sub(since);
+        let escalated = self.serve_wait_escalations.swap(0, Ordering::SeqCst);
+        crate::debug_log(&format!(
+            "serve wait end pos={pos} waited_ms={waited} reason={reason} escalated={escalated}"
+        ));
+    }
+
+    /// `(hot, warm, rest)` claims in flight right now (the serve-wait line).
+    fn inflight_kinds(&self) -> (u32, u32, u32) {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut hot = 0u32;
+        let mut warm = 0u32;
+        let mut rest = 0u32;
+        for slot in state.workers.iter().filter(|slot| slot.busy) {
+            match slot.kind {
+                Some(ChunkKind::Hot) => hot = hot.saturating_add(1),
+                Some(ChunkKind::Warm) => warm = warm.saturating_add(1),
+                Some(ChunkKind::Rest) => rest = rest.saturating_add(1),
+                _ => {}
+            }
+        }
+        (hot, warm, rest)
+    }
+
+    /// Give the body waiting at `pos` absolute priority over speculative work.
+    ///
+    /// Called by the serve path while a wait is open (every
+    /// [`SERVE_WAIT_ENFORCE_POLL`]), and once when it opens:
+    ///
+    /// 1. The exact offset the body is blocked on is registered as an urgent
+    ///    claim ([`State::urgent`]) when nothing is fetching it. The next worker
+    ///    starts its request at `pos`, not at the chunk boundary: on a 4 MiB
+    ///    chunk the prefix is three seconds of media the client cannot use yet.
+    ///    If every connection is busy with look-ahead, the farthest one is
+    ///    cancelled once per wait to free a slot.
+    /// 2. Every in-flight speculative claim (`Warm`/`Rest`) is cancelled. Its
+    ///    worker id's cancellation token is bumped, so the transfer lets go at
+    ///    its next network read and the freed slot claims the hot bytes; the
+    ///    range itself goes back to the queue and is fetched later.
+    /// 3. A `Hot` claim covering `pos` that produced no byte for
+    ///    [`HOT_STUCK_MS`] is stuck: the worker is marked slow — which makes
+    ///    `run_claim` retry the same range on the next host — its route is
+    ///    degraded, and a duplicate race is queued on another mirror. That is
+    ///    the existing per-host retry/race path, running 4.5 s earlier than the
+    ///    general health timer.
+    /// 4. Past [`SERVE_WAIT_BUDGET_MS`] the breach is logged once per wait span
+    ///    — the escalation itself is the host switch above, which cannot help
+    ///    when no single claim is to blame.
+    fn enforce_serve_priority(&self, pos: u64, waited_ms: u64) {
+        let now = Instant::now();
+        let force = waited_ms >= SERVE_WAIT_BUDGET_MS;
+        let live = self.desired_connections();
+        let mut cancelled = 0usize;
+        let mut stuck: Option<(usize, u64, u64, String, u64)> = None;
+        let mut breach = false;
+        let mut ahead: Option<(usize, u64)> = None;
+        {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let generation = state.generation;
+            let covered = chunks_cover(&state.chunks, pos);
+            let mut inflight_cover = false;
+            let mut free_slots = 0usize;
+            let mut farthest_ahead: Option<(usize, u64)> = None;
+            for id in 0..state.workers.len() {
+                let Some(slot) = state.workers.get(id) else {
+                    continue;
+                };
+                if !slot.busy {
+                    if id < live {
+                        free_slots = free_slots.saturating_add(1);
+                    }
+                    continue;
+                }
+                if slot.start <= pos && pos < slot.end {
+                    inflight_cover = true;
+                }
+                if slot.kind == Some(ChunkKind::Hot) && slot.start > pos {
+                    // The farthest look-ahead claim is the least valuable right
+                    // now: the body is blocked, that chunk is not due yet.
+                    if farthest_ahead.map_or(true, |(_, start)| slot.start > start) {
+                        farthest_ahead = Some((id, slot.start));
+                    }
+                }
+                // Silence is measured from the last byte this request produced
+                // (or from its claim when it has not produced one yet).
+                let last = slot
+                    .samples
+                    .back()
+                    .map_or_else(|| slot.range_started.unwrap_or(now), |(at, _)| *at);
+                let silent_ms = now.saturating_duration_since(last).as_millis() as u64;
+                match slot.kind {
+                    Some(ChunkKind::Warm) | Some(ChunkKind::Rest) => {
+                        if let Some(token) = self.worker_cancel.get(id) {
+                            token.fetch_add(1, Ordering::SeqCst);
+                        }
+                        cancelled = cancelled.saturating_add(1);
+                    }
+                    Some(ChunkKind::Hot) => {
+                        // Only the claim that covers the missing offset can end
+                        // this wait, and only after it has had a fair chance
+                        // ([`HOT_STUCK_MS`]): a just-re-routed range must not be
+                        // cancelled again before its first read.
+                        let age_ms = slot.range_started.map_or(0, |claimed| {
+                            now.saturating_duration_since(claimed).as_millis() as u64
+                        });
+                        if !(slot.start <= pos && pos < slot.end)
+                            || slot.slow
+                            || age_ms < HOT_STUCK_MS
+                        {
+                            continue;
+                        }
+                        // Dead or stalled: not one byte for 500 ms. A range
+                        // that is merely slow-but-flowing is not cancelled here;
+                        // the budget line reports the breach instead, because
+                        // restarting a transfer that is making progress only
+                        // makes the wait longer.
+                        if silent_ms >= HOT_STUCK_MS && stuck.is_none() {
+                            stuck = Some((id, slot.start, slot.end, slot.host.clone(), silent_ms));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !covered && !inflight_cover {
+                // Nothing is fetching the byte the client is blocked on (or the
+                // range that contained it was just cancelled): register the
+                // exact offset. The next claim starts there, not at the chunk
+                // boundary, so the wait never sits behind a chunk prefix.
+                let urgent_new = !state.urgent.contains(&pos);
+                if urgent_new {
+                    state.urgent.retain(|start| *start == pos);
+                    state.urgent.push_back(pos);
+                }
+                // Every connection busy with look-ahead: take the farthest one
+                // for this byte. Once per wait (not per enforcement tick), so a
+                // claim is never churned while it is being established.
+                if urgent_new && free_slots == 0 {
+                    if let Some((id, start)) = farthest_ahead {
+                        if let Some(token) = self.worker_cancel.get(id) {
+                            token.fetch_add(1, Ordering::SeqCst);
+                        }
+                        ahead = Some((id, start));
+                    }
+                }
+            }
+            if let Some((id, start, end, ref host, _)) = stuck {
+                if let Some(slot) = state.workers.get_mut(id) {
+                    slot.slow = true;
+                }
+                if let Some(index) = state.hosts.iter().position(|known| &known.label == host) {
+                    degrade_host(&mut state, index);
+                }
+                if let Some(token) = self.worker_cancel.get(id) {
+                    token.fetch_add(1, Ordering::SeqCst);
+                }
+                if start < end && !state.race_tokens.contains_key(&start) {
+                    state.races.push_back(RaceRequest {
+                        generation,
+                        start,
+                        end,
+                        slow_host: host.clone(),
+                    });
+                    state
+                        .race_tokens
+                        .insert(start, Arc::new(AtomicBool::new(false)));
+                }
+            }
+            if force && self.serve_wait_escalations.load(Ordering::SeqCst) == 0 {
+                self.serve_wait_escalations.store(1, Ordering::SeqCst);
+                breach = true;
+            }
+        }
+        if cancelled > 0 {
+            crate::debug_log(&format!(
+                "serve wait preempt pos={pos} waited_ms={waited_ms} speculative_cancelled={cancelled}"
+            ));
+        }
+        if let Some((id, start)) = ahead {
+            crate::debug_log(&format!(
+                "serve wait preempt pos={pos} waited_ms={waited_ms} hot_ahead_cancelled={id} range_start={start}"
+            ));
+        }
+        if let Some((id, start, end, host, silent_ms)) = stuck {
+            crate::debug_log(&format!(
+                "hot stuck pos={pos} waited_ms={waited_ms} range={start}-{end} host={host} silent_ms={silent_ms} worker={id} switching host action=retry"
+            ));
+        }
+        if breach {
+            crate::debug_log(&format!(
+                "serve wait budget pos={pos} waited_ms={waited_ms} budget_ms={SERVE_WAIT_BUDGET_MS} action=escalate"
+            ));
+        }
+    }
+
     /// Publish counters from `state`. Callers hold the state lock; the stats
     /// lock is only ever taken *after* it, everywhere in this module.
     fn publish(&self, state: &mut State, now: Instant) {
@@ -1181,11 +3617,15 @@ impl Engine {
             stats.point_cache_bytes = state.points.bytes;
             // Per-connection view: the exact range and host each worker holds
             // right now (a waiting worker keeps its last range, `busy: false`).
+            // Only the live connection count is published; the extra worker
+            // tasks wait outside the queue when the count is lowered.
+            let live = self.desired_connections();
             stats.workers.clear();
             stats.workers.extend(
                 state
                     .workers
                     .iter()
+                    .take(live)
                     .enumerate()
                     .map(|(id, slot)| WorkerStat {
                         id: id as u32,
@@ -1194,22 +3634,67 @@ impl Engine {
                         end: slot.end,
                         busy: slot.busy,
                         bytes: slot.bytes,
+                        bps: slot.bps,
+                        slow: slot.slow,
                     }),
             );
-            stats.active_workers = state.workers.iter().filter(|slot| slot.busy).count() as u32;
-            // Heatmap view: everything held now, as one compact range list.
-            // The chunks are already offset-ordered; the point cache is added
-            // and the whole list is coalesced/capped by `merge_ranges`.
-            let mut ranges: Vec<(u64, u64)> =
-                Vec::with_capacity(state.chunks.len() + state.points.entries.len());
-            ranges.extend(state.chunks.iter().filter_map(|(start, data)| {
-                let len = data.len() as u64;
-                (len > 0).then_some((*start, start.saturating_add(len)))
-            }));
-            let points = point_ranges(&state.points);
-            ranges.extend(points.iter().copied());
-            stats.downloaded = merge_ranges(ranges, MAX_DOWNLOADED_RANGES);
-            stats.point_cache = points;
+            stats.active_workers = state
+                .workers
+                .iter()
+                .take(live)
+                .filter(|slot| slot.busy)
+                .count() as u32;
+            // Whole-file queue: chunks the scheduler still has to hand out
+            // (fetched and in-flight chunks are no longer queued).
+            let chunk = self.config.chunk_bytes.max(1);
+            let total_chunks = state.total.map(|total| total.div_ceil(chunk)).unwrap_or(0);
+            let claimed = state.done.len() as u64 + state.inflight.len() as u64;
+            let queued = total_chunks.saturating_sub(claimed);
+            stats.queue_chunks = queued;
+            stats.queue_bytes = queued.saturating_mul(chunk);
+            // Heatmap view: the session cache file is the truth, so the map is
+            // stable across seeks and window trims. The memory window and the
+            // point cache can only add bytes the file could not persist (cache
+            // cap, or a session with no writable directory).
+            //
+            // The disk lock is taken with `try_lock`: `publish` runs with the
+            // state lock held on every network read, and a worker writing a
+            // 256 KiB block must never make the serve path wait. A busy disk
+            // leaves the previous (still correct) map in place instead of
+            // publishing a memory-only one.
+            if let Ok(mut disk) = self.disk.try_lock() {
+                let cache_capped = disk.capped;
+                let present = disk.ranges();
+                let cache_bytes: u64 = present
+                    .iter()
+                    .map(|(start, end)| end.saturating_sub(*start))
+                    .sum();
+                let mut ranges: Vec<(u64, u64)> =
+                    Vec::with_capacity(present.len() + state.chunks.len());
+                let on_disk = disk.present();
+                if on_disk {
+                    ranges.extend(present.iter().copied());
+                }
+                if !on_disk || cache_capped {
+                    // Without a file (or past its cap) the memory window and the
+                    // warm points are the only record of those bytes.
+                    ranges.extend(state.chunks.iter().filter_map(|(start, data)| {
+                        let len = data.len() as u64;
+                        (len > 0).then_some((*start, start.saturating_add(len)))
+                    }));
+                    ranges.extend(point_ranges(&state.points).iter().copied());
+                }
+                stats.downloaded = merge_ranges(ranges, MAX_DOWNLOADED_RANGES);
+                stats.cache_bytes = cache_bytes;
+                stats.cache_capped = cache_capped;
+            }
+            stats.point_cache = point_ranges(&state.points);
+            stats.disk_hits = state.disk_hits;
+            stats.disk_bytes = state.disk_served;
+            stats.bytes_hot = state.hot_bytes;
+            stats.bytes_warm = state.warm_fetch_bytes;
+            stats.bytes_rest = state.rest_bytes;
+            stats.bytes_retry = state.retry_bytes;
         }
     }
 
@@ -1225,43 +3710,262 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// Point the read-ahead window at `offset` (the offset of the response
-    /// being served now, not the old cursor).
-    ///
-    /// The window is kept only when it is already serving exactly that offset:
-    /// the cursor sits there and either the chunk grid is still aligned there
-    /// (the workers are fetching for it right now) or the byte is buffered.
-    /// Every other request — a seek forward, a seek backward, or a cursor that
-    /// an abandoned response moved past the last byte it actually delivered —
-    /// recomputes the window from the requested offset, so the workers never
-    /// fetch for a position the client has left.
-    fn seek(&self, offset: u64) {
+    /// Per-worker `(id, host, slow, bytes_per_sec)` for the live connections,
+    /// refreshing the five-second rate before returning it.
+    fn worker_health_snapshot(&self) -> Vec<(u32, String, bool, u64)> {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // `base == offset` means nothing was consumed since the last reset, so
-        // the window is still exactly the one this offset needs — which is the
-        // first-request case: keep the chunks the workers already started.
-        let ready = state.cursor == offset
-            && (state.base == offset
-                || state.total == Some(offset)
-                || chunks_cover(&state.chunks, offset));
-        if ready {
+        let now = Instant::now();
+        let live = self.desired_connections();
+        let mut health = Vec::with_capacity(live);
+        for (id, slot) in state.workers.iter_mut().take(live).enumerate() {
+            if slot.busy {
+                slot.bps = window_rate(&mut slot.samples, now, HEALTH_WINDOW);
+            }
+            health.push((id as u32, slot.host.clone(), slot.slow, slot.bps));
+        }
+        health
+    }
+
+    /// Merged, sorted `[start, end)` ranges present in the session cache file —
+    /// the disk map, which is what "downloaded" means — unioned with the
+    /// memory window and the point cache for the bytes the file could not
+    /// persist (cache cap or no writable directory).
+    ///
+    /// This does not change when the read cursor moves: a seek trims the memory
+    /// window, never the file.
+    fn cached_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges = {
+            let mut disk = match self.disk.lock() {
+                Ok(disk) => disk,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            disk.ranges()
+        };
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        ranges.extend(state.chunks.iter().filter_map(|(start, data)| {
+            let len = data.len() as u64;
+            (len > 0).then_some((*start, start.saturating_add(len)))
+        }));
+        ranges.extend(point_ranges(&state.points).iter().copied());
+        let cap = ranges.len().max(1);
+        merge_ranges(ranges, cap)
+    }
+
+    /// Ranges the session cache file holds (the disk map the 下载分布 panel
+    /// draws). Unlike [`Engine::cached_ranges`] this excludes the memory window,
+    /// which by design changes when the read cursor moves.
+    fn disk_ranges(&self) -> Vec<(u64, u64)> {
+        let mut disk = match self.disk.lock() {
+            Ok(disk) => disk,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        disk.ranges()
+    }
+
+    /// What the **disk map** holds, in one lock: the contiguous run of bytes
+    /// starting at `offset` (0 when the offset itself is missing), the number of
+    /// present ranges and their total bytes.
+    ///
+    /// This is the only honest answer to "is this seek already downloaded": the
+    /// map is what the 下载分布 panel draws and what the player's local-file
+    /// decode tests, while the memory window and the warm-point *size estimate*
+    /// say nothing about a hole in the middle of a range.
+    fn disk_cover(&self, offset: u64) -> (u64, usize, u64) {
+        let mut disk = match self.disk.lock() {
+            Ok(disk) => disk,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        disk.cover(offset)
+    }
+
+    /// Whether the session cache file holds the byte at `pos`.
+    fn disk_covers(&self, pos: u64) -> bool {
+        match self.disk.lock() {
+            Ok(disk) => disk.end_at(pos) > pos,
+            Err(poisoned) => poisoned.into_inner().end_at(pos) > pos,
+        }
+    }
+
+    /// Complete length the cache file already knows (`set_len` or a loaded
+    /// preload map), without waiting for any upstream response.
+    fn disk_total(&self) -> Option<u64> {
+        let disk = match self.disk.lock() {
+            Ok(disk) => disk,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (disk.len() > 0).then(|| disk.len())
+    }
+
+    /// Path of the session cache file, when the session really has one.
+    fn cache_path(&self) -> Option<PathBuf> {
+        let disk = match self.disk.lock() {
+            Ok(disk) => disk,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        disk.present().then(|| disk.path.clone())
+    }
+
+    /// Path of the session cache file when it holds at least `need` contiguous
+    /// bytes at `offset` (the caller decodes the local file instead of the
+    /// proxy). `None` when the run is shorter, so the proxy keeps serving.
+    fn cache_path_for(&self, offset: u64, need: u64) -> Option<PathBuf> {
+        let disk = match self.disk.lock() {
+            Ok(disk) => disk,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !disk.present() || disk.len() == 0 {
+            return None;
+        }
+        let end = disk.end_at(offset);
+        if end.saturating_sub(offset) < need.max(1) {
+            return None;
+        }
+        Some(disk.path.clone())
+    }
+
+    /// Hand one fetched range to the session's writer. Never blocks on the disk:
+    /// a full queue drops the block (it then simply is not cached), and the
+    /// range only reaches the presence map once the writer's call returned.
+    fn disk_write(&self, offset: u64, data: &[u8]) {
+        if data.is_empty() {
             return;
         }
-        state.generation += 1;
-        state.base = offset;
+        let writer = match self.writer.lock() {
+            Ok(writer) => writer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match writer.as_ref() {
+            Some(writer) => writer.write(offset, Arc::from(data)),
+            // No writer: a memory-only session (nothing to do) or a test engine.
+            None => match self.disk.lock() {
+                Ok(mut disk) => disk.write(offset, data),
+                Err(poisoned) => poisoned.into_inner().write(offset, data),
+            },
+        }
+    }
+
+    /// Give the cache file the complete media length (`set_len`) the moment an
+    /// upstream response states it, so the file is a valid sparse media file.
+    ///
+    /// The map adopts the length here (readers see it immediately); the
+    /// `set_len` itself is queued to the writer. Only a full queue falls back to
+    /// sizing the file inline - once per session, never on a data path.
+    fn disk_ensure_len(&self, total: u64) {
+        let writer = match self.writer.lock() {
+            Ok(writer) => writer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let file = match self.disk.lock() {
+            Ok(mut disk) => {
+                disk.ensure_len(None, total);
+                disk.file.clone()
+            }
+            Err(poisoned) => {
+                let mut disk = poisoned.into_inner();
+                disk.ensure_len(None, total);
+                disk.file.clone()
+            }
+        };
+        let queued = writer
+            .as_ref()
+            .map(|writer| writer.ensure_len(total))
+            .unwrap_or(false);
+        if !queued {
+            if let Some(file) = file {
+                if total > 0 && total <= CACHE_CAP_BYTES {
+                    let _ = file.set_len(total);
+                }
+            }
+        }
+    }
+
+    /// Read from the session cache file. The caller then credits the bytes with
+    /// [`Engine::note_disk_served`].
+    fn disk_read(&self, pos: u64, max_len: u64) -> Option<Vec<u8>> {
+        let disk = match self.disk.lock() {
+            Ok(disk) => disk,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        disk.read_at(pos, max_len)
+    }
+
+    /// Account a disk-served block: the read cursor moves, the map does not.
+    fn note_disk_served(&self, pos: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.cursor = pos.saturating_add(bytes);
+        state.served = state.served.saturating_add(bytes);
+        state.disk_served = state.disk_served.saturating_add(bytes);
+        state.disk_hits = state.disk_hits.saturating_add(1);
+        note_serve_rate(&mut state, now, bytes);
+        self.publish(&mut state, now);
+    }
+
+    fn cached_bytes_at(&self, offset: u64) -> u64 {
+        let ranges = self.cached_ranges();
+        match ranges.binary_search_by(|(start, _)| start.cmp(&offset)) {
+            Ok(index) => ranges[index].1.saturating_sub(offset),
+            Err(0) => 0,
+            Err(index) => {
+                let (_start, end) = ranges[index - 1];
+                if offset < end {
+                    end.saturating_sub(offset)
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Point the read cursor at `offset` and tell the caller whether the bytes
+    /// there were already buffered (a window hit).
+    ///
+    /// A seek never throws buffered bytes away. The buffered window and the
+    /// point cache belong to the whole stream, and the whole-file scheduler
+    /// keeps fetching independently of the cursor, so a seek to an offset that
+    /// is already in memory is served with no upstream request at all. Only
+    /// bytes *behind* the new cursor are dropped: they can never be served
+    /// again. The generation is left alone for the same reason: in-flight
+    /// requests are still useful to the whole-file queue.
+    fn seek(&self, offset: u64) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let covered = chunks_cover(&state.chunks, offset);
+        if state.cursor == offset && (state.total == Some(offset) || covered) {
+            // Repeated read at the position the cursor already sits on.
+            return covered;
+        }
         state.cursor = offset;
-        state.chunks.clear();
-        state.inflight.clear();
-        state.dead.clear();
-        state.read_ahead = 0;
+        state.base = offset;
+        // A seek ends the previous wait: an offset the old body was blocked on
+        // is not what this client reads any more.
+        state.urgent.clear();
+        // Drop only what the new cursor left behind.
+        state.chunks.retain(|start, data| {
+            let end = start.saturating_add(data.len() as u64);
+            end > offset
+        });
+        state.read_ahead = state.chunks.values().map(|data| data.len() as u64).sum();
         drop(state);
         crate::debug_log(&format!(
-            "prefetch seek reset offset={offset} after_ms={}",
+            "prefetch seek cursor={offset} hit={covered} after_ms={}",
             self.started.elapsed().as_millis()
         ));
+        covered
     }
 
     /// Take ownership of the proxy for one response. The returned token is what
@@ -1281,21 +3985,47 @@ impl Engine {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // Buffered bytes are served even after every upstream host failed: a
+        // cache/window seek must never depend on the network being healthy.
+        let Some(data) = take_bounded(&mut state.chunks, pos, max_len) else {
+            if let Some(error) = &state.fatal {
+                return Err(error.clone());
+            }
+            if state.dead.contains(&(state.generation, pos)) {
+                return Err(format!("区间 {pos} 无法从任何主机获取"));
+            }
+            return Ok(None);
+        };
+        let take = data.len() as u64;
+        let now = Instant::now();
+        state.cursor = pos + take;
+        state.served += take;
+        state.read_ahead = state.read_ahead.saturating_sub(take);
+        // What the client pulled over the whole session, not over the last
+        // second: with no duration to divide by this is the media bitrate, and
+        // a one-second window read a startup burst (2 MiB in 50 ms = 40 MB/s)
+        // as the bitrate, which then multiplied every scheduling horizon.
+        note_serve_rate(&mut state, now, take);
+        self.publish(&mut state, now);
+        Ok(Some(data))
+    }
+
+    /// Why a byte at `pos` can never arrive, if that is already known: the
+    /// upstream pool failed fatally or the chunk was retired on every host.
+    /// Used by the serve path only *after* the memory window and the session
+    /// cache file both missed, so a cached range never inherits a network error.
+    fn consume_error(&self, pos: u64) -> Result<(), String> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if let Some(error) = &state.fatal {
             return Err(error.clone());
         }
         if state.dead.contains(&(state.generation, pos)) {
             return Err(format!("区间 {pos} 无法从任何主机获取"));
         }
-        let Some(data) = take_bounded(&mut state.chunks, pos, max_len) else {
-            return Ok(None);
-        };
-        let take = data.len() as u64;
-        state.cursor = pos + take;
-        state.served += take;
-        state.read_ahead = state.read_ahead.saturating_sub(take);
-        self.publish(&mut state, Instant::now());
-        Ok(Some(data))
+        Ok(())
     }
 
     /// Whether the file ends exactly at `pos` (the response should stop).
@@ -1314,6 +4044,24 @@ impl Engine {
             Err(poisoned) => poisoned.into_inner(),
         };
         state.total.is_some()
+    }
+
+    /// The complete media length, once an upstream response has stated it.
+    fn total(&self) -> Option<u64> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.total
+    }
+
+    /// Bytes buffered ahead of the read cursor right now (diagnostics).
+    fn read_ahead(&self) -> u64 {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.read_ahead
     }
 
     /// Retire a range that a `416` proved to be past EOF while the total was
@@ -1335,10 +4083,16 @@ impl Engine {
     /// Store one network read at its absolute offset. Bytes become servable
     /// immediately, so the first response does not wait for a whole chunk.
     ///
-    /// Returns `false` when the read belongs to a superseded generation (a seek
-    /// moved the window) or the proxy is shutting down: the bytes are dropped
-    /// and the caller stops reading this response instead of draining a body
-    /// nobody can use.
+    /// The read is only *retained* inside the read-ahead window around the
+    /// current cursor. Whole-file scheduling deliberately fetches far past that
+    /// window; those bytes are counted (throughput, health, host split) and
+    /// then dropped, which is what keeps the window bounded to
+    /// [`PrefetchConfig::read_ahead_bytes`] no matter how far ahead the queue
+    /// is.
+    ///
+    /// Returns `false` when the read belongs to a superseded generation or the
+    /// proxy is shutting down: the caller stops reading this response instead
+    /// of draining a body nobody can use.
     fn push_bytes(
         &self,
         generation: u64,
@@ -1346,6 +4100,7 @@ impl Engine {
         data: &[u8],
         host: usize,
         worker: usize,
+        kind: ChunkKind,
         shutdown: &AtomicBool,
     ) -> bool {
         if data.is_empty() {
@@ -1360,17 +4115,58 @@ impl Engine {
             return false;
         }
         let len = data.len() as u64;
-        state.chunks.insert(offset, data.to_vec());
-        state.read_ahead += len;
+        let limit = self.read_ahead_window();
+        let cursor = state.cursor;
+        let window_end = cursor.saturating_add(limit);
+        let retain = offset < window_end && offset.saturating_add(len) > cursor;
+        if retain {
+            if let Some(old) = state.chunks.insert(offset, data.to_vec()) {
+                state.read_ahead = state.read_ahead.saturating_sub(old.len() as u64);
+            }
+            state.read_ahead = state.read_ahead.saturating_add(len);
+            trim_window(&mut state, limit);
+        }
         state.bytes_fetched += len;
+        match kind {
+            ChunkKind::Hot => state.hot_bytes = state.hot_bytes.saturating_add(len),
+            ChunkKind::Warm => {
+                state.warm_fetch_bytes = state.warm_fetch_bytes.saturating_add(len)
+            }
+            ChunkKind::Rest => state.rest_bytes = state.rest_bytes.saturating_add(len),
+            ChunkKind::Requeue | ChunkKind::Race => {
+                state.retry_bytes = state.retry_bytes.saturating_add(len)
+            }
+        }
         if let Some(host) = state.hosts.get_mut(host) {
             host.bytes += len;
+            // Bytes arrived from this route: it works. Clears the failure
+            // streak `mark_host_failure` recorded (see its doc comment).
+            if host.failures > 0 || host.failed {
+                host.failures = 0;
+                host.failed = false;
+                host.degraded_until = None;
+            }
         }
+        let mut recovered = None;
         if let Some(slot) = state.workers.get_mut(worker) {
             slot.bytes = slot.bytes.saturating_add(len);
+            slot.samples.push_back((now, len));
+            if slot.slow {
+                slot.slow = false;
+                recovered = Some((worker, slot.host.clone()));
+            }
         }
         state.samples.push_back((now, len));
         self.publish(&mut state, now);
+        drop(state);
+        // The file is the truth for "downloaded": every fetched byte is
+        // persisted, whether or not the memory window keeps a copy of it. The
+        // write happens outside the state lock so the serve path never waits on
+        // a disk write.
+        self.disk_write(offset, data);
+        if let Some((worker, host)) = recovered {
+            crate::debug_log(&format!("worker recover id={worker} host={host}"));
+        }
         true
     }
 
@@ -1404,19 +4200,56 @@ impl Engine {
                 changed = true;
             }
         }
-        if changed {
+        // The warm plan needs the complete length; build it the moment it is
+        // known so the workers can put seek points ahead of the rest.
+        let mut warm_plan = None;
+        if !state.warm_plan_started {
+            if let Some(total) = state.total {
+                build_warm_plan(
+                    &mut state,
+                    self.config.chunk_bytes,
+                    self.config.point_bytes,
+                    self.config.warm_points,
+                    total,
+                );
+                warm_plan = Some((total, state.warm_points_total, state.warm_chunk));
+            }
+        }
+        if changed || warm_plan.is_some() {
             self.publish(&mut state, now);
         }
         drop(state);
+        // A known length makes the cache file a sparse file of exactly the right
+        // size (`set_len`), which is what a local-file decode needs.
         if let Some(total) = learned_total {
+            self.disk_ensure_len(total);
+            self.refresh_media_bps(total);
             crate::debug_log(&format!(
-                "prefetch learned total={total} after_ms={}",
+                "prefetch learned total={total} media_bps={} duration_ms={} window={} after_ms={}",
+                self.media_bps(),
+                self.config.media_duration_ms.map_or(0, |ms| ms),
+                self.read_ahead_window(),
                 self.started.elapsed().as_millis()
+            ));
+        }
+        if let Some((total, points, chunk)) = warm_plan {
+            crate::debug_log(&format!(
+                "seek warm plan total={total} points={points} chunk={chunk}"
             ));
         }
     }
 
     /// Release the range claim after the upstream body ended (possibly short).
+    ///
+    /// A body that stops before the requested end is **not** evidence about the
+    /// file's length once a real `Content-Range` has stated it: rewriting the
+    /// total here is what closed the serving body at that offset ("Stream ends
+    /// prematurely at N, should be M", then EOF, then the "playback ended"
+    /// machinery). The length from the response headers is authoritative; a
+    /// short body sends the range back to the queue so another attempt can
+    /// fetch the rest, and only a range that keeps stopping early is retired.
+    ///
+    /// Returns `true` when the body stopped short against a known length.
     fn complete_range(
         &self,
         generation: u64,
@@ -1424,64 +4257,107 @@ impl Engine {
         next: u64,
         end: u64,
         shutdown: &AtomicBool,
-    ) {
+    ) -> bool {
         let now = Instant::now();
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.inflight.remove(&(generation, chunk_start));
         if generation != state.generation || shutdown.load(Ordering::SeqCst) {
-            return;
+            return false;
         }
+        let mut learned = None;
+        let mut short_against_total = None;
         if next < end {
             match state.total {
                 None => {
-                    // Short body with no known length: this is EOF.
+                    // Short body with no known length: this is the only way to
+                    // learn the length here, so it is still EOF evidence.
                     state.total = Some(next);
+                    learned = Some(next);
                     crate::debug_log(&format!(
                         "prefetch eof total={} after_ms={}",
                         next,
                         self.started.elapsed().as_millis()
                     ));
                 }
-                Some(total) if next < total => {
-                    // A `206` that stops early is the CDN's word on the real
-                    // end. Trust it; a client that was promised more sees a
-                    // closed connection instead of a hang.
-                    state.total = Some(next);
-                    crate::debug_log(&format!(
-                        "prefetch total shortened start={chunk_start} next={next} was={total}"
-                    ));
+                Some(total) if next >= total => {}
+                Some(total) => {
+                    // Known length, body stopped early: a truncated range, not
+                    // a file end. Requeue it a bounded number of times.
+                    let attempts = state
+                        .short_bodies
+                        .entry(chunk_start)
+                        .and_modify(|count| *count = count.saturating_add(1))
+                        .or_insert(1);
+                    let attempts = *attempts;
+                    let retired = attempts >= SHORT_BODY_LIMIT;
+                    if retired {
+                        state.dead.insert((generation, chunk_start));
+                    } else {
+                        state.requeued.insert(chunk_start);
+                    }
+                    short_against_total = Some((next, total, attempts, retired));
                 }
-                _ => {}
             }
         }
         self.publish(&mut state, now);
+        drop(state);
+        if let Some(total) = learned {
+            self.disk_ensure_len(total);
+            self.refresh_media_bps(total);
+        }
+        if let Some((next, total, attempts, retired)) = short_against_total {
+            crate::debug_log(&format!(
+                "prefetch range short start={chunk_start} next={next} total={total} attempt={attempts} action={}",
+                if retired { "retire" } else { "requeue" }
+            ));
+            return true;
+        }
+        false
     }
 
-    /// Mark one host unusable after a failed range attempt. Called even when a
-    /// retry on another host succeeds, so a broken mirror is not picked again.
+    /// Record one failed range attempt on a host.
+    ///
+    /// This used to set `failed = true` on the first error — with a single
+    /// mirror (the normal Bilibili case) one transient `error decoding response
+    /// body` mid-range retired the only route, the range was marked dead, and
+    /// the serving body closed a few hundred milliseconds later: the client saw
+    /// a truncated stream and the player's "ended" machinery took over. Now a
+    /// failure only cools the route down; the first byte it stores later
+    /// ([`Engine::note_host_ok`]) clears the count.
     fn mark_host_failure(&self, host: usize, error: &str) {
         let now = Instant::now();
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(host) = state.hosts.get_mut(host) {
-            host.failed = true;
+        let mut retired = false;
+        if let Some(entry) = state.hosts.get_mut(host) {
+            entry.failures = entry.failures.saturating_add(1);
+            if entry.failures >= HOST_FAILURE_LIMIT {
+                entry.failed = true;
+                retired = true;
+            } else {
+                // Linear cooldown: 1 s, 2 s, then capped. Short enough that a
+                // single-host config is usable again almost immediately.
+                let cooldown = Duration::from_secs(u64::from(entry.failures).min(3));
+                entry.degraded_until = Some(now + cooldown);
+            }
         }
         state.failed_ranges += 1;
         self.publish(&mut state, now);
+        let failures = state.hosts.get(host).map_or(0, |entry| entry.failures);
         drop(state);
         crate::debug_log(&format!(
-            "prefetch host failed host={host} err={error} after_ms={}",
+            "prefetch host failure host={host} failures={failures} retired={retired} err={error} after_ms={}",
             self.started.elapsed().as_millis()
         ));
     }
 
     /// Give up on a range: the bytes at `next` will never arrive, so a reader
-    /// waiting there gets an error. Stops every task when no host is left.
+    /// waiting there gets an error. Stops every task only when every host has
+    /// been retired after repeated failures.
     fn fail_range(
         &self,
         generation: u64,
@@ -1502,7 +4378,10 @@ impl Engine {
         }
         for index in attempted {
             if let Some(host) = state.hosts.get_mut(*index) {
-                host.failed = true;
+                host.failures = host.failures.saturating_add(1);
+                if host.failures >= HOST_FAILURE_LIMIT {
+                    host.failed = true;
+                }
             }
         }
         state.dead.insert((generation, next));
@@ -1526,15 +4405,6 @@ impl Engine {
         let index = pick_host(&mut state, exclude)?;
         let host = state.hosts[index].clone();
         Some((index, host.origin, host.label))
-    }
-
-    /// Complete media length, once any real range response revealed it.
-    fn total(&self) -> Option<u64> {
-        let state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state.total
     }
 
     /// Complete length plus the upstream MIME type, once both/one are known.
@@ -1585,63 +4455,76 @@ impl Engine {
         crate::debug_log(&format!("seek warm hit offset={offset} bytes={bytes}"));
     }
 
-    /// Publish the warm plan (`points` distinct offsets, `chunk` bytes each).
-    fn start_warm(&self, points: usize, chunk: u64, total: u64) {
-        let now = Instant::now();
-        {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            state.warm_points_total = points as u32;
-            state.warm_points_done = 0;
-            state.warm_chunk = chunk;
-            state.warm_bytes = 0;
-            state.points = PointCache::default();
-            self.publish(&mut state, now);
-        }
-        crate::debug_log(&format!(
-            "seek warm plan total={total} points={points} chunk={chunk}"
-        ));
+    /// The configured `i/count` offset of the warm task that owns `start`.
+    fn warm_point_at(&self, start: u64) -> Option<u64> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state
+            .warm_plan
+            .iter()
+            .find(|task| task.start == start)
+            .map(|task| task.point)
     }
 
-    /// Mark one point as available without fetching it (the window or an
-    /// earlier point already holds those bytes).
-    fn note_warm_covered(&self, offset: u64, source: &str) {
+    /// Store one warm point (chunk-aligned data) in the bounded point cache and
+    /// publish the QA line as it lands.
+    fn store_point(&self, offset: u64, data: Vec<u8>, point: u64) {
+        let len = data.len() as u64;
+        if len == 0 {
+            return;
+        }
+        // A warm point is fetched outside `push_bytes`, so it is persisted here,
+        // before the memory copy: the seek it serves must also work from disk.
+        self.disk_write(offset, &data);
         let now = Instant::now();
-        {
+        let (done, points, bytes, chunk, cached, cached_points, total) = {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            for task in &mut state.warm_plan {
+                if task.start == offset {
+                    task.done = true;
+                    task.claimed = true;
+                }
+            }
+            let count = state.warm_plan.len().min(MAX_WARM_POINTS).max(1);
+            state
+                .points
+                .insert(offset, data, count, MAX_POINT_CACHE_BYTES);
             state.warm_points_done = state.warm_points_done.saturating_add(1);
+            state.warm_bytes = state.warm_bytes.saturating_add(len);
             self.publish(&mut state, now);
-        }
-        crate::debug_log(&format!("seek warm skip offset={offset} covered={source}"));
-    }
-
-    /// Mark a point that could not be fetched. It still counts as processed, so
-    /// `done == total` once the task has walked the whole plan.
-    fn note_warm_failed(&self, offset: u64) {
-        let now = Instant::now();
-        {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            state.warm_points_done = state.warm_points_done.saturating_add(1);
-            self.publish(&mut state, now);
-        }
+            (
+                state.warm_points_done,
+                state.warm_points_total,
+                state.warm_bytes,
+                state.warm_chunk,
+                state.points.bytes,
+                state.points.len(),
+                state.total.unwrap_or(0),
+            )
+        };
         crate::debug_log(&format!(
-            "seek warm skip offset={offset} covered=none reason=fetch-failed"
+            "seek warm total={total} points={points} chunk={chunk} done={done} bytes={bytes}"
         ));
+        crate::debug_log(&format!(
+            "seek warm point offset={point} cached_at={offset} bytes={len} host=worker"
+        ));
+        if done >= points {
+            crate::debug_log(&format!(
+                "seek warm done total={total} points={points} chunk={chunk} done={done} bytes={bytes} cached={cached} points_cached={cached_points} ms={}",
+                self.started.elapsed().as_millis()
+            ));
+        }
     }
 
-    /// Account one warm-point network read. It IS upstream traffic (so it
-    /// appears in `bytes_fetched` and the per-host split) but it is not part of
-    /// the read-ahead window; it is also left out of the one-second rate
-    /// samples, whose job is to describe playback throughput.
-    fn note_warm_bytes(&self, host: usize, len: u64, shutdown: &AtomicBool) {
+    /// Account a warm-point network read: it is upstream traffic and counts for
+    /// the host split and the worker's health, but it is not part of the
+    /// read-ahead window.
+    fn note_warm_bytes(&self, host: usize, worker: usize, len: u64, shutdown: &AtomicBool) {
         if len == 0 || shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -1651,60 +4534,124 @@ impl Engine {
             Err(poisoned) => poisoned.into_inner(),
         };
         state.bytes_fetched = state.bytes_fetched.saturating_add(len);
+        state.warm_fetch_bytes = state.warm_fetch_bytes.saturating_add(len);
         if let Some(host) = state.hosts.get_mut(host) {
             host.bytes = host.bytes.saturating_add(len);
         }
+        let mut recovered = None;
+        if let Some(slot) = state.workers.get_mut(worker) {
+            slot.bytes = slot.bytes.saturating_add(len);
+            slot.samples.push_back((now, len));
+            if slot.slow {
+                slot.slow = false;
+                recovered = Some((worker, slot.host.clone()));
+            }
+        }
+        state.samples.push_back((now, len));
         self.publish(&mut state, now);
+        drop(state);
+        if let Some((worker, host)) = recovered {
+            crate::debug_log(&format!("worker recover id={worker} host={host}"));
+        }
     }
 
-    /// Store one warm point and log the QA line as it lands.
-    fn store_point(&self, offset: u64, data: Vec<u8>, count: usize, total: u64) {
-        let len = data.len() as u64;
+    /// Retire a claim: the chunk is fetched, its range leaves the inflight set,
+    /// and a raced chunk is resolved in favour of the first finisher. Returns
+    /// `true` when this worker won a race (the caller logs the winner line).
+    fn finish_chunk(
+        &self,
+        generation: u64,
+        start: u64,
+        kind: ChunkKind,
+        worker: usize,
+        race: Option<&Arc<AtomicBool>>,
+    ) -> bool {
         let now = Instant::now();
-        let (done, points, bytes, chunk) = {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            state
-                .points
-                .insert(offset, data, count.min(MAX_WARM_POINTS).max(1), MAX_POINT_CACHE_BYTES);
-            state.warm_points_done = state.warm_points_done.saturating_add(1);
-            state.warm_bytes = state.warm_bytes.saturating_add(len);
-            self.publish(&mut state, now);
-            (
-                state.warm_points_done,
-                state.warm_points_total,
-                state.warm_bytes,
-                state.warm_chunk,
-            )
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        crate::debug_log(&format!(
-            "seek warm total={total} points={points} chunk={chunk} done={done} bytes={bytes}"
-        ));
+        if generation == state.generation {
+            state.done.insert(start);
+            state.inflight.remove(&(generation, start));
+        }
+        let mut won = false;
+        if let Some(token) = race {
+            won = !token.swap(true, Ordering::SeqCst);
+            if won {
+                state.race_tokens.remove(&start);
+            }
+        }
+        if kind == ChunkKind::Race && !won {
+            // The loser stops here; the winner owns the chunk.
+            state.inflight.remove(&(generation, start));
+        }
+        if let Some(slot) = state.workers.get_mut(worker) {
+            slot.busy = false;
+            slot.range_started = None;
+        }
+        self.publish(&mut state, now);
+        won
     }
 
-    /// Final warm summary (`done == points` once every offset was processed).
-    fn finish_warm(&self) {
-        let (points, done, bytes, chunk, cached, cached_points, total) = {
-            let state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            (
-                state.warm_points_total,
-                state.warm_points_done,
-                state.warm_bytes,
-                state.warm_chunk,
-                state.points.bytes,
-                state.points.len(),
-                state.total.unwrap_or(0),
-            )
+    /// Return a claim that produced no useful bytes to the queue. A slow
+    /// worker's range stays owned while a duplicate race is running; the race
+    /// finishes it instead.
+    fn release_range(
+        &self,
+        generation: u64,
+        start: u64,
+        kind: ChunkKind,
+        race: Option<&Arc<AtomicBool>>,
+    ) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        crate::debug_log(&format!(
-            "seek warm done total={total} points={points} chunk={chunk} done={done} bytes={bytes} cached={cached} points_cached={cached_points} ms={}",
-            self.started.elapsed().as_millis()
-        ));
+        let race_won = race.is_some_and(|token| token.load(Ordering::SeqCst));
+        let racer_running = race.is_none() && state.race_tokens.contains_key(&start);
+        if kind == ChunkKind::Race && !race_won {
+            // The duplicate failed; drop its token so the original route keeps
+            // the range (a later health tick may race it again).
+            state.race_tokens.remove(&start);
+            state.inflight.remove(&(generation, start));
+            state.requeued.insert(start);
+            if let Some(task) = state.warm_plan.iter_mut().find(|task| task.start == start) {
+                task.claimed = false;
+            }
+            return;
+        }
+        if race_won {
+            return;
+        }
+        if !racer_running {
+            state.inflight.remove(&(generation, start));
+            if kind == ChunkKind::Warm {
+                if let Some(task) = state.warm_plan.iter_mut().find(|task| task.start == start) {
+                    task.claimed = false;
+                }
+            } else {
+                state.requeued.insert(start);
+            }
+        }
+    }
+
+    /// Whether the health watchdog marked a worker slow.
+    fn worker_is_slow(&self, worker: usize) -> bool {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.workers.get(worker).is_some_and(|slot| slot.slow)
+    }
+
+    /// Last measured throughput of one worker, bytes/s.
+    fn worker_bps(&self, worker: usize) -> u64 {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.workers.get(worker).map_or(0, |slot| slot.bps)
     }
 }
 
@@ -1712,36 +4659,578 @@ impl Engine {
 // Workers
 // ---------------------------------------------------------------------------
 
+struct FetchClaim {
+    generation: u64,
+    start: u64,
+    end: u64,
+    host: usize,
+    kind: ChunkKind,
+    /// Cancellation token of the worker at claim time (bumped by the health
+    /// watchdog when the worker is slow).
+    token: u64,
+    /// Set for a duplicate race: the first finisher wins, the other cancels.
+    race: Option<Arc<AtomicBool>>,
+    /// Host labels of a race, for the winner log.
+    race_hosts: String,
+}
+
 enum Claim {
-    Fetch {
-        generation: u64,
-        start: u64,
-        end: u64,
-        host: usize,
-    },
+    Fetch(FetchClaim),
     Wait,
     Stop,
 }
 
 /// Pick the next healthy host round-robin, excluding already-tried indices.
+///
+/// A route the watchdog found slow is skipped while it is degraded; if that
+/// leaves nothing (a single-host config, or every mirror degraded), the round
+/// robin falls back to the reachable hosts instead of failing playback.
 fn pick_host(state: &mut State, exclude: &[usize]) -> Option<usize> {
     let count = state.hosts.len();
-    for step in 0..count {
-        let index = (state.next_host + step) % count;
-        if state.hosts[index].failed || exclude.contains(&index) {
-            continue;
+    let now = Instant::now();
+    for pass in 0..2 {
+        for step in 0..count {
+            let index = (state.next_host + step) % count;
+            let host = &state.hosts[index];
+            if host.failed || exclude.contains(&index) {
+                continue;
+            }
+            if pass == 0 && host.degraded_until.is_some_and(|until| until > now) {
+                continue;
+            }
+            state.next_host = (index + 1) % count;
+            return Some(index);
         }
-        state.next_host = (index + 1) % count;
-        return Some(index);
     }
     None
 }
 
-/// Reserve the next chunk of the read-ahead window for one worker.
+/// Skip a route the health watchdog found slow for a cooldown period. It stays
+/// in the mirror list, so a single-host config keeps using it.
+fn degrade_host(state: &mut State, host: usize) {
+    if state.hosts.len() <= 1 {
+        return;
+    }
+    if let Some(host) = state.hosts.get_mut(host) {
+        host.degraded_until = Some(Instant::now() + Duration::from_secs(30));
+    }
+}
+
+/// Chunk start for `offset`: all chunk offsets are absolute multiples of the
+/// configured chunk size, independent of the cursor.
+fn chunk_start(offset: u64, chunk: u64) -> u64 {
+    if chunk == 0 {
+        return 0;
+    }
+    offset - offset % chunk
+}
+
+/// Whether a chunk start is already spoken for: **on disk**, buffered, in
+/// flight, dead, or fetched earlier and evicted.
 ///
-/// `worker_id` names the slot this connection owns; the slot is updated under
-/// the same lock that hands out the range, so a snapshot can never see a
-/// claimed range with no worker behind it (or the reverse).
+/// The session cache file is part of "already have": a chunk it holds must never
+/// go upstream again, whatever the memory window did with it.
+fn chunk_taken(state: &State, generation: u64, start: u64, chunk: u64, disk: &DiskCache) -> bool {
+    let end = state
+        .total
+        .map_or(start.saturating_add(chunk), |total| total.min(start.saturating_add(chunk)));
+    disk.covers_range(start, end)
+        || state.done.contains(&start)
+        || state.inflight.contains(&(generation, start))
+        || state.dead.contains(&(generation, start))
+        || chunks_cover(&state.chunks, start)
+        || chunks_cover(&state.chunks, start.saturating_add(chunk.saturating_sub(1)))
+}
+
+/// Whether a chunk the client is reading is already available. Unlike
+/// [`chunk_taken`], a chunk fetched earlier by the speculative whole-file queue
+/// and then discarded (it was outside the window at the time) is *not*
+/// available: playback must fetch it again.
+///
+/// The chunk that *contains* the cursor is special: bytes the client has
+/// already pulled are removed from the map as they are served, so coverage of
+/// that chunk has to be probed **at the cursor**. Probing at the chunk start
+/// said "missing" on every tick and re-downloaded the whole chunk every few
+/// seconds (measured: 577 MB fetched for a 27.6 MB file).
+fn hot_taken(state: &State, generation: u64, start: u64, chunk: u64, disk: &DiskCache) -> bool {
+    let probe = start.max(state.cursor);
+    let end = state
+        .total
+        .map_or(start.saturating_add(chunk), |total| total.min(start.saturating_add(chunk)));
+    // A chunk the cache file already holds is as good as buffered: re-fetching
+    // it was the 12 MiB of upstream traffic a cached seek used to cost.
+    disk.covers_range(start, end)
+        || state.inflight.contains(&(generation, start))
+        || state.dead.contains(&(generation, start))
+        || chunks_cover(&state.chunks, probe)
+}
+
+/// Byte frontier the client is expected to consume within
+/// [`HOT_AHEAD_SECONDS`], from the bitrate estimate alone.
+///
+/// It deliberately does **not** use the one-second serve rate: after a burst
+/// that rate reads tens of MB/s and the frontier becomes the whole file, which
+/// is how the speculative queue used to pull 66 MB/s. A stalled client cannot
+/// shrink the frontier either — the bitrate is a property of the stream.
+fn hot_frontier(state: &mut State, chunk: u64, bitrate: u64, _now: Instant) -> u64 {
+    let ahead = bitrate
+        .saturating_mul(HOT_AHEAD_SECONDS)
+        .max(chunk.saturating_mul(2));
+    state.cursor.saturating_add(ahead)
+}
+
+/// Record served bytes and keep the session-average serve rate up to date.
+///
+/// `serve_samples` still feeds the panel's one-second rate; `serve_bps` is the
+/// *average since the first byte*, which is the honest fallback bitrate when
+/// the caller did not supply the media duration.
+fn note_serve_rate(state: &mut State, now: Instant, bytes: u64) {
+    state.serve_samples.push_back((now, bytes));
+    let _ = window_rate(&mut state.serve_samples, now, RATE_WINDOW);
+    let first = *state.first_serve.get_or_insert(now);
+    let elapsed = now.saturating_duration_since(first).as_secs_f64();
+    state.serve_bps = if elapsed < 0.5 {
+        0
+    } else {
+        (state.served as f64 / elapsed).round() as u64
+    };
+}
+
+/// Refill rate of the speculative token bucket: [`SPECULATIVE_RATE_FACTOR`] ×
+/// the bitrate for the whole-file queue, [`WARM_RATE_FACTOR`] × while seek
+/// points are still being warmed (they are a one-shot job and each is small).
+fn speculative_rate(bitrate: u64, warm_pending: bool) -> u64 {
+    let factor = if warm_pending {
+        WARM_RATE_FACTOR
+    } else {
+        SPECULATIVE_RATE_FACTOR
+    };
+    bitrate.saturating_mul(factor)
+}
+
+/// Take `bytes` worth of speculative bandwidth. `false` means "do not start
+/// this fetch now" — the worker goes idle and the bytes are handed to the
+/// client path, which is never limited.
+fn spec_take(state: &mut State, bytes: u64, rate: u64, burst: u64) -> bool {
+    let now = Instant::now();
+    let elapsed = now.saturating_duration_since(state.spec_at);
+    if !elapsed.is_zero() {
+        let refill = (rate as u128)
+            .saturating_mul(elapsed.as_millis())
+            .saturating_div(1000)
+            .min(u64::MAX as u128) as u64;
+        state.spec_tokens = state.spec_tokens.saturating_add(refill).min(burst);
+        state.spec_at = now;
+    }
+    if state.spec_tokens >= bytes {
+        state.spec_tokens -= bytes;
+        state.spec_bytes = state.spec_bytes.saturating_add(bytes);
+        true
+    } else {
+        false
+    }
+}
+
+/// Build the warm plan once the total length is known. Points are aligned down
+/// to the chunk grid so a point is a whole scheduling unit and can share the
+/// same worker pool as playback.
+fn build_warm_plan(state: &mut State, chunk: u64, point_bytes: u64, points: usize, total: u64) {
+    if state.warm_plan_started || points == 0 || chunk == 0 || total == 0 {
+        return;
+    }
+    state.warm_plan_started = true;
+    let points = points.min(MAX_WARM_POINTS);
+    let per_point = point_chunk_bytes(total, points, point_bytes).max(1);
+    let mut seen = BTreeSet::new();
+    let mut plan = Vec::new();
+    for point in warm_point_offsets(total, points) {
+        let start = chunk_start(point, chunk);
+        if !seen.insert(start) {
+            continue;
+        }
+        let end = total.min(start.saturating_add(per_point.max(1)));
+        plan.push(WarmTask {
+            point,
+            start,
+            end,
+            done: false,
+            claimed: false,
+            urgent: false,
+        });
+    }
+    state.warm_points_total = plan.len() as u32;
+    state.warm_points_done = 0;
+    state.warm_chunk = per_point;
+    state.warm_bytes = 0;
+    state.points = PointCache::default();
+    state.warm_plan = plan;
+}
+
+/// Split `[start, total)` into `connections` equal, chunk-aligned parts. The
+/// rest of the file is then fetched part-per-worker instead of one global FIFO,
+/// so every connection owns a slice and the tail is reached quickly.
+fn build_parts(state: &mut State, connections: usize, chunk: u64) {
+    if state.parts_built {
+        return;
+    }
+    let Some(total) = state.total else {
+        return;
+    };
+    state.parts_built = true;
+    let start = chunk_start(state.cursor, chunk);
+    let span = total.saturating_sub(start);
+    if span < DYNAMIC_SPLIT_THRESHOLD || chunk == 0 {
+        return;
+    }
+    let count = connections.clamp(1, MAX_CONNECTIONS) as u64;
+    let per = span.div_ceil(count).div_ceil(chunk).saturating_mul(chunk).max(chunk);
+    let mut cursor = start;
+    let mut index = 0usize;
+    while cursor < total && index < MAX_CONNECTIONS {
+        let end = cursor.saturating_add(per).min(total);
+        state.parts.push(Part {
+            end,
+            next: cursor,
+            owner: Some(index),
+        });
+        cursor = end;
+        index += 1;
+    }
+}
+
+/// Take the next sub-chunk of one part, skipping chunks that are already
+/// buffered, in flight or dead. Nothing at or past `limit` is claimable: the
+/// far end of a part stays unclaimed until the playhead moves the download
+/// horizon forward.
+fn take_part_chunk(
+    state: &mut State,
+    index: usize,
+    generation: u64,
+    chunk: u64,
+    disk: &DiskCache,
+    limit: u64,
+) -> Option<u64> {
+    if chunk == 0 {
+        return None;
+    }
+    loop {
+        let next = state.parts.get(index)?.next;
+        let end = state.parts.get(index)?.end.min(limit);
+        if next >= end {
+            return None;
+        }
+        let start = chunk_start(next, chunk);
+        if start >= end {
+            // The part continues past the horizon: leave `next` alone so it
+            // resumes when the horizon moves, and report "nothing here now".
+            return None;
+        }
+        if let Some(part) = state.parts.get_mut(index) {
+            part.next = start.saturating_add(chunk);
+        }
+        if !chunk_taken(state, generation, start, chunk, disk) {
+            return Some(start);
+        }
+    }
+}
+
+/// Take one sub-chunk from the part with the most unclaimed bytes. A worker
+/// whose own part is exhausted keeps working by shrinking the largest one, so
+/// no connection ever sits idle while bytes remain.
+fn steal_chunk(
+    state: &mut State,
+    generation: u64,
+    chunk: u64,
+    disk: &DiskCache,
+    limit: u64,
+) -> Option<u64> {
+    loop {
+        let mut best = None;
+        let mut best_remaining = 0u64;
+        for index in 0..state.parts.len() {
+            let part = &state.parts[index];
+            // Only the bytes inside the download horizon count as available
+            // work; a part that is entirely past it must not look like the
+            // largest one and starve the parts the playhead can reach.
+            let remaining = part.end.min(limit).saturating_sub(part.next);
+            if remaining > best_remaining {
+                best_remaining = remaining;
+                best = Some(index);
+            }
+        }
+        let index = best?;
+        if let Some(start) = take_part_chunk(state, index, generation, chunk, disk, limit) {
+            return Some(start);
+        }
+        // The largest claimable part had no free chunk (all covered); retire it
+        // for this pass, but never past the horizon.
+        if let Some(part) = state.parts.get_mut(index) {
+            part.next = part.end.min(limit).max(part.next);
+        }
+    }
+}
+
+/// Give the speculative whole-file prefetch its full worker pool once the
+/// session is out of its opening phase (see [`BACKGROUND_RAMP`]).
+async fn background_ramp_loop(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
+    let started = Instant::now();
+    while started.elapsed() < BACKGROUND_RAMP {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(STARTUP_POLL).await;
+    }
+    if shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    let before = engine.background_workers.swap(0, Ordering::SeqCst);
+    let connections_before = engine.desired_connections.load(Ordering::SeqCst);
+    engine
+        .desired_connections
+        .store(engine.configured_connections, Ordering::SeqCst);
+    crate::debug_log(&format!(
+        "prefetch background ramp workers={}→unlimited connections={}→{} at_ms={}",
+        before,
+        connections_before,
+        engine.configured_connections,
+        engine.started.elapsed().as_millis()
+    ));
+}
+
+/// Priority-ordered chunk selection over the whole file.
+///
+/// 1. the chunk(s) the client reads now and the next [`HOT_AHEAD_SECONDS`] of
+///    playback (never rate limited: this is what plays),
+/// 2. a range that failed its retry route (back in the queue),
+/// 3. the seek warm points,
+/// 4. the worker's own part of the horizon, then the largest remaining part
+///    (work-stealing), or — for a short/unsplit file — the horizon in order.
+///
+/// 2–4 are speculative and share one token bucket refilled at
+/// [`speculative_rate`], so the whole-file pull can never own the machine.
+///
+/// **A serve wait suspends 2–4.** When `serve_waiting` (a response body is
+/// blocked on a missing hot chunk) only the hot window is claimable: every
+/// worker that finishes — including one preempted by
+/// [`Engine::enforce_serve_priority`] — takes the client's bytes, and the
+/// speculative queue resumes the moment the wait closes.
+#[allow(clippy::too_many_arguments)]
+fn pick_chunk(
+    state: &mut State,
+    worker_id: usize,
+    config: &PrefetchConfig,
+    held: bool,
+    serve_waiting: bool,
+    background_cap: usize,
+    bitrate: u64,
+    disk: &DiskCache,
+) -> Option<(u64, ChunkKind)> {
+    // A young session runs a small speculative pool: only the first
+    // `background_cap` workers may take Warm/Rest chunks. The hot window (what
+    // playback actually needs) is never limited.
+    let background_ok = background_cap == 0 || worker_id < background_cap;
+    let chunk = config.chunk_bytes.max(1);
+    let generation = state.generation;
+    let now = Instant::now();
+
+    // 0. The exact byte a response body is blocked on (a serve wait). This is
+    //    the client's own request and outranks every look-ahead chunk: claiming
+    //    the chunk that *contains* the offset would still deliver
+    //    `offset - chunk_start` bytes first — seconds of media on a 4 MiB
+    //    chunk behind a slow-to-start route. The entry is dropped as soon as
+    //    the bytes are here, in flight, dead, or already on disk.
+    while let Some(start) = state.urgent.pop_front() {
+        let end = state.total.map_or(start.saturating_add(chunk), |total| {
+            total.min(start.saturating_add(chunk))
+        });
+        if chunks_cover(&state.chunks, start)
+            || state.inflight.contains(&(generation, start))
+            || state.dead.contains(&(generation, start))
+            || disk.covers_range(start, end)
+        {
+            continue;
+        }
+        return Some((start, ChunkKind::Hot));
+    }
+
+    // 1. Hot window: current chunk plus the next [`HOT_AHEAD_SECONDS`] of
+    //    playback. The frontier is clamped to the known length: past EOF there
+    //    is nothing to fetch. An
+    //    unclamped frontier used to claim `start >= total` ranges forever
+    //    (start=16777216 end=15402399), and because nothing can ever mark such
+    //    a range as covered, every worker spun on it at 1-4k claims/s.
+    let frontier = hot_frontier(state, chunk, bitrate, now).min(state.total.unwrap_or(u64::MAX));
+    let mut start = chunk_start(state.cursor, chunk);
+    while start < frontier {
+        if !hot_taken(state, generation, start, chunk, disk) {
+            return Some((start, ChunkKind::Hot));
+        }
+        start = start.saturating_add(chunk);
+    }
+
+    // 2. A range whose retry route failed goes back ahead of the rest. It is a
+    //    range the client was waiting for, so it is not rate limited.
+    //
+    //    A serve wait suspends everything below: while the body is blocked on a
+    //    missing hot chunk, the freed workers must claim hot bytes, not
+    //    speculative ones. A requeued hot chunk is still reachable — the hot
+    //    scan above picks it, because `hot_taken` does not know about
+    //    `requeued`.
+    if serve_waiting {
+        return None;
+    }
+    if !background_ok {
+        return None;
+    }
+    if let Some(&start) = state.requeued.iter().next() {
+        state.requeued.remove(&start);
+        if !chunk_taken(state, generation, start, chunk, disk) {
+            return Some((start, ChunkKind::Requeue));
+        }
+    }
+
+    // Everything below is speculative. A player-held session and an exhausted
+    // token bucket both leave the workers idle, which is the point: those
+    // bytes are a convenience for a later seek, not playback.
+    if held {
+        return None;
+    }
+    let warm_pending = state
+        .warm_plan
+        .iter()
+        .any(|task| !task.done && !task.claimed);
+    let rate = speculative_rate(bitrate, warm_pending);
+    let burst = chunk.saturating_mul(SPECULATIVE_BURST_CHUNKS);
+
+    // 3. Seek warm points (one-shot: the plan is a few dozen MiB in total).
+    //    A point primed for a seek that is happening right now (`urgent`) does
+    //    not take from the speculative bucket: it is the client's own work, and
+    //    the bucket would hold it back for seconds on a small stream.
+    if state.warm_plan_started {
+        for index in 0..state.warm_plan.len() {
+            if state.warm_plan[index].done || state.warm_plan[index].claimed {
+                continue;
+            }
+            let start = state.warm_plan[index].start;
+            if chunk_taken(state, generation, start, chunk, disk) {
+                state.warm_plan[index].done = true;
+                state.warm_points_done = state.warm_points_done.saturating_add(1);
+                continue;
+            }
+            if state.dead.contains(&(generation, start)) {
+                state.warm_plan[index].done = true;
+                state.warm_points_done = state.warm_points_done.saturating_add(1);
+                continue;
+            }
+            let bytes = state.warm_plan[index]
+                .end
+                .saturating_sub(start)
+                .max(chunk);
+            if !state.warm_plan[index].urgent && !spec_take(state, bytes, rate, burst) {
+                return None;
+            }
+            state.warm_plan[index].claimed = true;
+            return Some((start, ChunkKind::Warm));
+        }
+    }
+
+    // 4. The whole-file queue, only inside the download horizon: the file may
+    //    be at most [`PLAYBACK_AHEAD_SECONDS`] of media ahead of the playhead.
+    //    Fetching further would download video the playhead cannot reach for
+    //    minutes — the entire file at sixteen connections — which is exactly
+    //    the work this limit removes.
+    //
+    //    Without a bitrate estimate (`0`: tests, and the first few hundred
+    //    milliseconds of a session) there is no horizon the caller could
+    //    express, so only the token bucket limits this queue.
+    let horizon = if bitrate == 0 {
+        u64::MAX
+    } else {
+        bitrate.saturating_mul(PLAYBACK_AHEAD_SECONDS)
+    };
+    let limit = state
+        .total
+        .map_or(state.cursor.saturating_add(horizon), |total| {
+            total.min(state.cursor.saturating_add(horizon))
+        });
+    if disk.end_at(state.cursor) >= limit && limit > state.cursor {
+        return None;
+    }
+    // One chunk is reserved from the bucket *before* the search (the bucket is
+    // the aggregate rate limit) and given back when there was nothing left to
+    // fetch.
+    if !state.parts_built {
+        let total = state.total?;
+        if total.saturating_sub(chunk_start(state.cursor, chunk)) >= DYNAMIC_SPLIT_THRESHOLD {
+            build_parts(state, config.connections, chunk);
+        } else {
+            state.parts_built = true;
+        }
+    }
+    if !spec_take(state, chunk, rate, burst) {
+        return None;
+    }
+    let found = pick_rest_chunk(state, worker_id, generation, chunk, disk, limit);
+    if found.is_none() {
+        state.spec_tokens = state.spec_tokens.saturating_add(chunk).min(burst);
+        return None;
+    }
+    found.map(|start| (start, ChunkKind::Rest))
+}
+
+/// The next whole-file chunk: the worker's own part, then the largest remaining
+/// part, then (short or unsplit files) read order wrapping to the head.
+fn pick_rest_chunk(
+    state: &mut State,
+    worker_id: usize,
+    generation: u64,
+    chunk: u64,
+    disk: &DiskCache,
+    limit: u64,
+) -> Option<u64> {
+    if !state.parts.is_empty() {
+        for index in 0..state.parts.len() {
+            if state.parts[index].owner != Some(worker_id) {
+                continue;
+            }
+            if let Some(start) = take_part_chunk(state, index, generation, chunk, disk, limit) {
+                return Some(start);
+            }
+        }
+        // Own part has nothing inside the horizon: steal from the largest
+        // remaining claimable part.
+        if let Some(start) = steal_chunk(state, generation, chunk, disk, limit) {
+            return Some(start);
+        }
+    }
+
+    // Short file (or no split yet): the rest in read order, wrapping to the
+    // head of the file once the cursor's tail is done. `limit` caps the
+    // forward scan so nothing beyond the horizon is fetched.
+    let total = state.total?;
+    // The cursor can sit at (or past) EOF once the file is fully read. Clamp
+    // the wrap to the length so the head scan never runs past it.
+    let from = chunk_start(state.cursor, chunk).min(total);
+    let mut start = from;
+    while start < total.min(limit) {
+        if !chunk_taken(state, generation, start, chunk, disk) {
+            return Some(start);
+        }
+        start = start.saturating_add(chunk);
+    }
+    let mut start = 0u64;
+    while start < from {
+        if !chunk_taken(state, generation, start, chunk, disk) {
+            return Some(start);
+        }
+        start = start.saturating_add(chunk);
+    }
+    None
+}
+
+/// Reserve the next piece of work for one worker, honouring the priority
+/// order. The slot is updated under the same lock that hands out the range, so
+/// a snapshot can never see a claimed range with no worker behind it.
 fn claim(engine: &Engine, shutdown: &AtomicBool, worker_id: usize) -> Claim {
     let mut state = match engine.state.lock() {
         Ok(state) => state,
@@ -1751,180 +5240,483 @@ fn claim(engine: &Engine, shutdown: &AtomicBool, worker_id: usize) -> Claim {
         mark_worker_idle(&mut state, worker_id);
         return Claim::Stop;
     }
-    // No probe gate: the first claims happen as soon as the proxy is bound, so
-    // the real first chunk is already in flight (or buffered) when ffmpeg's
-    // first request lands. Its response headers are what teach `total`.
-    let Some(start) = next_chunk_offset(
-        state.base,
-        state.cursor,
-        engine.config.chunk_bytes,
-        engine.config.read_ahead_bytes,
-        state.total,
-        &state.chunks,
-        &state.inflight,
-        &state.dead,
-        state.generation,
-    ) else {
-        // Window full (or the file ended): the worker keeps its last range but
-        // stops counting as active.
+    if worker_id >= engine.desired_connections() {
         mark_worker_idle(&mut state, worker_id);
         return Claim::Wait;
-    };
-    let Some(host) = pick_host(&mut state, &[]) else {
-        state.fatal = Some("没有可用的上游主机".to_string());
-        mark_worker_idle(&mut state, worker_id);
-        engine.publish(&mut state, Instant::now());
-        return Claim::Stop;
-    };
+    }
     let generation = state.generation;
-    let end = state
-        .total
-        .map_or(start.saturating_add(engine.config.chunk_bytes), |total| {
-            total.min(start.saturating_add(engine.config.chunk_bytes))
-        });
-    let label = state.hosts[host].label.clone();
+    let chunk = engine.config.chunk_bytes.max(1);
+    if !state.warm_plan_started {
+        if let Some(total) = state.total {
+            build_warm_plan(
+                &mut state,
+                chunk,
+                engine.config.point_bytes,
+                engine.config.warm_points,
+                total,
+            );
+        }
+    }
+
+    // A duplicate race for a slow range comes first: an idle worker takes it
+    // on a different host while the slow worker keeps trying.
+    let mut race_claim: Option<(u64, u64, Arc<AtomicBool>, String, usize)> = None;
+    while let Some(request) = state.races.pop_front() {
+        let start = request.start;
+        if state.done.contains(&start) {
+            state.race_tokens.remove(&start);
+            continue;
+        }
+        if !state.inflight.contains(&(request.generation, start)) {
+            // The slow worker already gave the range back; requeue normally.
+            state.race_tokens.remove(&start);
+            state.requeued.insert(start);
+            continue;
+        }
+        let exclude = state
+            .hosts
+            .iter()
+            .position(|host| host.label == request.slow_host)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let host = pick_host(&mut state, &exclude).or_else(|| pick_host(&mut state, &[]));
+        let Some(host) = host else {
+            state.races.push_front(request);
+            break;
+        };
+        let token = state
+            .race_tokens
+            .entry(start)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+        race_claim = Some((
+            start,
+            request.end,
+            token,
+            format!("{},{}", request.slow_host, state.hosts[host].label),
+            host,
+        ));
+        break;
+    }
+    let bitrate = engine.bitrate_for(&state);
+    let (start, end, kind, race, race_hosts, race_host) = if let Some((
+        start,
+        end,
+        token,
+        hosts,
+        host,
+    )) = race_claim
+    {
+        (start, end, ChunkKind::Race, Some(token), hosts, Some(host))
+    } else {
+        // `pick_chunk` already skips everything the session cache file holds
+        // (`chunk_taken` / `hot_taken`), so this is one pass, not a search loop:
+        // the disk lock is taken once, under the state lock, exactly like
+        // `publish`.
+        let disk = match engine.disk.lock() {
+            Ok(disk) => disk,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match pick_chunk(
+            &mut state,
+            worker_id,
+            &engine.config,
+            engine.background_held(),
+            engine.serve_waiting(),
+            engine.background_workers.load(Ordering::Relaxed) as usize,
+            bitrate,
+            &disk,
+        ) {
+            Some((start, kind)) => {
+                let mut end = state.total.map_or(start.saturating_add(chunk), |total| {
+                    total.min(start.saturating_add(chunk))
+                });
+                if kind == ChunkKind::Warm {
+                    // A warm point may be larger than one scheduling chunk; use
+                    // the range the plan fixed for it.
+                    if let Some(task) = state.warm_plan.iter().find(|task| task.start == start) {
+                        end = task.end;
+                    }
+                }
+                (start, end, kind, None, String::new(), None)
+            }
+            None => {
+                drop(disk);
+                mark_worker_idle(&mut state, worker_id);
+                return Claim::Wait;
+            }
+        }
+    };
+
+    // Defensive: a past-EOF start can only produce an empty body or a `416`,
+    // and since no chunk can ever cover it, the pool would claim it again on
+    // the next tick. Retire it and let the worker look for real work.
+    if let Some(total) = state.total {
+        if start >= total {
+            state.done.insert(start);
+            mark_worker_idle(&mut state, worker_id);
+            return Claim::Wait;
+        }
+    }
+
+    let host = match race_host {
+        Some(host) => host,
+        None => match pick_host(&mut state, &[]) {
+            Some(host) => host,
+            None => {
+                state.fatal = Some("没有可用的上游主机".to_string());
+                mark_worker_idle(&mut state, worker_id);
+                engine.publish(&mut state, Instant::now());
+                return Claim::Stop;
+            }
+        },
+    };
+    let label = state.hosts.get(host).map_or_else(String::new, |host| host.label.clone());
     state.inflight.insert((generation, start));
+    let token = engine
+        .worker_cancel
+        .get(worker_id)
+        .map(|token| token.load(Ordering::SeqCst))
+        .unwrap_or(0);
     if let Some(slot) = state.workers.get_mut(worker_id) {
         slot.host = label.clone();
         slot.start = start;
         slot.end = end;
         slot.busy = true;
+        slot.kind = Some(kind);
+        slot.samples.clear();
+        slot.range_started = Some(Instant::now());
     }
     drop(state);
     crate::debug_log(&format!(
-        "prefetch chunk claim after_ms={} gen={generation} worker={worker_id} start={start} end={end} host={label}",
+        "prefetch chunk claim after_ms={} gen={generation} worker={worker_id} start={start} end={end} host={label} kind={kind:?} bitrate={bitrate}",
         engine.started.elapsed().as_millis()
     ));
-    Claim::Fetch {
+    Claim::Fetch(FetchClaim {
         generation,
         start,
         end,
         host,
-    }
+        kind,
+        token,
+        race,
+        race_hosts,
+    })
 }
 
-/// Mark a worker as waiting for window space, keeping its last range visible.
+/// Mark a worker as waiting for work, keeping its last range visible.
 fn mark_worker_idle(state: &mut State, worker_id: usize) {
     if let Some(slot) = state.workers.get_mut(worker_id) {
         slot.busy = false;
+        slot.range_started = None;
     }
 }
 
+/// Everything one fetch attempt needs to know about cancellation.
+struct FetchContext {
+    worker: usize,
+    token: u64,
+    race: Option<Arc<AtomicBool>>,
+    /// The session's shutdown flag. A claim is no longer a task the server can
+    /// abort (the pool owns it), so the transfer polls this too: closing a
+    /// player lets go of every connection within [`WAIT_POLL`] instead of
+    /// leaving it to the request timeout, and never competes with the next
+    /// video for the link.
+    closed: Arc<AtomicBool>,
+}
+
+impl FetchContext {
+    fn cancelled(&self, engine: &Engine) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return true;
+        }
+        if self
+            .race
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::SeqCst))
+        {
+            return true;
+        }
+        engine
+            .worker_cancel
+            .get(self.worker)
+            .is_some_and(|token| token.load(Ordering::SeqCst) != self.token)
+    }
+}
+
+/// Await `future`, checking for cancellation every [`WAIT_POLL`]. Used for
+/// every connect and body wait, so a hung route lets go within milliseconds of
+/// being marked slow instead of at the 30 s request timeout. The future is
+/// pinned and re-polled across the short waits rather than recreated.
+async fn cancellable<F>(engine: &Engine, context: &FetchContext, future: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    let mut future = std::pin::pin!(future);
+    loop {
+        if context.cancelled(engine) {
+            return None;
+        }
+        match tokio::time::timeout(WAIT_POLL, &mut future).await {
+            Ok(output) => return Some(output),
+            Err(_) => continue,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pool-owned connection slots
+//
+// A session no longer starts a thread per connection (and never starts one per
+// request): it **binds** its `connections` worker ids into the global slot
+// registry below, and the fixed [`crate::netpool`] threads that already exist
+// pick the work up. Slot *i* always means worker id *i*, so the per-worker
+// health, route, slow-route and duplicate-race bookkeeping in [`State::workers`]
+// is exactly what it was.
+//
+// The transfer itself stays on the shared async runtime: a step is the
+// admission decision plus one dispatch, which keeps sixteen connections in
+// flight from twelve threads - the pool must not become the ceiling on
+// throughput. What changes is ownership: no thread and no long-lived fetch task
+// is created for a video session any more.
+// ---------------------------------------------------------------------------
+
+/// One bound session: the engine, and the worker id this slot drives.
+struct EngineBinding {
+    engine: Arc<Engine>,
+    shutdown: Arc<AtomicBool>,
+    slot: usize,
+    /// One dispatch at a time per slot (the worker-id bookkeeping is per slot).
+    busy: AtomicBool,
+}
+
+/// Releases a bound slot when the transfer task ends — including a panicking or
+/// cancelled task — so a connection can never be lost to a slot that still
+/// looks busy.
+struct SlotGuard(Arc<EngineBinding>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Sessions the registry can host at once, each with [`MAX_CONNECTIONS`] slots.
+/// Two player windows are the supported case, and each window may hold a video
+/// proxy, an audio proxy and a seek shadow's audio proxy at the same time; the
+/// extra blocks are headroom so a briefly overlapping close/open never falls
+/// back to per-session tasks.
+const MAX_BOUND_ENGINES: usize = 8;
+
+static SLOTS: Mutex<Vec<Option<Arc<EngineBinding>>>> = Mutex::new(Vec::new());
+
+impl Engine {
+    /// One scheduling step of one worker id: claim a range and dispatch it.
+    ///
+    /// Returns `true` when a transfer was dispatched. `false` means the slot has
+    /// nothing to do right now (queue empty, hot window full, or this id is
+    /// above the live connection count) - the caller should sleep, not spin.
+    ///
+    /// The slot stays reserved (`binding.busy`) until the transfer *ends*, not
+    /// until this function returns. Releasing it earlier let `pump_slot` hand a
+    /// second claim to the same worker id while the first was still streaming:
+    /// the per-worker slot then described only the newest claim, so a slow hot
+    /// range became invisible to the health watchdog and to the serve-path
+    /// priority, and the session could exceed its configured connection count.
+    fn worker_step(self: &Arc<Self>, binding: &Arc<EngineBinding>) -> bool {
+        let slot = binding.slot;
+        let shutdown = &binding.shutdown;
+        if shutdown.load(Ordering::SeqCst) {
+            binding.busy.store(false, Ordering::SeqCst);
+            return false;
+        }
+        let claim = match claim(self, shutdown, slot) {
+            Claim::Fetch(claim) => claim,
+            Claim::Wait | Claim::Stop => {
+                binding.busy.store(false, Ordering::SeqCst);
+                return false;
+            }
+        };
+        let Some(runtime) = crate::bilibili::shared_runtime() else {
+            self.release_range(
+                claim.generation,
+                claim.start,
+                claim.kind,
+                claim.race.as_ref(),
+            );
+            binding.busy.store(false, Ordering::SeqCst);
+            return false;
+        };
+        let engine = self.clone();
+        let shutdown = shutdown.clone();
+        let binding = binding.clone();
+        runtime.spawn(async move {
+            // The slot is released when this task ends, however it ends.
+            let _slot = SlotGuard(binding);
+            run_claim(slot, &engine, &shutdown, claim).await;
+            // The worker id must never be left looking busy: the health
+            // watchdog reads `busy` + `range_started` to decide on a slow
+            // route, and a stale range would race a transfer that is over.
+            if let Ok(mut state) = engine.state.lock() {
+                mark_worker_idle(&mut state, slot);
+            }
+        });
+        true
+    }
+}
+
+/// Bind this session's worker ids into the global slot registry.
+///
+/// `false` when the pool is not running (a unit test, or `main` wiring failed)
+/// or every block is taken; the caller then keeps the old task-per-worker
+/// schedule, so a session can never end up bound to slots nothing pumps.
+fn bind_slots(engine: &Arc<Engine>, shutdown: &Arc<AtomicBool>) -> bool {
+    if !crate::netpool::initialized() {
+        crate::debug_log("prefetch slots unbound reason=no-netpool");
+        return false;
+    }
+    let mut slots = match SLOTS.lock() {
+        Ok(slots) => slots,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut chosen = None;
+    for block in 0..MAX_BOUND_ENGINES {
+        let base = block * MAX_CONNECTIONS;
+        if base + MAX_CONNECTIONS > slots.len() {
+            slots.resize(base + MAX_CONNECTIONS, None);
+        }
+        if slots[base..base + MAX_CONNECTIONS]
+            .iter()
+            .all(Option::is_none)
+        {
+            chosen = Some(base);
+            break;
+        }
+    }
+    let Some(base) = chosen else {
+        crate::debug_log(&format!(
+            "prefetch slots unbound reason=registry-full blocks={MAX_BOUND_ENGINES}"
+        ));
+        return false;
+    };
+    for slot in 0..MAX_CONNECTIONS {
+        slots[base + slot] = Some(Arc::new(EngineBinding {
+            engine: engine.clone(),
+            shutdown: shutdown.clone(),
+            slot,
+            busy: AtomicBool::new(false),
+        }));
+    }
+    let total = slots.iter().filter(|entry| entry.is_some()).count();
+    let threads = crate::netpool::threads();
+    let connections = engine.desired_connections();
+    drop(slots);
+    crate::netpool::wake();
+    crate::debug_log(&format!(
+        "prefetch slots bound at={base} slots={MAX_CONNECTIONS} connections={connections} pool_threads={threads} bound_total={total}"
+    ));
+    true
+}
+
+/// Drop every slot this engine owns (session close / new video / quality
+/// switch). In-flight transfers notice the shutdown flag and exit on their own;
+/// nothing is aborted mid-write.
+fn unbind_slots(engine: &Arc<Engine>) {
+    let mut slots = match SLOTS.lock() {
+        Ok(slots) => slots,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut dropped = 0usize;
+    for entry in slots.iter_mut() {
+        if entry
+            .as_ref()
+            .is_some_and(|binding| Arc::ptr_eq(&binding.engine, engine))
+        {
+            *entry = None;
+            dropped += 1;
+        }
+    }
+    let left = slots.iter().filter(|entry| entry.is_some()).count();
+    drop(slots);
+    if dropped > 0 {
+        crate::netpool::wake();
+        crate::debug_log(&format!(
+            "prefetch slots unbound dropped={dropped} bound_left={left}"
+        ));
+    }
+}
+
+/// Whether any session owns slots right now (the pool uses this to choose
+/// between a 5 ms prefetch poll and parking until a job arrives).
+pub(crate) fn has_bindings() -> bool {
+    match SLOTS.lock() {
+        Ok(slots) => slots.iter().any(Option::is_some),
+        Err(poisoned) => poisoned.into_inner().iter().any(Option::is_some),
+    }
+}
+
+/// Give one bound slot a step. Called by an idle [`crate::netpool`] thread.
+///
+/// `cursor` is the calling thread's own round-robin position, so idle slots are
+/// skipped without re-claiming the same one on every tick.
+pub(crate) fn pump_slot(cursor: &mut usize) -> bool {
+    let slots = match SLOTS.lock() {
+        Ok(slots) => slots,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let total = slots.len();
+    if total == 0 {
+        return false;
+    }
+    let start = *cursor % total;
+    for step in 0..total {
+        let index = (start + step) % total;
+        let Some(binding) = slots[index].as_ref() else {
+            continue;
+        };
+        if binding.slot >= binding.engine.desired_connections() {
+            continue;
+        }
+        if binding
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            continue;
+        }
+        let binding = binding.clone();
+        // Never hold the registry while claiming: `claim` takes the engine
+        // lock, and a session close wants the registry.
+        drop(slots);
+        *cursor = index + 1;
+        let dispatched = binding.engine.worker_step(&binding);
+        return dispatched;
+    }
+    *cursor = start + 1;
+    false
+}
+
+/// Fallback schedule (only when no pool exists, e.g. a unit test): one async
+/// task per worker id, exactly the pre-pool behaviour.
 async fn worker(worker_id: usize, engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+        if worker_id >= engine.desired_connections() {
+            // Outside the live pool: wait without touching the shared state.
+            tokio::time::sleep(IDLE_CONNECTION_POLL).await;
+            continue;
+        }
         match claim(&engine, &shutdown, worker_id) {
             Claim::Stop => break,
             Claim::Wait => {
-                tokio::time::sleep(WAIT_POLL).await;
+                // Nothing is due for this worker: the hot window is filled,
+                // the speculative bucket is empty or no seek point is pending.
+                tokio::time::sleep(IDLE_WAIT).await;
             }
-            Claim::Fetch {
-                generation,
-                start,
-                end,
-                host,
-            } => {
-                let started = Instant::now();
-                let Some(mut current) = engine.host_info(host) else {
-                    continue;
-                };
-                let mut attempted: Vec<usize> = Vec::new();
-                let mut cursor = start;
-                let mut received_total = 0u64;
-                loop {
-                    let url = forward_url(&engine.target, &current.1);
-                    match fetch_stream(
-                        &engine,
-                        &url,
-                        generation,
-                        cursor,
-                        end,
-                        current.0,
-                        worker_id,
-                        &shutdown,
-                    )
-                    .await
-                    {
-                        Ok(received) => {
-                            cursor += received;
-                            received_total += received;
-                            engine.complete_range(
-                                generation,
-                                start,
-                                cursor,
-                                end,
-                                &shutdown,
-                            );
-                            crate::debug_log(&format!(
-                                "prefetch chunk done after_ms={} start={start} bytes={received_total} host={} ms={}",
-                                engine.started.elapsed().as_millis(),
-                                current.2,
-                                started.elapsed().as_millis()
-                            ));
-                            break;
-                        }
-                        Err((received, eof, error)) => {
-                            cursor += received;
-                            received_total += received;
-                            if eof {
-                                // 416 or an empty body: the file ends here.
-                                if received == 0 && cursor > 0 && !engine.total_known() {
-                                    // A 416 above 0 only proves the file ends
-                                    // at or before this offset; the real total
-                                    // comes from the first 206 response.
-                                    engine.mark_range_beyond_end(
-                                        generation,
-                                        start,
-                                        &shutdown,
-                                    );
-                                } else {
-                                    engine.complete_range(
-                                        generation,
-                                        start,
-                                        cursor,
-                                        end,
-                                        &shutdown,
-                                    );
-                                }
-                                break;
-                            }
-                            if shutdown.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            attempted.push(current.0);
-                            engine.mark_host_failure(current.0, &error);
-                            if shutdown.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            // The first host can reject the very first chunk
-                            // (a `403`, a dead mirror). Fall through to the next
-                            // healthy host for this same range, still inside
-                            // the request that is waiting for it.
-                            match engine.next_host(&attempted) {
-                                Some(next) => {
-                                    crate::debug_log(&format!(
-                                        "prefetch range retry start={start} at={cursor} host={} err={error}",
-                                        next.2
-                                    ));
-                                    current = next;
-                                }
-                                None => {
-                                    engine.fail_range(
-                                        generation,
-                                        start,
-                                        cursor,
-                                        &attempted,
-                                        &error,
-                                        &shutdown,
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+            Claim::Fetch(claim) => {
+                run_claim(worker_id, &engine, &shutdown, claim).await;
             }
         }
     }
@@ -1933,225 +5725,419 @@ async fn worker(worker_id: usize, engine: Arc<Engine>, shutdown: Arc<AtomicBool>
     }
 }
 
-// ---------------------------------------------------------------------------
-// Seek-point warming
-// ---------------------------------------------------------------------------
-
-/// Background task: once playback has pulled its first bytes, fill the point
-/// cache with one bounded chunk per evenly spaced seek position.
-///
-/// It is deliberately separate from the window workers: it fetches at most one
-/// point at a time, waits for the read-ahead window to be healthy first, and
-/// never claims, marks dead or retires a window chunk. Dropping the handle
-/// aborts it (it lives in the server's `JoinSet`).
-async fn warm_loop(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
-    let count = engine.config.warm_points;
-    if count == 0 {
-        return;
-    }
-    // Wait for the first client bytes AND the total length. Neither is on the
-    // critical path of the first request: the warm task only observes them.
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-        let (served, total, fatal) = {
-            let state = match engine.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            (state.served, state.total, state.fatal.is_some())
-        };
-        if fatal {
-            return;
-        }
-        if served > 0 && total.is_some() {
-            break;
-        }
-        if engine.started.elapsed() > WARM_START_TIMEOUT {
-            return;
-        }
-        tokio::time::sleep(WARM_POLL).await;
-    }
-    let Some(total) = engine.total() else {
+/// Fetch one claim to completion, rotating hosts on failure, retrying once on
+/// a new route after the health watchdog marks the worker slow, and handing a
+/// range that still fails back to the queue.
+async fn run_claim(
+    worker_id: usize,
+    engine: &Arc<Engine>,
+    shutdown: &Arc<AtomicBool>,
+    claim: FetchClaim,
+) {
+    let started = Instant::now();
+    let Some(mut current) = engine.host_info(claim.host) else {
+        engine.release_range(claim.generation, claim.start, claim.kind, claim.race.as_ref());
         return;
     };
-    // Short quiet period after the first served byte, so the reader's initial
-    // burst (and `buffer_s`) settles before any extra fetch starts.
-    tokio::time::sleep(WARM_DELAY).await;
-    if shutdown.load(Ordering::SeqCst) {
-        return;
-    }
-    let offsets = warm_point_offsets(total, count);
-    if offsets.is_empty() {
-        return;
-    }
-    let chunk = point_chunk_bytes(total, count, engine.config.point_bytes);
-    if chunk == 0 {
-        return;
-    }
-    engine.start_warm(offsets.len(), chunk, total);
-    for offset in offsets {
-        if shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-        // Never refetch bytes the window (or an overlapping point) already
-        // holds: those seeks are instant already.
-        if engine.window_covers(offset) {
-            engine.note_warm_covered(offset, "window");
-            continue;
-        }
-        if engine.point_lookup(offset).is_some() {
-            engine.note_warm_covered(offset, "point");
-            continue;
-        }
-        if !await_playback_room(&engine, chunk, &shutdown).await {
-            return;
-        }
-        let end = total.min(offset.saturating_add(chunk));
-        match fetch_warm_point(&engine, offset, end, &shutdown).await {
-            Some(data) => engine.store_point(offset, data, count, total),
-            None => {
-                if shutdown.load(Ordering::SeqCst) {
+    let context = FetchContext {
+        worker: worker_id,
+        token: claim.token,
+        race: claim.race.clone(),
+        closed: shutdown.clone(),
+    };
+    let mut attempted: Vec<usize> = Vec::new();
+    let mut attempts = 0u32;
+    let mut cursor = claim.start;
+    let mut received_total = 0u64;
+    let mut retried_slow = false;
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        let url = forward_url(&engine.target, &current.1);
+        let outcome = if claim.kind == ChunkKind::Warm {
+            fetch_warm_stream(
+                engine,
+                &url,
+                claim.generation,
+                cursor,
+                claim.end,
+                current.0,
+                worker_id,
+                shutdown,
+                &context,
+                &mut collected,
+            )
+            .await
+        } else {
+            fetch_stream(
+                engine,
+                &url,
+                claim.generation,
+                cursor,
+                claim.end,
+                current.0,
+                worker_id,
+                claim.kind,
+                shutdown,
+                &context,
+            )
+            .await
+        };
+        match outcome {
+            Ok(received) => {
+                cursor += received;
+                received_total += received;
+                let short = engine.complete_range(
+                    claim.generation,
+                    claim.start,
+                    cursor,
+                    claim.end,
+                    shutdown,
+                );
+                if short {
+                    // The body stopped before the promised end while the file
+                    // length is known: a truncated range. It is back in the
+                    // queue (or retired); it must not be marked fetched, and
+                    // it must not be reported as a finished chunk.
+                    engine.release_range(
+                        claim.generation,
+                        claim.start,
+                        claim.kind,
+                        claim.race.as_ref(),
+                    );
+                    crate::debug_log(&format!(
+                        "prefetch chunk short start={} next={cursor} end={} kind={:?} host={}",
+                        claim.start, claim.end, claim.kind, current.2
+                    ));
                     return;
                 }
-                engine.note_warm_failed(offset);
+                if claim.kind == ChunkKind::Warm {
+                    let point = engine.warm_point_at(claim.start).unwrap_or(claim.start);
+                    engine.store_point(claim.start, collected, point);
+                }
+                let won = engine.finish_chunk(
+                    claim.generation,
+                    claim.start,
+                    claim.kind,
+                    worker_id,
+                    claim.race.as_ref(),
+                );
+                if won {
+                    crate::debug_log(&format!(
+                        "worker race range={}-{} hosts={} winner={worker_id}",
+                        claim.start, claim.end, claim.race_hosts
+                    ));
+                }
+                crate::debug_log(&format!(
+                    "prefetch chunk done after_ms={} start={} bytes={received_total} kind={:?} host={} ms={}",
+                    engine.started.elapsed().as_millis(),
+                    claim.start,
+                    claim.kind,
+                    current.2,
+                    started.elapsed().as_millis()
+                ));
+                return;
+            }
+            Err(fail) => {
+                cursor += fail.received;
+                received_total += fail.received;
+                if fail.cancelled {
+                    // A race loser does nothing: the winner owns the chunk.
+                    if context
+                        .race
+                        .as_ref()
+                        .is_some_and(|token| token.load(Ordering::SeqCst))
+                        && claim.kind == ChunkKind::Race
+                    {
+                        engine.finish_chunk(
+                            claim.generation,
+                            claim.start,
+                            claim.kind,
+                            worker_id,
+                            claim.race.as_ref(),
+                        );
+                        return;
+                    }
+                    // Slow (zero bytes for 5 s): drop the request, re-pick a
+                    // host round-robin, retry the same range exactly once.
+                    if engine.worker_is_slow(worker_id) && !retried_slow {
+                        retried_slow = true;
+                        attempted.push(current.0);
+                        // A slow route is transient: exclude it for this one
+                        // retry, but keep it in the mirror list (a single-host
+                        // config must keep working).
+                        let next = engine.next_host(&attempted);
+                        if let Some(next) = next {
+                            crate::debug_log(&format!(
+                                "worker slow id={worker_id} bps={} action=retry host={}",
+                                engine.worker_bps(worker_id),
+                                next.2
+                            ));
+                            current = next;
+                            continue;
+                        }
+                    }
+                    if shutdown.load(Ordering::SeqCst) {
+                        engine.release_range(
+                            claim.generation,
+                            claim.start,
+                            claim.kind,
+                            claim.race.as_ref(),
+                        );
+                        return;
+                    }
+                    engine.release_range(claim.generation, claim.start, claim.kind, claim.race.as_ref());
+                    crate::debug_log(&format!(
+                        "worker requeue id={worker_id} range={}-{} kind={:?} received={received_total}",
+                        claim.start, claim.end, claim.kind
+                    ));
+                    return;
+                }
+                if fail.eof {
+                    // 416 or an empty body: the file ends here.
+                    if fail.received == 0 && cursor > 0 && !engine.total_known() {
+                        engine.mark_range_beyond_end(claim.generation, claim.start, shutdown);
+                    } else {
+                        let short = engine.complete_range(
+                            claim.generation,
+                            claim.start,
+                            cursor,
+                            claim.end,
+                            shutdown,
+                        );
+                        if short {
+                            // Same rule as a short `206`: the advertised length
+                            // stands and the range is requeued, never marked
+                            // fetched.
+                            engine.release_range(
+                                claim.generation,
+                                claim.start,
+                                claim.kind,
+                                claim.race.as_ref(),
+                            );
+                            return;
+                        }
+                        engine.finish_chunk(
+                            claim.generation,
+                            claim.start,
+                            claim.kind,
+                            worker_id,
+                            claim.race.as_ref(),
+                        );
+                    }
+                    return;
+                }
+                if shutdown.load(Ordering::SeqCst) {
+                    engine.release_range(claim.generation, claim.start, claim.kind, claim.race.as_ref());
+                    return;
+                }
+                attempted.push(current.0);
+                engine.mark_host_failure(current.0, &fail.error);
+                attempts += 1;
+                // The first host can reject the very first chunk (a `403`, a
+                // dead mirror). Fall through to the next healthy host for this
+                // same range, still inside the request that waits for it.
+                match engine.next_host(&attempted) {
+                    Some(next) if attempts < RANGE_ATTEMPTS => {
+                        crate::debug_log(&format!(
+                            "prefetch range retry start={} at={cursor} host={} attempt={attempts} err={}",
+                            claim.start, next.2, fail.error
+                        ));
+                        current = next;
+                    }
+                    other => {
+                        if attempts < RANGE_ATTEMPTS {
+                            // No untried route left. A body that died mid-range
+                            // is transient far more often than it is a dead
+                            // mirror, so resume the remainder on the same host
+                            // after a short pause instead of ending the stream.
+                            attempted.clear();
+                            crate::debug_log(&format!(
+                                "prefetch range retry start={} at={cursor} host={} attempt={attempts} same_host=true err={}",
+                                claim.start, other.map_or_else(|| current.2.clone(), |next| next.2),
+                                fail.error
+                            ));
+                            tokio::time::sleep(RETRY_BACKOFF * attempts).await;
+                            if shutdown.load(Ordering::SeqCst) {
+                                engine.release_range(
+                                    claim.generation,
+                                    claim.start,
+                                    claim.kind,
+                                    claim.race.as_ref(),
+                                );
+                                return;
+                            }
+                            continue;
+                        }
+                        engine.fail_range(
+                            claim.generation,
+                            claim.start,
+                            cursor,
+                            &attempted,
+                            &fail.error,
+                            shutdown,
+                        );
+                        // The range is dead, not done: never mark it fetched.
+                        engine.release_range(
+                            claim.generation,
+                            claim.start,
+                            claim.kind,
+                            claim.race.as_ref(),
+                        );
+                        return;
+                    }
+                }
             }
         }
-        tokio::time::sleep(WARM_POINT_PAUSE).await;
     }
-    engine.finish_warm();
 }
 
-/// Wait until warming one point cannot starve playback: the window holds at
-/// least one point-chunk of unread bytes, the file ends at the cursor, or the
-/// reader has not asked for anything for [`WARM_STARVED_MS`] (paused/closed).
-/// Returns `false` only when the proxy shuts down.
-async fn await_playback_room(engine: &Engine, chunk: u64, shutdown: &AtomicBool) -> bool {
-    let started = Instant::now();
-    let mut last_served = u64::MAX;
-    let mut idle_since = Instant::now();
+/// Per-worker health watchdog: measures each busy worker over a five-second
+/// window, marks zero-throughput (5 s) and below-20 %-of-median (15 s) workers
+/// slow, cancels their request, and queues a duplicate race when another
+/// connection is idle.
+async fn health_loop(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            return false;
+            return;
         }
-        let (read_ahead, served, at_eof) = {
+        tokio::time::sleep(HEALTH_POLL).await;
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = Instant::now();
+        let mut slow: Vec<(usize, u64, String)> = Vec::new();
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let live = engine.desired_connections();
+            let mut rates: Vec<(usize, u64)> = Vec::new();
+            for (id, slot) in state.workers.iter_mut().take(live).enumerate() {
+                if !slot.busy {
+                    continue;
+                }
+                slot.bps = window_rate(&mut slot.samples, now, HEALTH_WINDOW);
+                rates.push((id, slot.bps));
+            }
+            let mut sorted: Vec<u64> = rates.iter().map(|(_, bps)| *bps).filter(|bps| *bps > 0).collect();
+            sorted.sort_unstable();
+            let median = if sorted.is_empty() {
+                0
+            } else {
+                sorted[sorted.len() / 2]
+            };
+            for (id, bps) in rates {
+                let Some(slot) = state.workers.get(id) else {
+                    continue;
+                };
+                if slot.slow {
+                    // Already cancelled once; the retry is in flight.
+                    continue;
+                }
+                let Some(started) = slot.range_started else {
+                    continue;
+                };
+                let age = now.duration_since(started);
+                let zero = bps == 0 && age >= HEALTH_SLOW_AFTER;
+                let low = median > 0 && bps.saturating_mul(5) < median && age >= HEALTH_LOW_AFTER;
+                if zero || low {
+                    let host = slot.host.clone();
+                    slow.push((id, bps, host));
+                }
+            }
+            for (id, bps, host) in &slow {
+                if let Some(slot) = state.workers.get_mut(*id) {
+                    slot.slow = true;
+                }
+                if let Some(index) = state.hosts.iter().position(|known| known.label == *host) {
+                    degrade_host(&mut state, index);
+                }
+                if let Some(token) = engine.worker_cancel.get(*id) {
+                    token.fetch_add(1, Ordering::SeqCst);
+                }
+                crate::debug_log(&format!(
+                    "worker slow id={id} bps={bps} action=cancel host={host}"
+                ));
+                // One duplicate per slow range, and only when a connection is
+                // idle (or its part is done). Take whichever finishes first.
+                let target = state.workers.get(*id).map(|slot| (slot.start, slot.end));
+                if let Some((start, end)) = target {
+                    // The next worker that finishes (its part is done) takes
+                    // the duplicate, so this is also queued when every
+                    // connection is currently busy.
+                    if start < end && !state.race_tokens.contains_key(&start) {
+                        let generation = state.generation;
+                        state.races.push_back(RaceRequest {
+                            generation,
+                            start,
+                            end,
+                            slow_host: host.clone(),
+                        });
+                        state
+                            .race_tokens
+                            .insert(start, Arc::new(AtomicBool::new(false)));
+                        crate::debug_log(&format!(
+                            "worker race queued range={start}-{end} slow={id} hosts={host}"
+                        ));
+                    }
+                }
+            }
+        }
+        let _ = engine.snapshot();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup gate (playback-first scheduling)
+// ---------------------------------------------------------------------------
+
+/// Widen the read-ahead window from [`STARTUP_READ_AHEAD_BYTES`] (and start the
+/// held-back connections) once the first frames are actually flowing.
+///
+/// "Frames flowing" is observed as the first bytes the client pulled: the
+/// player's decoder asked for media, which happens before it can present a
+/// frame. A proxy whose client never reads stays on the small window for at
+/// most [`STARTUP_WINDOW_MAX`], so a dead reader cannot pin the gate forever.
+/// Only spawned when the gate is on.
+async fn startup_gate_loop(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
+    let started = Instant::now();
+    while started.elapsed() < STARTUP_WINDOW {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(STARTUP_POLL).await;
+    }
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let served = {
             let state = match engine.state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            (
-                state.read_ahead,
-                state.served,
-                state.total == Some(state.cursor),
-            )
+            state.served
         };
-        if read_ahead >= chunk || at_eof {
-            return true;
-        }
-        if served != last_served {
-            last_served = served;
-            idle_since = Instant::now();
-        } else if idle_since.elapsed() >= WARM_STARVED_MS {
-            return true;
-        }
-        // Never wait forever behind a reader that stays slow: after 30 s the
-        // point is abandoned rather than fetched into a window under pressure.
-        if started.elapsed() > Duration::from_secs(30) {
-            return true;
-        }
-        tokio::time::sleep(WARM_POLL).await;
-    }
-}
-
-/// Fetch one seek point, rotating through healthy hosts on failure. Returns
-/// `None` when every host refused or the proxy shut down. A failure here never
-/// marks a host dead for playback: the point is optional.
-async fn fetch_warm_point(
-    engine: &Engine,
-    start: u64,
-    end: u64,
-    shutdown: &AtomicBool,
-) -> Option<Vec<u8>> {
-    let started = Instant::now();
-    let mut attempted: Vec<usize> = Vec::new();
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return None;
-        }
-        let (host, origin, label) = engine.next_host(&attempted)?;
-        let url = forward_url(&engine.target, &origin);
-        match warm_point_request(engine, &url, start, end, host, shutdown).await {
-            Ok(data) => {
-                crate::debug_log(&format!(
-                    "seek warm point offset={start} bytes={} host={label} ms={}",
-                    data.len(),
-                    started.elapsed().as_millis()
-                ));
-                return Some(data);
-            }
-            Err(error) => {
-                crate::debug_log(&format!(
-                    "seek warm point failed offset={start} host={label} err={error}"
-                ));
-                attempted.push(host);
-            }
-        }
-    }
-}
-
-/// One ranged GET whose whole (bounded) body is kept in memory. It never
-/// touches the window: no `push_bytes`, no `inflight`/`dead` bookkeeping.
-async fn warm_point_request(
-    engine: &Engine,
-    url: &str,
-    start: u64,
-    end: u64,
-    host: usize,
-    shutdown: &AtomicBool,
-) -> std::result::Result<Vec<u8>, String> {
-    let expected = end.saturating_sub(start);
-    if expected == 0 {
-        return Err("空区间".to_string());
-    }
-    let mut response = tokio::time::timeout(
-        CHUNK_TIMEOUT,
-        engine
-            .client
-            .get(url)
-            .header(RANGE, format!("bytes={start}-{}", end - 1))
-            .send(),
-    )
-    .await
-    .map_err(|_| "请求超时".to_string())?
-    .map_err(|error| error.to_string())?;
-    let status = response.status();
-    if status != StatusCode::PARTIAL_CONTENT {
-        return Err(format!("HTTP {}", status.as_u16()));
-    }
-    let capacity = expected.min(DEFAULT_POINT_BYTES) as usize;
-    let mut data: Vec<u8> = Vec::with_capacity(capacity);
-    while (data.len() as u64) < expected {
-        if shutdown.load(Ordering::SeqCst) {
-            return Err("代理已关闭".to_string());
-        }
-        let chunk = match tokio::time::timeout(CHUNK_TIMEOUT, response.chunk()).await {
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => return Err(error.to_string()),
-            Err(_) => return Err("读取超时".to_string()),
-        };
-        let take = chunk.len().min((expected - data.len() as u64) as usize);
-        if take == 0 {
+        if served > 0 || started.elapsed() >= STARTUP_WINDOW_MAX {
             break;
         }
-        data.extend_from_slice(&chunk[..take]);
-        engine.note_warm_bytes(host, take as u64, shutdown);
+        tokio::time::sleep(STARTUP_POLL).await;
     }
-    if data.is_empty() {
-        return Err("空响应".to_string());
-    }
-    Ok(data)
+    let before = engine.read_ahead_window();
+    engine.read_ahead_cap.store(u64::MAX, Ordering::Relaxed);
+    // The connection count stays at its startup value here: widening the window
+    // *and* letting sixteen streams loose at the same moment is what cost 2–5
+    // cores for the first seconds (measured `fetched` 12→50 MB in 4 s). The
+    // speculative ramp raises it after [`BACKGROUND_RAMP`]; four streams already
+    // outrun any stream bitrate.
+    crate::debug_log(&format!(
+        "startup gate readahead={}→{} connections={} (ramp pending) at_ms={}",
+        before >> 20,
+        engine.read_ahead_window() >> 20,
+        engine.desired_connections.load(Ordering::SeqCst),
+        engine.started.elapsed().as_millis()
+    ));
 }
 
 impl Engine {
@@ -2166,11 +6152,31 @@ impl Engine {
     }
 }
 
+/// Why one ranged GET ended without its whole range.
+struct FetchFail {
+    received: u64,
+    eof: bool,
+    /// The health watchdog cancelled this request (slow worker), or a race
+    /// winner owns the chunk.
+    cancelled: bool,
+    error: String,
+}
+
+impl FetchFail {
+    fn cancelled(received: u64, reason: &str) -> Self {
+        Self {
+            received,
+            eof: false,
+            cancelled: true,
+            error: reason.to_string(),
+        }
+    }
+}
+
 /// Stream one range request straight into the shared buffer. Every network
 /// read is stored at its absolute offset, so a reader can start before the
-/// range completes. Returns the bytes stored, or the bytes stored plus whether
-/// the upstream reported EOF (416) and the error text.
-#[allow(clippy::type_complexity)]
+/// range completes. Returns the bytes stored, or the bytes received plus why
+/// the range could not finish (EOF, a route failure, or cancellation).
 async fn fetch_stream(
     engine: &Engine,
     url: &str,
@@ -2179,32 +6185,64 @@ async fn fetch_stream(
     end: u64,
     host: usize,
     worker: usize,
+    kind: ChunkKind,
     shutdown: &AtomicBool,
-) -> std::result::Result<u64, (u64, bool, String)> {
+    context: &FetchContext,
+) -> std::result::Result<u64, FetchFail> {
     let expected = end.saturating_sub(start);
     if expected == 0 {
         return Ok(0);
     }
-    let response = tokio::time::timeout(
+    if context.cancelled(engine) {
+        return Err(FetchFail::cancelled(0, "请求已取消"));
+    }
+    let send = tokio::time::timeout(
         CHUNK_TIMEOUT,
         engine
             .client
             .get(url)
             .header(RANGE, format!("bytes={start}-{}", end - 1))
             .send(),
-    )
-    .await
-    .map_err(|_| (0u64, false, "请求超时".to_string()))?
-    .map_err(|error| (0u64, false, error.to_string()))?;
+    );
+    let response = match cancellable(engine, context, send).await {
+        Some(Ok(Ok(response))) => response,
+        Some(Ok(Err(error))) => {
+            return Err(FetchFail {
+                received: 0,
+                eof: false,
+                cancelled: false,
+                error: error.to_string(),
+            });
+        }
+        Some(Err(_)) => {
+            return Err(FetchFail {
+                received: 0,
+                eof: false,
+                cancelled: false,
+                error: "请求超时".to_string(),
+            });
+        }
+        None => return Err(FetchFail::cancelled(0, "请求已取消")),
+    };
 
     let status = response.status();
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        return Err((0, true, "HTTP 416".to_string()));
+        return Err(FetchFail {
+            received: 0,
+            eof: true,
+            cancelled: false,
+            error: "HTTP 416".to_string(),
+        });
     }
     // A server that ignores Range is only usable for offset 0; in that case
     // the first `expected` bytes of the body are the requested range.
     if status != StatusCode::PARTIAL_CONTENT && !(status.is_success() && start == 0) {
-        return Err((0, false, format!("HTTP {}", status.as_u16())));
+        return Err(FetchFail {
+            received: 0,
+            eof: false,
+            cancelled: false,
+            error: format!("HTTP {}", status.as_u16()),
+        });
     }
 
     // This response *is* the metadata source: no probe ever ran for it. Learn
@@ -2219,29 +6257,173 @@ async fn fetch_stream(
     let mut offset = start;
     while received < expected {
         if shutdown.load(Ordering::SeqCst) {
-            return Err((received, false, "代理已关闭".to_string()));
+            return Err(FetchFail {
+                received,
+                eof: false,
+                cancelled: false,
+                error: "代理已关闭".to_string(),
+            });
         }
-        let chunk = match tokio::time::timeout(CHUNK_TIMEOUT, response.chunk()).await {
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
-                return Err((received, false, error.to_string()));
+        // Health cancellation and a race winner are checked per network read,
+        // so a slow or duplicate request lets go within one chunk.
+        if context.cancelled(engine) {
+            return Err(FetchFail::cancelled(received, "请求已取消"));
+        }
+        let read = tokio::time::timeout(CHUNK_TIMEOUT, response.chunk());
+        let chunk = match cancellable(engine, context, read).await {
+            Some(Ok(Ok(Some(chunk)))) => chunk,
+            Some(Ok(Ok(None))) => break,
+            Some(Ok(Err(error))) => {
+                return Err(FetchFail {
+                    received,
+                    eof: false,
+                    cancelled: false,
+                    error: error.to_string(),
+                });
             }
-            Err(_) => return Err((received, false, "读取超时".to_string())),
+            Some(Err(_)) => {
+                return Err(FetchFail {
+                    received,
+                    eof: false,
+                    cancelled: false,
+                    error: "读取超时".to_string(),
+                });
+            }
+            None => return Err(FetchFail::cancelled(received, "请求已取消")),
         };
         let take = chunk.len().min((expected - received) as usize);
         if take == 0 {
             break;
         }
-        // A seek bumps the generation: stop reading this response at once
-        // instead of draining bytes that can no longer be served. The worker
-        // then claims a range for the new window, so `WorkerStat` never shows
-        // it busy with work that has been discarded.
-        if !engine.push_bytes(generation, offset, &chunk[..take], host, worker, shutdown) {
+        // A superseded generation stops reading at once instead of draining
+        // bytes that can no longer be served.
+        if !engine.push_bytes(generation, offset, &chunk[..take], host, worker, kind, shutdown) {
             return Ok(received);
         }
         offset += take as u64;
         received += take as u64;
+    }
+    Ok(received)
+}
+
+/// Fetch one seek point into `data` instead of the window. The bytes still
+/// count as upstream traffic and for the worker's health; they are committed
+/// to the point cache by the caller only once the whole chunk arrived.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_warm_stream(
+    engine: &Engine,
+    url: &str,
+    _generation: u64,
+    start: u64,
+    end: u64,
+    host: usize,
+    worker: usize,
+    shutdown: &AtomicBool,
+    context: &FetchContext,
+    data: &mut Vec<u8>,
+) -> std::result::Result<u64, FetchFail> {
+    let expected = end.saturating_sub(start);
+    if expected == 0 {
+        return Ok(0);
+    }
+    if context.cancelled(engine) {
+        return Err(FetchFail::cancelled(0, "请求已取消"));
+    }
+    let send = tokio::time::timeout(
+        CHUNK_TIMEOUT,
+        engine
+            .client
+            .get(url)
+            .header(RANGE, format!("bytes={start}-{}", end - 1))
+            .send(),
+    );
+    let mut response = match cancellable(engine, context, send).await {
+        Some(Ok(Ok(response))) => response,
+        Some(Ok(Err(error))) => {
+            return Err(FetchFail {
+                received: 0,
+                eof: false,
+                cancelled: false,
+                error: error.to_string(),
+            });
+        }
+        Some(Err(_)) => {
+            return Err(FetchFail {
+                received: 0,
+                eof: false,
+                cancelled: false,
+                error: "请求超时".to_string(),
+            });
+        }
+        None => return Err(FetchFail::cancelled(0, "请求已取消")),
+    };
+    let status = response.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        return Err(FetchFail {
+            received: 0,
+            eof: true,
+            cancelled: false,
+            error: "HTTP 416".to_string(),
+        });
+    }
+    if status != StatusCode::PARTIAL_CONTENT && !(status.is_success() && start == 0) {
+        return Err(FetchFail {
+            received: 0,
+            eof: false,
+            cancelled: false,
+            error: format!("HTTP {}", status.as_u16()),
+        });
+    }
+    if let Some(learned) = learn_metadata(status, start, response.headers()) {
+        engine.learn_metadata(&learned, shutdown);
+    }
+    data.reserve(expected.min(MAX_CHUNK_BYTES) as usize);
+    let mut received = 0u64;
+    while received < expected {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(FetchFail {
+                received,
+                eof: false,
+                cancelled: false,
+                error: "代理已关闭".to_string(),
+            });
+        }
+        if context.cancelled(engine) {
+            data.truncate(received as usize);
+            return Err(FetchFail::cancelled(received, "请求已取消"));
+        }
+        let read = tokio::time::timeout(CHUNK_TIMEOUT, response.chunk());
+        let chunk = match cancellable(engine, context, read).await {
+            Some(Ok(Ok(Some(chunk)))) => chunk,
+            Some(Ok(Ok(None))) => break,
+            Some(Ok(Err(error))) => {
+                return Err(FetchFail {
+                    received,
+                    eof: false,
+                    cancelled: false,
+                    error: error.to_string(),
+                });
+            }
+            Some(Err(_)) => {
+                return Err(FetchFail {
+                    received,
+                    eof: false,
+                    cancelled: false,
+                    error: "读取超时".to_string(),
+                });
+            }
+            None => {
+                data.truncate(received as usize);
+                return Err(FetchFail::cancelled(received, "请求已取消"));
+            }
+        };
+        let take = chunk.len().min((expected - received) as usize);
+        if take == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..take]);
+        received += take as u64;
+        engine.note_warm_bytes(host, worker, take as u64, shutdown);
     }
     Ok(received)
 }
@@ -2263,14 +6445,38 @@ async fn run_server(
         }
     };
     let mut workers = JoinSet::new();
-    for id in 0..engine.config.connections {
-        workers.spawn(worker(id, engine.clone(), shutdown.clone()));
+    let gate = startup_gate_enabled();
+    // Every connection is live from the first byte: the window is the only
+    // thing the startup gate still holds back, never the worker count. Slots
+    // above the configured count wait cheaply so `set_connections` can raise
+    // the count at any moment.
+    //
+    // The fetch workers themselves are the process-wide pool's threads, bound
+    // to this session's worker ids: opening a video creates no thread at all.
+    // Only a session that cannot bind (no pool: unit tests, or every registry
+    // block taken) falls back to one async task per worker id.
+    if !bind_slots(&engine, &shutdown) {
+        for id in 0..MAX_CONNECTIONS {
+            workers.spawn(worker(id, engine.clone(), shutdown.clone()));
+        }
     }
-    // The warm task shares the JoinSet, so the usual shutdown path (abort_all)
-    // and dropping the handle both cancel it.
-    if engine.config.warm_points > 0 {
-        workers.spawn(warm_loop(engine.clone(), shutdown.clone()));
+    // Widens the window after the first frames are flowing (a no-op when the
+    // gate is off: `read_ahead_cap` is already `u64::MAX`).
+    if gate {
+        workers.spawn(startup_gate_loop(
+            engine.clone(),
+            shutdown.clone(),
+        ));
+        // Release the small speculative pool after the ramp window. Playback
+        // (hot window, seek points) never waits on this.
+        workers.spawn(background_ramp_loop(
+            engine.clone(),
+            shutdown.clone(),
+        ));
     }
+    // Per-worker throughput watchdog: slow routes, route fallback and
+    // duplicate-request races.
+    workers.spawn(health_loop(engine.clone(), shutdown.clone()));
     // `BILI_PREFETCH_STATS_TEST=1`: one live per-second line describing the
     // workers and the downloaded ranges (QA only; same JoinSet, same shutdown).
     if stats_probe_enabled() {
@@ -2302,6 +6508,7 @@ async fn run_server(
     }
 
     shutdown.store(true, Ordering::SeqCst);
+    unbind_slots(&engine);
     handlers.abort_all();
     workers.abort_all();
     let _ = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2309,6 +6516,21 @@ async fn run_server(
     })
     .await;
     drop(listener);
+    // One line per session: the upstream byte split by scheduling class. A run
+    // whose hot share is a small fraction still did the right thing (playback
+    // is cheap); one whose warm+rest share is zero spent every byte on the
+    // client, which is what a permanent priority would look like and must not
+    // happen without a serve wait.
+    let stats = engine.snapshot();
+    crate::debug_log(&format!(
+        "prefetch split end hot={} warm={} rest={} retry={} fetched={} total={:?}",
+        format_bytes(stats.bytes_hot),
+        format_bytes(stats.bytes_warm),
+        format_bytes(stats.bytes_rest),
+        format_bytes(stats.bytes_retry),
+        format_bytes(stats.bytes_fetched),
+        stats.bytes_total
+    ));
     crate::debug_log("prefetch server stopped");
 }
 
@@ -2419,8 +6641,23 @@ async fn stats_probe(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
         distinct.sort_unstable();
         distinct.dedup();
         let delta = covered as i64 - previous_covered as i64;
+        // Upstream bytes by scheduling class: hot (what plays), warm (seek
+        // points), rest (speculative whole file) and retry. While a serve wait
+        // is open the hot share must own the link; with nothing waiting,
+        // warm/rest keep filling — this line proves both.
+        let split = format!(
+            "hot={} warm={} rest={} retry={}",
+            format_bytes(stats.bytes_hot),
+            format_bytes(stats.bytes_warm),
+            format_bytes(stats.bytes_rest),
+            format_bytes(stats.bytes_retry)
+        );
         crate::debug_log(&format!(
-            "prefetch stats qa tick={tick} busy_ranges={}/{} overlaps={} ranges={} covered={} delta={delta:+} point_ranges={} point_bytes={} active={}",
+            "prefetch split tick={tick} {split} fetched={}",
+            format_bytes(stats.bytes_fetched)
+        ));
+        crate::debug_log(&format!(
+            "prefetch stats qa tick={tick} busy_ranges={}/{} overlaps={} ranges={} covered={} delta={delta:+} point_ranges={} point_bytes={} active={} {split}",
             distinct.len(),
             busy.len(),
             range_overlaps(&stats.downloaded),
@@ -2429,6 +6666,29 @@ async fn stats_probe(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
             stats.point_cache.len(),
             format_bytes(stats.point_cache_bytes),
             stats.active_workers
+        ));
+        // Scheduler view: busy/idle split, per-worker throughput, whole-file
+        // queue and in-memory bytes. This is what the dynamic-connection QA
+        // reads to prove every connection is working and none idles while
+        // unclaimed chunks exist.
+        let health = engine.worker_health_snapshot();
+        let bps = health
+            .iter()
+            .map(|(id, _, _, bps)| format!("{id}:{}", format_rate(*bps)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let slow = health.iter().filter(|(_, _, slow, _)| *slow).count();
+        let cached = engine.cached_ranges();
+        crate::debug_log(&format!(
+            "prefetch sched tick={tick} busy={} idle={} connections={} slow={slow} bps=[{bps}] queue={}/{} window={} cached={} ranges={}",
+            stats.active_workers,
+            stats.workers.len().saturating_sub(stats.active_workers as usize),
+            stats.workers.len(),
+            stats.queue_chunks,
+            format_bytes(stats.queue_bytes),
+            format_bytes(stats.read_ahead_bytes),
+            format_bytes(ranges_bytes(&cached)),
+            cached.len()
         ));
         previous_covered = covered;
     }
@@ -2572,6 +6832,23 @@ async fn write_all_live(
     Ok(())
 }
 
+/// Why a body write failed, in the serve log's vocabulary. A client that seeks
+/// or closes abandons the socket, which the kernel reports as a reset or a
+/// broken pipe: that is the normal end of an abandoned response, not a proxy
+/// error, and it must not read like a truncation.
+fn write_end_reason(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::WriteZero
+        | io::ErrorKind::UnexpectedEof => "client-closed",
+        io::ErrorKind::TimedOut => "write-timeout",
+        _ => "write-error",
+    }
+}
+
 async fn send_error(
     stream: &mut TcpStream,
     code: u16,
@@ -2646,12 +6923,21 @@ async fn await_first_metadata(
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            let buffered = start.is_some_and(|start| {
+                chunks_cover(&state.chunks, start)
+                    || engine.disk_covers(start)
+            });
+            // A preloaded/cached file states its own length, so a seek into it
+            // never has to wait for an upstream response to shape the 206.
+            let disk_total = if buffered { engine.disk_total() } else { None };
+            // A buffered offset is served from memory even when the upstream
+            // pool is in a bad state: a failed speculative range must never
+            // break a seek the cache can already answer.
+            if metadata_ready(spec, state.total.or(disk_total), buffered) {
+                return Ok((state.total.or(disk_total), state.content_type.clone()));
+            }
             if let Some(error) = &state.fatal {
                 return Err(error.clone());
-            }
-            let buffered = start.is_some_and(|start| chunks_cover(&state.chunks, start));
-            if metadata_ready(spec, state.total, buffered) {
-                return Ok((state.total, state.content_type.clone()));
             }
             // The chunk that would deliver this offset is dead on every host:
             // no metadata can arrive from it, so fail instead of hanging.
@@ -2725,9 +7011,26 @@ async fn handle_connection(
         Some(RangeSpec::Bounded(start, _)) => Some(start),
         Some(RangeSpec::Suffix(_)) => None,
     };
-    // Sample this before any seek below: a reset clears the chunks, so the
-    // question "did the client wait for upstream?" must be answered now.
-    let buffered_at_request = requested_start.is_some_and(|start| engine.window_covers(start));
+    // Sample this before any seek below: a seek keeps the buffer, but the
+    // question "did the client wait for upstream?" is still answered now.
+    let buffered_memory = requested_start.is_some_and(|start| engine.window_covers(start));
+    let buffered_disk = requested_start.is_some_and(|start| engine.disk_covers(start));
+    let buffered_at_request = buffered_memory || buffered_disk;
+    if buffered_at_request {
+        if let Some(start) = requested_start {
+            if buffered_disk {
+                crate::debug_log(&format!(
+                    "seek hit offset={start} src=disk ms={} upstream=0",
+                    request_started.elapsed().as_millis()
+                ));
+            } else {
+                crate::debug_log(&format!(
+                    "seek hit offset={start} src=window ms={} upstream=0",
+                    request_started.elapsed().as_millis()
+                ));
+            }
+        }
+    }
 
     // Fast path, before the response lock: a warmed seek point is answered
     // from memory. It must not wait behind an older open-ended response (a
@@ -2767,6 +7070,14 @@ async fn handle_connection(
         Some(acquired) => acquired,
         None => return Err("代理已关闭".to_string()),
     };
+    // The epoch is what an older body checks itself against. Logging it with
+    // the range makes "this body was superseded by which request" answerable
+    // from the log alone.
+    crate::debug_log(&format!(
+        "serve claim epoch={epoch} range={} waited_ms={}",
+        request.range.as_deref().unwrap_or("-"),
+        request_started.elapsed().as_millis()
+    ));
 
     // Move the read-ahead window to the client's offset before waiting: the
     // workers claim their next chunks from the new cursor, so this request's
@@ -2817,8 +7128,11 @@ async fn handle_connection(
         request.range.is_some(),
     );
     // `window` = the requested offset was already buffered when the request
-    // arrived, `upstream` = this response waited for a network read.
-    let source = if buffered_at_request {
+    // arrived, `disk` = it came out of the session cache file, `upstream` =
+    // this response waited for a network read.
+    let source = if buffered_disk {
+        "disk"
+    } else if buffered_memory {
         "window"
     } else {
         "upstream"
@@ -2893,6 +7207,10 @@ fn point_hit(
         spec.is_some(),
     );
     serve_trace(spec, range, Some(total), "point", request_started);
+    crate::debug_log(&format!(
+        "seek hit offset={start} src=cache ms={}",
+        request_started.elapsed().as_millis()
+    ));
     Some(PointHit {
         head,
         range,
@@ -2989,8 +7307,13 @@ async fn write_chunk_live(
     }
 }
 
-/// Write the body from `pos` out of the read-ahead window. The caller holds
-/// the serve guard and the window has already been moved to `pos`.
+/// Write the body from `pos` out of the read-ahead window, then the session
+/// cache file. The caller holds the serve guard and the window has already been
+/// moved to `pos`.
+///
+/// Serving order is memory → **disk** → upstream: a block the cache file holds
+/// is answered locally even when the network is dead, which is what makes a
+/// cached seek cost zero upstream bytes.
 ///
 /// When a newer request takes the proxy over (`epoch` is stale) the body simply
 /// ends: the client abandoned it — a seek always opens a new connection — and
@@ -3004,12 +7327,33 @@ async fn serve_body(
     mut remaining: Option<u64>,
     chunked: bool,
 ) -> Result<(), String> {
-    loop {
+    let started = Instant::now();
+    let start = pos;
+    let mut disk_logged = false;
+    let mut disk_bytes = 0u64;
+    let mut window_bytes = 0u64;
+    // Times this response had to wait for a network read at all. 0 = the whole
+    // body came out of memory/the session cache file, which is what a cached
+    // seek must show.
+    let mut upstream_waits = 0u64;
+    // Why the body stopped. Every early end must name itself: a truncated
+    // response is the "playback ends in the middle" bug, and a bare `serve
+    // done` line could not tell a completed range from a superseded one.
+    // Every exit from the loop names itself before breaking, so the compiler
+    // can see the value is always set.
+    let reason;
+    // Throttle of the `serve wait` line (see the wait arm below), and of the
+    // hot-priority enforcement it accompanies.
+    let mut wait_logged: Option<Instant> = None;
+    let mut last_enforce: Option<Instant> = None;
+    let result: Result<(), String> = loop {
         if remaining == Some(0) {
-            break;
+            reason = "complete";
+            break Ok(());
         }
         if !engine.is_current(epoch) {
-            return Ok(());
+            reason = "superseded";
+            break Ok(());
         }
         let want = remaining.unwrap_or(u64::MAX);
         match engine.consume(pos, want) {
@@ -3021,37 +7365,128 @@ async fn serve_body(
                     // A write that failed because we were superseded is the
                     // normal end of an abandoned response, not an error.
                     if !engine.is_current(epoch) {
-                        return Ok(());
+                        reason = "write-superseded";
+                        break Ok(());
                     }
-                    return Err(error.to_string());
+                    reason = write_end_reason(&error);
+                    break Err(error.to_string());
                 }
+                window_bytes = window_bytes.saturating_add(written);
                 pos += written;
                 remaining = remaining.map(|left| left - written);
+                // Bytes landed: the wait (if any) is over. `available` is the
+                // only ending that cost the client the hot window's priority.
+                engine.close_serve_wait("available");
+                wait_logged = None;
+                last_enforce = None;
             }
-            Ok(None) => {
+            Ok(None) | Err(_) => {
+                // Not in the hot window: try the session cache file before
+                // waiting on the network (or giving up on a dead range).
+                if let Some(data) = engine.disk_read(pos, want) {
+                    let written = data.len() as u64;
+                    if !disk_logged {
+                        disk_logged = true;
+                        if serve_log_enabled() {
+                            crate::debug_log(&format!(
+                                "serve src=disk pos={pos} bytes={written}"
+                            ));
+                        }
+                    }
+                    if let Err(error) =
+                        write_chunk_live(stream, engine, epoch, chunked, &data).await
+                    {
+                        if !engine.is_current(epoch) {
+                            reason = "write-superseded";
+                            break Ok(());
+                        }
+                        reason = write_end_reason(&error);
+                        break Err(error.to_string());
+                    }
+                    engine.note_disk_served(pos, written);
+                    disk_bytes = disk_bytes.saturating_add(written);
+                    pos += written;
+                    remaining = remaining.map(|left| left - written);
+                    // Local bytes: a wait that was open is satisfied without
+                    // the network, which is exactly what a cached seek shows.
+                    engine.close_serve_wait("available");
+                    wait_logged = None;
+                    last_enforce = None;
+                    continue;
+                }
                 if shutdown.load(Ordering::SeqCst) {
-                    return Err("代理已关闭".to_string());
+                    reason = "shutdown";
+                    break Err("代理已关闭".to_string());
                 }
                 if !engine.is_current(epoch) {
-                    return Ok(());
+                    reason = "superseded-wait";
+                    break Ok(());
                 }
                 if engine.at_eof(pos) {
                     // The upstream ended before the promised length (only
                     // reachable when the total never came from a response).
                     // Closing here is what tells the client the body is short.
-                    break;
+                    reason = "eof";
+                    break Ok(());
+                }
+                if let Err(error) = engine.consume_error(pos) {
+                    reason = "upstream-error";
+                    break Err(error);
+                }
+                upstream_waits = upstream_waits.saturating_add(1);
+                // A hole the network should be filling. From here on the serve
+                // path has absolute priority: the wait is registered (which
+                // suspends speculative claims), and every 20 ms the scheduler
+                // cancels in-flight speculative work so a worker frees up for
+                // this chunk, and re-routes a silent hot range after
+                // HOT_STUCK_MS instead of after the 5 s health timer.
+                let waited_ms = engine.open_serve_wait(pos);
+                let enforce_due = last_enforce
+                    .map_or(true, |last| last.elapsed() >= SERVE_WAIT_ENFORCE_POLL);
+                if enforce_due {
+                    last_enforce = Some(Instant::now());
+                    engine.enforce_serve_priority(pos, waited_ms);
+                }
+                // Say so once per second (and at the first miss) rather than
+                // waiting in silence: this is the line that tells a proxy stall
+                // apart from a decoder stall, and names what the workers were
+                // doing instead of serving this offset.
+                let log_due = wait_logged
+                    .map_or(true, |last| last.elapsed() >= Duration::from_secs(1));
+                if log_due {
+                    wait_logged = Some(Instant::now());
+                    let (hot, warm, rest) = engine.inflight_kinds();
+                    crate::debug_log(&format!(
+                        "serve wait pos={pos} waited_ms={waited_ms} hot_inflight={hot} warm_inflight={warm} rest_inflight={rest} buffered={} total={:?}",
+                        engine.read_ahead(),
+                        engine.total()
+                    ));
                 }
                 tokio::time::sleep(WAIT_POLL).await;
             }
-            Err(error) => return Err(error),
         }
-    }
-    if chunked {
+    };
+    // A body that ends while still waiting closes the span as `timeout` — the
+    // bytes never came, whatever ended the body (supercede, error, EOF,
+    // shutdown). The successful path already closed it as `available`.
+    engine.close_serve_wait("timeout");
+    if chunked && result.is_ok() {
         write_all(stream, b"0\r\n\r\n")
             .await
             .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    // One line per response: how much of it was local, whether it ever needed
+    // the network, and *why* it ended. A cached seek must read
+    // `upstream_waits=0`; a playback body must read `reason=complete`.
+    crate::debug_log(&format!(
+        "serve end reason={reason} from={start} pos={pos} sent={} window={window_bytes} disk={disk_bytes} total={:?} expected={:?} epoch={epoch} current={} upstream_waits={upstream_waits} ms={}",
+        pos.saturating_sub(start),
+        engine.total(),
+        remaining.map(|left| pos.saturating_add(left)),
+        engine.is_current(epoch),
+        started.elapsed().as_millis()
+    ));
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -3167,7 +7602,7 @@ fn qa_log_contains(needle: &str) -> bool {
 /// This is the "plain HTTP client instead of ffmpeg" harness required for the
 /// first pass; the player can call it from a diagnostic env hook later. Call
 /// it from a synchronous thread.
-#[allow(dead_code)]
+#[allow(dead_code)] // QA hook: reached only by `cargo test -- --ignored live_prefetch_proxy`
 pub fn qa_verify(
     url: &str,
     hosts: &[String],
@@ -3782,6 +8217,266 @@ mod tests {
     }
 
     #[test]
+    fn serve_wait_claims_the_exact_blocked_offset() {
+        let mut engine = test_engine();
+        engine.config.chunk_bytes = 4;
+        engine.config.read_ahead_bytes = 8;
+        // A 1 B/s stream: the hot frontier is 12 bytes, so chunks 0/4/8 are
+        // look-ahead. The blocked byte sits inside chunk 0, two bytes in.
+        engine.media_bps.store(1, Ordering::Relaxed);
+        engine.desired_connections.store(1, Ordering::SeqCst);
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.total = Some(4000);
+            state.cursor = 2;
+        }
+        let shutdown = AtomicBool::new(false);
+        assert_eq!(engine.open_serve_wait(2), 0);
+        engine.enforce_serve_priority(2, 0);
+        {
+            let state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(
+                state.urgent.front().copied(),
+                Some(2),
+                "the blocked offset must be registered as an urgent claim"
+            );
+        }
+        // The claim starts at the blocked byte, not at the chunk boundary: the
+        // two-byte prefix is worthless until the wait is over.
+        assert!(
+            matches!(
+                claim(&engine, &shutdown, 0),
+                Claim::Fetch(claim) if claim.kind == ChunkKind::Hot && claim.start == 2 && claim.end == 6
+            ),
+            "the serve wait must be served from its own offset first"
+        );
+
+        // A wait already covered by an in-flight claim adds nothing.
+        let engine = test_engine();
+        engine.desired_connections.store(1, Ordering::SeqCst);
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.total = Some(4000);
+        }
+        assert!(matches!(claim(&engine, &shutdown, 0), Claim::Fetch(_)));
+        assert_eq!(engine.open_serve_wait(1), 0);
+        engine.enforce_serve_priority(1, 0);
+        {
+            let state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert!(
+                state.urgent.is_empty(),
+                "an offset already being fetched needs no urgent claim"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_wait_suspends_speculative_claims_until_bytes_land() {
+        let mut engine = test_engine();
+        engine.config.chunk_bytes = 4;
+        engine.config.read_ahead_bytes = 8;
+        // A 1 B/s stream puts the hot frontier 12 chunky bytes ahead (the
+        // [`HOT_AHEAD_SECONDS`] floor is `chunk * 2`), so exactly three hot
+        // chunks (0, 4, 8) are claimable before speculation starts.
+        engine.media_bps.store(1, Ordering::Relaxed);
+        engine.desired_connections.store(8, Ordering::SeqCst);
+        if let Ok(mut state) = engine.state.lock() {
+            state.total = Some(4000);
+            state.warm_plan_started = true;
+            state.warm_plan = vec![
+                WarmTask {
+                    point: 2000,
+                    start: 2000,
+                    end: 2004,
+                    done: false,
+                    claimed: false,
+                    urgent: false,
+                },
+                WarmTask {
+                    point: 3000,
+                    start: 3000,
+                    end: 3004,
+                    done: false,
+                    claimed: false,
+                    urgent: false,
+                },
+            ];
+        }
+        let shutdown = AtomicBool::new(false);
+        assert!(
+            matches!(claim(&engine, &shutdown, 0), Claim::Fetch(claim) if claim.kind == ChunkKind::Hot && claim.start == 0)
+        );
+        assert!(
+            matches!(claim(&engine, &shutdown, 1), Claim::Fetch(claim) if claim.kind == ChunkKind::Hot && claim.start == 4)
+        );
+        assert!(
+            matches!(claim(&engine, &shutdown, 2), Claim::Fetch(claim) if claim.kind == ChunkKind::Hot && claim.start == 8)
+        );
+        // With the hot window fully in flight, the next worker speculates.
+        assert!(
+            matches!(claim(&engine, &shutdown, 3), Claim::Fetch(claim) if claim.kind == ChunkKind::Warm && claim.start == 2000)
+        );
+
+        // A body blocked on offset 0 suspends everything speculative: even a
+        // free worker may not claim the second seek point while it waits.
+        assert_eq!(engine.open_serve_wait(0), 0);
+        assert!(engine.serve_waiting());
+        assert!(matches!(claim(&engine, &shutdown, 4), Claim::Wait));
+
+        // Bytes landed: the queue resumes at the pending seek point.
+        engine.close_serve_wait("available");
+        assert!(!engine.serve_waiting());
+        assert!(
+            matches!(claim(&engine, &shutdown, 4), Claim::Fetch(claim) if claim.kind == ChunkKind::Warm && claim.start == 3000),
+            "speculative work must resume after the serve wait closes"
+        );
+    }
+
+    #[test]
+    fn serve_wait_preempts_speculation_and_routes_around_a_stuck_hot_range() {
+        let mut engine = test_engine();
+        engine.config.chunk_bytes = 4;
+        engine.config.read_ahead_bytes = 8;
+        engine.desired_connections.store(2, Ordering::SeqCst);
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.total = Some(4000);
+            for (id, kind, start) in [(0usize, ChunkKind::Warm, 2000u64), (1, ChunkKind::Rest, 3000)] {
+                state.inflight.insert((0, start));
+                if let Some(slot) = state.workers.get_mut(id) {
+                    slot.busy = true;
+                    slot.kind = Some(kind);
+                    slot.start = start;
+                    slot.end = start + 4;
+                    slot.host = "cdn.example.com".to_string();
+                    slot.range_started = Some(Instant::now());
+                }
+            }
+        }
+        let waited = engine.open_serve_wait(100);
+        engine.enforce_serve_priority(100, waited);
+        // Both speculative claims were cancelled by bumping their worker token.
+        assert_eq!(engine.worker_cancel[0].load(Ordering::SeqCst), 1);
+        assert_eq!(engine.worker_cancel[1].load(Ordering::SeqCst), 1);
+
+        // Now the worker holds the chunk that covers the waiting offset and has
+        // been silent for longer than the fast stuck threshold.
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.inflight.insert((0, 100));
+            if let Some(slot) = state.workers.get_mut(0) {
+                slot.busy = true;
+                slot.kind = Some(ChunkKind::Hot);
+                slot.start = 100;
+                slot.end = 104;
+                slot.samples.clear();
+                slot.range_started = Some(Instant::now() - Duration::from_millis(700));
+            }
+        }
+        engine.enforce_serve_priority(100, 700);
+        {
+            let state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert!(state.workers[0].slow, "a silent hot claim must be marked slow");
+            assert_eq!(state.races.len(), 1, "and raced on another route");
+            assert_eq!(state.races.front().map(|race| race.start), Some(100));
+        }
+        // The escalation is also counted on the worker that held the range.
+        assert_eq!(engine.worker_cancel[0].load(Ordering::SeqCst), 2);
+        engine.close_serve_wait("timeout");
+        assert!(!engine.serve_waiting());
+    }
+
+    #[test]
+    fn serve_wait_span_reports_its_elapsed_time() {
+        let engine = test_engine();
+        assert_eq!(engine.open_serve_wait(512), 0);
+        std::thread::sleep(Duration::from_millis(5));
+        let waited = engine.open_serve_wait(512);
+        assert!(waited >= 5, "a continuing wait reports its age, got {waited} ms");
+        engine.close_serve_wait("available");
+        assert!(!engine.serve_waiting());
+        // Closing twice is a no-op (the second reason cannot overwrite the end).
+        engine.close_serve_wait("timeout");
+        assert!(!engine.serve_waiting());
+    }
+
+    #[test]
+    fn fetched_bytes_are_split_by_scheduling_class() {
+        let engine = test_engine();
+        let shutdown = AtomicBool::new(false);
+        engine.push_bytes(0, 0, &[1u8; 16], 0, 0, ChunkKind::Hot, &shutdown);
+        engine.push_bytes(0, 16, &[1u8; 8], 0, 0, ChunkKind::Rest, &shutdown);
+        engine.push_bytes(0, 24, &[1u8; 4], 0, 0, ChunkKind::Requeue, &shutdown);
+        engine.push_bytes(0, 28, &[1u8; 2], 0, 0, ChunkKind::Race, &shutdown);
+        engine.note_warm_bytes(0, 0, 6, &shutdown);
+        let stats = engine.snapshot();
+        assert_eq!(stats.bytes_hot, 16);
+        assert_eq!(stats.bytes_warm, 6);
+        assert_eq!(stats.bytes_rest, 8);
+        assert_eq!(stats.bytes_retry, 6, "requeue and race are retries");
+        assert_eq!(stats.bytes_fetched, 36);
+    }
+
+    #[test]
+    fn startup_gate_caps_memory_and_holds_background_work() {
+        let mut engine = test_engine();
+        // The unfetched test engine has no cap: the configured window is used.
+        assert_eq!(engine.read_ahead_window(), DEFAULT_READ_AHEAD_BYTES);
+        // A session starts at the startup window ...
+        engine.config.read_ahead_bytes = 8;
+        engine.config.chunk_bytes = 4;
+        engine.read_ahead_cap.store(4, Ordering::Relaxed);
+        assert_eq!(engine.read_ahead_window(), 4);
+        let shutdown = AtomicBool::new(false);
+        // All workers may still fetch (whole-file scheduling): the cap only
+        // bounds what is *retained* in memory.
+        assert!(matches!(
+            claim(&engine, &shutdown, 0),
+            Claim::Fetch(claim) if claim.start == 0
+        ));
+        // A read outside the 4-byte window is counted but not retained.
+        engine.push_bytes(0, 8, &[0u8; 4], 0, 0, ChunkKind::Hot, &shutdown);
+        assert_eq!(engine.cached_bytes_at(8), 0);
+        assert_eq!(engine.snapshot().bytes_fetched, 4);
+        // A read inside it is.
+        engine.push_bytes(0, 0, &[1u8; 4], 0, 0, ChunkKind::Hot, &shutdown);
+        assert_eq!(engine.cached_bytes_at(0), 4);
+        // Opening the gate restores the configured window.
+        engine.read_ahead_cap.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(engine.read_ahead_window(), 8);
+        // The player's hold gates background work (warm points, parts) only.
+        assert!(engine.background_allowed());
+        engine.background_paused.store(true, Ordering::SeqCst);
+        assert!(!engine.background_allowed());
+        // A held session still claims the hot window.
+        assert!(matches!(
+            claim(&engine, &shutdown, 0),
+            Claim::Fetch(claim) if claim.kind == ChunkKind::Hot
+        ));
+    }
+
+    #[test]
     fn claim_publishes_the_worker_range_and_idles_it() {
         let mut engine = test_engine();
         // A tiny window so "full" is reachable without allocating megabytes:
@@ -3792,7 +8487,10 @@ mod tests {
 
         // First claim: a real range from the configured host.
         let first = claim(&engine, &shutdown, 0);
-        assert!(matches!(first, Claim::Fetch { start: 0, end: 4, .. }));
+        assert!(matches!(
+            first,
+            Claim::Fetch(claim) if claim.start == 0 && claim.end == 4
+        ));
         let stats = engine.snapshot();
         assert_eq!(stats.workers.len(), 1);
         assert_eq!(stats.active_workers, 1);
@@ -3824,8 +8522,8 @@ mod tests {
     fn worker_bytes_are_counted_per_connection() {
         let engine = test_engine();
         let shutdown = AtomicBool::new(false);
-        engine.push_bytes(0, 0, &[1u8; 32], 0, 0, &shutdown);
-        engine.push_bytes(0, 32, &[2u8; 8], 0, 0, &shutdown);
+        engine.push_bytes(0, 0, &[1u8; 32], 0, 0, ChunkKind::Hot, &shutdown);
+        engine.push_bytes(0, 32, &[2u8; 8], 0, 0, ChunkKind::Hot, &shutdown);
         let stats = engine.snapshot();
         assert_eq!(stats.workers[0].bytes, 40);
         assert_eq!(stats.bytes_fetched, 40);
@@ -3880,11 +8578,13 @@ mod tests {
             warm_points: 999,
             point_bytes: 0,
             hosts: vec!["".to_string(), "  ".to_string(), "cdn.example.com".to_string()],
+            cache_key: None,
+            media_duration_ms: None,
         }
         .normalized();
         assert_eq!(clamped.read_ahead_bytes, MIN_READ_AHEAD_BYTES);
         assert_eq!(clamped.chunk_bytes, MIN_CHUNK_BYTES);
-        assert_eq!(clamped.connections, 1);
+        assert_eq!(clamped.connections, DEFAULT_CONNECTIONS, "0 = auto");
         assert_eq!(clamped.warm_points, MAX_WARM_POINTS);
         assert_eq!(clamped.point_bytes, 1);
         assert_eq!(clamped.hosts, vec!["cdn.example.com".to_string()]);
@@ -3896,6 +8596,8 @@ mod tests {
             warm_points: 0,
             point_bytes: u64::MAX,
             hosts: Vec::new(),
+            cache_key: None,
+            media_duration_ms: None,
         }
         .normalized();
         assert_eq!(clamped.read_ahead_bytes, MAX_READ_AHEAD_BYTES);
@@ -4135,8 +8837,280 @@ mod tests {
         );
     }
 
+    #[test]
+    fn queue_priority_prefers_hot_then_warm_then_rest() {
+        let mut engine = test_engine();
+        let chunk = 1 << 20;
+        engine.config.chunk_bytes = chunk;
+        engine.config.connections = 4;
+        engine.config.warm_points = 1;
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.total = Some(256 << 20);
+            state.cursor = 0;
+            state.warm_plan_started = true;
+            state.warm_plan = vec![WarmTask {
+                point: 40 << 20,
+                start: 40 << 20,
+                end: 41 << 20,
+                done: false,
+                claimed: false,
+                urgent: false,
+            }];
+        }
+        let mut state = match engine.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // The client's own chunk, then the next two seconds of playback.
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            Some((0, ChunkKind::Hot))
+        );
+        state.inflight.insert((0, 0));
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            Some((chunk, ChunkKind::Hot))
+        );
+        state.inflight.insert((0, chunk));
+        // Only then the seek warm point.
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            Some((40 << 20, ChunkKind::Warm))
+        );
+        state.inflight.insert((0, 40 << 20));
+        state.warm_plan[0].claimed = true;
+        // And finally the rest of the whole-file split.
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            Some((2 * chunk, ChunkKind::Rest))
+        );
+    }
+
+    /// The hot window reaches two seconds past the cursor. At the end of the
+    /// file that frontier runs past `total`, and before the clamp it produced
+    /// `start >= end` claims that could never be covered, so every worker
+    /// re-claimed the same past-EOF range thousands of times per second.
+    #[test]
+    fn past_eof_cursor_never_claims_a_range_beyond_the_total() {
+        let mut engine = test_engine();
+        let chunk = 1 << 20;
+        engine.config.chunk_bytes = chunk;
+        engine.config.warm_points = 0;
+        let total = 15_402_399u64; // not chunk aligned, like the reported file
+        let tail = chunk_start(total - 1024, chunk);
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.total = Some(total);
+            state.cursor = total - 1024;
+            let mut start = 0;
+            while start < total {
+                state.done.insert(start);
+                start = start.saturating_add(chunk);
+            }
+            state.done.remove(&tail);
+        }
+        let mut state = match engine.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            Some((tail, ChunkKind::Hot))
+        );
+        state.inflight.insert((0, tail));
+        // The whole file is spoken for: the workers must go idle instead of
+        // spinning on the past-EOF tail of the frontier.
+        assert_eq!(pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()), None);
+    }
+
+    #[test]
+    fn hot_window_does_not_refetch_the_served_prefix_of_the_cursor_chunk() {
+        let mut engine = test_engine();
+        let chunk = 1 << 20;
+        engine.config.chunk_bytes = chunk;
+        engine.config.warm_points = 0;
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.total = Some(8 << 20);
+            state.cursor = 300 << 10;
+            // The prefix of the cursor's chunk was already served (and removed
+            // from the map); the rest is buffered.
+            state.chunks.insert(300 << 10, vec![0u8; 724 << 10]);
+            state.done.insert(0);
+        }
+        let mut state = match engine.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            Some((chunk, ChunkKind::Hot))
+        );
+    }
+
+    #[test]
+    fn dynamic_split_covers_the_file_and_steals_from_the_largest_part() {
+        let mut engine = test_engine();
+        let chunk = 1 << 20;
+        engine.config.chunk_bytes = chunk;
+        let mut state = match engine.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.total = Some(256 << 20);
+        state.cursor = 0;
+        build_parts(&mut state, 4, chunk);
+        assert_eq!(state.parts.len(), 4);
+        // The parts tile the whole remaining range without gaps or overlaps.
+        assert_eq!(state.parts[0].next, 0);
+        assert_eq!(state.parts.last().map(|part| part.end), Some(256 << 20));
+        for pair in state.parts.windows(2) {
+            assert_eq!(pair[0].end, pair[1].next);
+        }
+        assert!(state
+            .parts
+            .iter()
+            .all(|part| (part.end - part.next) % chunk == 0 || part.end == 256 << 20));
+        // A worker takes sub-chunks from its own part.
+        let everywhere = u64::MAX;
+        assert_eq!(
+            take_part_chunk(&mut state, 0, 0, chunk, &test_disk(), everywhere),
+            Some(0)
+        );
+        state.inflight.insert((0, 0));
+        // Exhaust one part; the next take steals from the largest remaining
+        // (part 1, untouched) instead of leaving that worker idle.
+        state.parts[3].next = state.parts[3].end;
+        let largest_next = state.parts[1].next;
+        let stolen = steal_chunk(&mut state, 0, chunk, &test_disk(), everywhere);
+        assert_eq!(stolen, Some(largest_next));
+        assert_eq!(state.parts[1].next, largest_next + chunk);
+        // Nothing at or past the horizon is claimable, and the blocked part
+        // keeps its cursor so it resumes when the horizon moves.
+        state.parts[1].next = largest_next + chunk;
+        assert_eq!(
+            take_part_chunk(&mut state, 1, 0, chunk, &test_disk(), largest_next + chunk),
+            None
+        );
+        assert_eq!(state.parts[1].next, largest_next + chunk);
+    }
+
+    #[test]
+    fn live_connection_count_clamps_and_republishes() {
+        let engine = test_engine();
+        assert_eq!(engine.desired_connections(), 1);
+        engine.desired_connections.store(16, Ordering::SeqCst);
+        assert_eq!(engine.desired_connections(), 16);
+        assert_eq!(engine.snapshot().workers.len(), 16);
+        engine.desired_connections.store(0, Ordering::SeqCst);
+        assert_eq!(engine.desired_connections(), 1, "never below one");
+        engine
+            .desired_connections
+            .store(999, Ordering::SeqCst);
+        assert_eq!(engine.desired_connections(), MAX_CONNECTIONS);
+        assert_eq!(engine.snapshot().workers.len(), MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn duplicate_race_first_finisher_wins() {
+        let engine = test_engine();
+        if let Ok(mut state) = engine.state.lock() {
+            state.inflight.insert((0, 0));
+            state
+                .race_tokens
+                .insert(0, Arc::new(AtomicBool::new(false)));
+        }
+        let token = Arc::new(AtomicBool::new(false));
+        assert!(
+            engine.finish_chunk(0, 0, ChunkKind::Race, 1, Some(&token)),
+            "the first finisher wins"
+        );
+        assert!(
+            !engine.finish_chunk(0, 0, ChunkKind::Race, 2, Some(&token)),
+            "the loser must not claim the range"
+        );
+        let state = match engine.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(state.done.contains(&0));
+        assert!(!state.race_tokens.contains_key(&0));
+    }
+
+    #[test]
+    fn cached_ranges_merge_window_and_point_cache() {
+        let engine = test_engine();
+        if let Ok(mut state) = engine.state.lock() {
+            state.chunks.insert(0, vec![0u8; 4]);
+            state.chunks.insert(4, vec![0u8; 4]);
+            state
+                .points
+                .insert(8, vec![1u8; 4], 10, MAX_POINT_CACHE_BYTES);
+            state
+                .points
+                .insert(20, vec![2u8; 4], 10, MAX_POINT_CACHE_BYTES);
+            state
+                .points
+                .insert(22, vec![3u8; 4], 10, MAX_POINT_CACHE_BYTES);
+        }
+        // Adjacent window and point ranges coalesce; overlapping points too.
+        assert_eq!(engine.cached_ranges(), vec![(0, 12), (20, 26)]);
+        assert_eq!(engine.cached_bytes_at(0), 12);
+        assert_eq!(engine.cached_bytes_at(6), 6);
+        assert_eq!(engine.cached_bytes_at(12), 0);
+        assert_eq!(engine.cached_bytes_at(21), 5);
+        assert_eq!(engine.cached_bytes_at(26), 0);
+    }
+
     /// Bare engine for the window/token/point tests: no listener, no workers,
     /// and a client that is never used.
+    /// A cache that never touches the disk, for the scheduler tests.
+    fn test_disk() -> DiskCache {
+        DiskCache::disabled()
+    }
+
+    /// The seek-cache decision may only trust the disk map: a hole in the
+    /// middle of a fetched file must read as "not covered" even when the ranges
+    /// around it are present (the old size heuristic claimed those as cached and
+    /// the seek then fetched megabytes upstream).
+    #[test]
+    fn disk_cover_reports_a_hole_instead_of_an_estimate() {
+        let mut disk = test_disk();
+        disk.insert(0, 4096);
+        disk.insert(8192, 12288);
+        // Covered from the start: the run ends where the hole starts.
+        let (run, ranges, bytes) = disk.cover(0);
+        assert_eq!(run, 4096);
+        assert_eq!(ranges, 2);
+        assert_eq!(bytes, 8192);
+        // The hole itself: no run at all, even though ranges exist on both
+        // sides.
+        assert_eq!(disk.cover(4096).0, 0);
+        assert_eq!(disk.cover(5000).0, 0);
+        // Inside the second range the run is what is left of it.
+        assert_eq!(disk.cover(8192).0, 4096);
+        assert_eq!(disk.cover(10000).0, 2288);
+        // Past the end.
+        assert_eq!(disk.cover(12288).0, 0);
+        // The whole-file case: one range, and the run reaches the end.
+        let mut whole = test_disk();
+        whole.insert(0, 12288);
+        assert_eq!(whole.cover(0), (12288, 1, 12288));
+        assert!(whole.covers_range(0, 12288));
+        assert!(!whole.covers_range(0, 12289));
+        assert!(!disk.covers_range(0, 12288), "a hole is not coverage");
+    }
+
     fn test_engine() -> Engine {
         Engine {
             config: PrefetchConfig::default().normalized(),
@@ -4149,6 +9123,7 @@ mod tests {
                 query: "x=1".to_string(),
             },
             client: reqwest::Client::new(),
+            cache_key: "test".to_string(),
             state: Mutex::new(State {
                 base: 0,
                 cursor: 0,
@@ -4156,33 +9131,75 @@ mod tests {
                 chunks: BTreeMap::new(),
                 inflight: BTreeSet::new(),
                 dead: BTreeSet::new(),
+                done: BTreeSet::new(),
+                parts: Vec::new(),
+                parts_built: false,
+                requeued: BTreeSet::new(),
+                short_bodies: BTreeMap::new(),
+                warm_plan: Vec::new(),
+                warm_plan_started: false,
+                serve_samples: VecDeque::new(),
+                races: VecDeque::new(),
+                urgent: VecDeque::new(),
+                race_tokens: BTreeMap::new(),
                 total: None,
                 fatal: None,
                 content_type: None,
                 hosts: vec![Host {
                     label: "cdn.example.com".to_string(),
                     origin: "https://cdn.example.com".to_string(),
+                    failures: 0,
                     failed: false,
                     bytes: 0,
+                    degraded_until: None,
                 }],
                 next_host: 0,
                 samples: VecDeque::new(),
                 bytes_fetched: 0,
                 failed_ranges: 0,
                 served: 0,
+                serve_bps: 0,
+                first_serve: None,
+                spec_tokens: DEFAULT_CHUNK_BYTES.saturating_mul(SPECULATIVE_BURST_CHUNKS),
+                spec_at: Instant::now(),
+                spec_bytes: 0,
                 read_ahead: 0,
                 points: PointCache::default(),
                 warm_points_total: 0,
                 warm_points_done: 0,
                 warm_chunk: 0,
                 warm_bytes: 0,
+                hot_bytes: 0,
+                warm_fetch_bytes: 0,
+                rest_bytes: 0,
+                retry_bytes: 0,
                 point_hits: 0,
                 point_served: 0,
-                workers: vec![WorkerSlot::default()],
+                disk_hits: 0,
+                disk_served: 0,
+                workers: (0..MAX_CONNECTIONS)
+                    .map(|_| WorkerSlot::default())
+                    .collect(),
             }),
+            disk: Arc::new(Mutex::new(DiskCache::disabled())),
+            // No writer in a scheduler test: `disk_write` falls back to writing
+            // through the map, and a disabled cache has no file anyway.
+            writer: Mutex::new(None),
             stats: Arc::new(Mutex::new(PrefetchStats::default())),
             serving: AtomicBool::new(false),
             serve_epoch: AtomicU64::new(0),
+            // No startup cap: the unit tests exercise the scheduling arithmetic
+            // directly against `config`.
+            read_ahead_cap: AtomicU64::new(u64::MAX),
+            background_paused: AtomicBool::new(false),
+            desired_connections: AtomicU64::new(1),
+            configured_connections: 1,
+            background_workers: AtomicU64::new(0),
+            worker_cancel: (0..MAX_CONNECTIONS).map(|_| AtomicU64::new(0)).collect(),
+            media_bps: AtomicU64::new(0),
+            serve_wait_pos: AtomicU64::new(u64::MAX),
+            serve_wait_since_ms: AtomicU64::new(0),
+            serve_wait_escalations: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -4195,52 +9212,43 @@ mod tests {
     }
 
     #[test]
-    fn seek_recomputes_the_window_from_the_requested_offset() {
+    fn seek_keeps_buffered_ranges_and_reports_a_hit() {
         let engine = test_engine();
-        // The window starts aligned at 0, so the first request keeps it: the
-        // chunks the workers already started are the ones it is about to read.
-        engine.seek(0);
-        assert_eq!(generation_of(&engine), 0);
-
-        // The buffer already serves the next byte: a repeat request keeps it,
-        // so a resumed reader does not throw its read-ahead away.
+        // The buffered window covers 0..16 and the point cache covers 400..410.
         if let Ok(mut state) = engine.state.lock() {
-            state.chunks.insert(0, vec![7u8; 4]);
-        }
-        engine.seek(0);
-        assert_eq!(generation_of(&engine), 0);
-
-        // A forward seek, a backward seek and a different offset all move the
-        // window: the workers must never fetch for a position the client left.
-        engine.seek(2);
-        assert_eq!(generation_of(&engine), 1);
-        engine.seek(0);
-        assert_eq!(generation_of(&engine), 2);
-
-        // A cursor that only equals the requested offset because an abandoned
-        // response consumed past it (the grid sits behind it, the byte is not
-        // buffered) is not a served offset: the window is rebuilt there.
-        if let Ok(mut state) = engine.state.lock() {
+            state.chunks.insert(0, vec![7u8; 16]);
             state.total = Some(1000);
-            state.base = 0;
-            state.cursor = 10;
-            state.chunks.clear();
+            state
+                .points
+                .insert(400, vec![9u8; 10], 10, MAX_POINT_CACHE_BYTES);
         }
-        engine.seek(10);
+
+        // A seek inside the window is a hit and keeps every buffered byte.
+        assert!(engine.seek(8));
+        let stats = engine.snapshot();
+        assert_eq!(stats.downloaded, vec![(0, 16), (400, 410)]);
         assert_eq!(
             generation_of(&engine),
-            3,
-            "a consumed-past cursor must be recomputed, not trusted"
+            0,
+            "a seek must not invalidate in-flight whole-file work"
         );
+        let cached = engine.cached_ranges();
+        assert_eq!(cached, vec![(0, 16), (400, 410)]);
+        // Contiguous bytes ahead: inside the window chunk and inside the point.
+        assert_eq!(engine.cached_bytes_at(4), 12);
+        assert_eq!(engine.cached_bytes_at(400), 10);
+        assert_eq!(engine.cached_bytes_at(500), 0);
 
-        // At EOF there is nothing to fetch and nothing to resend: no reset.
-        if let Ok(mut state) = engine.state.lock() {
-            state.total = Some(10);
-            state.cursor = 10;
-            state.base = 10;
-        }
-        engine.seek(10);
-        assert_eq!(generation_of(&engine), 3);
+        // A seek past the window moves the cursor but keeps the bytes ahead.
+        assert!(!engine.seek(20));
+        let stats = engine.snapshot();
+        assert_eq!(stats.read_ahead_bytes, 0, "bytes behind the cursor are gone");
+        assert_eq!(engine.cached_ranges(), vec![(400, 410)]);
+        assert_eq!(generation_of(&engine), 0);
+
+        // A seek backwards is answered from the point cache with no reset.
+        assert!(engine.cached_bytes_at(400) > 0);
+        assert!(engine.cached_bytes_at(409) == 1);
     }
 
     #[test]
@@ -4337,6 +9345,331 @@ mod tests {
         );
     }
 
+    /// Read exactly `want` bytes from `url` starting at `start` through the
+    /// local proxy. Used by the live scheduler proof below.
+    async fn live_read(
+        client: &reqwest::Client,
+        url: &str,
+        start: u64,
+        want: u64,
+    ) -> Result<u64> {
+        let mut response = client
+            .get(url)
+            .header(
+                RANGE,
+                format!("bytes={start}-{}", start.saturating_add(want).saturating_sub(1)),
+            )
+            .send()
+            .await
+            .with_context(|| format!("live read {start}+{want}"))?;
+        if response.status() != StatusCode::PARTIAL_CONTENT
+            && response.status() != StatusCode::OK
+        {
+            bail!("live read {start}: HTTP {}", response.status());
+        }
+        let mut read = 0u64;
+        while read < want {
+            let Some(chunk) = response.chunk().await? else {
+                break;
+            };
+            read += chunk.len() as u64;
+        }
+        Ok(read)
+    }
+
+    /// The dynamic multi-connection run required by the work order. Ignored by
+    /// default; driven by `BILI_PREFETCH_TEST_STREAM=<url>` plus
+    /// `BILI_DEBUG_LOG=<file>` (and `BILI_PREFETCH_LOG=1` for the serve lines):
+    ///
+    /// `cargo test --release -- --ignored --nocapture live_dynamic_scheduler`
+    ///
+    /// Phase 1 runs a real sequential reader for 10 s at 16 connections and
+    /// samples busy/idle, per-worker bps, queue and cached bytes every second.
+    /// It then seeks to a warmed point and to a buffered window offset and
+    /// proves both are answered from memory (`serve src=cache|window`).
+    /// Phase 2 injects a black-holed host and proves the slow worker is
+    /// cancelled, re-routed (and raced) and recovers.
+    #[test]
+    #[ignore = "network: BILI_PREFETCH_TEST_STREAM=<url> live 16-connection scheduler run"]
+    fn live_dynamic_scheduler() {
+        let url = match std::env::var("BILI_PREFETCH_TEST_STREAM") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => return,
+        };
+        let Some(runtime) = crate::bilibili::shared_runtime() else {
+            crate::debug_log("prefetch live skipped reason=no-runtime");
+            return;
+        };
+        let mut handle = match spawn(
+            &url,
+            PrefetchConfig {
+                connections: 16,
+                warm_points: 10,
+                ..PrefetchConfig::default()
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                crate::debug_log(&format!("prefetch live skipped reason=spawn err={error}"));
+                return;
+            }
+        };
+        let local = handle.local_url.clone();
+        let client = match reqwest::Client::builder()
+            .user_agent(crate::bilibili::UA)
+            .timeout(Duration::from_secs(60))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                crate::debug_log(&format!("prefetch live skipped reason=client err={error}"));
+                return;
+            }
+        };
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let mut peak_busy = 0u32;
+        let mut min_busy_after_start = u32::MAX;
+        let mut queue_peak = 0u64;
+        let (cache_offset, window_offset) = runtime.block_on(async {
+            let reader = {
+                let client = client.clone();
+                let local = local.clone();
+                let stop = reader_stop.clone();
+                tokio::spawn(async move {
+                    let mut offset = 0u64;
+                    while !stop.load(Ordering::SeqCst) {
+                        if live_read(&client, &local, offset, 512 << 10).await.is_err() {
+                            break;
+                        }
+                        offset = offset.saturating_add(512 << 10);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    offset
+                })
+            };
+            let mut took_next_after_idle = false;
+            for tick in 1..=20u64 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Live connection change: lower the pool, then raise it. The
+                // workers that were waiting outside the queue must pick up the
+                // next chunk immediately, not after a restart.
+                if tick == 4 {
+                    handle.set_connections(4);
+                }
+                if tick == 5 {
+                    handle.set_connections(16);
+                }
+                let stats = handle.snapshot();
+                let health = handle.worker_health();
+                let busy = stats.active_workers;
+                peak_busy = peak_busy.max(busy);
+                if tick > 1 {
+                    min_busy_after_start = min_busy_after_start.min(busy);
+                }
+                queue_peak = queue_peak.max(stats.queue_chunks);
+                let bps = health
+                    .iter()
+                    .map(|(id, _, _, bps)| format!("{id}:{}", format_rate(*bps)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let idle = health.len().saturating_sub(busy as usize);
+                crate::debug_log(&format!(
+                    "prefetch live t={tick}s busy={busy}/{} idle={idle} bps=[{bps}] queue={} cached={} window={}",
+                    health.len(),
+                    stats.queue_chunks,
+                    format_bytes(ranges_bytes(&handle.cached_ranges())),
+                    format_bytes(stats.read_ahead_bytes)
+                ));
+                if tick == 1 {
+                    assert_eq!(
+                        busy as usize,
+                        health.len(),
+                        "every configured connection must be busy at start"
+                    );
+                }
+                if tick == 6 {
+                    assert!(
+                        busy >= 12,
+                        "raised pool must take the next chunk immediately: busy={busy}"
+                    );
+                    took_next_after_idle = true;
+                }
+            }
+            reader_stop.store(true, Ordering::SeqCst);
+            let cursor = reader.await.unwrap_or(0);
+            crate::debug_log(&format!(
+                "prefetch live reader done offset={cursor} peak_busy={peak_busy} min_busy={min_busy_after_start} queue_peak={queue_peak} took_next={took_next_after_idle}"
+            ));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let stats = handle.snapshot();
+            let cached = handle.cached_ranges();
+            // Prefer a point-cache range for the cache seek; for the window
+            // seek pick a buffered range the point cache does not cover.
+            let cache_offset = stats
+                .point_cache
+                .iter()
+                .find(|(start, end)| end.saturating_sub(*start) >= 64 << 10)
+                .map(|(start, _)| *start)
+                .unwrap_or(0);
+            // The window part of the merged cache: walk each merged range and
+            // take the first gap the point cache does not cover.
+            let mut window_offset = 0u64;
+            'outer: for (start, end) in &cached {
+                let mut cursor = *start;
+                for (point_start, point_end) in &stats.point_cache {
+                    if *point_end <= cursor || *point_start >= *end {
+                        continue;
+                    }
+                    if *point_start > cursor && *point_start - cursor >= 64 << 10 {
+                        window_offset = cursor.saturating_add(1024);
+                        break 'outer;
+                    }
+                    cursor = (*point_end).max(cursor);
+                }
+                if *end > cursor && *end - cursor >= 64 << 10 {
+                    window_offset = cursor.saturating_add(1024);
+                    break;
+                }
+            }
+            (cache_offset, window_offset)
+        });
+        // Seek proofs: each must be served from memory, and its `seek hit`
+        // line must exist with the right source.
+        let cache_read = runtime.block_on(live_read(&client, &local, cache_offset, 64 << 10));
+        let window_read = runtime.block_on(live_read(&client, &local, window_offset, 64 << 10));
+        let cache_ms = handle.snapshot().point_hits;
+        crate::debug_log(&format!(
+            "prefetch live seek cache_offset={cache_offset} read={cache_read:?} point_hits={cache_ms}"
+        ));
+        crate::debug_log(&format!(
+            "prefetch live seek window_offset={window_offset} read={window_read:?}"
+        ));
+        assert!(
+            qa_log_contains(&format!("seek hit offset={cache_offset} src=cache")),
+            "cache seek must log src=cache"
+        );
+        assert!(
+            qa_log_contains(&format!("seek hit offset={window_offset} src=window")),
+            "window seek must log src=window"
+        );
+        handle.shutdown();
+
+        // Phase 2: a black-holed mirror. The listener accepts and never
+        // answers, so a worker on it reports zero bytes and the watchdog must
+        // cancel, re-route and recover it.
+        let blackhole = match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) => {
+                crate::debug_log(&format!("prefetch live slow skipped err={error}"));
+                return;
+            }
+        };
+        let blackhole_port = blackhole.local_addr().map(|addr| addr.port()).unwrap_or(0);
+        let held_sockets: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held = held_sockets.clone();
+        std::thread::spawn(move || {
+            for stream in blackhole.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        if let Ok(mut sockets) = held.lock() {
+                            sockets.push(stream);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let origin = match reqwest::Url::parse(&url) {
+            Ok(parsed) => parsed
+                .host_str()
+                .map(|host| {
+                    parsed
+                        .port()
+                        .map(|port| format!("{host}:{port}"))
+                        .unwrap_or_else(|| host.to_string())
+                })
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let mut slow_handle = match spawn(
+            &url,
+            PrefetchConfig {
+                connections: 3,
+                warm_points: 0,
+                hosts: vec![origin, format!("127.0.0.1:{blackhole_port}")],
+                ..PrefetchConfig::default()
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                crate::debug_log(&format!("prefetch live slow skipped err={error}"));
+                return;
+            }
+        };
+        slow_handle.set_background_paused(true);
+        let slow_local = slow_handle.local_url.clone();
+        runtime.block_on(async {
+            let stop = Arc::new(AtomicBool::new(false));
+            let reader = {
+                let client = client.clone();
+                let local = slow_local.clone();
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    let mut offset = 0u64;
+                    while !stop.load(Ordering::SeqCst) {
+                        if live_read(&client, &local, offset, 256 << 10).await.is_err() {
+                            break;
+                        }
+                        offset = offset.saturating_add(256 << 10);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                })
+            };
+            for tick in 1..=9u64 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let stats = slow_handle.snapshot();
+                let health = slow_handle.worker_health();
+                let bps = health
+                    .iter()
+                    .map(|(id, _, slow, bps)| {
+                        format!(
+                            "{id}:{}{}",
+                            if *slow { "S" } else { "" },
+                            format_rate(*bps)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                crate::debug_log(&format!(
+                    "prefetch live slow t={tick}s busy={} bps=[{bps}] fetched={} slow={}",
+                    stats.active_workers,
+                    stats.bytes_fetched,
+                    health.iter().filter(|(_, _, slow, _)| *slow).count()
+                ));
+            }
+            stop.store(true, Ordering::SeqCst);
+            let _ = reader.await;
+        });
+        let slow_stats = slow_handle.snapshot();
+        crate::debug_log(&format!(
+            "prefetch live slow done fetched={} failed_ranges={} hosts={:?}",
+            slow_stats.bytes_fetched, slow_stats.failed_ranges, slow_stats.hosts
+        ));
+        assert!(
+            qa_log_contains("worker slow id="),
+            "the watchdog must log the slow worker"
+        );
+        assert!(
+            qa_log_contains("action=retry host="),
+            "the slow worker must be re-routed"
+        );
+        assert!(
+            qa_log_contains("worker recover id="),
+            "the re-routed worker must log recovery"
+        );
+        slow_handle.shutdown();
+    }
+
     /// Live end-to-end check against the real CDN. Ignored by default:
     /// `$env:BILI_DEBUG_LOG="prefetch-live.log"; cargo test --release -- --ignored --nocapture live_prefetch_proxy`
     /// Set `BILI_PREFETCH_BVID=<bvid>` to pin a video, or `BILI_PREFETCH_URL`
@@ -4385,11 +9718,13 @@ mod tests {
         let bvid = match pinned {
             Some(bvid) => bvid,
             None => {
-                let popular = match runtime.block_on(session.popular(1, 30)) {
+                let popular = match runtime
+                    .block_on(session.search_video("原神", 1, "", 30))
+                {
                     Ok(popular) => popular,
                     Err(error) => {
                         crate::debug_log(&format!(
-                            "prefetch live skipped reason=popular err={error}"
+                            "prefetch live skipped reason=feed err={error}"
                         ));
                         return None;
                     }
@@ -4401,7 +9736,7 @@ mod tests {
                 {
                     Some(card) => card.bvid.clone(),
                     None => {
-                        crate::debug_log("prefetch live skipped reason=no-popular-item");
+                        crate::debug_log("prefetch live skipped reason=no-feed-item");
                         return None;
                     }
                 }
@@ -4637,6 +9972,369 @@ mod tests {
         ));
         handle.shutdown();
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    // ---- session cache file -------------------------------------------------
+
+    /// A cache in its own temporary directory, removed when the test ends.
+    struct TempCache {
+        dir: PathBuf,
+        cache: DiskCache,
+    }
+
+    impl TempCache {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "o11a1-cache-test-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cache = DiskCache::open_at(dir.clone(), name);
+            Self { dir, cache }
+        }
+    }
+
+    impl Drop for TempCache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn disk_cache_tracks_exact_written_ranges() {
+        let mut temp = TempCache::new("ranges");
+        temp.cache.adopt_len(4 * CACHE_BLOCK_BYTES);
+        // An unaligned write (the shape of a network read) is tracked exactly:
+        // this was the bug in the earlier 256 KiB bitmap, where a unit that
+        // straddled two reads never completed and a full file reported empty.
+        temp.cache.write(0, &vec![1u8; 100_000]);
+        assert!(temp.cache.end_at(0) > 0);
+        assert_eq!(temp.cache.ranges(), vec![(0, 100_000)]);
+        assert_eq!(temp.cache.end_at(0), 100_000);
+        assert!(temp.cache.read_at(0, 16).is_some());
+        // A gap is a real gap: the run ends there.
+        temp.cache.write(200_000, &vec![2u8; 50_000]);
+        assert_eq!(temp.cache.end_at(0), 100_000);
+        assert_eq!(temp.cache.end_at(150_000), 0);
+        assert_eq!(temp.cache.end_at(200_000), 250_000);
+        assert_eq!(temp.cache.ranges(), vec![(0, 100_000), (200_000, 250_000)]);
+        assert_eq!(temp.cache.bytes(), 150_000);
+        // The next write bridges the gap and the two ranges become one.
+        temp.cache.write(100_000, &vec![3u8; 100_000]);
+        assert_eq!(temp.cache.ranges(), vec![(0, 250_000)]);
+        assert_eq!(temp.cache.first_hole(), 250_000);
+        // Adjacent writes coalesce too.
+        temp.cache.write(250_000, &vec![4u8; 10_000]);
+        assert_eq!(temp.cache.ranges(), vec![(0, 260_000)]);
+        assert_eq!(temp.cache.len(), 4 * CACHE_BLOCK_BYTES);
+    }
+
+    #[test]
+    fn disk_cache_keeps_ranges_across_a_seek_shaped_rewrite() {
+        let mut temp = TempCache::new("stable");
+        temp.cache.adopt_len(8 * CACHE_BLOCK_BYTES);
+        temp.cache
+            .write(0, &vec![3u8; (4 * CACHE_BLOCK_BYTES) as usize]);
+        let before = temp.cache.ranges();
+        assert_eq!(before, vec![(0, 4 * CACHE_BLOCK_BYTES)]);
+        // Reading another region (what a seek does) changes the file, never the
+        // ranges that were already there.
+        temp.cache.write(
+            6 * CACHE_BLOCK_BYTES,
+            &vec![4u8; CACHE_BLOCK_BYTES as usize],
+        );
+        let after = temp.cache.ranges();
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[1], (6 * CACHE_BLOCK_BYTES, 7 * CACHE_BLOCK_BYTES));
+    }
+
+    #[test]
+    fn disk_cache_tail_read_stops_at_the_media_end() {
+        let mut temp = TempCache::new("tail");
+        // 2.5 blocks; the last write ends exactly at the media end.
+        let total = 2 * CACHE_BLOCK_BYTES + CACHE_BLOCK_BYTES / 2;
+        temp.cache.adopt_len(total);
+        temp.cache.write(0, &vec![5u8; total as usize]);
+        assert_eq!(temp.cache.ranges(), vec![(0, total)]);
+        assert_eq!(temp.cache.end_at(total - 1), total);
+        assert_eq!(temp.cache.end_at(total), 0);
+        // A write past the known length is clamped away, not recorded.
+        temp.cache.write(total, &vec![6u8; 1024]);
+        assert_eq!(temp.cache.ranges(), vec![(0, total)]);
+    }
+
+    #[test]
+    fn disk_cache_refuses_bytes_past_the_cap() {
+        let mut temp = TempCache::new("cap");
+        temp.cache.adopt_len(CACHE_CAP_BYTES + CACHE_BLOCK_BYTES);
+        // A write that crosses the cap is dropped whole, and the flag is set.
+        temp.cache.write(CACHE_CAP_BYTES, &vec![1u8; 4096]);
+        assert!(temp.cache.capped);
+        assert!(temp.cache.ranges().is_empty());
+        // Nothing past the cap is recorded, but the memory path is unaffected —
+        // the cache only ever refuses its own writes.
+        temp.cache.write(0, &vec![1u8; CACHE_BLOCK_BYTES as usize]);
+        assert_eq!(temp.cache.ranges(), vec![(0, CACHE_BLOCK_BYTES)]);
+    }
+
+    #[test]
+    fn disk_cache_removes_its_file() {
+        let mut temp = TempCache::new("remove");
+        temp.cache.adopt_len(2 * CACHE_BLOCK_BYTES);
+        temp.cache.write(0, &vec![7u8; CACHE_BLOCK_BYTES as usize]);
+        let path = temp.cache.path.clone();
+        assert!(path.exists());
+        temp.cache.remove();
+        // The removal runs on a bounded retry thread; a shared handle is gone
+        // here, so the first attempt succeeds.
+        for _ in 0..40 {
+            if !path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn disk_cache_map_round_trips_for_a_preload() {
+        let dir = std::env::temp_dir().join(format!("o11a1-cache-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut first = DiskCache::open_at(dir.clone(), "roundtrip");
+        first.adopt_len(10 * CACHE_BLOCK_BYTES);
+        first.write(0, &vec![1u8; (3 * CACHE_BLOCK_BYTES) as usize]);
+        first.write(7 * CACHE_BLOCK_BYTES, &vec![2u8; CACHE_BLOCK_BYTES as usize]);
+        assert!(first.save_map());
+        let expected = first.ranges();
+        drop(first);
+        // Reopening adopts the saved map instead of truncating.
+        let mut second = DiskCache::open_at(dir.clone(), "roundtrip");
+        assert_eq!(second.len(), 10 * CACHE_BLOCK_BYTES);
+        assert_eq!(second.ranges(), expected);
+        assert_eq!(second.first_hole(), 3 * CACHE_BLOCK_BYTES);
+        assert!(second.read_at(7 * CACHE_BLOCK_BYTES, 16).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_key_from_url_keeps_the_stream_identity() {
+        let url = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/17/88/42872408817/42872408817-1-30080.m4s?e=abc&deadline=1";
+        assert_eq!(cache_key_from_url(url), "42872408817-42872408817-1-30080");
+        // A different stream of the same video is a different file.
+        let other = url.replace("30080", "30077");
+        assert_ne!(cache_key_from_url(url), cache_key_from_url(&other));
+        // Query strings (expiring signatures) never leak into the name.
+        assert_eq!(
+            cache_key_from_url(url),
+            cache_key_from_url(url.split('?').next().unwrap_or(url))
+        );
+        assert!(!cache_key_name("../a b/c:d").contains(['/', ':', ' ']));
+    }
+
+    #[test]
+    fn published_downloaded_is_the_disk_map_after_a_seek() {
+        let mut temp = TempCache::new("publish");
+        temp.cache.adopt_len(8 * CACHE_BLOCK_BYTES);
+        temp.cache.write(0, &vec![9u8; CACHE_BLOCK_BYTES as usize]);
+        let engine = test_engine();
+        if let Ok(mut disk) = engine.disk.lock() {
+            *disk = DiskCache::open_at(temp.dir.clone(), "publish");
+            disk.write(0, &vec![9u8; CACHE_BLOCK_BYTES as usize]);
+        }
+        let before = engine.snapshot().downloaded;
+        assert_eq!(before, vec![(0, CACHE_BLOCK_BYTES)]);
+        // A far seek drops the memory window; the map is the file and must not
+        // move.
+        engine.seek(4 * CACHE_BLOCK_BYTES);
+        assert_eq!(engine.snapshot().downloaded, before);
+        assert_eq!(engine.cached_ranges(), before);
+        assert_eq!(engine.cached_bytes_at(0), CACHE_BLOCK_BYTES);
+    }
+
+    /// The single writer is the whole point of this module's disk path: one
+    /// thread, one merged call per contiguous run, flushed before shutdown.
+    #[test]
+    fn single_writer_merges_adjacent_blocks_and_flushes_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!("o11a1-writer-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let disk = Arc::new(Mutex::new(DiskCache::open_at(dir.clone(), "writer")));
+        if let Ok(mut cache) = disk.lock() {
+            cache.adopt_len(64 * 1024);
+        }
+        let mut writer = DiskWriter::spawn(disk.clone()).expect("a cache file opens");
+        // Twelve 4 KiB network reads of one contiguous range arrive one at a
+        // time: the writer merges them into a single run instead of twelve
+        // calls, and shutdown flushes what is still open.
+        for index in 0..12u64 {
+            writer.write(index * 4096, Arc::from(vec![index as u8 + 1; 4096]));
+        }
+        writer.shutdown();
+        let mut cache = disk.lock().expect("map lock");
+        assert_eq!(cache.ranges(), vec![(0, 49_152)]);
+        let bytes = cache.read_at(0, 49_152).expect("the merged run is in the file");
+        assert_eq!(bytes.len(), 49_152);
+        // Every block kept exactly the bytes it was sent with.
+        for index in 0..12usize {
+            assert_eq!(
+                &bytes[index * 4096..(index + 1) * 4096],
+                &vec![index as u8 + 1; 4096][..],
+                "block {index} landed at the wrong offset"
+            );
+        }
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session with no file has no writer thread: nothing to write, nothing
+    /// to keep alive (this is the `BILI_DISK_CACHE=0` shape).
+    #[test]
+    fn a_memory_only_cache_has_no_writer() {
+        let disk = Arc::new(Mutex::new(DiskCache::memory_only("memory".to_string())));
+        assert!(!disk.lock().expect("map lock").present());
+        assert!(DiskWriter::spawn(disk).is_none());
+    }
+
+    /// The coalescer's merge itself: adjacent, overlapping and prepending
+    /// blocks all stay one contiguous run, with the newest bytes winning.
+    #[test]
+    fn coalescer_keeps_runs_contiguous() {
+        let mut run = OpenRun {
+            start: 100,
+            bytes: vec![0u8; 10],
+            last: Instant::now(),
+        };
+        run.absorb(110, &[7u8; 10]);
+        assert_eq!((run.start, run.bytes.len()), (100, 20));
+        assert_eq!(&run.bytes[10..], &[7u8; 10][..]);
+        // A block starting before the run prepends, keeps the tail, and its own
+        // bytes win where they overlap.
+        run.absorb(90, &[9u8; 15]);
+        assert_eq!((run.start, run.bytes.len()), (90, 30));
+        assert_eq!(&run.bytes[..15], &[9u8; 15][..]);
+        assert_eq!(&run.bytes[15..20], &[0u8; 5][..]);
+        assert_eq!(&run.bytes[20..], &[7u8; 10][..]);
+    }
+
+    /// A `206` that stops early must never rewrite the length the file's own
+    /// `Content-Range` stated. Doing so made the serving body close at that
+    /// offset — ffmpeg's "Stream ends prematurely at N, should be M" — and the
+    /// player then ran its whole "playback ended" path mid-video.
+    #[test]
+    fn a_short_body_never_rewrites_the_known_length() {
+        let engine = test_engine();
+        let chunk = 4 << 20;
+        let total = 60_412_891u64;
+        if let Ok(mut state) = engine.state.lock() {
+            state.total = Some(total);
+        }
+        let shutdown = AtomicBool::new(false);
+
+        assert!(
+            engine.complete_range(0, chunk, 11_959_445, 4 * chunk, &shutdown),
+            "a short body against a known length is reported to the caller"
+        );
+        assert_eq!(engine.total(), Some(total), "the length must not shrink");
+        if let Ok(state) = engine.state.lock() {
+            assert!(!state.done.contains(&chunk), "a short range is not fetched");
+            assert!(state.requeued.contains(&chunk), "it goes back to the queue");
+            assert!(state.dead.is_empty(), "and it is not dead yet");
+        }
+
+        // A range that keeps stopping early is eventually retired — still
+        // without touching the length.
+        for _ in 0..SHORT_BODY_LIMIT {
+            engine.complete_range(0, chunk, 11_959_445, 4 * chunk, &shutdown);
+        }
+        assert_eq!(engine.total(), Some(total));
+        if let Ok(state) = engine.state.lock() {
+            assert!(state.dead.contains(&(0, chunk)));
+        }
+
+        // With no length known at all a short body is still EOF evidence (that
+        // is the only place the length can come from on such a response).
+        let unknown = test_engine();
+        assert!(!unknown.complete_range(0, 0, 4096, chunk, &shutdown));
+        assert_eq!(unknown.total(), Some(4096));
+    }
+
+    /// The whole-file queue is a convenience for a later seek, not playback:
+    /// it must not fetch while the bucket is empty or while the file is already
+    /// further ahead of the playhead than [`PLAYBACK_AHEAD_SECONDS`].
+    #[test]
+    fn whole_file_queue_is_rate_limited_and_horizon_bounded() {
+        let mut engine = test_engine();
+        let chunk = 1 << 20;
+        engine.config.chunk_bytes = chunk;
+        engine.config.warm_points = 1;
+        let bitrate = 400_000u64; // ~3.2 Mbit/s
+        let horizon = bitrate * PLAYBACK_AHEAD_SECONDS;
+        let mut disk = test_disk();
+        {
+            let mut state = match engine.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.total = Some(400 << 20);
+            state.cursor = 0;
+            state.warm_plan_started = false;
+            // Fill the hot window: everything up to the frontier is spoken for.
+            let frontier = (bitrate * HOT_AHEAD_SECONDS).max(chunk * 2);
+            let mut start = 0;
+            while start < frontier {
+                state.inflight.insert((0, start));
+                start += chunk;
+            }
+            // The bucket starts with one burst; spend it so the next claim has
+            // nothing left.
+            state.spec_tokens = 0;
+            state.spec_at = Instant::now();
+        }
+        let mut state = match engine.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, bitrate, &disk),
+            None,
+            "an empty speculative bucket must idle the worker"
+        );
+        // A full bucket lets exactly one chunk through (the burst), then the
+        // refill rate takes over.
+        state.spec_tokens = chunk;
+        state.spec_at = Instant::now() + Duration::from_secs(600);
+        assert!(matches!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, bitrate, &disk),
+            Some((_, ChunkKind::Rest))
+        ));
+        // Ahead of the horizon: the file is already downloaded far enough.
+        state.spec_tokens = chunk;
+        state.spec_at = Instant::now() + Duration::from_secs(600);
+        disk.insert(0, horizon);
+        assert_eq!(
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, bitrate, &disk),
+            None,
+            "nothing may be fetched past the {PLAYBACK_AHEAD_SECONDS}s horizon"
+        );
+    }
+
+    /// The read-ahead window is the configured size, but never more than
+    /// [`PLAYBACK_AHEAD_SECONDS`] of the stream (a 400 kbit/s video must not
+    /// buffer ten minutes), which is what keeps memory and trim work bounded.
+    #[test]
+    fn read_ahead_window_is_capped_to_the_horizon() {
+        let mut engine = test_engine();
+        engine.config.read_ahead_bytes = 64 << 20;
+        engine.config.media_duration_ms = Some(600_000);
+        if let Ok(mut state) = engine.state.lock() {
+            state.total = Some(60_000_000);
+        }
+        // 60 MB over 600 s = 100 kB/s -> 90 s is 9 MB.
+        engine.refresh_media_bps(60_000_000);
+        assert_eq!(engine.media_bps(), 100_000);
+        assert_eq!(engine.read_ahead_window(), 9_000_000);
+        // Without a duration the configured window stands (fallback path).
+        let plain = test_engine();
+        assert_eq!(plain.read_ahead_window(), DEFAULT_READ_AHEAD_BYTES);
     }
 }
 

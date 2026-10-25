@@ -68,6 +68,8 @@ const DM_THUMBUP_URL: &str = "https://api.bilibili.com/x/v2/dm/thumbup/add";
 const DM_AI_CONFIG_URL: &str = "https://api.bilibili.com/x/v2/dm/web/config";
 const LIKE_HAS_URL: &str = "https://api.bilibili.com/x/web-interface/archive/has/like";
 const LIKE_URL: &str = "https://api.bilibili.com/x/web-interface/archive/like";
+/// Playback heartbeat: the call that writes the official 历史记录 entry.
+const HEARTBEAT_URL: &str = "https://api.bilibili.com/x/click-interface/web/heartbeat";
 const COIN_STATE_URL: &str = "https://api.bilibili.com/x/web-interface/archive/coins";
 const COIN_ADD_URL: &str = "https://api.bilibili.com/x/web-interface/coin/add";
 const FAV_FOLDERS_URL: &str = "https://api.bilibili.com/x/v3/fav/folder/created/list-all";
@@ -84,10 +86,8 @@ const TOVIEW_ADD_URL: &str = "https://api.bilibili.com/x/v2/history/toview/add";
 const TOVIEW_DEL_URL: &str = "https://api.bilibili.com/x/v2/history/toview/del";
 const REGION_URL: &str = "https://api.bilibili.com/x/web-interface/dynamic/region";
 const REGION_NEWLIST_URL: &str = "https://api.bilibili.com/x/web-interface/newlist";
+#[allow(dead_code)] // reached by download.rs's benchmark helper (cfg(test))
 const RANKING_URL: &str = "https://api.bilibili.com/x/web-interface/ranking/v2";
-const POPULAR_URL: &str = "https://api.bilibili.com/x/web-interface/popular";
-/// 入站必刷: same `data.list[]` shape as 热门 (`page_size` up to 100).
-const PRECIOUS_URL: &str = "https://api.bilibili.com/x/web-interface/popular/precious";
 const SUGGEST_URL: &str = "https://s.search.bilibili.com/main/suggest";
 const HOTWORD_URL: &str = "https://s.search.bilibili.com/main/hotword";
 const SQUARE_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/square";
@@ -107,6 +107,7 @@ const RELATION_MODIFY_URL: &str = "https://api.bilibili.com/x/relation/modify";
 const LOGOUT_URL: &str = "https://passport.bilibili.com/login/exit/v2";
 /// `ranking/v2` is rejected (risk control `-352`) unless the request carries the
 /// ranking page as `Referer`; the shared client's default `bilibili.com/` fails.
+#[allow(dead_code)] // used with RANKING_URL
 const RANK_REFERER: &str = "https://www.bilibili.com/v/popular/rank/all";
 
 // -- 视频评论 (comments) ------------------------------------------------------
@@ -264,13 +265,6 @@ pub fn token_path() -> PathBuf {
 pub fn load_token() -> Option<Token> {
     let data = std::fs::read_to_string(token_path()).ok()?;
     serde_json::from_str::<Token>(&data).ok()
-}
-
-#[allow(dead_code)]
-pub fn save_token(token: &Token) -> Result<()> {
-    let data = serde_json::to_string_pretty(token)?;
-    std::fs::write(token_path(), data)?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -946,8 +940,7 @@ impl Session {
     /// verbatim instead of failing on a non-zero code, so write endpoints whose
     /// result depends on risk control can report exactly what came back.
     /// `label` names the endpoint in the debug log (the URL may carry `csrf`).
-    async fn post_form_code(
-        &self,
+    async fn post_form_code(        &self,
         label: &str,
         url: &str,
         referer: &str,
@@ -972,8 +965,54 @@ impl Session {
         Ok((resp.code, resp.message))
     }
 
-    // -- Coin (投币) -------------------------------------------------------
+    // -- Watch history (历史记录) -----------------------------------------
 
+    /// Report one playback heartbeat, which is what makes a video appear in the
+    /// account's **历史记录** on the official web site and app, with the position
+    /// they show there.
+    ///
+    /// `played_s` is the position, `watched_s` the time actually spent in this
+    /// session, `start_ts` the Unix second the session began. `play_type` follows
+    /// the web player: 1 start, 0 playing, 2 pause, 3 resume, 4 ended. The API
+    /// answers `code = 0` on success; a non-zero code is returned (not an error)
+    /// so a risk-control rejection cannot break playback.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn report_heartbeat(
+        &self,
+        aid: u64,
+        bvid: &str,
+        cid: u64,
+        played_s: u64,
+        watched_s: u64,
+        duration_s: u64,
+        start_ts: u64,
+        play_type: u64,
+    ) -> Result<i64> {
+        let csrf = self.csrf_cookie()?;
+        let body = heartbeat_body(
+            aid,
+            bvid,
+            cid,
+            played_s,
+            watched_s,
+            duration_s,
+            start_ts,
+            play_type,
+            &csrf,
+        );
+        let referer = format!("https://www.bilibili.com/video/{bvid}");
+        let (code, message) = self
+            .post_form_code("heartbeat", HEARTBEAT_URL, &referer, body)
+            .await?;
+        if code != 0 {
+            crate::debug_log(&format!(
+                "heartbeat rejected bvid={bvid} code={code} msg={message}"
+            ));
+        }
+        Ok(code)
+    }
+
+    // -- Coin (投币) -------------------------------------------------------
     /// Coins the active account has already given `bvid`: 0, 1 or 2.
     pub async fn coin_state(&self, bvid: &str) -> Result<i64> {
         let resp: CoinStateResp = self
@@ -1390,7 +1429,6 @@ impl Session {
                 mid: item.mid,
                 play: item.play,
                 duration: item.duration,
-                pub_ts: item.pubdate,
             })
             .collect();
         Ok(SearchPage {
@@ -1428,11 +1466,6 @@ impl Session {
                 fans: item.fans,
                 videos: item.videos,
                 usign: item.usign,
-                level: item.level,
-                official: item
-                    .official_verify
-                    .map(|verify| verify.desc)
-                    .unwrap_or_default(),
             })
             .collect();
         Ok(SearchPage {
@@ -1478,42 +1511,35 @@ impl Session {
         let data = resp
             .data
             .ok_or_else(|| anyhow!("获取视频详情失败：响应缺少 data"))?;
-        let (owner_name, owner_face, owner_mid) = match data.owner {
-            Some(owner) => (owner.name, normalize_url(&owner.face), owner.mid),
-            None => (String::new(), String::new(), 0),
+        let (owner_name, owner_mid) = match data.owner {
+            Some(owner) => (owner.name, owner.mid),
+            None => (String::new(), 0),
         };
         let stat = data.stat.unwrap_or_default();
         let pages = data
             .pages
             .into_iter()
-            .map(|page| VideoPart {
-                cid: page.cid,
-                page: page.page,
-                part: page.part,
-                duration: page.duration,
-            })
+            .map(|page| VideoPart { cid: page.cid })
             .collect();
+        let native_height = data.dimension.as_ref().map(|size| size.height).unwrap_or(0);
+        // The upload's own resolution is the only evidence `playurl` cannot see
+        // (it reports what this account may play, not what the source has), so
+        // it is kept for the tier fallback of the very next `playurl` call.
+        remember_native_height(&data.bvid, native_height);
         Ok(VideoDetail {
             bvid: data.bvid,
             aid: data.aid,
             cid: data.cid,
             title: data.title,
-            desc: data.desc,
             pic: normalize_url(&data.pic),
             duration: data.duration,
             pubdate: data.pubdate,
-            tname: data.tname,
             owner_name,
-            owner_face,
             owner_mid,
             stat_view: stat.view,
-            stat_danmaku: stat.danmaku,
-            stat_reply: stat.reply,
-            stat_favorite: stat.favorite,
-            stat_coin: stat.coin,
-            stat_like: stat.like,
-            stat_share: stat.share,
             pages,
+            width: data.dimension.as_ref().map(|size| size.width).unwrap_or(0),
+            height: native_height,
         })
     }
 
@@ -1663,7 +1689,6 @@ impl Session {
             None => String::new(),
         };
         Ok(UpInfo {
-            mid: if data.mid == 0 { mid } else { data.mid },
             name: data.name,
             face: normalize_url(&data.face),
             sign: data.sign,
@@ -1714,10 +1739,8 @@ impl Session {
             .into_iter()
             .map(|item| SpaceVideo {
                 bvid: item.bvid,
-                aid: item.aid,
                 title: strip_html(&item.title),
                 pic: normalize_url(&item.pic),
-                created: item.created,
                 length: item.length,
                 play: item.play,
                 danmaku: item.video_review,
@@ -2024,9 +2047,8 @@ impl Session {
             bail!("获取消息列表失败（code={}）", body.code);
         }
         let data = body.data.unwrap_or_default();
-        let is_end = data.cursor.map(|cursor| cursor.is_end).unwrap_or(true);
         let items = data.items.into_iter().map(msg_item_from).collect();
-        Ok(MsgPage { items, is_end })
+        Ok(MsgPage { items })
     }
 
     // -- 私信 (private messages, READ ONLY) --------------------------------
@@ -2188,7 +2210,50 @@ impl Session {
         let data = body
             .data
             .ok_or_else(|| anyhow!("获取播放地址失败：响应缺少 data"))?;
+        // The tier lists are the whole truth about what the video offers: the
+        // account's `dash.video[]` may be a strict subset (大会员 tiers are
+        // dropped for a non-VIP account). Logged verbatim so a QA run can tell
+        // "the video does not have 4K" from "this account may not play 4K".
+        crate::debug_log(&format!(
+            "playurl tiers accept_quality={:?} accept_description={:?} support_formats=[{}]",
+            data.accept_quality,
+            data.accept_description,
+            data.support_formats
+                .iter()
+                .map(|format| format!(
+                    "q={} new={} display={} codecs={}",
+                    format.quality,
+                    format.new_description,
+                    format.display_desc,
+                    format.codecs.join("|")
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let tiers = {
+            // The response only names tiers this account can reach; when it names
+            // nothing at all, the upload's own resolution is the remaining
+            // evidence. `video_view` usually ran first and left it cached, so
+            // this costs no request on the normal open path.
+            let advertised =
+                !data.accept_quality.is_empty() || !data.support_formats.is_empty();
+            let mut native_height = native_height_for(bvid).unwrap_or(0);
+            if !advertised && native_height == 0 {
+                native_height = self
+                    .video_view(bvid)
+                    .await
+                    .map(|view| view.height)
+                    .unwrap_or(0);
+            }
+            build_quality_tiers(&data, native_height)
+        };
         let info = build_play_info(data).ok_or_else(|| anyhow!("获取播放地址失败：未找到可用媒体流"))?;
+        // Remember the full tier list for the 画质 menu: the playable stream
+        // rows come from `info.qualities`, the locked 大会员 rows from this.
+        if tiers_qa_bvid().as_deref() == Some(bvid) {
+            log_tier_table(bvid, cid, &tiers);
+        }
+        remember_quality_tiers(bvid, cid, tiers);
         // Diagnostic only: every candidate's `qn`/`codecid`/`bandwidth`, so the
         // auto selection (smallest stream) can be checked against the others.
         crate::debug_log(&format!(
@@ -2769,7 +2834,7 @@ impl Session {
         Ok(out)
     }
 
-    // -- Discovery: 分区 / 排行 / 热门 / 热搜 / 搜索建议 -------------------
+    // -- Discovery: 分区 / 排行 / 热搜 / 搜索建议 -------------------------
 
     /// One page of a region's latest videos. `pn` is 1-based; `ps` is the
     /// requested page size (out of range keeps the endpoint's own default).
@@ -2809,6 +2874,7 @@ impl Session {
     }
 
     /// The 全站 (`rid = 0`) or one region's ranking list (single page).
+    #[allow(dead_code)] // the 排行 UI is gone; the download benchmark still picks a target here
     pub async fn ranking(&self, rid: i64) -> Result<Vec<VideoCard>> {
         let params = [("rid", rid.to_string()), ("type", "all".to_string())];
         let body: RankingResp = self
@@ -2816,47 +2882,6 @@ impl Session {
             .await?;
         if body.code != 0 {
             bail!("获取排行榜失败（code={}）", body.code);
-        }
-        Ok(body
-            .data
-            .unwrap_or_default()
-            .list
-            .into_iter()
-            .map(card_from)
-            .collect())
-    }
-
-    /// One page of the 热门 (popular) list. `pn` is 1-based; `ps` is the
-    /// requested page size (out of range keeps the endpoint's own default).
-    pub async fn popular(&self, pn: i64, ps: i64) -> Result<CardPage> {
-        let pn = pn.max(1);
-        let ps = page_size_param(ps).unwrap_or(20);
-        let params = [("ps", ps.to_string()), ("pn", pn.to_string())];
-        let body: PopularResp = self.get_query_json(POPULAR_URL, &params, None).await?;
-        if body.code != 0 {
-            bail!("获取热门失败（code={}）", body.code);
-        }
-        let data = body.data.unwrap_or_default();
-        let items: Vec<VideoCard> = data.list.into_iter().map(card_from).collect();
-        // A short page (fewer than the requested size) is the last one; the
-        // endpoint's own `no_more` wins when it says so.
-        let has_more = !data.no_more && items.len() as i64 >= ps;
-        Ok(CardPage {
-            page: pn,
-            has_more,
-            items,
-        })
-    }
-
-    /// The 入站必刷 list (up to 100 entries, no paging). Same card shape as 热门.
-    pub async fn precious(&self) -> Result<Vec<VideoCard>> {
-        let params = [
-            ("page_size", "100".to_string()),
-            ("page", "1".to_string()),
-        ];
-        let body: PopularResp = self.get_query_json(PRECIOUS_URL, &params, None).await?;
-        if body.code != 0 {
-            bail!("获取入站必刷失败（code={}）", body.code);
         }
         Ok(body
             .data
@@ -3250,8 +3275,32 @@ pub fn quality_fnval() -> i64 {
 
 /// Full signed parameter set for `playurl`. The `dm_img_*` / `web_location`
 /// entries are required since 2026-06 to avoid an HTTP 412 risk-control block.
-fn playurl_params(bvid: &str, cid: u64) -> Vec<(String, String)> {
-    vec![
+/// Form body of one `x/click-interface/web/heartbeat` call.
+///
+/// `type=3` / `sub_type=0` / `dt=2` / `play_type` mirror what the web player
+/// sends; `video_duration` keeps the history entry's progress bar proportional.
+#[allow(clippy::too_many_arguments)]
+fn heartbeat_body(
+    aid: u64,
+    bvid: &str,
+    cid: u64,
+    played_s: u64,
+    watched_s: u64,
+    duration_s: u64,
+    start_ts: u64,
+    play_type: u64,
+    csrf: &str,
+) -> String {
+    format!(
+        "aid={aid}&bvid={}&cid={cid}&played_time={played_s}&realtime={watched_s}\
+         &start_ts={start_ts}&type=3&sub_type=0&dt=2&play_type={play_type}\
+         &video_duration={duration_s}&csrf={}",
+        encode_component(bvid),
+        encode_component(csrf),
+    )
+}
+
+fn playurl_params(bvid: &str, cid: u64) -> Vec<(String, String)> {    vec![
         ("bvid".into(), bvid.to_string()),
         ("cid".into(), cid.to_string()),
         ("qn".into(), "80".into()),
@@ -3533,6 +3582,161 @@ fn default_quality(tracks: &[VideoTrack]) -> i64 {
 }
 
 /// Select every video quality plus one audio URL from a DASH/DURL response.
+/// Every quality tier the response advertises or returned, marking the ones
+/// this account may not play.
+///
+/// `accept_quality` / `support_formats` name the video's tiers; `dash.video[]`
+/// is the subset the signed-in account may play. A tier with no stream is a
+/// locked 大会员 row. Tiers are ordered high→low, the same as the stream rows.
+///
+/// `native_height` is the upload's own `dimension.height` (`0` when unknown).
+/// It is used only when the advertised list stops at what the account may play
+/// — see [`possible_tiers`] — so a 1080p upload never gets a 4K/8K row.
+fn build_quality_tiers(data: &PlayUrlData, native_height: u32) -> Vec<QualityTier> {
+    let video = data
+        .dash
+        .as_ref()
+        .map(|dash| dash.video.as_slice())
+        .unwrap_or(&[]);
+    let mut played: Vec<i64> = Vec::new();
+    let mut fps = 0.0f64;
+    for track in video {
+        if !played.contains(&track.id) {
+            played.push(track.id);
+        }
+        let rate = track_frame_rate(track);
+        if rate > fps && rate < 200.0 {
+            fps = rate;
+        }
+    }
+    // The video's own frame rate for tiers whose id does not name one (4K,
+    // HDR): the permitted streams are the same source and carry it.
+    let observed_fps = if fps > 1.0 { fps } else { 30.0 };
+    let fps = observed_fps.round() as u32;
+
+    // Union of what the video advertises and what actually came back: a stream
+    // the API did not list (e.g. `100` 智能修复) is still a playable tier.
+    let mut qns: Vec<i64> = Vec::new();
+    for qn in data
+        .accept_quality
+        .iter()
+        .copied()
+        .chain(data.support_formats.iter().map(|format| format.quality))
+        .chain(played.iter().copied())
+    {
+        if qn > 0 && !qns.contains(&qn) {
+            qns.push(qn);
+        }
+    }
+
+    // Nothing advertised is missing from `dash.video[]`, so this response says
+    // nothing about a tier the account cannot play. The upload's own resolution
+    // is the remaining evidence: derive the tiers such a source can have and
+    // mark them locked. Always additive — a derived `qn` that came back stays
+    // playable.
+    if native_height > 0 && qns.iter().all(|qn| played.contains(qn)) {
+        for qn in possible_tiers(native_height, observed_fps) {
+            if !qns.contains(&qn) {
+                qns.push(qn);
+            }
+        }
+    }
+
+    let mut tiers: Vec<QualityTier> = qns
+        .into_iter()
+        .map(|qn| QualityTier {
+            qn,
+            label: tier_label(data, qn),
+            detail: tier_detail(qn, fps),
+            locked: !played.contains(&qn),
+        })
+        .collect();
+    tiers.sort_by(|left, right| right.qn.cmp(&left.qn));
+    tiers
+}
+
+/// Tiers a source `native_height` pixels tall can have **beyond** the ones this
+/// account was allowed to play, derived only from evidence the API gives:
+///
+/// * `≥4320` → 8K (`127`); `≥2160` → 4K (`120`).
+/// * 1080P+ (`112`) is a ≥4K derivative and only exists for a source that is not
+///   already 60 fps; 1080P60 (`116`) needs a ≥50 fps source.
+/// * HDR (`125` / `129`) and 杜比视界 (`126`) need a response flag the view API
+///   does not carry, so they are never derived.
+///
+/// Everything returned here is a tier the video could actually have, which is
+/// what keeps the 画质 menu from offering 8K on a 1080p upload.
+fn possible_tiers(native_height: u32, fps: f64) -> Vec<i64> {
+    let mut qns = Vec::new();
+    if native_height >= 4320 {
+        qns.push(127);
+    }
+    if native_height >= 2160 {
+        qns.push(120);
+    }
+    let sixty = fps >= 50.0;
+    if native_height >= 2160 && !sixty {
+        qns.push(112);
+    }
+    if native_height >= 1080 && sixty {
+        qns.push(116);
+    }
+    qns
+}
+
+/// The app-wide label for a tier; an id [`qn_label`] does not know falls back
+/// to the API's own description instead of showing `默认`.
+fn tier_label(data: &PlayUrlData, qn: i64) -> String {
+    let known = qn_label(qn);
+    if known != "默认" {
+        return known.to_string();
+    }
+    if let Some(index) = data.accept_quality.iter().position(|id| *id == qn) {
+        if let Some(text) = data
+            .accept_description
+            .get(index)
+            .filter(|text| !text.is_empty())
+        {
+            return text.clone();
+        }
+    }
+    data.support_formats
+        .iter()
+        .find(|format| format.quality == qn)
+        .map(|format| {
+            if format.new_description.is_empty() {
+                format.display_desc.clone()
+            } else {
+                format.new_description.clone()
+            }
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| format!("qn {qn}"))
+}
+
+/// The expected picture of a tier: `3840×2160 · 30fps`.
+///
+/// 74/116 are the 60 fps tiers by definition; every other tier runs at the
+/// video's own frame rate. A tier with no documented size still gets copy that
+/// says why it cannot be picked.
+fn tier_detail(qn: i64, video_fps: u32) -> String {
+    let size = match qn {
+        6 => (320, 240),
+        16 => (640, 360),
+        32 => (852, 480),
+        64 | 74 => (1280, 720),
+        80 | 100 | 112 | 116 => (1920, 1080),
+        120 | 125 | 126 | 129 => (3840, 2160),
+        127 => (7680, 4320),
+        _ => return "大会员专享".to_string(),
+    };
+    let fps = match qn {
+        74 | 116 => 60,
+        _ => video_fps,
+    };
+    format!("{}×{} · {}fps", size.0, size.1, fps)
+}
+
 fn build_play_info(data: PlayUrlData) -> Option<PlayInfo> {
     let mut video_tracks = Vec::new();
     let mut qualities = Vec::new();
@@ -3580,7 +3784,6 @@ fn build_play_info(data: PlayUrlData) -> Option<PlayInfo> {
     })
 }
 
-#[allow(dead_code)] // Remove once the player / QA hook in main.rs calls into this layer.
 mod cdn_select {
     use super::*;
 
@@ -4510,7 +4713,6 @@ mod cdn_select {
     }
 }
 
-#[allow(unused_imports)] // Only warning while nothing re-exports these names yet.
 pub use self::cdn_select::*;
 
 // ---------------------------------------------------------------------------
@@ -4520,12 +4722,52 @@ pub use self::cdn_select::*;
 /// `BILI_QUALITY_TEST=<bvid>` for the quality QA hook. `BILI_QUALITY_FNVAL`
 /// (see [`quality_fnval`]) optionally overrides the requested `fnval` so two
 /// runs can be diffed.
-#[allow(dead_code)] // Driven by the env var from the live test / startup hook.
+///
+/// `BILI_TIERS_TEST=<bvid>` is the narrower hook of the two and names a bvid on
+/// its own (see [`tiers_qa_bvid`]): the same selftest runs, and `playurl` logs
+/// the resolved tier table.
 pub fn quality_qa_bvid() -> Option<String> {
-    std::env::var("BILI_QUALITY_TEST")
+    let from_env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    from_env("BILI_QUALITY_TEST").or_else(|| from_env("BILI_TIERS_TEST"))
+}
+
+/// `BILI_TIERS_TEST=<bvid>`: log the resolved tier table of that video, one row
+/// per line, through [`crate::debug_log`].
+///
+/// Read on the normal `playurl` path, so it needs no hook of its own: the video
+/// is fetched by [`Session::quality_selftest`] (which
+/// [`quality_qa_bvid`] also drives) or by opening it in the player.
+pub fn tiers_qa_bvid() -> Option<String> {
+    std::env::var("BILI_TIERS_TEST")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// One `tiers …` line per tier plus a `tiers summary …` line, for
+/// `BILI_TIERS_TEST`. The table is exactly the one the 画质 menu reads, so a
+/// locked 大会员 row can be told from a tier the video does not have.
+fn log_tier_table(bvid: &str, cid: u64, tiers: &[QualityTier]) {
+    for tier in tiers {
+        crate::debug_log(&format!(
+            "tiers bvid={bvid} cid={cid} qn={} label={} locked={} note={} detail={}",
+            tier.qn,
+            tier.label,
+            tier.locked,
+            tier.note(),
+            tier.detail
+        ));
+    }
+    let locked = tiers.iter().filter(|tier| tier.locked).count();
+    crate::debug_log(&format!(
+        "tiers summary bvid={bvid} cid={cid} total={} locked={locked}",
+        tiers.len()
+    ));
 }
 
 impl Session {
@@ -4537,7 +4779,6 @@ impl Session {
     /// what the account can actually get. Everything goes through
     /// [`crate::debug_log`] (`BILI_DEBUG_LOG`) and is also returned as one block,
     /// like [`Session::cdn_selftest`].
-    #[allow(dead_code)] // Called from the `BILI_QUALITY_TEST` hook / live test.
     pub async fn quality_selftest(&self, bvid: &str) -> Result<String> {
         let detail = self.video_view(bvid).await?;
         let cid = if detail.cid > 0 {
@@ -4553,12 +4794,18 @@ impl Session {
             bail!("画质 QA: {bvid} 没有可用 cid");
         }
         let info = self.playurl(bvid, cid).await?;
-        let mut report = vec![format!(
-            "quality bvid={bvid} cid={cid} fnval={} streams={} audio={}",
-            quality_fnval(),
-            info.qualities.len(),
-            info.audio_tracks.len()
-        )];
+        let mut report = vec![
+            format!(
+                "quality bvid={bvid} cid={cid} fnval={} streams={} audio={}",
+                quality_fnval(),
+                info.qualities.len(),
+                info.audio_tracks.len()
+            ),
+            format!(
+                "quality view bvid={bvid} width={} height={} pubdate={} cid={}",
+                detail.width, detail.height, detail.pubdate, detail.cid
+            ),
+        ];
         for quality in &info.qualities {
             report.push(format!(
                 "quality qn={} label={} {}x{} {:.2}fps codec={}({}) {:.2}Mbps hdr={} dolby={} 8k={}",
@@ -4651,7 +4898,6 @@ impl Session {
 
 /// `BILI_FAV_TEST=1` enables the 收藏推荐 hook
 /// ([`Session::fav_selftest`]). Values other than `1`/`true` leave it off.
-#[allow(dead_code)] // Driven by the env var from the live test / startup hook.
 pub fn fav_qa_enabled() -> bool {
     std::env::var("BILI_FAV_TEST")
         .map(|value| {
@@ -4663,7 +4909,6 @@ pub fn fav_qa_enabled() -> bool {
 
 /// Up to two distinct pseudo-random picks from `items`, clock-seeded so repeated
 /// runs sample different videos. Never indexes out of bounds.
-#[allow(dead_code)] // Only used by the `BILI_FAV_TEST` hook.
 fn fav_qa_picks(items: &[FeedVideo]) -> Vec<&FeedVideo> {
     let mut picks = Vec::with_capacity(2);
     if items.is_empty() {
@@ -4702,7 +4947,6 @@ impl Session {
     /// logged in, so an anonymous run is visible instead of silently empty.
     /// Everything goes through [`crate::debug_log`] and is returned as one block,
     /// like [`Session::quality_selftest`].
-    #[allow(dead_code)] // Called from the `BILI_FAV_TEST` hook / live test.
     pub async fn fav_selftest(&self) -> Result<String> {
         let mut report = Vec::new();
         match self.nav().await {
@@ -4849,7 +5093,6 @@ pub struct Relation {
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct FeedVideo {
     pub bvid: String,
     pub cid: u64,
@@ -4866,20 +5109,17 @@ pub struct FeedVideo {
     pub pub_ts: i64,
 }
 
-/// One discovery card (分区 / 排行 / 热门 item).
+/// One discovery card (分区 / 排行 item).
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct VideoCard {
     pub bvid: String,
     pub title: String,
     pub pic: String,
     pub owner: String,
     pub view: u64,
-    pub danmaku: u64,
+    #[allow(dead_code)] // card metadata (kept for the API shape)
     pub like: u64,
     pub duration: u64,
-    pub score: i64,
-    pub pubdate: i64,
 }
 
 /// One paged card list plus its pagination state.
@@ -4891,11 +5131,9 @@ pub struct CardPage {
 
 /// One trending-search entry.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct HotSearch {
     pub keyword: String,
     pub show_name: String,
-    pub icon: String,
 }
 
 #[derive(Deserialize)]
@@ -5510,6 +5748,102 @@ pub fn quality_label(qn: i64) -> String {
     qn_label(qn).to_string()
 }
 
+/// One quality tier the video advertises in `accept_quality` /
+/// `support_formats`, whether or not the signed-in account may play it.
+///
+/// For a non-VIP account the lists still name every tier the upload has (4K,
+/// 1080P60, HDR, 8K …); `dash.video[]` is the strict subset the account may
+/// actually play. `locked` is that difference: no stream came back at this
+/// `qn`, so the row is a 大会员 upsell, not a playable stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualityTier {
+    /// Tier id (`116` 1080P60, `120` 4K, `125` HDR, `127` 8K, …).
+    pub qn: i64,
+    /// The app-wide label for the tier (`1080P60`, `4K 超清`, …).
+    pub label: String,
+    /// Expected picture, formatted for the menu: `3840×2160 · 30fps`.
+    pub detail: String,
+    /// No `dash.video[]` stream was returned at this `qn` for this account.
+    pub locked: bool,
+}
+
+impl QualityTier {
+    /// The menu copy a locked row carries: `需要大会员` for a VIP tier this
+    /// account may not play, empty for a playable row and for a locked tier
+    /// that is not a 大会员 one.
+    ///
+    /// Derived from `qn`/`locked` instead of stored, so the two can never
+    /// disagree.
+    pub fn note(&self) -> &'static str {
+        if self.locked && is_vip_quality(self.qn) {
+            "需要大会员"
+        } else {
+            ""
+        }
+    }
+}
+
+/// The upload's native picture height (`dimension.height` of
+/// `x/web-interface/view`) for the last few videos, keyed by `bvid`.
+///
+/// `playurl` reports what this account may play, never the source resolution,
+/// so the tier fallback ([`possible_tiers`]) needs the value `video_view`
+/// already fetched when the video was opened. Bounded and only a hint: a miss
+/// (`None`) means "unknown", never "0 pixels".
+static NATIVE_SIZE_CACHE: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+
+const NATIVE_SIZE_CACHE_MAX: usize = 64;
+
+fn remember_native_height(bvid: &str, height: u32) {
+    if bvid.is_empty() || height == 0 {
+        return;
+    }
+    let Ok(mut cache) = NATIVE_SIZE_CACHE.lock() else {
+        return;
+    };
+    cache.retain(|(cached_bvid, _)| cached_bvid != bvid);
+    cache.insert(0, (bvid.to_string(), height));
+    cache.truncate(NATIVE_SIZE_CACHE_MAX);
+}
+
+fn native_height_for(bvid: &str) -> Option<u32> {
+    let cache = NATIVE_SIZE_CACHE.lock().ok()?;
+    cache
+        .iter()
+        .find(|(cached_bvid, _)| cached_bvid == bvid)
+        .map(|(_, height)| *height)
+}
+
+/// Last few `playurl` tier lists, keyed by the video they belong to.
+///
+/// The player's catalogue (`PlayInfo::qualities`) only ever holds playable
+/// streams, and its structs are the player's contract, so the tier list a
+/// non-VIP account cannot play is kept here from the same response that
+/// produced the streams. Bounded and keyed by `(bvid, cid)` so several open
+/// player windows never read another video's list.
+static QUALITY_TIER_CACHE: Mutex<Vec<(String, u64, Vec<QualityTier>)>> = Mutex::new(Vec::new());
+
+const QUALITY_TIER_CACHE_MAX: usize = 16;
+
+fn remember_quality_tiers(bvid: &str, cid: u64, tiers: Vec<QualityTier>) {
+    let Ok(mut cache) = QUALITY_TIER_CACHE.lock() else {
+        return;
+    };
+    cache.retain(|(cached_bvid, cached_cid, _)| cached_bvid != bvid || *cached_cid != cid);
+    cache.insert(0, (bvid.to_string(), cid, tiers));
+    cache.truncate(QUALITY_TIER_CACHE_MAX);
+}
+
+/// The tier list `playurl` saw for `bvid`/`cid`, if this process fetched it.
+/// `None` (never an invented list) when the video was not opened yet.
+pub fn quality_tiers_for(bvid: &str, cid: u64) -> Option<Vec<QualityTier>> {
+    let cache = QUALITY_TIER_CACHE.lock().ok()?;
+    cache
+        .iter()
+        .find(|(cached_bvid, cached_cid, _)| cached_bvid == bvid && *cached_cid == cid)
+        .map(|(_, _, tiers)| tiers.clone())
+}
+
 /// Human label for a DASH `codecid`.
 pub fn codec_label(codecid: i64) -> &'static str {
     match codecid {
@@ -5594,6 +5928,31 @@ struct PlayUrlData {
     durl: Vec<Durl>,
     #[serde(default)]
     timelength: u64,
+    /// Every tier the video advertises (`120` 4K, `116` 1080P60, …), in the
+    /// API's own order. The signed-in account may not be able to play all of
+    /// them; `dash.video[]` is the authoritative list of what it may play.
+    #[serde(default)]
+    accept_quality: Vec<i64>,
+    /// Labels parallel to `accept_quality` (`4K 超清`, `1080P 高码率`, …).
+    #[serde(default)]
+    accept_description: Vec<String>,
+    /// The same tiers with their marketing copy and codec list.
+    #[serde(default)]
+    support_formats: Vec<SupportFormat>,
+}
+
+/// One `support_formats[]` entry: a tier the video offers, not necessarily one
+/// this account may play.
+#[derive(Clone, Deserialize)]
+struct SupportFormat {
+    #[serde(default)]
+    quality: i64,
+    #[serde(default)]
+    new_description: String,
+    #[serde(default)]
+    display_desc: String,
+    #[serde(default)]
+    codecs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -5967,6 +6326,192 @@ mod track_tests {
         assert_eq!(info.default_qn, 0);
         assert_eq!(info.duration, 125);
         assert!(info.audio_tracks.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::{
+        build_quality_tiers, quality_tiers_for, remember_quality_tiers, tiers_qa_bvid, PlayUrlData,
+    };
+
+    fn data(json: &str) -> PlayUrlData {
+        match serde_json::from_str(json) {
+            Ok(data) => data,
+            Err(err) => panic!("tier fixture did not parse: {err}"),
+        }
+    }
+
+    /// The real shape for a 4K video on a non-VIP account: the tier lists name
+    /// 4K/1080P60, `dash.video[]` only has 1080P and below.
+    const FOUR_K_NON_VIP: &str = r#"{
+        "accept_quality":[120,116,80,64],
+        "accept_description":["超清 4K","高清 1080P60","高清 1080P","高清 720P"],
+        "support_formats":[
+            {"quality":120,"new_description":"4K 超清","display_desc":"4K","codecs":["avc1.640034"]},
+            {"quality":116,"new_description":"1080P 60帧","display_desc":"1080P","codecs":["avc1.640032"]}
+        ],
+        "dash":{"video":[
+            {"id":80,"frameRate":"29.97","baseUrl":"https://x/80"},
+            {"id":64,"frameRate":"29.97","baseUrl":"https://x/64"}
+        ]}
+    }"#;
+
+    #[test]
+    fn advertised_tiers_include_the_locked_vip_ones() {
+        let tiers = build_quality_tiers(&data(FOUR_K_NON_VIP), 0);
+        assert_eq!(
+            tiers.iter().map(|tier| tier.qn).collect::<Vec<_>>(),
+            vec![120, 116, 80, 64],
+            "accept_quality order, high→low"
+        );
+        let tier = |qn: i64| tiers.iter().find(|tier| tier.qn == qn).expect("tier");
+        assert!(tier(120).locked, "4K has no returned stream");
+        assert!(tier(116).locked, "1080P60 has no returned stream");
+        assert!(!tier(80).locked, "1080P has a returned stream");
+        assert_eq!(tier(116).label, "1080P60");
+        assert_eq!(tier(116).detail, "1920×1080 · 60fps");
+        assert_eq!(tier(120).detail, "3840×2160 · 30fps", "video's own fps");
+        assert_eq!(tier(120).note(), "需要大会员", "locked VIP tier upsell");
+        assert_eq!(tier(116).note(), "需要大会员");
+        assert_eq!(tier(80).note(), "", "a playable row has no note");
+    }
+
+    #[test]
+    fn a_video_without_a_tier_list_invents_nothing() {
+        let tiers = build_quality_tiers(
+            &data(r#"{"dash":{"video":[{"id":80,"frameRate":"30"}]}}"#),
+            0,
+        );
+        assert_eq!(
+            tiers.iter().map(|tier| tier.qn).collect::<Vec<_>>(),
+            vec![80],
+            "only the stream that came back, with no known native size"
+        );
+        assert!(!tiers[0].locked);
+    }
+
+    #[test]
+    fn a_1080p_upload_never_gets_a_4k_or_8k_row() {
+        let tiers = build_quality_tiers(
+            &data(r#"{"dash":{"video":[{"id":80,"frameRate":"25"}]}}"#),
+            1080,
+        );
+        assert_eq!(
+            tiers.iter().map(|tier| tier.qn).collect::<Vec<_>>(),
+            vec![80],
+            "a 1080p25 source has no 1080P+/4K/8K/1080P60 tier to offer"
+        );
+    }
+
+    #[test]
+    fn the_native_size_fills_in_the_tiers_the_api_kept_quiet_about() {
+        // Nothing advertised at all, 2160p source, 29.97 fps: the two tiers a
+        // 4K source is known to have are derived and locked.
+        let tiers = build_quality_tiers(
+            &data(r#"{"dash":{"video":[{"id":80,"frameRate":"29.97"}]}}"#),
+            2160,
+        );
+        assert_eq!(
+            tiers.iter().map(|tier| tier.qn).collect::<Vec<_>>(),
+            vec![120, 112, 80]
+        );
+        let tier = |qn: i64| tiers.iter().find(|tier| tier.qn == qn).expect("tier");
+        assert!(tier(120).locked && tier(112).locked);
+        assert_eq!(tier(120).note(), "需要大会员");
+        assert_eq!(tier(112).note(), "需要大会员");
+        assert!(!tier(80).locked, "the returned stream stays playable");
+    }
+
+    #[test]
+    fn an_8k_source_derives_8k_and_a_1080p60_source_derives_1080p60() {
+        let eight_k = build_quality_tiers(
+            &data(r#"{"dash":{"video":[{"id":80,"frameRate":"25"}]}}"#),
+            4320,
+        );
+        assert_eq!(
+            eight_k.iter().map(|tier| tier.qn).collect::<Vec<_>>(),
+            vec![127, 120, 112, 80]
+        );
+        let sixty = build_quality_tiers(
+            &data(r#"{"dash":{"video":[{"id":80,"frameRate":"59.94"}]}}"#),
+            1080,
+        );
+        assert_eq!(
+            sixty.iter().map(|tier| tier.qn).collect::<Vec<_>>(),
+            vec![116, 80],
+            "1080P60 needs a 60 fps source, and is the only derived tier"
+        );
+        assert!(sixty[0].locked);
+    }
+
+    #[test]
+    fn a_returned_stream_the_api_did_not_list_is_a_playable_tier() {
+        let tiers = build_quality_tiers(
+            &data(
+                r#"{"accept_quality":[80],"dash":{"video":[{"id":100,"frameRate":"30"},{"id":80,"frameRate":"30"}]}}"#,
+            ),
+            0,
+        );
+        assert_eq!(
+            tiers.iter().map(|tier| tier.qn).collect::<Vec<_>>(),
+            vec![100, 80]
+        );
+        assert!(!tiers[0].locked, "it came back, so it is playable");
+        assert_eq!(tiers[0].note(), "", "only locked VIP tiers carry a note");
+    }
+
+    #[test]
+    fn the_tiers_hook_reads_the_env_var() {
+        // Never mutate process env here (tests run in parallel); just make sure
+        // the accessor does not panic and is wired to `BILI_TIERS_TEST`.
+        let value = tiers_qa_bvid();
+        assert!(value.is_none() || value.iter().all(|item| !item.is_empty()));
+    }
+
+    #[test]
+    fn the_tier_cache_is_keyed_by_video() {
+        let tiers = build_quality_tiers(&data(FOUR_K_NON_VIP), 0);
+        remember_quality_tiers("BVcacheTest", 42, tiers.clone());
+        assert_eq!(quality_tiers_for("BVcacheTest", 42), Some(tiers));
+        assert_eq!(
+            quality_tiers_for("BVcacheTest", 43),
+            None,
+            "another part never reads this part's list"
+        );
+        assert_eq!(quality_tiers_for("BVneverFetched", 1), None);
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::heartbeat_body;
+
+    #[test]
+    fn heartbeat_body_carries_the_position_and_the_play_flags() {
+        let body = heartbeat_body(170001, "BV1xx411c7mD", 62131, 1248, 300, 3600, 1_592_720_840, 0, "abc123");
+        for field in [
+            "aid=170001",
+            "bvid=BV1xx411c7mD",
+            "cid=62131",
+            "played_time=1248",
+            "realtime=300",
+            "start_ts=1592720840",
+            "type=3",
+            "sub_type=0",
+            "dt=2",
+            "play_type=0",
+            "video_duration=3600",
+            "csrf=abc123",
+        ] {
+            assert!(body.contains(field), "missing {field} in {body}");
+        }
+    }
+
+    #[test]
+    fn heartbeat_body_encodes_the_csrf_value() {
+        let body = heartbeat_body(1, "BV1", 2, 3, 4, 5, 6, 2, "a b&c");
+        assert!(body.contains("csrf=a%20b%26c"), "{body}");
     }
 }
 
@@ -6723,8 +7268,6 @@ pub struct SearchPage<T> {
 }
 
 #[derive(Clone, Debug, Default)]
-// `pub_ts` rides along for the card redesign; no consumer yet.
-#[allow(dead_code)]
 pub struct SearchVideo {
     pub bvid: String,
     pub title: String,
@@ -6736,12 +7279,9 @@ pub struct SearchVideo {
     pub play: u64,
     /// Ready to display as `mm:ss`.
     pub duration: String,
-    /// Publish stamp in Unix seconds (`0` = unknown).
-    pub pub_ts: i64,
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct SearchUser {
     pub mid: i64,
     pub uname: String,
@@ -6749,54 +7289,32 @@ pub struct SearchUser {
     pub fans: u64,
     pub videos: u64,
     pub usign: String,
-    pub level: i64,
-    pub official: String,
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct VideoDetail {
     pub bvid: String,
     pub aid: i64,
     pub cid: i64,
     pub title: String,
-    pub desc: String,
     pub pic: String,
     pub duration: u64,
     pub pubdate: i64,
-    pub tname: String,
     pub owner_name: String,
-    pub owner_face: String,
     pub owner_mid: i64,
     pub stat_view: u64,
-    pub stat_danmaku: u64,
-    pub stat_reply: u64,
-    pub stat_favorite: u64,
-    pub stat_coin: u64,
-    pub stat_like: u64,
-    pub stat_share: u64,
     pub pages: Vec<VideoPart>,
+    /// Native picture size from `dimension` (`0` when the API omitted it). Used
+    /// to derive which tiers a video can possibly offer.
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, Default)]
 // The fields mirror the 分P payload from `video_view`; only `cid` has a
 // consumer today (the player resolves parts by cid).
-#[allow(dead_code)]
 pub struct VideoPart {
     pub cid: i64,
-    pub page: i64,
-    pub part: String,
-    pub duration: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
-pub struct RelatedVideo {
-    pub bvid: String,
-    pub title: String,
-    pub pic: String,
-    pub owner: String,
-    pub view: u64,
 }
 
 /// Which order a UP主's 投稿 list is asked for.
@@ -6824,9 +7342,7 @@ impl UpOrder {
 
 /// UP主 profile from the space page.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct UpInfo {
-    pub mid: i64,
     pub name: String,
     pub face: String,
     pub sign: String,
@@ -6839,13 +7355,10 @@ pub struct UpInfo {
 
 /// One投稿 entry on a UP主's space page.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct SpaceVideo {
     pub bvid: String,
-    pub aid: i64,
     pub title: String,
     pub pic: String,
-    pub created: i64,
     pub length: String,
     pub play: u64,
     pub danmaku: u64,
@@ -6997,6 +7510,7 @@ struct SearchVideoItem {
     duration: String,
     /// Publish stamp (Unix seconds) the search item carries.
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     pubdate: i64,
 }
 
@@ -7015,8 +7529,10 @@ struct SearchUserItem {
     #[serde(default)]
     usign: String,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     level: i64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     official_verify: Option<OfficialVerify>,
 }
 
@@ -7045,6 +7561,7 @@ struct ViewData {
     #[serde(default)]
     title: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
+    #[allow(dead_code)] // serde field (payload shape)
     desc: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
     pic: String,
@@ -7053,6 +7570,7 @@ struct ViewData {
     #[serde(default)]
     pubdate: i64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     tname: String,
     #[serde(default)]
     owner: Option<ViewOwner>,
@@ -7060,6 +7578,16 @@ struct ViewData {
     stat: Option<ViewStat>,
     #[serde(default)]
     pages: Vec<ViewPage>,
+    #[serde(default)]
+    dimension: Option<ViewDimension>,
+}
+
+#[derive(Deserialize)]
+struct ViewDimension {
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
 }
 
 #[derive(Deserialize)]
@@ -7069,6 +7597,7 @@ struct ViewOwner {
     #[serde(default)]
     name: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
+    #[allow(dead_code)] // serde field (payload shape)
     face: String,
 }
 
@@ -7076,17 +7605,24 @@ struct ViewOwner {
 struct ViewStat {
     #[serde(default)]
     view: u64,
+    // The remaining counters stay as the payload's shape; only `view` is shown.
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     danmaku: u64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     reply: u64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     favorite: u64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     coin: u64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     like: u64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     share: u64,
 }
 
@@ -7094,11 +7630,15 @@ struct ViewStat {
 struct ViewPage {
     #[serde(default)]
     cid: i64,
+    // 分P metadata: only `cid` is consumed (the player resolves parts by cid).
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     page: i64,
     #[serde(default, deserialize_with = "de_string_lenient")]
+    #[allow(dead_code)] // serde field (payload shape)
     part: String,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     duration: u64,
 }
 
@@ -7114,6 +7654,7 @@ struct SpaceInfoResp {
 #[derive(Deserialize)]
 struct SpaceInfoData {
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     mid: i64,
     #[serde(default)]
     name: String,
@@ -7267,6 +7808,7 @@ struct ArchivePageInfo {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // payload of `ranking` (see above)
 struct RankingResp {
     #[serde(default)]
     code: i64,
@@ -7275,25 +7817,10 @@ struct RankingResp {
 }
 
 #[derive(Deserialize, Default)]
+#[allow(dead_code)] // payload of RankingResp
 struct RankingData {
     #[serde(default)]
     list: Vec<CardItem>,
-}
-
-#[derive(Deserialize)]
-struct PopularResp {
-    #[serde(default)]
-    code: i64,
-    #[serde(default)]
-    data: Option<PopularData>,
-}
-
-#[derive(Deserialize, Default)]
-struct PopularData {
-    #[serde(default)]
-    list: Vec<CardItem>,
-    #[serde(default)]
-    no_more: bool,
 }
 
 #[derive(Deserialize)]
@@ -7307,8 +7834,10 @@ struct CardItem {
     #[serde(default)]
     duration: u64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     pubdate: i64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     score: i64,
     #[serde(default)]
     owner: Option<CardOwner>,
@@ -7327,6 +7856,7 @@ struct CardStat {
     #[serde(default)]
     view: u64,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     danmaku: u64,
     #[serde(default)]
     like: u64,
@@ -7379,6 +7909,7 @@ struct SquareItem {
     #[serde(default)]
     show_name: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
+    #[allow(dead_code)] // serde field (payload shape)
     icon: String,
 }
 
@@ -7395,6 +7926,7 @@ struct HotwordItem {
     #[serde(default)]
     show_name: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
+    #[allow(dead_code)] // serde field (payload shape)
     icon: String,
 }
 
@@ -7404,19 +7936,14 @@ struct HotwordItem {
 
 /// One dynamic-feed item after flattening its `modules`.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct DynamicItem {
     pub id_str: String,
-    pub kind: String,
     pub author_name: String,
     pub author_face: String,
-    pub author_mid: i64,
     pub pub_time: String,
     pub text: String,
-    pub archive_bvid: String,
     pub archive_title: String,
     pub archive_cover: String,
-    pub archive_desc: String,
     pub archive_meta: String,
     pub images: Vec<String>,
     pub like_count: u64,
@@ -7451,11 +7978,9 @@ pub struct MsgUnread {
 
 /// One 回复/@/赞 message entry.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct MsgItem {
     pub nickname: String,
     pub avatar: String,
-    pub mid: i64,
     pub title: String,
     pub detail: String,
     pub time: i64,
@@ -7463,21 +7988,17 @@ pub struct MsgItem {
 }
 
 /// One page of a message list.
-#[allow(dead_code)]
 pub struct MsgPage {
     pub items: Vec<MsgItem>,
-    pub is_end: bool,
 }
 
 /// One private-message session (READ ONLY).
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct DmSession {
     pub talker_id: i64,
     pub at_time: i64,
     pub unread: i64,
     pub preview: String,
-    pub system_msg_type: i64,
 }
 
 /// One private-message entry (READ ONLY).
@@ -7529,6 +8050,7 @@ struct DynamicRawItem {
     #[serde(default)]
     id_str: String,
     #[serde(default, rename = "type")]
+    #[allow(dead_code)] // serde field: dynamic `type` discriminator, unused
     kind: String,
     #[serde(default)]
     modules: Option<DynamicModules>,
@@ -7551,6 +8073,7 @@ struct DynamicAuthor {
     #[serde(default, deserialize_with = "de_string_lenient")]
     face: String,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     mid: i64,
     #[serde(default)]
     pub_time: String,
@@ -7581,12 +8104,14 @@ struct DynamicMajor {
 #[derive(Deserialize, Default)]
 struct DynamicArchiveRaw {
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     bvid: String,
     #[serde(default)]
     title: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
     cover: String,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     desc: String,
     #[serde(default)]
     duration_text: String,
@@ -7653,12 +8178,14 @@ struct MsgFeedData {
     #[serde(default)]
     items: Vec<MsgFeedItem>,
     #[serde(default)]
+    #[allow(dead_code)] // serde field: paging cursor, not consumed today
     cursor: Option<MsgCursor>,
 }
 
 #[derive(Deserialize, Default)]
 struct MsgCursor {
     #[serde(default)]
+    #[allow(dead_code)] // serde field (reached only through `MsgFeedData::cursor`)
     is_end: bool,
 }
 
@@ -7677,6 +8204,7 @@ struct MsgFeedItem {
 #[derive(Deserialize, Default)]
 struct MsgUser {
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     mid: i64,
     #[serde(default)]
     nickname: String,
@@ -7709,6 +8237,7 @@ struct DmSessionRaw {
     #[serde(default)]
     last_msg: Option<serde_json::Value>,
     #[serde(default)]
+    #[allow(dead_code)] // serde field (payload shape)
     system_msg_type: i64,
 }
 
@@ -7881,35 +8410,22 @@ fn dynamic_from(raw: DynamicRawItem) -> DynamicItem {
     let text = content.desc.map(|desc| desc.text).unwrap_or_default();
     let major = content.major.unwrap_or_default();
 
-    let (archive_bvid, archive_title, archive_cover, archive_desc, archive_meta) =
-        match major.archive {
-            Some(archive) => {
-                let (play, danmaku) = match archive.stat {
-                    Some(stat) => (stat.play, stat.danmaku),
-                    None => (0, 0),
-                };
-                let meta = format!(
-                    "{}播放 · {}弹幕 · {}",
-                    short_num(play),
-                    short_num(danmaku),
-                    archive.duration_text
-                );
-                (
-                    archive.bvid,
-                    archive.title,
-                    normalize_url(&archive.cover),
-                    archive.desc,
-                    meta,
-                )
-            }
-            None => (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
-        };
+    let (archive_title, archive_cover, archive_meta) = match major.archive {
+        Some(archive) => {
+            let (play, danmaku) = match archive.stat {
+                Some(stat) => (stat.play, stat.danmaku),
+                None => (0, 0),
+            };
+            let meta = format!(
+                "{}播放 · {}弹幕 · {}",
+                short_num(play),
+                short_num(danmaku),
+                archive.duration_text
+            );
+            (archive.title, normalize_url(&archive.cover), meta)
+        }
+        None => (String::new(), String::new(), String::new()),
+    };
 
     let images: Vec<String> = major
         .draw
@@ -7925,16 +8441,12 @@ fn dynamic_from(raw: DynamicRawItem) -> DynamicItem {
 
     DynamicItem {
         id_str: raw.id_str,
-        kind: raw.kind,
         author_name: author.name,
         author_face: normalize_url(&author.face),
-        author_mid: author.mid,
         pub_time: author.pub_time,
         text,
-        archive_bvid,
         archive_title,
         archive_cover,
-        archive_desc,
         archive_meta,
         images,
         like_count: like.count,
@@ -7950,7 +8462,6 @@ fn msg_item_from(raw: MsgFeedItem) -> MsgItem {
     MsgItem {
         nickname: user.nickname,
         avatar: normalize_url(&user.avatar),
-        mid: user.mid,
         title,
         detail,
         time: raw.reply_time,
@@ -7996,7 +8507,6 @@ fn dm_session_from(raw: DmSessionRaw) -> DmSession {
         at_time: raw.at_time,
         unread: raw.unread_count,
         preview,
-        system_msg_type: raw.system_msg_type,
     }
 }
 
@@ -8246,11 +8756,8 @@ fn card_from(item: CardItem) -> VideoCard {
         pic: normalize_url(&item.pic),
         owner: item.owner.map(|owner| owner.name).unwrap_or_default(),
         view: item.stat.as_ref().map(|stat| stat.view).unwrap_or(0),
-        danmaku: item.stat.as_ref().map(|stat| stat.danmaku).unwrap_or(0),
         like: item.stat.map(|stat| stat.like).unwrap_or(0),
         duration: item.duration,
-        score: item.score,
-        pubdate: item.pubdate,
     }
 }
 
@@ -8268,7 +8775,6 @@ fn square_to_hot(item: SquareItem) -> HotSearch {
     HotSearch {
         keyword,
         show_name,
-        icon: normalize_url(&item.icon),
     }
 }
 
@@ -8286,7 +8792,6 @@ fn hotword_to_hot(item: HotwordItem) -> HotSearch {
     HotSearch {
         keyword,
         show_name,
-        icon: normalize_url(&item.icon),
     }
 }
 
@@ -8392,6 +8897,499 @@ where
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     })
+}
+
+/// A boolean flag the payload may send as `true`, `1`, `"true"` or `null`.
+fn de_option_bool_flexible<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Bool(flag) => Some(flag),
+        serde_json::Value::Number(number) => number.as_i64().map(|number| number != 0),
+        serde_json::Value::String(text) => {
+            let text = text.trim().to_ascii_lowercase();
+            Some(!(text.is_empty() || text == "0" || text == "false" || text == "null"))
+        }
+        _ => None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 养鱼: AI 摘要 + 一次性元数据
+// ---------------------------------------------------------------------------
+
+/// `x/web-interface/view/conclusion/get`：Bilibili 的 AI 摘要 / 提纲 / 字幕。
+const CONCLUSION_URL: &str = "https://api.bilibili.com/x/web-interface/view/conclusion/get";
+
+/// 一条视频的 AI 提纲小节。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+pub struct OutlineSection {
+    /// 小节开始时间（秒，取自 `timestamp`）。
+    pub timestamp: u64,
+    pub title: String,
+    /// 小节里的要点，每个点自带时间。
+    pub points: Vec<OutlinePoint>,
+}
+
+/// AI 提纲里的一个要点。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+pub struct OutlinePoint {
+    pub timestamp: u64,
+    pub content: String,
+}
+
+/// AI 字幕的一小段（`part_subtitle[]`），时间单位是秒。
+#[derive(Clone, Debug, Default, PartialEq)]
+#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+pub struct Cue {
+    pub start_s: u64,
+    pub end_s: u64,
+    pub text: String,
+}
+
+/// One video's AI conclusion: a summary, an outline and (sometimes) a full
+/// transcript.
+///
+/// `data_code` mirrors the endpoint's own `data.code`:
+/// `0` = summary + outline, `1` = no summary, `-1` = this video is not
+/// supported. **`-1` is not an error**: the transcript can still be complete
+/// (measured: 3 of 13 sampled videos answered `-1` with a full
+/// `part_subtitle`). Callers therefore always inspect [`Conclusion::cues`].
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+pub struct Conclusion {
+    pub summary: String,
+    pub outline: Vec<OutlineSection>,
+    pub cues: Vec<Cue>,
+    pub data_code: i32,
+    /// Whether Bilibili says a summary may be shown for this video. When the
+    /// payload omits the flag it is derived from `data_code` (`-1` = false).
+    pub allow_summary: bool,
+}
+
+/// Everything the fish engine needs about one video in a single request.
+///
+/// The recommendation feed already carries title/owner/duration/view, but not
+/// `tname`, `desc` or the `aid` the comment endpoint wants, so the engine asks
+/// `x/web-interface/wbi/view` once per video for this shape.
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+pub struct FishMeta {
+    pub bvid: String,
+    pub aid: i64,
+    pub cid: u64,
+    pub title: String,
+    pub up_mid: u64,
+    pub up_name: String,
+    pub duration_s: u64,
+    pub view: u64,
+    /// Unix seconds; `0` when the payload has none.
+    pub pub_ts: i64,
+    pub cover: String,
+    pub tname: String,
+    /// HTML already stripped, whitespace collapsed.
+    pub desc: String,
+}
+
+impl Session {
+    /// One video's AI summary / outline / transcript (`conclusion/get`).
+    ///
+    /// WBI-signed with the session's cookies (SESSDATA is required by the
+    /// endpoint) and retried once after refreshing the WBI keys, exactly like
+    /// the other signed reads. A non-zero top-level `code` is an error — except
+    /// that `data.code == -1` is NOT one, see [`Conclusion`].
+    ///
+    /// Rate limiting belongs to the caller: the fish engine keeps at least
+    /// 1.5 s between calls and backs off on `-352` / `-412`.
+    #[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+    pub async fn conclusion(&self, bvid: &str, cid: u64, up_mid: u64) -> Result<Conclusion> {
+        let params = vec![
+            ("bvid".to_string(), bvid.trim().to_string()),
+            ("cid".to_string(), cid.to_string()),
+            ("up_mid".to_string(), up_mid.to_string()),
+        ];
+        let referer = format!("https://www.bilibili.com/video/{}", bvid.trim());
+        let (_, mut resp): (u16, ConclusionResp) = self
+            .wbi_call_referer(CONCLUSION_URL, &params, false, Some(&referer))
+            .await?;
+        if resp.code != 0 {
+            resp = self
+                .wbi_call_referer(CONCLUSION_URL, &params, true, Some(&referer))
+                .await?
+                .1;
+        }
+        if resp.code != 0 {
+            let message = resp.message.trim();
+            if message.is_empty() {
+                bail!("获取 AI 摘要失败（code={}）", resp.code);
+            }
+            bail!("获取 AI 摘要失败：{message}（code={}）", resp.code);
+        }
+        let conclusion = conclusion_from(resp.data.unwrap_or_default());
+        crate::debug_log(&format!(
+            "conclusion bvid={bvid} cid={cid} code={} cues={} outline={}",
+            conclusion.data_code,
+            conclusion.cues.len(),
+            conclusion.outline.len()
+        ));
+        Ok(conclusion)
+    }
+
+    /// Full metadata for one video, shaped for the fish engine.
+    #[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+    pub async fn fish_meta(&self, bvid: &str) -> Result<FishMeta> {
+        let params = vec![("bvid".to_string(), bvid.trim().to_string())];
+        let mut resp: ViewResp = self.wbi_call(VIEW_URL, &params, false).await?.1;
+        if resp.code != 0 {
+            resp = self.wbi_call(VIEW_URL, &params, true).await?.1;
+        }
+        if resp.code != 0 {
+            bail!("获取视频信息失败（code={}）", resp.code);
+        }
+        let data = resp
+            .data
+            .ok_or_else(|| anyhow!("获取视频信息失败：响应缺少 data"))?;
+        let (up_mid, up_name) = match data.owner {
+            Some(owner) => (owner.mid.max(0) as u64, owner.name),
+            None => (0, String::new()),
+        };
+        let desc = strip_html(&data.desc)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(FishMeta {
+            bvid: if data.bvid.trim().is_empty() {
+                bvid.trim().to_string()
+            } else {
+                data.bvid
+            },
+            aid: data.aid,
+            cid: data.cid.max(0) as u64,
+            title: data.title,
+            up_mid,
+            up_name,
+            duration_s: data.duration,
+            view: data.stat.map(|stat| stat.view).unwrap_or(0),
+            pub_ts: data.pubdate,
+            cover: normalize_url(&data.pic),
+            tname: data.tname,
+            desc,
+        })
+    }
+}
+
+/// True when a Bilibili error is risk control (`-352` / `-412`).
+///
+/// Those two codes mean "you are going too fast" (or the fingerprint/signature
+/// was rejected), not "this video has no data", so the fish engine backs off
+/// and retries instead of burning the queue entry.
+#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
+pub fn is_risk_control(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("-352") || text.contains("-412")
+}
+
+// -- conclusion payload ------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct ConclusionResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: Option<ConclusionData>,
+}
+
+#[derive(Deserialize, Default)]
+struct ConclusionData {
+    /// `0` summary, `1` no summary, `-1` unsupported.
+    #[serde(default)]
+    code: Option<i32>,
+    #[serde(default, deserialize_with = "de_option_bool_flexible")]
+    allow_summary: Option<bool>,
+    #[serde(default)]
+    model_result: Option<ConclusionModel>,
+}
+
+#[derive(Deserialize, Default)]
+struct ConclusionModel {
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    outline: Option<Vec<RawOutline>>,
+    /// The web payload sends a one-element array; some responses send the
+    /// object directly, so both shapes are accepted.
+    #[serde(default)]
+    subtitle: Option<SubtitleField>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SubtitleField {
+    List(Vec<RawSubtitle>),
+    One(RawSubtitle),
+}
+
+impl Default for SubtitleField {
+    fn default() -> Self {
+        SubtitleField::List(Vec::new())
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct RawSubtitle {
+    #[serde(default)]
+    part_subtitle: Vec<RawCue>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawCue {
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    start_timestamp: u64,
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    end_timestamp: u64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    content: String,
+}
+
+#[derive(Deserialize, Default)]
+struct RawOutline {
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    timestamp: u64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+    #[serde(default)]
+    part_outline: Vec<RawPoint>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPoint {
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    timestamp: u64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    content: String,
+}
+
+/// Turn the endpoint's `data` block into a [`Conclusion`].///
+/// Tolerant on purpose: every field is optional, `data.code` is trusted when
+/// present (so `-1` survives as "unsupported" instead of becoming an error),
+/// and transcript cues are kept even when there is no summary at all.
+fn conclusion_from(data: ConclusionData) -> Conclusion {
+    let model = data.model_result.unwrap_or_default();
+    let summary = model
+        .summary
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let outline = model
+        .outline
+        .unwrap_or_default()
+        .into_iter()
+        .map(|section| OutlineSection {
+            timestamp: section.timestamp,
+            title: section.title.trim().to_string(),
+            points: section
+                .part_outline
+                .into_iter()
+                .map(|point| OutlinePoint {
+                    timestamp: point.timestamp,
+                    content: point.content.trim().to_string(),
+                })
+                .filter(|point| !point.content.is_empty())
+                .collect(),
+        })
+        .filter(|section| !section.title.is_empty() || !section.points.is_empty())
+        .collect::<Vec<_>>();
+    let subtitle = model.subtitle.unwrap_or_default();
+    let part = match subtitle {
+        SubtitleField::List(mut list) => {
+            if list.is_empty() {
+                RawSubtitle::default()
+            } else {
+                list.remove(0)
+            }
+        }
+        SubtitleField::One(one) => one,
+    };
+    let cues = part
+        .part_subtitle
+        .into_iter()
+        .map(|cue| Cue {
+            start_s: cue.start_timestamp,
+            end_s: cue.end_timestamp,
+            text: cue.content.trim().to_string(),
+        })
+        .filter(|cue| !cue.text.is_empty())
+        .collect::<Vec<_>>();
+    let data_code = data.code.unwrap_or(if summary.is_empty() { 1 } else { 0 });
+    let allow_summary = data.allow_summary.unwrap_or(data_code != -1);
+    Conclusion {
+        summary,
+        outline,
+        cues,
+        data_code,
+        allow_summary,
+    }
+}
+
+#[cfg(test)]
+mod conclusion_tests {
+    use super::{conclusion_from, ConclusionResp};
+
+    fn parse(json: &str) -> super::Conclusion {
+        let resp: ConclusionResp = serde_json::from_str(json).expect("fixture parses");
+        assert_eq!(resp.code, 0);
+        conclusion_from(resp.data.unwrap_or_default())
+    }
+
+    /// Captured shape: summary + outline + full transcript.
+    #[test]
+    fn summary_outline_and_transcript_are_parsed() {
+        let json = r#"{
+            "code": 0,
+            "message": "0",
+            "data": {
+                "code": 0,
+                "model_result": {
+                    "summary": "这是一个讲 Rust 所有权的视频。",
+                    "outline": [
+                        {
+                            "timestamp": 0,
+                            "title": "所有权是什么",
+                            "part_outline": [
+                                { "timestamp": 12, "content": "每个值有唯一所有者" },
+                                { "timestamp": 48, "content": "离开作用域就释放" }
+                            ]
+                        },
+                        {
+                            "timestamp": 120,
+                            "title": "借用",
+                            "part_outline": []
+                        }
+                    ],
+                    "subtitle": [
+                        {
+                            "part_subtitle": [
+                                { "start_timestamp": 0, "end_timestamp": 5, "content": "大家好" },
+                                { "start_timestamp": 5, "end_timestamp": 11, "content": "今天我们聊所有权" },
+                                { "start_timestamp": 11, "end_timestamp": 18, "content": "  " }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let conclusion = parse(json);
+        assert_eq!(conclusion.data_code, 0);
+        assert!(conclusion.allow_summary);
+        assert_eq!(conclusion.summary, "这是一个讲 Rust 所有权的视频。");
+        assert_eq!(conclusion.outline.len(), 2);
+        assert_eq!(conclusion.outline[0].timestamp, 0);
+        assert_eq!(conclusion.outline[0].title, "所有权是什么");
+        assert_eq!(conclusion.outline[0].points.len(), 2);
+        assert_eq!(conclusion.outline[0].points[1].timestamp, 48);
+        assert_eq!(conclusion.outline[1].points.len(), 0);
+        assert_eq!(conclusion.cues.len(), 2, "blank cue dropped");
+        assert_eq!(conclusion.cues[1].start_s, 5);
+        assert_eq!(conclusion.cues[1].end_s, 11);
+        assert_eq!(conclusion.cues[1].text, "今天我们聊所有权");
+    }
+
+    /// A measured payload: `data.code == -1` (no summary) but a FULL transcript.
+    /// This must not become an error and must not lose the cues.
+    #[test]
+    fn unsupported_code_keeps_the_full_transcript() {
+        let json = r#"{
+            "code": 0,
+            "message": "0",
+            "data": {
+                "code": -1,
+                "allow_summary": false,
+                "model_result": {
+                    "summary": "",
+                    "outline": [],
+                    "subtitle": [
+                        {
+                            "part_subtitle": [
+                                { "start_timestamp": 0, "end_timestamp": 3, "content": "第一句" },
+                                { "start_timestamp": 3, "end_timestamp": 9, "content": "第二句" },
+                                { "start_timestamp": 9, "end_timestamp": 15, "content": "第三句" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let conclusion = parse(json);
+        assert_eq!(conclusion.data_code, -1);
+        assert!(!conclusion.allow_summary);
+        assert!(conclusion.summary.is_empty());
+        assert!(conclusion.outline.is_empty());
+        assert_eq!(conclusion.cues.len(), 3);
+        assert_eq!(conclusion.cues[2].text, "第三句");
+    }
+
+    /// `data.code == 1` with no model_result at all: no summary, no cues, and
+    /// the conclusion still reports code 1 rather than failing.
+    #[test]
+    fn missing_model_result_is_a_plain_no_summary() {
+        let json = r#"{ "code": 0, "message": "0", "data": { "code": 1 } }"#;
+        let conclusion = parse(json);
+        assert_eq!(conclusion.data_code, 1);
+        assert!(conclusion.allow_summary);
+        assert!(conclusion.cues.is_empty());
+    }
+
+    /// The subtitle block may arrive as an object instead of a one-element array.
+    #[test]
+    fn subtitle_accepts_both_shapes() {
+        let object = r#"{
+            "code": 0,
+            "data": {
+                "code": 0,
+                "model_result": {
+                    "summary": "有摘要",
+                    "subtitle": {
+                        "part_subtitle": [
+                            { "start_timestamp": 0, "end_timestamp": 2, "content": "对象形状" }
+                        ]
+                    }
+                }
+            }
+        }"#;
+        assert_eq!(parse(object).cues.len(), 1);
+        let array = r#"{
+            "code": 0,
+            "data": {
+                "code": 0,
+                "model_result": {
+                    "summary": "有摘要",
+                    "subtitle": [
+                        { "part_subtitle": [] },
+                        { "part_subtitle": [ { "start_timestamp": 0, "end_timestamp": 2, "content": "第二段" } ] }
+                    ]
+                }
+            }
+        }"#;
+        let conclusion = parse(array);
+        assert!(conclusion.cues.is_empty(), "only the first part is used");
+    }
+
+    /// A risk-control envelope is an error, and the classifier sees the code.
+    #[test]
+    fn risk_control_is_classified() {
+        let error = anyhow::anyhow!("获取 AI 摘要失败（code=-352）");
+        assert!(super::is_risk_control(&error));
+        let error = anyhow::anyhow!("获取 AI 摘要失败：请求被拦截（code=-412）");
+        assert!(super::is_risk_control(&error));
+        let error = anyhow::anyhow!("获取 AI 摘要失败（code=-404）");
+        assert!(!super::is_risk_control(&error));
+    }
 }
 
 #[cfg(test)]

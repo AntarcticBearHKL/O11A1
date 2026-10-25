@@ -1,6 +1,6 @@
 [package]
 name = "o11a1"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition = "2021"
 build = "build.rs"
 description = "O11A1 — a Rust + Slint Bilibili desktop client"
@@ -16,6 +16,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Embedded storage for the 养鱼 engine (see src/fish.rs). `bundled` compiles the
+# SQLite amalgamation into the binary, so there is no system DLL to ship or find.
+rusqlite = { version = "0.32", features = ["bundled"] }
 md-5 = "0.10"
 percent-encoding = "2"
 futures = "0.3"
@@ -33,6 +36,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
@@ -58,3 +62,32 @@ incremental = true
 opt-level = 2
 debug = 1
 incremental = false
+
+# Release is the profile agents and users verify against, so its *rebuild* time
+# is what the edit loop pays. Measured on this tree (6C/12T, `-j 8`, lld-link,
+# warm dependency graph), `touch src/main.rs` then `cargo build --release`:
+#
+#   default (opt-level 3, 16 codegen units, no incremental)  4m18s - 5m35s
+#   opt-level = 2 (this crate only)                            -5..-8 %    (rejected)
+#   codegen-units = 64                                         +6 %       (rejected)
+#   incremental = true                                        0m30s - 0m50s  (kept)
+#
+# Breakdown of the default build: the Slint build script costs 0 s on a .rs
+# touch (it re-runs only for ui/app.slint, the four fonts and the tray icon --
+# see the rerun-if-changed lines in build.rs), linking is ~1 s, and the other
+# ~4.3 min is a single rustc invocation, 79 % of which is LLVM codegen of the
+# 23 MB / 230 k-line app.rs that `slint::include_modules!()` pulls into
+# main.rs. That is why more codegen units do not help (the generated module is
+# one CGU and cannot be split, and 64 units just duplicate monomorphisations)
+# and why incremental -- the one thing that can skip CGUs -- wins big.
+#
+# Scoped to this package on purpose: the dependency graph (Slint runtime,
+# reqwest/rustls, image codecs) is not rebuilt when this changes and keeps a
+# non-incremental cache. Costs: ~2.4 GB of incremental cache for build (+1.1 GB
+# for `cargo check`, which keeps its own cache), and the first build after a
+# profile change pays a full rebuild (~6 min) to write that cache.
+#
+# A shippable, non-incremental build:
+#   cargo build --release --config 'profile.release.package.o11a1.incremental=false'
+[profile.release.package.o11a1]
+incremental = true

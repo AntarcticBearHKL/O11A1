@@ -50,7 +50,6 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 
 /// `JOBOBJECT_BASIC_LIMIT_INFORMATION` (winnt.h).
 #[repr(C)]
-#[allow(dead_code)]
 struct JobObjectBasicLimitInformation {
     per_process_user_time_limit: i64,
     per_job_user_time_limit: i64,
@@ -65,7 +64,6 @@ struct JobObjectBasicLimitInformation {
 
 /// `IO_COUNTERS` (winnt.h).
 #[repr(C)]
-#[allow(dead_code)]
 struct IoCounters {
     read_operation_count: u64,
     write_operation_count: u64,
@@ -77,7 +75,6 @@ struct IoCounters {
 
 /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` (winnt.h).
 #[repr(C)]
-#[allow(dead_code)]
 struct JobObjectExtendedLimitInformation {
     basic_limit_information: JobObjectBasicLimitInformation,
     io_info: IoCounters,

@@ -1108,8 +1108,8 @@ mod tests {
         runtime.block_on(crate::bilibili::Session::new()).ok()
     }
 
-    /// `BILI_DOWNLOAD_BVID` when set, else the longest item on the 热门 first
-    /// page (a larger file makes throughput differences readable).
+    /// `BILI_DOWNLOAD_BVID` when set, else the longest item on the ranking
+    /// first page (a larger file makes throughput differences readable).
     fn pick_target(
         session: &crate::bilibili::Session,
         runtime: &tokio::runtime::Runtime,
@@ -1117,9 +1117,8 @@ mod tests {
         let bvid = match download_bvid_override() {
             Some(bvid) => bvid,
             None => runtime
-                .block_on(session.popular(1, 20))
+                .block_on(session.ranking(0))
                 .ok()?
-                .items
                 .iter()
                 .max_by_key(|card| card.duration)?
                 .bvid

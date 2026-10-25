@@ -34,8 +34,12 @@ pub struct QueueEntry {
 /// `danmaku_font`: 0 = 小, 1 = 标准, 2 = 大. `danmaku_speed`: scroll-speed
 /// percent (50..=200). `danmaku_area`: the top percentage of the video that
 /// danmaku may occupy (25 / 50 / 75 / 100). `player_speed`: playback speed times
-/// 1000 (1000 = 1.0x). `glass_transparency` / `glass_blur`: the main window's
-/// frosted-glass sliders, percent (0..=100). `page_size`: cards per page in the
+/// 1000 (1000 = 1.0x). `glass_transparency`: the main window's frosted-glass
+/// tint, percent (0 = fully opaque tint, 100 = no tint; default 45).
+/// `backdrop_blur`: the wallpaper's diffusion radius in image pixels
+/// (`0..=160`, default 60; see `backdrop::set_blur`). `glass_blur` is the
+/// retired capture-engine slot, kept only so old files still round-trip.
+/// `page_size`: cards per page in the
 /// no-scroll lists, one of [`PAGE_SIZES`]. `close_action`: what ✕ / Alt+F4 /
 /// the taskbar's 关闭 does, one of [`CLOSE_ACTIONS`]. `feed_prefetch_batches`:
 /// how many recommendation batches the home feed keeps preloaded
@@ -44,6 +48,9 @@ pub struct QueueEntry {
 /// how many evenly spaced positions of the stream the prefetch proxy warms in
 /// the background, so dragging the seek bar near one of them resumes from
 /// memory (`4..=SEEK_POINTS_MAX`; see [`normalise_seek_points`]).
+/// `prefetch_connections`: how many parallel upstream fetchers the proxy opens
+/// while the startup gate fills the cache (`4..=PREFETCH_CONNECTIONS_MAX`,
+/// default 16; see [`normalise_prefetch_connections`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_opacity")]
@@ -105,9 +112,15 @@ pub struct Settings {
     #[serde(default = "default_glass_transparency")]
     pub glass_transparency: f32,
     /// Main-window frosted glass: Gaussian blur strength in percent (0 = no
-    /// blur layer at all, 100 = strongest; mapped to `glass::SIGMA_MAX`).
+    /// blur layer at all, 100 = strongest; retired capture-engine slot).
     #[serde(default = "default_glass_blur")]
     pub glass_blur: f32,
+    /// 背景模糊: the generated wallpaper's blur radius in **image pixels**
+    /// (1024-space), `0..=160`, default 60. `0` leaves the coloured balls
+    /// crisp, `60` melts them into a mesh gradient, `160` is a near-flat wash.
+    /// Applied through `backdrop::set_blur` and persisted here.
+    #[serde(default = "default_backdrop_blur")]
+    pub backdrop_blur: u32,
     /// Cards per page in the no-scroll lists (首页推荐 / 搜索 / 历史 / ...):
     /// the 设置 menu offers [`PAGE_SIZES`]; Rust drives the UI's
     /// `list_page_size` property and the paging helpers from this value.
@@ -142,6 +155,22 @@ pub struct Settings {
     /// 就取 4，不能关到 0。
     #[serde(default = "default_seek_points")]
     pub seek_points: u32,
+    /// 预取代理的上游并发连接数（`PREFETCH_CONNECTIONS_MIN..=PREFETCH_CONNECTIONS_MAX`，
+    /// 默认 16）。开始播放前由 `player.rs` 读入 `PrefetchConfig::connections`：
+    /// 连接越多，开头几秒的缓存越快填满。`0` 表示"未设置"（旧文件或新建的
+    /// 字段），回落到默认值；其余越界值夹到区间内。见
+    /// [`normalise_prefetch_connections`]。
+    #[serde(default = "default_prefetch_connections")]
+    pub prefetch_connections: u32,
+    /// 网络线程池的常驻线程数（`NET_THREADS_MIN..=NET_THREADS_MAX`，默认 12）。
+    /// 整个进程只创建一次，见 `netpool::init`：所有一次性网络请求（封面、
+    /// 头像、点赞/投币/收藏、评论分页……）都排进这个池；视频播放时预取代理
+    /// 只是把它的连接槽位绑定到这些已有线程上，开视频不再创建线程。
+    /// `BILI_NET_THREADS` 可在启动时覆盖本字段（用于 A/B）。
+    /// `0` 表示"未设置"，回落到默认值；其余越界值夹到区间内。见
+    /// [`normalise_net_threads`]。
+    #[serde(default = "default_net_threads")]
+    pub net_threads: u32,
     /// 播放列表：整个应用共用的一个队列（见 `main.rs` 的 `PlaybackQueue`）。
     /// 队首最早，队尾最新；重启后恢复但不自动播放。加载时用
     /// [`normalise_playlist_state`] 去空、去重（同一 bvid 只留第一次出现）、
@@ -156,10 +185,51 @@ pub struct Settings {
     /// 2 = 随机（播完随机跳一条未播过的）。见 [`normalise_play_mode`]。
     #[serde(default = "default_play_mode")]
     pub play_mode: u32,
-    /// 帧插值模式：0 = 关闭, 1 = 帧混合（blend）。2 预留给将来的 RIFE；
+    /// 帧插值模式：0 = 关闭, 1 = 帧混合（blend）, 2 = 块匹配运动（motion）。
     /// 未知值在加载时归一为 0。见 [`normalise_interp_mode`]。
     #[serde(default)]
     pub interp_mode: u8,
+    /// DeepSeek API key（`sk-...`），养鱼引擎用它替用户看视频。空串 = 未配置，
+    /// 此时引擎只报 `NeedsKey`、不发任何网络请求。界面上只显示
+    /// [`mask_key`] 的脱敏结果。
+    #[serde(default)]
+    pub deepseek_key: String,
+    /// 养鱼使用的 DeepSeek 模型（默认 `deepseek-chat`）。空串在加载时回落到
+    /// [`default_fish_model`]。
+    #[serde(default = "default_fish_model")]
+    pub fish_model: String,
+    /// 鱼主人的指令：拼在每条养鱼提示词的最后一段，告诉鲸鱼该怎么看视频。
+    /// 空白值在加载时回落到 [`default_fish_instruction`]。
+    #[serde(default = "default_fish_instruction")]
+    pub fish_instruction: String,
+    /// 每次出巡最多看多少条视频（`1..=FISH_BUDGET_MAX`，默认 40）。见
+    /// [`normalise_fish_budget`]。
+    #[serde(default = "default_fish_budget_videos")]
+    pub fish_budget_videos: u32,
+    /// 两条视频之间的休息毫秒数（`FISH_INTERVAL_MIN_MS..=FISH_INTERVAL_MAX_MS`，
+    /// 默认 1500）。见 [`normalise_fish_interval`]。
+    #[serde(default = "default_fish_interval_ms")]
+    pub fish_interval_ms: u64,
+    /// 养鱼开关；关闭时引擎不起线程。
+    #[serde(default)]
+    pub fish_enabled: bool,
+    /// 自动喂食：每天到 [`fish_feed_time`] 自己开饭。仍然需要
+    /// [`fish_enabled`]，关掉大肥鱼就什么都不会跑。
+    #[serde(default)]
+    pub fish_auto_feed: bool,
+    /// 自动喂食的时间，`HH:MM`（本机时间，默认 `20:00`）。加载时由
+    /// [`normalise_fish_time`] 归一，坏值回落到默认。
+    #[serde(default = "default_fish_feed_time")]
+    pub fish_feed_time: String,
+    /// 喂食来源位掩码：`1` 首页 / `2` 关注 / `4` 收藏夹。加载时由
+    /// [`normalise_fish_sources`] 去掉未知位，空掩码回落到首页。
+    #[serde(default = "default_fish_sources")]
+    pub fish_sources: u32,
+    /// 播放器选用的音频音质档位（Bilibili 的 `audio` id）。`0` = 自动（视频
+    /// 提供的最好一档）；其余见 [`AUDIO_QUALITIES`]。见
+    /// [`normalise_audio_quality`]。
+    #[serde(default)]
+    pub audio_quality: u32,
 }
 
 /// Number of remappable player actions.
@@ -181,14 +251,42 @@ pub const SEEK_POINTS_MIN: u32 = 4;
 /// Largest accepted count of warmed seek positions. The point cache is capped
 /// at 80 MiB, so 20 points × 4 MiB still fits ([`crate::prefetch`] enforces it).
 pub const SEEK_POINTS_MAX: u32 = 20;
+/// Smallest number of upstream connections the prefetch proxy may use.
+pub const PREFETCH_CONNECTIONS_MIN: u32 = 1;
+/// Largest number of upstream connections the prefetch proxy may use.
+pub const PREFETCH_CONNECTIONS_MAX: u32 = 32;
+/// Smallest number of threads the network pool may own.
+pub const NET_THREADS_MIN: u32 = 2;
+/// Largest number of threads the network pool may own (see
+/// [`normalise_net_threads`]).
+pub const NET_THREADS_MAX: u32 = 32;
+/// Pool size when the field is absent or `0`: large enough to keep a dozen
+/// covers and a UI request in flight, small enough to leave the cores to the
+/// picture.
+pub const NET_THREADS_DEFAULT: u32 = 12;
 /// 播放列表最多保留多少条；超出时丢掉最旧的（见
 /// [`normalise_playlist_state`] 和 `PlaybackQueue::push`）。
 pub const PLAYLIST_MAX: usize = 200;
 /// 循环模式：0 = 手动, 1 = 自动, 2 = 随机.
 pub const PLAY_MODES: [u32; 3] = [0, 1, 2];
-/// 帧插值模式：0 = 关闭, 1 = 帧混合（blend）. 将来的 `2 = rife` 加进这个
-/// 列表即可，加载端无需改动。
-pub const INTERP_MODES: [u8; 3] = [0, 1, 2];
+/// 帧插值模式：0 = 关闭, 1 = 帧混合（blend）, 2 = 块匹配（block-match motion）.
+pub const INTERP_MODES: [u8; 4] = [0, 1, 2, 3];
+/// 播放器可选的音频档位（`audio` id）：0 = 自动。
+pub const AUDIO_QUALITIES: [u32; 6] = [0, 30216, 30232, 30280, 30250, 30251];
+/// 每次养鱼出巡最多看多少条视频的上限。
+pub const FISH_BUDGET_MAX: u32 = 500;
+/// 养鱼两条视频之间的最小休息间隔（毫秒）。
+pub const FISH_INTERVAL_MIN_MS: u64 = 800;
+/// 养鱼两条视频之间的最大休息间隔（毫秒）。
+pub const FISH_INTERVAL_MAX_MS: u64 = 10_000;
+/// 喂食来源：首页推荐（`feed_store` 里已经有的那一页）。
+pub const FISH_SOURCE_HOME: u32 = 1;
+/// 喂食来源：关注动态。
+pub const FISH_SOURCE_FOLLOW: u32 = 2;
+/// 喂食来源：收藏夹。
+pub const FISH_SOURCE_FAV: u32 = 4;
+/// 已知喂食来源的全部位。
+pub const FISH_SOURCES_ALL: u32 = FISH_SOURCE_HOME | FISH_SOURCE_FOLLOW | FISH_SOURCE_FAV;
 
 /// Default mapping, one candidate index per action:
 /// 播放/暂停, 快退, 快进, 音量+, 音量-, 静音, 全屏, 退出全屏, 弹幕, 点赞, 截图.
@@ -237,10 +335,23 @@ fn default_player_quality() -> i64 {
     80
 }
 
-/// 20% see-through: a light tint that leaves the frosted backdrop clearly
-/// visible (the blur below does the work).
+/// 背景透明度 default: 45 % see-through. The window tint keeps 55 % alpha
+/// (0x8C over the wallpaper), which is the exact alpha this window shipped
+/// with before the slider existed.
 pub fn default_glass_transparency() -> f32 {
-    20.0
+    45.0
+}
+
+/// 背景模糊 default: 60 image px. Soft enough to read as a mesh gradient,
+/// sharp enough that the blobs still have a direction.
+pub fn default_backdrop_blur() -> u32 {
+    60
+}
+
+/// Normalise the stored wallpaper blur: clamp into the slider's range, so a
+/// hand-edited `9999` can never ask `backdrop` for a radius outside `0..=160`.
+pub fn normalise_backdrop_blur(value: u32) -> u32 {
+    value.min(160)
 }
 
 /// 100% blur: the strongest the slider offers, mapped to the full
@@ -278,6 +389,44 @@ pub fn default_seek_points() -> u32 {
     10
 }
 
+/// 默认 16 路并发上游连接：足够在开头几秒把缓存推到 8 MiB 上限，
+/// 又不至于把带宽切得过碎（见 `player.rs` 的启动门）。
+pub fn default_prefetch_connections() -> u32 {
+    16
+}
+
+/// Normalise the prefetch connection count.
+///
+/// The value arrives both from JSON (a hand-edited or older file can hold
+/// anything) and from the future 设置 menu. `0` is the one special case: it
+/// means "unset" and falls back to [`default_prefetch_connections`] (16).
+/// Everything else is clamped into
+/// `PREFETCH_CONNECTIONS_MIN..=PREFETCH_CONNECTIONS_MAX`, so a corrupt `99` can
+/// never ask for more sockets than the UI offers.
+pub fn normalise_prefetch_connections(value: u32) -> u32 {
+    if value == 0 {
+        return default_prefetch_connections();
+    }
+    value.clamp(PREFETCH_CONNECTIONS_MIN, PREFETCH_CONNECTIONS_MAX)
+}
+
+/// Default size of the process-wide network thread pool.
+pub fn default_net_threads() -> u32 {
+    NET_THREADS_DEFAULT
+}
+
+/// Normalise the network pool size.
+///
+/// `0` means "unset" and falls back to [`default_net_threads`] (12); anything
+/// else is clamped into `NET_THREADS_MIN..=NET_THREADS_MAX`, so a hand-edited
+/// `999` can never ask for hundreds of threads.
+pub fn normalise_net_threads(value: u32) -> u32 {
+    if value == 0 {
+        return default_net_threads();
+    }
+    value.clamp(NET_THREADS_MIN, NET_THREADS_MAX)
+}
+
 /// 默认循环模式：自动（播完顺序播下一条）。
 pub fn default_play_mode() -> u32 {
     1
@@ -298,14 +447,166 @@ pub fn normalise_play_mode(value: u32) -> u32 {
 /// Normalise the 帧插值 mode.
 ///
 /// Only the modes this build implements ([`INTERP_MODES`]) are accepted; a
-/// hand-edited or newer `settings.json` value (including a future `2 = rife`
-/// written by a later build) falls back to off. Off is always safe: it costs
-/// one atomic load per presented source frame and changes nothing else.
+/// hand-edited or newer `settings.json` value falls back to off. Off is always
+/// safe: it costs one atomic load per presented source frame and changes
+/// nothing else.
 pub fn normalise_interp_mode(value: u8) -> u8 {
     if INTERP_MODES.contains(&value) {
         value
     } else {
         0
+    }
+}
+
+fn default_fish_model() -> String {
+    "deepseek-chat".to_string()
+}
+
+/// 默认的鱼主人指令：只说材料里有的内容。
+pub fn default_fish_instruction() -> String {
+    "看到什么就说什么；只说材料里有的内容。".to_string()
+}
+
+/// 自动喂食时间（`HH:MM`，本机时间）。
+pub fn default_fish_feed_time() -> String {
+    "20:00".to_string()
+}
+
+/// 喂食来源默认只有首页：关注 / 收藏夹还没有独立的入队路径。
+pub fn default_fish_sources() -> u32 {
+    FISH_SOURCE_HOME
+}
+
+fn default_fish_budget_videos() -> u32 {
+    40
+}
+
+fn default_fish_interval_ms() -> u64 {
+    1500
+}
+
+/// Normalise the 养鱼 model name.
+///
+/// A blank value (hand-edited or older file) falls back to
+/// [`default_fish_model`]; anything else is kept verbatim, so a newer model
+/// name typed into `settings.json` is never silently replaced.
+pub fn normalise_fish_model(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default_fish_model()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Normalise the 鱼主人的指令.
+///
+/// A blank instruction would leave the prompt's last section empty, so it falls
+/// back to [`default_fish_instruction`]; otherwise the text is kept verbatim
+/// (only trimmed at both ends).
+pub fn normalise_fish_instruction(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default_fish_instruction()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Normalise the per-run video budget (clamped into `1..=FISH_BUDGET_MAX`).
+///
+/// `0` is not a valid budget — it would mean "look at nothing" — so it clamps to
+/// the minimum of 1, exactly like a corrupt large value clamps to 500.
+pub fn normalise_fish_budget(value: u32) -> u32 {
+    value.clamp(1, FISH_BUDGET_MAX)
+}
+
+/// Normalise the pause between two videos (clamped into
+/// `FISH_INTERVAL_MIN_MS..=FISH_INTERVAL_MAX_MS`).
+pub fn normalise_fish_interval(value: u64) -> u64 {
+    value.clamp(FISH_INTERVAL_MIN_MS, FISH_INTERVAL_MAX_MS)
+}
+
+/// Snap an `HH:MM` string to a valid local time, falling back to `20:00`.
+///
+/// Accepts `H:MM` and `HH:MM` (24-hour); anything else — an empty field, a
+/// pasted date, `25:00` — falls back to [`default_fish_feed_time`] instead of
+/// silently scheduling nothing.
+pub fn normalise_fish_time(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut parts = trimmed.split(':');
+    let (Some(hour), Some(minute), None) = (parts.next(), parts.next(), parts.next()) else {
+        return default_fish_feed_time();
+    };
+    let (Ok(hour), Ok(minute)) = (hour.trim().parse::<u32>(), minute.trim().parse::<u32>())
+    else {
+        return default_fish_feed_time();
+    };
+    if hour > 23 || minute > 59 {
+        return default_fish_feed_time();
+    }
+    format!("{hour:02}:{minute:02}")
+}
+
+/// Drop unknown source bits; an empty mask falls back to 首页, because a source
+/// set of nothing would make every 开饭 a no-op.
+pub fn normalise_fish_sources(value: u32) -> u32 {
+    let known = value & FISH_SOURCES_ALL;
+    if known == 0 {
+        default_fish_sources()
+    } else {
+        known
+    }
+}
+
+/// Parse an `HH:MM` time into minutes since midnight (`None` when invalid).
+pub fn fish_time_minutes(value: &str) -> Option<u32> {
+    let normalised = normalise_fish_time(value);
+    let mut parts = normalised.split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+    Some(hour * 60 + minute)
+}
+
+/// Normalise the player's audio tier.
+///
+/// Only the ids the player can actually request ([`AUDIO_QUALITIES`]) are kept;
+/// anything else (a hand-edited or older file) becomes `0` = 自动, which always
+/// plays something.
+pub fn normalise_audio_quality(value: u32) -> u32 {
+    if AUDIO_QUALITIES.contains(&value) {
+        value
+    } else {
+        0
+    }
+}
+
+/// Human-readable name of one audio tier (see [`AUDIO_QUALITIES`]).
+#[allow(dead_code)] // the player/设置 UI (another change) is the consumer
+pub fn audio_tier_name(id: u32) -> &'static str {
+    match id {
+        30216 => "64K",
+        30232 => "132K",
+        30280 => "192K",
+        30250 => "杜比全景声",
+        30251 => "Hi-Res 无损",
+        _ => "自动",
+    }
+}
+
+/// Mask a DeepSeek key for display: `sk-…abcd`.
+///
+/// Only the `sk-` prefix and the last four characters are shown, so a
+/// screenshot or a shared log never leaks a usable key. Short or blank values
+/// degrade to `sk-…` instead of revealing themselves.
+#[allow(dead_code)] // the 设置 UI (another change) is the consumer
+pub fn mask_key(key: &str) -> String {
+    let key = key.trim();
+    let last: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    if key.chars().count() <= 8 || last.chars().count() < 4 {
+        "sk-…".to_string()
+    } else {
+        format!("sk-…{last}")
     }
 }
 
@@ -467,6 +768,7 @@ impl Default for Settings {
             player_keys: default_player_keys(),
             glass_transparency: default_glass_transparency(),
             glass_blur: default_glass_blur(),
+            backdrop_blur: default_backdrop_blur(),
             page_size: default_page_size(),
             close_action: default_close_action(),
             player_layout: None,
@@ -474,10 +776,22 @@ impl Default for Settings {
             cdn_select: default_cdn_select(),
             prefetch_proxy: default_prefetch_proxy(),
             seek_points: default_seek_points(),
+            prefetch_connections: default_prefetch_connections(),
+            net_threads: default_net_threads(),
             playlist: Vec::new(),
             playlist_current: None,
             play_mode: default_play_mode(),
             interp_mode: 0,
+            deepseek_key: String::new(),
+            fish_model: default_fish_model(),
+            fish_instruction: default_fish_instruction(),
+            fish_budget_videos: default_fish_budget_videos(),
+            fish_interval_ms: default_fish_interval_ms(),
+            fish_enabled: false,
+            fish_auto_feed: false,
+            fish_feed_time: default_fish_feed_time(),
+            fish_sources: default_fish_sources(),
+            audio_quality: 0,
         }
     }
 }
@@ -533,6 +847,7 @@ pub fn load() -> Settings {
             default_glass_transparency(),
         ),
         glass_blur: normalise_glass(settings.glass_blur, default_glass_blur()),
+        backdrop_blur: normalise_backdrop_blur(settings.backdrop_blur),
         page_size: normalise_page_size(settings.page_size),
         close_action: normalise_close_action(settings.close_action),
         player_layout: normalise_player_layout(settings.player_layout),
@@ -540,10 +855,22 @@ pub fn load() -> Settings {
         cdn_select: settings.cdn_select,
         prefetch_proxy: settings.prefetch_proxy,
         seek_points: normalise_seek_points(settings.seek_points),
+        prefetch_connections: normalise_prefetch_connections(settings.prefetch_connections),
+        net_threads: normalise_net_threads(settings.net_threads),
         playlist,
         playlist_current,
         play_mode: normalise_play_mode(settings.play_mode),
         interp_mode: normalise_interp_mode(settings.interp_mode),
+        deepseek_key: settings.deepseek_key.trim().to_string(),
+        fish_model: normalise_fish_model(&settings.fish_model),
+        fish_instruction: normalise_fish_instruction(&settings.fish_instruction),
+        fish_budget_videos: normalise_fish_budget(settings.fish_budget_videos),
+        fish_interval_ms: normalise_fish_interval(settings.fish_interval_ms),
+        fish_enabled: settings.fish_enabled,
+        fish_auto_feed: settings.fish_auto_feed,
+        fish_feed_time: normalise_fish_time(&settings.fish_feed_time),
+        fish_sources: normalise_fish_sources(settings.fish_sources),
+        audio_quality: normalise_audio_quality(settings.audio_quality),
     };
     if loaded.theme != stored_theme {
         let _ = save(&loaded);
@@ -730,6 +1057,92 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn net_threads_defaults_to_twelve_and_normalises() {
+        assert_eq!(default_net_threads(), NET_THREADS_DEFAULT);
+        assert_eq!(Settings::default().net_threads, NET_THREADS_DEFAULT);
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.net_threads, NET_THREADS_DEFAULT);
+        assert_eq!(normalise_net_threads(0), NET_THREADS_DEFAULT);
+        assert_eq!(normalise_net_threads(1), NET_THREADS_MIN);
+        assert_eq!(normalise_net_threads(12), 12);
+        assert_eq!(normalise_net_threads(999), NET_THREADS_MAX);
+        assert_eq!(normalise_net_threads(u32::MAX), NET_THREADS_MAX);
+        let encoded = match serde_json::to_string(&Settings::default()) {
+            Ok(encoded) => encoded,
+            Err(_) => String::new(),
+        };
+        assert!(encoded.contains("\"net_threads\":12"), "{encoded}");
+    }
+
+    #[test]
+    fn prefetch_connections_defaults_to_sixteen() {
+        assert_eq!(default_prefetch_connections(), 16);
+        assert_eq!(Settings::default().prefetch_connections, 16);
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.prefetch_connections, 16);
+    }
+
+    #[test]
+    fn prefetch_connections_keeps_every_offered_value() {
+        for value in PREFETCH_CONNECTIONS_MIN..=PREFETCH_CONNECTIONS_MAX {
+            assert_eq!(normalise_prefetch_connections(value), value);
+        }
+    }
+
+    #[test]
+    fn prefetch_connections_zero_means_unset() {
+        assert_eq!(
+            normalise_prefetch_connections(0),
+            default_prefetch_connections()
+        );
+        let settings = match serde_json::from_str::<Settings>(r#"{ "prefetch_connections": 0 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(
+            normalise_prefetch_connections(settings.prefetch_connections),
+            default_prefetch_connections()
+        );
+    }
+
+    #[test]
+    fn prefetch_connections_clamps_out_of_range_values() {
+        for value in 1..PREFETCH_CONNECTIONS_MIN {
+            assert_eq!(
+                normalise_prefetch_connections(value),
+                PREFETCH_CONNECTIONS_MIN
+            );
+        }
+        for value in [PREFETCH_CONNECTIONS_MAX + 1, 33, 99, u32::MAX] {
+            assert_eq!(
+                normalise_prefetch_connections(value),
+                PREFETCH_CONNECTIONS_MAX
+            );
+        }
+    }
+
+    #[test]
+    fn prefetch_connections_round_trips_through_json() -> Result<()> {
+        let settings = Settings {
+            prefetch_connections: PREFETCH_CONNECTIONS_MAX,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert_eq!(
+            normalise_prefetch_connections(decoded.prefetch_connections),
+            PREFETCH_CONNECTIONS_MAX
+        );
+        Ok(())
+    }
+
     fn queued(bvid: &str) -> QueueEntry {
         QueueEntry {
             bvid: bvid.to_string(),
@@ -869,12 +1282,13 @@ mod tests {
         }
         assert_eq!(normalise_interp_mode(1), 1);
         assert_eq!(normalise_interp_mode(2), 2);
+        assert_eq!(normalise_interp_mode(3), 3);
     }
 
     #[test]
     fn interp_mode_rejects_corrupt_and_future_values() {
-        // 0/1/2 are implemented (off / blend / RIFE); anything above is not.
-        for value in [3u8, 9, 99, u8::MAX] {
+        // 0..=3 are implemented (off / blend / block match / OFA); anything else is not.
+        for value in [4u8, 9, 99, u8::MAX] {
             assert_eq!(normalise_interp_mode(value), 0);
             assert!(!INTERP_MODES.contains(&value));
         }
@@ -882,13 +1296,117 @@ mod tests {
 
     #[test]
     fn interp_mode_round_trips_through_json() -> Result<()> {
-        let settings = Settings {
-            interp_mode: 1,
-            ..Settings::default()
-        };
-        let encoded = serde_json::to_string(&settings)?;
-        let decoded = serde_json::from_str::<Settings>(&encoded)?;
-        assert_eq!(normalise_interp_mode(decoded.interp_mode), 1);
+        for mode in INTERP_MODES {
+            let settings = Settings {
+                interp_mode: mode,
+                ..Settings::default()
+            };
+            let encoded = serde_json::to_string(&settings)?;
+            let decoded = serde_json::from_str::<Settings>(&encoded)?;
+            assert_eq!(normalise_interp_mode(decoded.interp_mode), mode);
+        }
         Ok(())
+    }
+
+    #[test]
+    fn audio_quality_keeps_every_offered_id() {
+        for id in AUDIO_QUALITIES {
+            assert_eq!(normalise_audio_quality(id), id);
+        }
+        assert_eq!(Settings::default().audio_quality, 0);
+    }
+
+    #[test]
+    fn audio_quality_rejects_unknown_ids() {
+        for id in [1u32, 999, 30217, 30252, u32::MAX] {
+            assert_eq!(normalise_audio_quality(id), 0);
+        }
+    }
+
+    #[test]
+    fn audio_tier_names_match_the_ids() {
+        assert_eq!(audio_tier_name(0), "自动");
+        assert_eq!(audio_tier_name(30216), "64K");
+        assert_eq!(audio_tier_name(30232), "132K");
+        assert_eq!(audio_tier_name(30280), "192K");
+        assert_eq!(audio_tier_name(30250), "杜比全景声");
+        assert_eq!(audio_tier_name(30251), "Hi-Res 无损");
+        assert_eq!(audio_tier_name(999), "自动");
+        for id in AUDIO_QUALITIES {
+            assert!(!audio_tier_name(id).is_empty());
+        }
+    }
+
+    #[test]
+    fn audio_quality_missing_from_a_legacy_file_loads_as_auto() -> Result<()> {
+        // A settings.json written before this field existed.
+        let legacy = r#"{ "page_size": 36, "play_mode": 1, "theme": 2 }"#;
+        let decoded = serde_json::from_str::<Settings>(legacy)?;
+        assert_eq!(decoded.audio_quality, 0);
+        assert_eq!(normalise_audio_quality(decoded.audio_quality), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn audio_quality_round_trips_through_json() -> Result<()> {
+        for id in AUDIO_QUALITIES {
+            let settings = Settings {
+                audio_quality: id,
+                ..Settings::default()
+            };
+            let encoded = serde_json::to_string(&settings)?;
+            let decoded = serde_json::from_str::<Settings>(&encoded)?;
+            assert_eq!(normalise_audio_quality(decoded.audio_quality), id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fish_defaults_are_off_with_a_usable_prompt() {
+        let defaults = Settings::default();
+        assert!(defaults.deepseek_key.is_empty());
+        assert!(!defaults.fish_enabled);
+        assert_eq!(defaults.fish_model, "deepseek-chat");
+        assert_eq!(defaults.fish_instruction, default_fish_instruction());
+        assert_eq!(defaults.fish_budget_videos, 40);
+        assert_eq!(defaults.fish_interval_ms, 1500);
+        let legacy = r#"{ "page_size": 36 }"#;
+        let decoded = serde_json::from_str::<Settings>(legacy).expect("legacy file parses");
+        assert_eq!(decoded.fish_model, "deepseek-chat");
+        assert_eq!(decoded.fish_instruction, default_fish_instruction());
+        assert_eq!(decoded.fish_budget_videos, 40);
+        assert_eq!(decoded.fish_interval_ms, 1500);
+        assert!(!decoded.fish_enabled);
+    }
+
+    #[test]
+    fn fish_budget_and_interval_clamp_into_range() {
+        assert_eq!(normalise_fish_budget(0), 1);
+        assert_eq!(normalise_fish_budget(1), 1);
+        assert_eq!(normalise_fish_budget(40), 40);
+        assert_eq!(normalise_fish_budget(FISH_BUDGET_MAX), FISH_BUDGET_MAX);
+        assert_eq!(normalise_fish_budget(FISH_BUDGET_MAX + 1), FISH_BUDGET_MAX);
+        assert_eq!(normalise_fish_budget(u32::MAX), FISH_BUDGET_MAX);
+        assert_eq!(normalise_fish_interval(0), FISH_INTERVAL_MIN_MS);
+        assert_eq!(normalise_fish_interval(1500), 1500);
+        assert_eq!(normalise_fish_interval(u64::MAX), FISH_INTERVAL_MAX_MS);
+    }
+
+    #[test]
+    fn fish_model_and_instruction_never_stay_blank() {
+        assert_eq!(normalise_fish_model("  "), "deepseek-chat");
+        assert_eq!(normalise_fish_model("deepseek-reasoner"), "deepseek-reasoner");
+        assert_eq!(normalise_fish_instruction("   "), default_fish_instruction());
+        assert_eq!(normalise_fish_instruction(" 只看教程 "), "只看教程");
+    }
+
+    #[test]
+    fn mask_key_shows_only_the_last_four_characters() {
+        assert_eq!(mask_key("sk-1234567890abcd"), "sk-…abcd");
+        assert_eq!(mask_key("  sk-1234567890abcd  "), "sk-…abcd");
+        assert_eq!(mask_key(""), "sk-…");
+        assert_eq!(mask_key("sk-"), "sk-…");
+        assert_eq!(mask_key("sk-1234"), "sk-…");
+        assert!(!mask_key("sk-1234567890abcd").contains("1234567890"));
     }
 }

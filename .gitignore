@@ -14,6 +14,11 @@ tools/*.log
 /settings.json.*
 /token.json.*
 
+# 养鱼 database: local analysis history, regenerated per user.
+/fish.db
+/fish.db-shm
+/fish.db-wal
+
 # Editor / OS noise
 .DS_Store
 Thumbs.db

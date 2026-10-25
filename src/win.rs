@@ -24,7 +24,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -80,6 +80,8 @@ const WH_CBT: i32 = 5;
 const HCBT_CREATEWND: i32 = 3;
 
 // Window messages the subclass hook handles (winuser.h).
+/// Sent after a window has moved; the wallpaper parallax hook hangs off it.
+const WM_MOVE: u32 = 0x0003;
 const WM_CLOSE: u32 = 0x0010;
 const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_STYLECHANGING: u32 = 0x007C;
@@ -220,6 +222,12 @@ type HookProc = unsafe extern "system" fn(i32, usize, isize) -> isize;
 /// and we never double-install the hook.
 static SUBCLASSED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
+/// Windows whose DWM attributes (rounded corner, dark chrome, no border) have
+/// already been applied. A window can be subclassed by the `WH_CBT` hook before
+/// `CreateWindowExW` returns, i.e. before DWM will accept those attributes, so
+/// "subclass exists" and "glass applied" are two different facts.
+static GLASS_READY: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
 /// The process-lifetime `WH_CBT` hook. Never unhooked: the player and mini
 /// windows are created long after `main` starts and must be born frameless too.
 static CREATE_HOOK: AtomicIsize = AtomicIsize::new(0);
@@ -245,6 +253,16 @@ static TOP_DRAG_STRIP: AtomicI32 = AtomicI32::new(0);
 /// The hook is `Arc`-cloned out of the guard before it runs, because it calls
 /// back into Slint and must never execute under this lock.
 static CLOSE_HOOK: Mutex<Option<(isize, Arc<dyn Fn() + Send + Sync>)>> = Mutex::new(None);
+
+/// Per-window `WM_MOVE` observers, keyed by handle.
+///
+/// The wallpaper is anchored to the window's SCREEN position, so every native
+/// move - the frameless drag path, a snap, a maximize, a programmatic
+/// `set_position` - has to republish the tile origin. Nothing here runs on a
+/// timer: `WM_MOVE` is the only trigger, which is why an idle window costs
+/// nothing. The hook is cloned out of the lock before it runs, exactly like
+/// [`CLOSE_HOOK`], because it re-enters Slint.
+static MOVE_HOOKS: Mutex<Vec<(isize, Arc<dyn Fn() + Send + Sync>)>> = Mutex::new(Vec::new());
 
 #[link(name = "user32")]
 extern "system" {
@@ -305,6 +323,39 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetCurrentThreadId() -> u32;
+
+    fn GetCurrentThread() -> isize;
+
+    fn GetCurrentProcess() -> isize;
+
+    fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+
+    fn SetPriorityClass(process: isize, class: u32) -> i32;
+}
+
+/// `THREAD_PRIORITY_HIGHEST` (winbase.h).
+const THREAD_PRIORITY_HIGHEST: i32 = 2;
+/// `BELOW_NORMAL_PRIORITY_CLASS` (winbase.h).
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+
+/// Hand the machine back to the rest of the desktop, and keep our own UI on top
+/// of our own workers.
+///
+/// The app used to run at `NORMAL_PRIORITY_CLASS` with every thread at normal
+/// priority: 16 network workers, three decode threads, the fish worker and the
+/// Slint event loop all competed as equals, so a playing video could starve the
+/// window that draws it *and* every other application on the machine. Setting
+/// the **process** class below normal fixes the second half (any other app wins
+/// against us), and raising the **UI thread** inside that class fixes the first
+/// (the event loop always wins against our network/decode threads, which stay at
+/// the class default, i.e. below normal in absolute terms).
+///
+/// Call once, from the thread that runs the Slint event loop.
+pub fn tune_priorities() {
+    unsafe {
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
 }
 
 #[link(name = "comctl32")]
@@ -610,11 +661,27 @@ unsafe extern "system" fn subclass_proc(
                 return 0;
             }
         }
+        // Wallpaper parallax: the moved window republishes its tile origin.
+        // Falling through (no `return`) keeps the default move bookkeeping.
+        WM_MOVE => {
+            let hook = MOVE_HOOKS.lock().ok().and_then(|hooks| {
+                hooks
+                    .iter()
+                    .find(|(move_hwnd, _)| *move_hwnd == hwnd)
+                    .map(|(_, hook)| Arc::clone(hook))
+            });
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         WM_NCDESTROY => {
             if let Ok(mut slot) = CLOSE_HOOK.lock() {
                 if matches!(slot.as_ref(), Some((close_hwnd, _)) if *close_hwnd == hwnd) {
                     *slot = None;
                 }
+            }
+            if let Ok(mut hooks) = MOVE_HOOKS.lock() {
+                hooks.retain(|(move_hwnd, _)| *move_hwnd != hwnd);
             }
             if let Ok(mut set) = SUBCLASSED.lock() {
                 set.retain(|entry| *entry != hwnd);
@@ -760,9 +827,25 @@ fn install_subclass_hwnd(hwnd: isize, remove_border: bool) -> bool {
             // are all booked in through this function.
             let _ = dwm_remove_border(hwnd);
         }
+        normalise_frameless(hwnd);
+        // Report "installed" only on the installation itself. The player's
+        // 1 Hz retry timer used to re-run `normalise_frameless` + three DWM
+        // attribute writes + a frame-state log **every second for every open
+        // window**, which showed up as 0.2-1.0 s UI hitches during playback.
+        // Once the subclass exists, `WM_STYLECHANGING` keeps winit from
+        // re-decorating, so the retry only has to wait for the HWND.
+        return true;
     }
-    normalise_frameless(hwnd);
-    true
+    // Already subclassed (possibly by the create hook, before DWM accepts
+    // attributes). Ask the caller once more so `setup_glass` actually runs.
+    !glass_ready(hwnd)
+}
+
+fn glass_ready(hwnd: isize) -> bool {
+    GLASS_READY
+        .lock()
+        .map(|set| set.contains(&hwnd))
+        .unwrap_or(false)
 }
 
 /// Raise/lower the given window in the Z-order by toggling `WS_EX_TOPMOST`.
@@ -842,8 +925,31 @@ pub fn set_close_hook(window: &slint::Window, hook: impl Fn() + Send + Sync + 's
     }
 }
 
-/// Post `WM_CLOSE` to a window, as the ✕ / Alt+F4 / taskbar close would.
+/// Register an observer that runs after every native move (`WM_MOVE`).
 ///
+/// One observer per window; registering again replaces the previous one. Purely
+/// event-driven - the callback is the wallpaper republish, so no timer polls the
+/// window position. Returns `false` when the native handle does not exist yet.
+pub fn set_move_hook(window: &slint::Window, hook: impl Fn() + Send + Sync + 'static) -> bool {
+    let Some(hwnd) = hwnd_of(window) else {
+        return false;
+    };
+    install_subclass_hwnd(hwnd, false);
+    match MOVE_HOOKS.lock() {
+        Ok(mut hooks) => {
+            let fresh = !hooks.iter().any(|(move_hwnd, _)| *move_hwnd == hwnd);
+            hooks.retain(|(move_hwnd, _)| *move_hwnd != hwnd);
+            hooks.push((hwnd, Arc::new(hook)));
+            if fresh {
+                crate::debug_log(&format!("move-hook registered hwnd={hwnd}"));
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Post `WM_CLOSE` to a window, as the ✕ / Alt+F4 / taskbar close would.///
 /// Diagnostic only (`BILI_PLAYER_CLOSE_TEST=native`): no synthetic input is
 /// involved, the message goes straight to the window procedure. Best-effort.
 pub fn post_close(hwnd: isize) -> bool {
@@ -1061,6 +1167,11 @@ pub fn setup_glass(window: &slint::Window, dark: bool) -> bool {
         "glass hwnd={hwnd} blur_behind={blur_hr} corner_set={corner_hr} dark_set={dark_hr} \
          border_set={border_hr}"
     ));
+    if let Ok(mut set) = GLASS_READY.lock() {
+        if !set.contains(&hwnd) {
+            set.push(hwnd);
+        }
+    }
     true
 }
 
@@ -1131,6 +1242,24 @@ fn percentile(samples: &[u32], p: f64) -> Option<u32> {
     sorted.sort_unstable();
     let rank = ((sorted.len() - 1) as f64 * p).round() as usize;
     sorted.get(rank.min(sorted.len() - 1)).copied()
+}
+
+/// How many windows are being moved by the self-driven drag loop right now.
+///
+/// One mouse drag moves exactly one window, so this is normally 0 or 1; it is
+/// a counter (not a flag) because each [`WindowDrag`] must balance its own
+/// transition. The video pacer reads it through
+/// [`window_drag_active`] to suspend frame interpolation, and both frosted-glass
+/// loops read it to skip a desktop capture: generating display frames and
+/// reading back the screen are both expensive enough to be visible on top of
+/// the window manager's own move, which is exactly where the judder came from.
+static DRAGS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a window is currently being dragged by the app's own move loop.
+///
+/// Cheap (one relaxed load) so the pacer can call it once per source frame.
+pub fn window_drag_active() -> bool {
+    DRAGS_IN_FLIGHT.load(Ordering::Relaxed) > 0
 }
 
 /// Self-driven, frame-locked window move state for one Slint window.
@@ -1210,22 +1339,38 @@ impl WindowDrag {
         self.pending_target.set(None);
         self.applied.set(None);
         let Some(hwnd) = hwnd_of(window) else {
-            self.dragging.set(false);
+            self.set_dragging(false);
             return Err("no-hwnd");
         };
         let Some(cursor) = cursor_position() else {
-            self.dragging.set(false);
+            self.set_dragging(false);
             return Err("no-cursor");
         };
         let Some(origin) = window_origin_hwnd(hwnd) else {
-            self.dragging.set(false);
+            self.set_dragging(false);
             return Err("no-origin");
         };
         self.anchor_cursor.set((cursor.x, cursor.y));
         self.anchor_window.set(origin);
         self.applied.set(Some(origin));
-        self.dragging.set(true);
+        self.set_dragging(true);
         Ok(())
+    }
+
+    /// Set the drag flag and keep [`DRAGS_IN_FLIGHT`] in step with it.
+    ///
+    /// Only a real transition counts, so a refused `start` on an already
+    /// dragging window (or a repeated `end`) can never unbalance the counter
+    /// the pacer and the glass loops read.
+    fn set_dragging(&self, active: bool) {
+        if self.dragging.replace(active) == active {
+            return;
+        }
+        if active {
+            DRAGS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DRAGS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Whether a drag is in progress.
@@ -1357,7 +1502,7 @@ impl WindowDrag {
 
     pub fn end(&self) {
         self.log_profile();
-        self.dragging.set(false);
+        self.set_dragging(false);
         self.pending_cursor.set(false);
         self.pending_target.set(None);
         self.applied.set(None);

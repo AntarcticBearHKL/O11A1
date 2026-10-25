@@ -94,13 +94,9 @@ bundled under `assets/fonts/` with its licence text.
 
 ## Frame smoothing
 
-Settings → 优化 / the player's 平滑 button cycles three modes:
+Settings → 优化 / the player's 平滑 button cycles two modes:
 
 | Mode | What it does | Limits |
 | --- | --- | --- |
 | 关闭 | native frame rate | — |
 | 混合 | blends adjacent frames to the display rate (display-only, no A/V impact) | 1080p capped at 60 fps; 120 fps only at ≤960×540 |
-| RIFE | optical-flow interpolation through the bundled helper (real intermediate frames) | **≤1280×720, 30/25 fps sources only**; falls back to 混合 above that or if the helper is missing |
-
-RIFE needs `rife-helper.exe` + `assets/rife/model` next to the exe (both are in the
-release bundle). Measured on an RTX 4060 Ti: 16–18 ms per 720p pair (≈58 pairs/s).
