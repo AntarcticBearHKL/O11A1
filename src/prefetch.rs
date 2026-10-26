@@ -128,7 +128,7 @@
 //! session owns that file; the exact call site is documented on
 //! `PlaybackControl::preload_playlist` in `player.rs`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::io::Write;
@@ -531,6 +531,16 @@ pub struct PrefetchStats {
     /// [`MAX_DOWNLOADED_RANGES`] entries, merging the smallest gaps first, so
     /// the UI always receives a compact list.
     pub downloaded: Vec<(u64, u64)>,
+    /// Everything the session can serve **right now**: the session cache file
+    /// plus the in-memory read-ahead window and the point cache.
+    ///
+    /// The 下载分布 panel draws this, not [`PrefetchStats::downloaded`]: bytes
+    /// that were fetched and are being served from memory are already playable,
+    /// so painting them as "not downloaded" (and, worse, as "downloading" while
+    /// the worker happens to hold that range again) contradicted the picture the
+    /// user was watching. `downloaded` stays the disk truth, which is what the
+    /// seek path must use.
+    pub available: Vec<(u64, u64)>,
     /// Same value as [`PrefetchStats::bytes_total`], under the name the panel
     /// uses for the heatmap denominator.
     pub total_bytes: Option<u64>,
@@ -596,6 +606,11 @@ async fn preload_one(
     }
     let mut offset = disk.first_hole();
     let mut total = disk.len();
+    // A file the previous pass already completed: the ring stays full without
+    // touching the network.
+    if total > 0 && offset >= total {
+        set_preload_progress(key, total, total, true);
+    }
     let mut fetched = 0u64;
     let mut failures = 0u32;
     loop {
@@ -653,6 +668,7 @@ async fn preload_one(
                 progress
                     .bytes_total
                     .fetch_add(learned, Ordering::SeqCst);
+                set_preload_progress(key, offset, total, false);
             }
         }
         let mut body = 0u64;
@@ -668,6 +684,7 @@ async fn preload_one(
             body += chunk.len() as u64;
             fetched += chunk.len() as u64;
             progress.bytes_done.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+            set_preload_progress(key, offset, total, total > 0 && offset >= total);
             if total > 0 && offset >= total {
                 break;
             }
@@ -691,6 +708,11 @@ async fn preload_one(
         // in the file (this file is meant to outlive its writer, unlike a
         // session file).
         disk.flush_and_save_map();
+        set_preload_progress(key, total, total, true);
+    } else if offset == 0 && total == 0 {
+        // Nothing ever landed: a failed resolution must not leave a ring that
+        // looks pending forever.
+        set_preload_progress(key, 0, 0, false);
     }
     if let Ok(mut current) = progress.current.lock() {
         current.clear();
@@ -744,6 +766,168 @@ struct PreloadProgressShared {
     /// partial file instead of leaving it behind.
     #[allow(dead_code)]
     current: Mutex<String>,
+}
+
+/// One playlist-preload file as the playlist rows see it: bytes landed, the
+/// media's own length once known, and whether the file is complete.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreloadFileProgress {
+    pub done: u64,
+    pub total: u64,
+    pub complete: bool,
+}
+
+/// Per-key progress of the **last** playlist preload pass.
+///
+/// [`PrefetchHandle::preload_progress`] is the aggregate counter; the playlist
+/// panel draws one 16px ring per row, so it needs the per-file split. The map is
+/// process-wide on purpose: the preload lives inside the active player's proxy,
+/// while the rows are published by the main window's playlist host, which never
+/// holds that handle. Entries of completed files stay until the file is removed
+/// (`PreloadFileProgress::complete` keeps the ring full).
+static PRELOAD_FILES: OnceLock<Mutex<HashMap<String, PreloadFileProgress>>> = OnceLock::new();
+
+fn preload_files() -> &'static Mutex<HashMap<String, PreloadFileProgress>> {
+    PRELOAD_FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_preload_progress(key: &str, done: u64, total: u64, complete: bool) {
+    if let Ok(mut files) = preload_files().lock() {
+        let entry = files.entry(key.to_string()).or_default();
+        // The sequential reader only moves forward; a later pass that finds the
+        // file already full keeps the completed state.
+        if done > entry.done || complete {
+            entry.done = done;
+        }
+        if total > 0 {
+            entry.total = total;
+        }
+        entry.complete |= complete;
+    }
+}
+
+/// Snapshot for the playlist rows: `(cache key, bytes done, bytes total,
+/// complete)`, sorted by key so a diagnostic line is stable. An empty map (no
+/// preload ever started) returns an empty vector.
+pub fn preload_snapshot() -> Vec<(String, u64, u64, bool)> {
+    let mut rows: Vec<(String, u64, u64, bool)> = preload_files()
+        .lock()
+        .map(|files| {
+            files
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.done, entry.total, entry.complete))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// Drop one key from the progress map (cache file removed / preload cancelled).
+fn forget_preload_progress(key: &str) {
+    if let Ok(mut files) = preload_files().lock() {
+        files.remove(key);
+    }
+}
+
+/// One `cache removed` line in the same shape [`DiskCache::remove`] uses, so a
+/// reader can grep either removal path.
+fn log_cache_removed(path: &std::path::Path, bytes: u64, reason: &str) {
+    crate::debug_log(&format!(
+        "cache removed path={} bytes={} written=0 reason={reason}",
+        path.display(),
+        bytes
+    ));
+}
+
+/// Delete every session cache file belonging to `bvid`/`cid` (video and audio,
+/// every quality/codec variant).
+///
+/// This is the playlist's ownership path: a queued item that was preloaded into
+/// its own `.part` has no player holding it, so removing the row (or finishing
+/// its playback) must remove the bytes it reserved. The active player's own
+/// session file is also matched; Windows only deletes it once the decoder has
+/// closed its handle, so a held file is retried on the low-priority pool rather
+/// than blocking the UI thread.
+///
+/// Returns the number of media files the call targeted (0 when nothing was
+/// cached). The progress map is cleared at the same time, so the row's ring
+/// cannot stay full after its file is gone.
+pub fn remove_cached_for(bvid: &str, cid: u64, reason: &str) -> usize {
+    if !disk_cache_enabled() {
+        return 0;
+    }
+    let dir = cache_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let prefix = format!("{}-{}-", cache_key_name(bvid), cid);
+    let mut stems: BTreeSet<String> = BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(stem) = name
+            .strip_suffix(".part")
+            .or_else(|| name.strip_suffix(".map"))
+        else {
+            continue;
+        };
+        if stem.starts_with(&prefix) {
+            stems.insert(stem.to_string());
+        }
+    }
+    let mut removed = 0usize;
+    for stem in stems {
+        forget_preload_progress(&stem);
+        let map = dir.join(format!("{stem}.map"));
+        let part = dir.join(format!("{stem}.part"));
+        let _ = std::fs::remove_file(&map);
+        let bytes = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
+        match std::fs::remove_file(&part) {
+            Ok(()) => {
+                removed += 1;
+                log_cache_removed(&part, bytes, reason);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                removed += 1;
+                log_cache_removed(&part, bytes, reason);
+            }
+            Err(_) => {
+                // The decoder or the preload reader still holds the handle.
+                // Retry off-thread; the same bounded 2 s the session removal
+                // gives ffmpeg on a close.
+                removed += 1;
+                let reason = reason.to_string();
+                crate::netpool::submit(
+                    crate::netpool::Prio::Low,
+                    Box::new(move || {
+                        for _ in 0..40 {
+                            match std::fs::remove_file(&part) {
+                                Ok(()) => {
+                                    log_cache_removed(&part, bytes, &reason);
+                                    return;
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                    log_cache_removed(&part, bytes, &reason);
+                                    return;
+                                }
+                                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                            }
+                        }
+                        crate::debug_log(&format!(
+                            "cache remove failed path={} bytes={bytes} reason=held",
+                            part.display()
+                        ));
+                    }),
+                );
+            }
+        }
+    }
+    if removed > 0 {
+        crate::debug_log(&format!(
+            "cache removed items={removed} bvid={bvid} cid={cid} reason={reason}"
+        ));
+    }
+    removed
 }
 
 impl PrefetchHandle {
@@ -1043,6 +1227,7 @@ impl PrefetchHandle {
             let name = cache_key_name(&partial);
             let _ = std::fs::remove_file(dir.join(format!("{name}.part")));
             let _ = std::fs::remove_file(dir.join(format!("{name}.map")));
+            forget_preload_progress(&name);
             crate::debug_log(&format!("preload cancel removed key={name}"));
         }
         crate::debug_log(&format!(
@@ -3672,6 +3857,17 @@ impl Engine {
                 let mut ranges: Vec<(u64, u64)> =
                     Vec::with_capacity(present.len() + state.chunks.len());
                 let on_disk = disk.present();
+                // Availability (what the panel paints): every byte the session
+                // can serve, file or memory.
+                let mut available: Vec<(u64, u64)> =
+                    Vec::with_capacity(present.len() + state.chunks.len());
+                available.extend(present.iter().copied());
+                available.extend(state.chunks.iter().filter_map(|(start, data)| {
+                    let len = data.len() as u64;
+                    (len > 0).then_some((*start, start.saturating_add(len)))
+                }));
+                available.extend(point_ranges(&state.points).iter().copied());
+                stats.available = merge_ranges(available, MAX_DOWNLOADED_RANGES);
                 if on_disk {
                     ranges.extend(present.iter().copied());
                 }

@@ -580,6 +580,13 @@ export struct SearchRow {
     meta: string,
     sub: string,
     badge: string,
+    // The home card's own fields (see VideoCardView): the UP name and its mid,
+    // the exact play count for the heat bulb, and the publish stamp for the
+    // freshness chip. Search results are home cards, not a second layout.
+    owner: string,
+    owner_mid: string,
+    view_count: int,
+    pub_ts: int,
 }
 
 // One row of the home bar's 播放列表 panel. `current` marks the row the player
@@ -592,6 +599,11 @@ export struct PlaylistRow {
     cover: image,
     current: bool,
     playing: bool,
+    // 0..1 preload progress of a queued (not current) row, and whether its
+    // cache file is complete. The row draws a 16px ring from this; full fades
+    // to a check.
+    preload: float,
+    preload_done: bool,
 }
 
 export struct PartRow {
@@ -901,8 +913,11 @@ export component MiniPlayerWindow inherits Window {
 
     // ---- backdrop (same contract as the other two windows) ------------------
     // The generated wallpaper TILE; the layer below repeats it under the whole
-    // client area, anchored to the window's screen position.
+    // client area, anchored to the window's screen position. `AppTheme.dark`
+    // selects the variant, so a theme switch swaps the layer immediately
+    // (Rust keeps both variants published).
     in property <image> wallpaper;
+    in property <image> wallpaper-light;
     in property <bool> wallpaper_valid: false;
 
     callback mini_toggle_pause();
@@ -923,7 +938,7 @@ export component MiniPlayerWindow inherits Window {
         y: 0;
         width: 100%;
         height: 100%;
-        source: root.wallpaper;
+        source: AppTheme.dark ? root.wallpaper : root.wallpaper-light;
     }
     Rectangle {
         x: 0;
@@ -1587,19 +1602,18 @@ component PillIcon inherits Rectangle {
 }
 
 // 药丸平滑: the frame-interpolation cell. It reuses PillIcon's chip language
-// (38x38 plate, 10px radius, same hover wash) but is its own component because
-// it carries STATE in a badge, not an on/off highlight:
+// (38x38 plate, 10px radius, same hover wash) but carries the MODE, not an
+// on/off highlight. Four states, each with its own glyph AND its own short
+// label, so the cell is readable at a glance without the tooltip:
 //
-//   level 0 关闭   - a dim 4px dot
-//   level 1 混合   - the same dot in `accent` at 60 %
-//   level 2 块匹配 - solid accent dot plus a 3px four-ray glint on the axes (+)
-//   level 3 OFA    - solid accent dot plus a 6.2px two-ray glint on the
-//                    diagonals: the same sparkle turned 45°, so the hardware
-//                    path differs in shape, not only in tint, from the CPU one
+//   0 关闭   关 - two frame outlines + a slash (dim)
+//   1 混合   混 - two overlapping frames (a blend)
+//   2 块匹配 块 - opposing motion arrows (block matching)
+//   3 OFA    光 - a wave (optical flow)
 //
-// The glyph is three nested right chevrons (frames advancing), drawn as one
-// stroked Path - deliberately unlike the danmaku dashes, the 网络 bars or the
-// play triangle, none of which has a chevron.
+// The int comes straight from `PlaybackControl::interp_mode()` (published
+// synchronously in the same cycle callback), NEVER derived from a label string,
+// so the icon cannot lag the mode by one frame or disagree with the 模式 row.
 component InterpIcon inherits Rectangle {
     in property <int> level: 0;
     in property <bool> interactive: true;
@@ -1612,70 +1626,92 @@ component InterpIcon inherits Rectangle {
     background: area.has-hover ? AppTheme.player-btn-hover : AppTheme.player-btn;
     animate background { duration: 120ms; easing: ease-out; }
 
-    Path {
-        x: (parent.width - 16px) / 2;
-        y: (parent.height - 16px) / 2;
-        width: 16px;
+    pure function mode-name(level: int) -> string {
+        if (level == 1) { return "混合"; }
+        if (level == 2) { return "块匹配"; }
+        if (level == 3) { return "OFA"; }
+        return "关闭";
+    }
+    property <string> short-label: root.level == 1 ? "混"
+        : (root.level == 2 ? "块" : (root.level == 3 ? "光" : "关"));
+    property <color> glyph-ink: root.level == 0 ? AppTheme.player-text-dim : AppTheme.accent;
+
+    // 0 关闭: a frame pair with a slash. Dim; the only state without accent.
+    if root.level == 0 : Path {
+        x: 8px;
+        y: 3px;
+        width: 22px;
         height: 16px;
-        viewbox-width: 16;
+        viewbox-width: 22;
         viewbox-height: 16;
-        commands: "M 1.8 3.4 L 6.2 8 L 1.8 12.6 M 5.8 3.4 L 10.2 8 L 5.8 12.6 M 9.8 3.4 L 14.2 8 L 9.8 12.6";
+        commands: "M 2 4 L 9 4 L 9 11 L 2 11 Z M 6 2 L 13 2 L 13 9 L 6 9 M 3 14 L 15 1";
         fill: #00000000;
-        stroke: AppTheme.player-text;
+        stroke: root.glyph-ink;
+        stroke-width: 1.3px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+    }
+
+    // 1 混合: two overlapping frames, the blend read.
+    if root.level == 1 : Path {
+        x: 8px;
+        y: 3px;
+        width: 22px;
+        height: 16px;
+        viewbox-width: 22;
+        viewbox-height: 16;
+        commands: "M 1 4 L 10 4 L 10 12 L 1 12 Z M 8 1 L 17 1 L 17 9 L 8 9";
+        fill: #00000000;
+        stroke: root.glyph-ink;
         stroke-width: 1.4px;
         stroke-line-cap: round;
         stroke-line-join: round;
     }
 
-    // State dot, top-right of the chip: dim while off, accent at 60 % for the
-    // blend mode, solid accent for both optical-flow modes (块匹配 on the CPU,
-    // OFA on the N-card engine); the glint below tells those two apart.
-    Rectangle {
-        x: 26.5px;
-        y: 6.5px;
-        width: 4px;
-        height: 4px;
-        border-radius: 2px;
-        background: root.level == 0 ? AppTheme.player-text-dim : AppTheme.accent;
-        opacity: root.level == 1 ? 0.6 : 1;
-        animate opacity { duration: 160ms; easing: ease-out; }
-        animate background { duration: 160ms; easing: ease-out; }
-    }
-
-    // Level-2 glint (块匹配, CPU): a 3px four-ray spark up-right of the dot (a
-    // stroked plus, crisper at 16px than a filled star). Orthogonal rays.
+    // 2 块匹配: two opposing motion arrows.
     if root.level == 2 : Path {
-        x: 32.5px;
-        y: 4.5px;
-        width: 3px;
-        height: 3px;
-        viewbox-width: 3;
-        viewbox-height: 3;
-        commands: "M 1.5 0 L 1.5 3 M 0 1.5 L 3 1.5";
+        x: 8px;
+        y: 3px;
+        width: 22px;
+        height: 16px;
+        viewbox-width: 22;
+        viewbox-height: 16;
+        commands: "M 2 4 L 15 4 M 12 1 L 15 4 L 12 7 M 20 12 L 7 12 M 10 9 L 7 12 L 10 15";
         fill: #00000000;
-        stroke: AppTheme.accent;
-        stroke-width: 0.9px;
+        stroke: root.glyph-ink;
+        stroke-width: 1.4px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+    }
+
+    // 3 OFA: a wave (optical flow), the hardware path's own mark.
+    if root.level == 3 : Path {
+        x: 7px;
+        y: 3px;
+        width: 24px;
+        height: 16px;
+        viewbox-width: 24;
+        viewbox-height: 16;
+        commands: "M 1 8 C 3.5 1 6 1 8.5 8 C 11 15 13.5 15 16 8 C 17.5 4 19.5 3.5 21 5";
+        fill: #00000000;
+        stroke: root.glyph-ink;
+        stroke-width: 1.5px;
         stroke-line-cap: round;
     }
 
-    // Level-3 glint (OFA, hardware): two rays on the diagonals (45° / 135°), a
-    // 6.2px sparkle in the same corner. It is the level-2 mark turned 45° - a
-    // different angle AND fewer rays - so 块匹配 and OFA never read as the same
-    // badge, even at 38px and without colour differences. The diagonal needs
-    // the extra size to survive the 1px pixel grid at 100% DPI: a 3px x would
-    // blur into a dot, while a 3px + still reads as a plus.
-    if root.level == 3 : Path {
-        x: 30.8px;
-        y: 2.4px;
-        width: 6.2px;
-        height: 6.2px;
-        viewbox-width: 6.2;
-        viewbox-height: 6.2;
-        commands: "M 1 1 L 5.2 5.2 M 5.2 1 L 1 5.2";
-        fill: #00000000;
-        stroke: AppTheme.accent;
-        stroke-width: 1px;
-        stroke-line-cap: round;
+    // The 1-character label: always visible, so the icon's state does not
+    // depend on hover. 9.5px keeps 关/混/块/光 inside the 38px plate.
+    Text {
+        x: 0;
+        y: 22px;
+        width: 100%;
+        height: 12px;
+        text: root.short-label;
+        color: root.glyph-ink;
+        font-size: 9.5px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 
     area := TouchArea {
@@ -1684,6 +1720,9 @@ component InterpIcon inherits Rectangle {
         width: parent.width + 2px;
         height: parent.height + 2px;
         enabled: root.interactive;
+        accessible-role: button;
+        // The accessible name spells the mode out, not just "平滑".
+        accessible-label: "插帧：" + root.mode-name(root.level);
         clicked => { root.clicked(); }
         // A wheel over a pill button is not the pill's background.
         scroll-event(event) => { EventResult.accept }
@@ -2819,8 +2858,11 @@ export component PlayerWindow inherits Window {
     // The generated wallpaper TILE (see `src/backdrop.rs`), repeated under the
     // whole client area and anchored to the window's screen position, then the
     // player-glass tint above it. Nothing samples the desktop any more, so the
-    // first painted frame is already the wallpaper + tint.
+    // first painted frame is already the wallpaper + tint. `wallpaper` is the
+    // DARK variant and `wallpaper-light` the light one; `AppTheme.dark` picks
+    // between them, so the layer follows a theme switch immediately.
     in property <image> wallpaper;
+    in property <image> wallpaper-light;
     in property <bool> wallpaper_valid: false;
 
     // ---- chrome lifetime ------------------------------------------------
@@ -2848,6 +2890,11 @@ export component PlayerWindow inherits Window {
     // target. The 缓冲屏 below is the only consumer.
     in property <bool> buffering: false;
     in property <float> buffer_progress: 0.0;
+    // QA only: force the 缓冲屏 on while a picture exists, for a deterministic
+    // "frame + scrim" capture when a fully cached clip never enters pre-roll.
+    // The player tick ORs this in and republishes, so the overlay is the same
+    // component the real gate drives.
+    in property <bool> qa_force_buffering: false;
 
     // ---- quality ----
     // `quality_menu_rows` is the model the 画质 menu draws (see
@@ -3112,19 +3159,16 @@ export component PlayerWindow inherits Window {
     // where its runtime is missing) and persists it; both the pill cell and the
     // panel row are entry points to the same call.
     in property <string> interp_mode_text: "关闭";
+    // The exact mode (`PlaybackControl::interp_mode()`), written by Rust in the
+    // same click callback that applies it. The icon binds to this int, not to a
+    // text string, so it can never show a stale mode for one frame.
+    in property <int> interp_mode: 0;
     in property <string> interp_stats_text: "—";
     in property <string> interp_gpu_text: "";
     callback interp_cycle();
 
-    // 0 关闭 · 1 混合 · 2 块匹配 · 3 OFA. "关闭" is the documented default; the
-    // optical-flow labels are matched on their own words, so a future spelling
-    // ("块匹配光流", "OFA 光流") still lights the right badge, and any other
-    // label reads as the blend mode instead of a false 关闭.
-    property <int> interp_level: root.interp_mode_text == "关闭"
-        || root.interp_mode_text == ""
-        ? 0
-        : (root.interp_mode_text.starts-with("块匹配") ? 2
-            : (root.interp_mode_text.starts-with("OFA") ? 3 : 1));
+    // 0 关闭 · 1 混合 · 2 块匹配 · 3 OFA.
+    property <int> interp_level: clamp(root.interp_mode, 0, 3);
     // The pill tooltip: one line per state, always naming the mode (never just
     // "平滑").
     property <string> interp_tip: root.interp_level == 0
@@ -3173,6 +3217,9 @@ export component PlayerWindow inherits Window {
     // panel) so one capture can show all three glass treatments. Production
     // leaves it false; the normal click/hover rules still own the popovers.
     in-out property <bool> qa_hold_popovers: false;
+    // QA-only: hold ONE popover (1 = 音量, 2 = 弹幕) so each can be captured and
+    // measured separately. Production never writes it.
+    in-out property <int> qa_popover_hold: 0;
     // QA-only: keep the chrome (and therefore the popovers) up for a replay
     // capture without touching the real cursor. Production leaves it false.
     in-out property <bool> qa_hold_chrome: false;
@@ -3208,6 +3255,14 @@ export component PlayerWindow inherits Window {
     out property <length> qa_vol_btn_y: vol_icon.absolute-position.y;
     out property <length> qa_vol_btn_w: vol_icon.width;
     out property <bool> qa_vol_shown: vol_plate.shown;
+    // Popover vs trigger geometry: the f146 measurement reads these and checks
+    // |popover centre - button centre| <= 1 px for both popovers.
+    out property <length> qa_vol_pop_x: vol_plate.absolute-position.x;
+    out property <length> qa_vol_pop_w: vol_plate.width;
+    out property <length> qa_dm_btn_x: dm_icon.absolute-position.x;
+    out property <length> qa_dm_btn_w: dm_icon.width;
+    out property <length> qa_dm_pop_x: dm_plate.absolute-position.x;
+    out property <length> qa_dm_pop_w: dm_plate.width;
     out property <length> qa_right_x: right_strip_area.absolute-position.x;
     out property <length> qa_right_w: right_strip_area.width;
 
@@ -3944,12 +3999,14 @@ export component PlayerWindow inherits Window {
     // offset derived from the window's SCREEN position (parallax); the tint is
     // the player-glass surface. The video band paints opaque black over both;
     // the chrome bands and the letterbox bars stay transparent over them.
+    // `AppTheme.dark` picks the variant, so the layer follows a theme switch in
+    // the same frame (both variants are published by Rust).
     if wallpaper_valid : WallpaperLayer {
         x: 0;
         y: 0;
         width: 100%;
         height: 100%;
-        source: root.wallpaper;
+        source: AppTheme.dark ? root.wallpaper : root.wallpaper-light;
     }
     Rectangle {
         x: 0;
@@ -4166,26 +4223,23 @@ export component PlayerWindow inherits Window {
         }
 
         // ===================== 缓冲屏 (buffering / pre-roll) =====================
-        // Sits over the PICTURE only: `pic_*` follows 适配's letterbox inside
-        // the band, so a 1100x700 window centres the mark on the 16:9 picture,
-        // not on the window, and the side/bottom panel strips are never
-        // covered. Declared after the picture band and before every chrome
-        // element: above the frozen frame, danmaku and status text, UNDER the
-        // title strip, top controls and the pill - those keep their exact
-        // hover behaviour. The layer has no TouchArea, so the picture still
-        // owns the drag and the click and the chrome's hover is untouched.
-        //
-        // Composition, in the app's own language: a faint scrim, then a
-        // 132px plate (same surface / hairline / 30px radius family as the
-        // floating pill and the 二级 panels) carrying a 92px ring. The ring's
-        // track is `player-track`; the arc is `accent`, the same colour the
-        // seek bar uses for progress. Nothing here is a font glyph or a new
-        // colour.
+        // Covers the WHOLE picture band (`video_w × band_h`), not the letterboxed
+        // picture rect. The band is transparent over the wallpaper, so a scrim
+        // only as wide as the picture drew a visible rectangle exactly at the
+        // 16:9 edge on open. The scrim is the SAME surface as the bars
+        // (`player-glass`, i.e. the bar tint over the wallpaper) and is hidden
+        // entirely until a frame exists: before the first frame there is no
+        // dimming at all, only the wallpaper the bars already show.
+        // The plate stays centred on the band. Declared after the picture band
+        // and before every chrome element: above the frozen frame, danmaku and
+        // status text, UNDER the title strip, top controls and the pill. The
+        // layer has no TouchArea, so the picture still owns the drag and the
+        // click and the chrome's hover is untouched.
         Rectangle {
-            x: root.reserve_l + root.pic_x;
-            y: root.pic_y;
-            width: root.pic_w;
-            height: root.pic_h;
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: root.band_h;
             background: #00000000;
             // 120 ms in / 200 ms out. Two directions, so a state transition
             // (which can differ per direction) rather than one implicit
@@ -4202,13 +4256,16 @@ export component PlayerWindow inherits Window {
                 }
             ]
 
-            // Scrim: dims a bright frame just enough for the ring to read. The
-            // chrome above it is not affected.
+            // Scrim: the bars' own surface over the whole band, so the picture
+            // area and the letterbox are one continuous tint. It appears only
+            // once `frame` has a size: the opening 0-frame state is not dimmed
+            // (the first painted frame is the wallpaper + plate).
             Rectangle {
                 width: 100%;
                 height: 100%;
-                background: AppTheme.video-bg;
-                opacity: 0.14 + 0.06 * root.buffer_pulse;
+                background: AppTheme.player-glass;
+                opacity: root.frame.width > 0 ? 1.0 : 0.0;
+                animate opacity { duration: 120ms; easing: ease-out; }
             }
 
             // The plate. Its own opacity breathes; the ring is a sibling, so
@@ -5167,10 +5224,16 @@ export component PlayerWindow inherits Window {
             // the old popover mid-drag. `vol_dragging` holds it open even when the
             // pointer is dragged outside the track.
             vol_plate := GlassPanel {
-                property <bool> shown: (pill.vol_open || root.qa_hold_popovers) && root.chrome_shown && root.scrub_level == 0;
+                property <bool> shown: (pill.vol_open || root.qa_hold_popovers || root.qa_popover_hold == 1) && root.chrome_shown && root.scrub_level == 0;
                 // Fade out, then stop hit-testing.
                 visible: self.shown || self.opacity > 0;
-                x: 153px;
+                // Centre on the trigger's REAL laid-out centre (absolute, so the
+                // 14px controls-row inset is included), then clamp to the
+                // window. The old `x: 153px` forgot that inset and sat 14px left
+                // of the button.
+                x: clamp(vol_icon.absolute-position.x + vol_icon.width / 2 - self.width / 2,
+                    6px,
+                    max(6px, root.width - 6px - self.width)) - pill.absolute-position.x;
                 y: -self.height - 8px + (self.shown ? 0px : 6px);
                 width: 64px;
                 height: 168px;
@@ -5300,12 +5363,17 @@ export component PlayerWindow inherits Window {
             // inside unusable. It now closes only on an explicit action - the
             // button again, a click outside, Esc, or another popover opening -
             // so nothing inside it can dismiss it while a slider is dragged.
-            GlassPanel {
-                property <bool> shown: (pill.dm_open || root.qa_hold_popovers) && root.chrome_shown && root.scrub_level == 0;
+            dm_plate := GlassPanel {
+                property <bool> shown: (pill.dm_open || root.qa_hold_popovers || root.qa_popover_hold == 2) && root.chrome_shown && root.scrub_level == 0;
                 // Fade out, then stop hit-testing: a closed popover must not
                 // sit invisibly over the picture.
                 visible: self.shown || self.opacity > 0;
-                x: 54px;
+                // Centred on the 弹幕 button's real laid-out centre (including
+                // the controls-row inset), clamped to the window. The old
+                // `x: 54px` was a stale constant 39px left of the button.
+                x: clamp(dm_icon.absolute-position.x + dm_icon.width / 2 - self.width / 2,
+                    6px,
+                    max(6px, root.width - 6px - self.width)) - pill.absolute-position.x;
                 y: -self.height - 8px + (self.shown ? 0px : 6px);
                 width: 300px;
                 height: 276px;
@@ -10060,10 +10128,15 @@ component FeedScroller inherits Rectangle {
 component SearchGrid inherits Rectangle {
     in property <[SearchRow]> items;
     in property <bool> people: false;
+    // The window clock for the home card's freshness chip (0 = hidden).
+    in property <int> now-ts: 0;
     callback activate(int);
     // Card pointer semantics (see VideoCardView): 0 left / 1 right /
     // 2 ctrl+left, with the card's absolute index.
     callback card_open(int, int);
+    // The UP name on a search video card opens that UP's page. `(row, mid)`;
+    // the home feed resolves the same click through its own list.
+    callback owner(int, string);
     // Declared even where the mark is hidden (`show-queue: false`), so the
     // grid keeps one shape and a later wiring change only flips the flag.
     callback queue(int);
@@ -10110,10 +10183,17 @@ component SearchGrid inherits Rectangle {
                     card-width: root.card-w;
                     show-queue: false;
                     people: root.people;
+                    // EXACTLY the home card: owner link, heat bulb, date chip.
+                    show-owner: !root.people && items[idx].owner != "";
                     thumb: items[idx].thumb;
                     title: items[idx].title;
+                    owner: items[idx].owner;
                     meta: items[idx].meta;
                     badge: items[idx].badge;
+                    view-count: items[idx].view_count;
+                    pub-ts: items[idx].pub_ts;
+                    now-ts: root.now-ts;
+                    owner-activate => { root.owner(idx, items[idx].owner_mid); }
                     activate => { root.activate(idx); }
                     card_press(mode) => { root.card_open(idx, mode); }
                 }
@@ -11016,32 +11096,32 @@ component VinylDisc inherits Rectangle {
     height: root.size;
     background: #00000000;
 
+    // Rotation follows the playing state EXACTLY: play spins, pause and
+    // buffering freeze on the current angle, and a cleared disc (no cover)
+    // stops and resets. No spin-down tail: a paused record is not a slowing
+    // record, and the bar's own 250ms tick already smooths the state.
     init => {
-        if (root.playing) {
-            root.spin = 1.0;
-            root.spinning = true;
-        }
+        root.spinning = root.playing;
+        root.spin = root.playing ? 1.0 : 0.0;
     }
     changed playing => {
-        if (root.playing) {
-            root.spin = 1.0;
-            root.spinning = true;
+        root.spinning = root.playing;
+        root.spin = root.playing ? 1.0 : 0.0;
+    }
+    // Closing the last item clears the vinyl: stop and re-seat the label. A
+    // stale angle under a blank disc would otherwise read as still playing.
+    changed disc-cover => {
+        if (root.disc-cover.width <= 0) {
+            root.spinning = false;
+            root.spin = 0.0;
+            root.disc-angle = 0deg;
         }
     }
     Timer {
         interval: 20ms;
-        running: root.spinning;
+        running: root.playing;
         triggered => {
-            if (root.playing) {
-                root.spin = 1.0;
-                root.disc-angle = root.disc-angle + (2.88deg * root.spin);
-            } else if (root.spin > 0.02) {
-                root.disc-angle = root.disc-angle + (2.88deg * root.spin);
-                root.spin = root.spin * 0.90;
-            } else {
-                root.spin = 0.0;
-                root.spinning = false;
-            }
+            root.disc-angle = root.disc-angle + (2.88deg * root.spin);
             if (root.disc-angle >= 360deg) {
                 root.disc-angle = root.disc-angle - 360deg;
             }
@@ -11194,6 +11274,13 @@ component HomeBar inherits Rectangle {
     callback play_prev();
     callback cycle_play_mode();
     callback toggle_playlist();
+    // The bar's blank surface is a window drag area too (declared behind every
+    // pill). This keeps a drag working while the playlist panel is open: the
+    // panel's outside-click catcher sits above the window's own drag layer but
+    // BELOW this bar.
+    callback window_drag_start();
+    callback window_drag_move();
+    callback window_drag_end();
 
 
     // Which of the bar's pills is the current destination. Left: 推荐/收藏/
@@ -11348,6 +11435,32 @@ component HomeBar inherits Rectangle {
         height: 100%;
         radius: 18px;
         tint: AppTheme.glass-tint;
+    }
+
+    // Behind every pill, above the window's drag layer: pressing the bar's own
+    // surface drags the window even when the playlist's outside-click catcher
+    // is up (the catcher is declared before the bar, so the bar wins).
+    bar_drag := TouchArea {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                if (event.button != PointerEventButton.left) {
+                    return EventResult.reject;
+                }
+                root.window_drag_start();
+                EventResult.accept
+            } else if (event.kind == PointerEventKind.move) {
+                root.window_drag_move();
+                EventResult.accept
+            } else {
+                root.window_drag_end();
+                EventResult.accept
+            }
+        }
     }
 
     // Compact by default: pills are sized to their text, clusters hug the
@@ -11646,10 +11759,13 @@ component HomeBar inherits Rectangle {
 
     surface := Rectangle {
         x: root.field_x_morph;
-        y: 10px - 2px * root.morph;
+        // Height is FIXED: the morph animates x/width (transform + width) and
+        // opacity only. A 4px vertical growth made the clip and the magnifier
+        // re-layout every frame for no readable gain.
+        y: 10px;
         width: root.field_w_morph;
-        height: 36px + 4px * root.morph;
-        border-radius: 18px + 2px * root.morph;
+        height: 36px;
+        border-radius: 18px;
         clip: true;
         // The wash appears WITH the rect (no opacity ramp): the growing shape is
         // the animation. Closed, it is the button's hover wash.
@@ -11813,10 +11929,155 @@ component HomeBar inherits Rectangle {
 
 
 // ---------------------------------------------------------------------------
+// 热搜 panel: the search field's empty state. It hangs directly above the home
+// bar, fades 0 -> 1 and rises 8px in 160ms. Only opacity and the plate's y
+// animate; the chip layout itself is fixed, so a morph never reflows per frame.
+// ---------------------------------------------------------------------------
+component HotSearchPanel inherits Rectangle {
+    in property <[string]> items;
+    in property <bool> active: false;
+    in property <length> panel-max-width: 460px;
+    callback pick(int);
+
+    property <int> rows: (root.items.length + 1) / 2;
+    property <int> shown-rows: min(root.rows, 6);
+    width: min(root.panel-max-width, 460px);
+    // Header 44 + 10px list padding + 34px per visible row (max 6, scroll).
+    height: 44px + 10px + root.shown-rows * 34px;
+    background: #00000000;
+    // The whole panel fades; the plate below also lifts. Both are paint-only.
+    opacity: root.active ? 1 : 0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+    visible: root.active || self.opacity > 0.01;
+
+    // The rise: 8px below its seat while closed, exactly on it once open.
+    property <float> reveal: root.active ? 1.0 : 0.0;
+    animate reveal { duration: 160ms; easing: ease-out; }
+
+    plate := Rectangle {
+        x: 0;
+        y: (1.0 - root.reveal) * 8px;
+        width: 100%;
+        height: 100%;
+        border-radius: 14px;
+        clip: true;
+
+        GlassPanel {
+            width: 100%;
+            height: 100%;
+            radius: 14px;
+            tint: AppTheme.glass-tint;
+        }
+
+        Rectangle {
+            width: 100%;
+            height: 1px;
+            background: AppTheme.divider;
+            y: 44px;
+        }
+
+        Text {
+            x: 14px;
+            y: 0;
+            width: parent.width - 72px;
+            height: 44px;
+            text: "热搜";
+            color: AppTheme.text;
+            font-size: 13px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+
+        Text {
+            x: 54px;
+            y: 0;
+            width: parent.width - 68px;
+            height: 44px;
+            text: root.items.length + " 条 · 点按搜索";
+            color: AppTheme.text-faint;
+            font-size: 10.5px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+
+        // Two columns, six visible rows, the rest by wheel. A ListView (not a
+        // layout) keeps the panel's height independent of the model, so a hot
+        // list refresh cannot resize the plate under the pointer.
+        ListView {
+            x: 4px;
+            y: 49px;
+            width: parent.width - 8px;
+            height: root.shown-rows * 34px;
+            vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+            mouse-drag-pan-enabled: true;
+
+            for r in root.rows : Rectangle {
+                width: 100%;
+                height: 34px;
+                background: #00000000;
+
+                if r * 2 < root.items.length : Rectangle {
+                    x: 4px;
+                    y: 2px;
+                    width: parent.width / 2 - 8px;
+                    height: 30px;
+                    border-radius: 8px;
+                    background: hot_a.has-hover ? AppTheme.hot-hover : AppTheme.hot-bg;
+
+                    Text {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: 100%;
+                        text: (r * 2 + 1) + "  " + root.items[r * 2];
+                        color: AppTheme.hot-fg;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    hot_a := TouchArea {
+                        accessible-role: button;
+                        accessible-label: root.items[r * 2];
+                        clicked => { root.pick(r * 2); }
+                    }
+                }
+
+                if r * 2 + 1 < root.items.length : Rectangle {
+                    x: parent.width / 2 + 4px;
+                    y: 2px;
+                    width: parent.width / 2 - 8px;
+                    height: 30px;
+                    border-radius: 8px;
+                    background: hot_b.has-hover ? AppTheme.hot-hover : AppTheme.hot-bg;
+
+                    Text {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: 100%;
+                        text: (r * 2 + 2) + "  " + root.items[r * 2 + 1];
+                        color: AppTheme.hot-fg;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    hot_b := TouchArea {
+                        accessible-role: button;
+                        accessible-label: root.items[r * 2 + 1];
+                        clicked => { root.pick(r * 2 + 1); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 播放列表 panel. A floating card in the bar's glass language (card tint over
-// the window tint, 1px bar-border hairline, drop shadow), 360 x 420 max, opened
-// above the bar. Rows are 56px; the current row gets a 3px accent rail and its
-// index becomes an animated level meter (playing) or a pause mark (paused).
+// the window tint, 1px bar-border hairline, NO drop shadow), 450 x 460 max,
+// opened above the bar. Rows are 64.4px; the current row gets a 3px accent rail
+// and its index becomes an animated level meter (playing) or a pause mark.
 // The ScrollView carries no scrollbar; wheel and drag scroll it.
 // ---------------------------------------------------------------------------
 component PlaylistPanel inherits Rectangle {
@@ -11825,24 +12086,32 @@ component PlaylistPanel inherits Rectangle {
     in property <bool> active: false;
     // Available height above the bar; the window passes it so a short window
     // makes the list scroll instead of pushing the panel off the top edge.
-    in property <length> panel-max-height: 420px;
+    in property <length> panel-max-height: 460px;
     // 0 手动 / 1 自动 / 2 随机, for the header's mode chip.
     in property <int> play_mode: 1;
+    // The focused player is playing (pause icon vs play icon).
+    in property <bool> playing: false;
+    // The home bar's top edge, so the panel can publish its real gap to the
+    // toolbar for the f146 measurement.
+    in property <length> bar_y: 0px;
 
     callback play(int);
     callback remove(int);
     callback clear();
-    // Header transport: 上一首 / 下一首 / mode chip. Wired by the window to the
-    // same callbacks the removed hover capsule used.
+    // Header transport: 上一首 / 播放暂停 / 下一首 / mode chip / close. Wired by
+    // the window to the same callbacks the removed hover capsule used.
     callback play_prev();
+    callback toggle_pause();
     callback play_next();
     callback cycle_play_mode();
     // Esc closes the panel. The FocusScope below owns the key so the panel
     // never has to steal a TextInput's focus away permanently.
     callback close();
     // QA: live panel metrics + a window-rect probe, so a replay can aim the
-    // row's ✕ without any hard-coded layout arithmetic.
-    callback metrics(length, length, length);
+    // row's ✕ without any hard-coded layout arithmetic. `gap` is the distance
+    // from the panel's bottom edge to the toolbar, `shadow` its drop-shadow
+    // alpha (0 after the shadow was removed).
+    callback metrics(length, length, length, length, float);
     in property <bool> probe: false;
     callback probe_rect(length, length, length, length);
 
@@ -11857,7 +12126,40 @@ component PlaylistPanel inherits Rectangle {
         if (root.active) {
             key_scope.focus();
         }
-        root.metrics(root.width, root.height, 64.4px);
+        root.publish_metrics();
+    }
+
+    // QA metrics: the real laid-out width/height/row, the toolbar gap and the
+    // shadow alpha. Re-published whenever any of them moves (open/close,
+    // row removal, a theme change) so a replay never reads a stale rect.
+    function publish_metrics() {
+        root.metrics(
+            root.width,
+            root.height,
+            64.4px,
+            root.bar_y - (root.y + root.height),
+            root.drop-shadow-color.alpha,
+        );
+    }
+    changed width => { root.publish_metrics(); }
+    changed height => { root.publish_metrics(); }
+    changed y => { root.publish_metrics(); }
+    changed bar_y => { root.publish_metrics(); }
+
+    // 16px preload ring: one SVG arc from 12 o'clock clockwise, centre (8,8),
+    // radius 6.2. 100% needs two half arcs (SVG cannot close a full circle from
+    // a point to itself). Changing `commands` re-tessellates one Path; it never
+    // creates a node, so a row whose bytes land repaints only itself.
+    pure function ring-path(progress: float) -> string {
+        if (progress <= 0.004) {
+            return "";
+        }
+        if (progress >= 0.996) {
+            return "M 8 1.8 A 6.2 6.2 0 1 1 8 14.2 A 6.2 6.2 0 1 1 8 1.8";
+        }
+        return "M 8 1.8 A 6.2 6.2 0 " + (progress > 0.5 ? "1" : "0") + " 1 "
+            + (8 + 6.2 * (progress * 360deg).sin()).to-fixed(2) + " "
+            + (8 - 6.2 * (progress * 360deg).cos()).to-fixed(2);
     }
 
     // One shared phase for every level meter: only the current row draws it,
@@ -11874,14 +12176,23 @@ component PlaylistPanel inherits Rectangle {
     // gets a panel that fits inside it (the app's min width).
     in property <length> panel-max-width: 450px;
     width: min(450px, root.panel-max-width);
-    // Header 46 + divider 1 + 8px list padding + one 64.4px row each.
-    height: min(root.panel-max-height, max(190px, 55px + root.items.length * 64.4px));
+    // Header 46 + divider 1 + 8px list padding + one 64.4px row each, plus the
+    // f146 40px of extra list height.
+    height: min(root.panel-max-height, max(230px, 95px + root.items.length * 64.4px));
     border-radius: 14px;
     background: #00000000;
-    drop-shadow-color: AppTheme.overlay;
-    drop-shadow-blur: 22px;
-    drop-shadow-offset-y: 8px;
+    // No drop shadow: the panel is a glass surface flush with the bar language.
+    drop-shadow-color: #00000000;
+    drop-shadow-blur: 0px;
+    drop-shadow-offset-y: 0px;
     clip: true;
+
+    // ---- open/close: fade + rising gradient reveal -------------------------
+    // `reveal` drives a real background gradient (transparent -> tint) and
+    // rides the same 200ms open / 160ms close clock as opacity and the 12px
+    // rise. Closing reverses all three.
+    property <float> reveal: root.active ? 1.0 : 0.0;
+    animate reveal { duration: root.active ? 200ms : 160ms; easing: ease-out; }
 
     // The panel floats over covers, so it is a full GlassPanel: the diffused
     // backdrop under the card tint (not the bar's single wash) keeps the rows
@@ -11890,7 +12201,20 @@ component PlaylistPanel inherits Rectangle {
         width: 100%;
         height: 100%;
         radius: 14px;
-        tint: AppTheme.glass-tint;
+        // The tint is the animated gradient below, so the panel's plate starts
+        // fully transparent and sweeps to full tint.
+        tint: #00000000;
+    }
+
+    // The animated tint: transparent -> full, bottom edge first, so the open
+    // reads as a wipe up the panel while the whole surface fades in. At
+    // `reveal` 1 both stops are the full `glass-tint`.
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: @linear-gradient(180deg,
+            AppTheme.glass-tint.transparentize(1.0 - root.reveal) 0%,
+            AppTheme.glass-tint.transparentize(1.0 - min(1.0, root.reveal * 1.35)) 100%);
     }
 
     // No hover keep-alive any more: the panel is opened and closed explicitly
@@ -11907,17 +12231,19 @@ component PlaylistPanel inherits Rectangle {
         padding: 0px;
         spacing: 0px;
 
-        // ---- header: 播放列表 · N 首 + 上一首 / 下一首 / 模式 + 清空 ----
-        // The transport controls moved here from the removed hover capsule:
-        // three 22px buttons right of the title, mode chip reading 手动/自动/随机.
+        // ---- header: 播放列表 · N 首 + 上一首 / 播放暂停 / 下一首 / 模式 / 关闭 ----
+        // One tidy row: five 28px hit areas with even 8px gaps, right-aligned
+        // 14px from the edge (5 * 28 + 4 * 8 = 172px).
         Rectangle {
             height: 46px;
             background: #00000000;
+            property <length> row_w: 172px;
+            property <length> row_x: parent.width - 14px - self.row_w;
 
             Text {
                 x: 14px;
                 y: 0;
-                width: parent.width - 196px;
+                width: max(0px, parent.width - 212px);
                 height: 100%;
                 text: "播放列表 · " + root.items.length + " 首";
                 color: AppTheme.text;
@@ -11929,17 +12255,17 @@ component PlaylistPanel inherits Rectangle {
 
             // ---- 上一首 ----
             Rectangle {
-                x: parent.width - 182px;
-                y: 12px;
-                width: 22px;
-                height: 22px;
-                border-radius: 6px;
+                x: parent.row_x;
+                y: 9px;
+                width: 28px;
+                height: 28px;
+                border-radius: 7px;
                 background: prev_hit.has-hover ? AppTheme.pill-hover : #00000000;
                 animate background { duration: 120ms; easing: ease-out; }
 
                 Path {
-                    x: 4px;
-                    y: 4px;
+                    x: 7px;
+                    y: 7px;
                     width: 14px;
                     height: 14px;
                     viewbox-width: 14;
@@ -11961,19 +12287,72 @@ component PlaylistPanel inherits Rectangle {
                 }
             }
 
+            // ---- 播放 / 暂停 ----
+            Rectangle {
+                x: parent.row_x + 36px;
+                y: 9px;
+                width: 28px;
+                height: 28px;
+                border-radius: 7px;
+                background: toggle_hit.has-hover ? AppTheme.pill-hover : #00000000;
+                animate background { duration: 120ms; easing: ease-out; }
+
+                if root.playing : Rectangle {
+                    x: 9px;
+                    y: 8px;
+                    width: 10px;
+                    height: 12px;
+                    background: #00000000;
+
+                    Rectangle {
+                        x: 0;
+                        width: 3px;
+                        height: 12px;
+                        border-radius: 1px;
+                        background: AppTheme.text;
+                    }
+                    Rectangle {
+                        x: 7px;
+                        width: 3px;
+                        height: 12px;
+                        border-radius: 1px;
+                        background: AppTheme.text;
+                    }
+                }
+
+                if !root.playing : Path {
+                    x: 10px;
+                    y: 8px;
+                    width: 11px;
+                    height: 12px;
+                    viewbox-width: 11;
+                    viewbox-height: 12;
+                    commands: "M 0.5 0.5 L 10.5 6 L 0.5 11.5 Z";
+                    fill: AppTheme.text;
+                }
+
+                toggle_hit := TouchArea {
+                    enabled: root.items.length > 0;
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: root.playing ? "暂停" : "播放";
+                    clicked => { root.toggle_pause(); }
+                }
+            }
+
             // ---- 下一首 ----
             Rectangle {
-                x: parent.width - 156px;
-                y: 12px;
-                width: 22px;
-                height: 22px;
-                border-radius: 6px;
+                x: parent.row_x + 72px;
+                y: 9px;
+                width: 28px;
+                height: 28px;
+                border-radius: 7px;
                 background: next_hit.has-hover ? AppTheme.pill-hover : #00000000;
                 animate background { duration: 120ms; easing: ease-out; }
 
                 Path {
-                    x: 4px;
-                    y: 4px;
+                    x: 7px;
+                    y: 7px;
                     width: 14px;
                     height: 14px;
                     viewbox-width: 14;
@@ -11997,18 +12376,18 @@ component PlaylistPanel inherits Rectangle {
 
             // ---- mode chip: 手动 -> 自动 -> 随机 -> 手动 ----
             Rectangle {
-                x: parent.width - 128px;
-                y: 12px;
-                width: 56px;
-                height: 22px;
-                border-radius: 6px;
+                x: parent.row_x + 108px;
+                y: 9px;
+                width: 28px;
+                height: 28px;
+                border-radius: 7px;
                 background: mode_hit.has-hover ? AppTheme.pill-hover : #00000000;
                 animate background { duration: 120ms; easing: ease-out; }
 
                 Text {
                     width: 100%;
                     height: 100%;
-                    text: root.play_mode == 0 ? "手动" : (root.play_mode == 2 ? "随机" : "自动");
+                    text: root.play_mode == 0 ? "手" : (root.play_mode == 2 ? "随" : "自");
                     color: AppTheme.accent;
                     font-size: 11px;
                     font-weight: 600;
@@ -12019,40 +12398,40 @@ component PlaylistPanel inherits Rectangle {
                 mode_hit := TouchArea {
                     mouse-cursor: pointer;
                     accessible-role: button;
-                    accessible-label: "播放模式";
+                    accessible-label: "播放模式：" + (root.play_mode == 0 ? "手动" : (root.play_mode == 2 ? "随机" : "自动"));
                     clicked => { root.cycle_play_mode(); }
                 }
             }
 
+            // ---- 关闭 ----
             Rectangle {
-                x: parent.width - 64px;
-                y: 10px;
-                width: 52px;
-                height: 26px;
+                x: parent.row_x + 144px;
+                y: 9px;
+                width: 28px;
+                height: 28px;
                 border-radius: 7px;
-                background: clear_hit.has-hover && root.items.length > 0
-                    ? AppTheme.danger-bg
-                    : #00000000;
+                background: close_hit.has-hover ? AppTheme.pill-hover : #00000000;
                 animate background { duration: 120ms; easing: ease-out; }
 
-                Text {
-                    width: 100%;
-                    height: 100%;
-                    text: "清空";
-                    color: root.items.length > 0
-                        ? (clear_hit.has-hover ? AppTheme.danger : AppTheme.text-dim)
-                        : AppTheme.text-faint;
-                    font-size: 11px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                Path {
+                    x: 8px;
+                    y: 8px;
+                    width: 12px;
+                    height: 12px;
+                    viewbox-width: 12;
+                    viewbox-height: 12;
+                    commands: "M 2.5 2.5 L 9.5 9.5 M 9.5 2.5 L 2.5 9.5";
+                    fill: #00000000;
+                    stroke: AppTheme.text;
+                    stroke-width: 1.5px;
+                    stroke-line-cap: round;
                 }
 
-                clear_hit := TouchArea {
-                    enabled: root.items.length > 0;
+                close_hit := TouchArea {
                     mouse-cursor: pointer;
                     accessible-role: button;
-                    accessible-label: "清空播放列表";
-                    clicked => { root.clear(); }
+                    accessible-label: "关闭播放列表";
+                    clicked => { root.close(); }
                 }
             }
         }
@@ -12217,7 +12596,7 @@ component PlaylistPanel inherits Rectangle {
                     Text {
                         x: 76px;
                         y: 13.2px;
-                        width: parent.width - 112px;
+                        width: parent.width - 132px;
                         height: 18px;
                         text: row.title;
                         color: row.current ? AppTheme.accent : AppTheme.text;
@@ -12230,7 +12609,7 @@ component PlaylistPanel inherits Rectangle {
                     Text {
                         x: 76px;
                         y: 32.2px;
-                        width: parent.width - 112px;
+                        width: parent.width - 132px;
                         height: 16px;
                         // The playing row says so in words as well as the rail +
                         // glyph, so a paused player is not guesswork.
@@ -12239,6 +12618,64 @@ component PlaylistPanel inherits Rectangle {
                         font-size: 11px;
                         vertical-alignment: center;
                         overflow: elide;
+                    }
+
+                    // ---- 16px preload ring (Zelda stamina shape) ----
+                    // Track first, then the byte arc. When the file completes
+                    // the arc fades out and a check fades in, so "ready" reads
+                    // without adding a second badge to the row.
+                    Rectangle {
+                        x: parent.width - 56px;
+                        y: 24.2px;
+                        width: 16px;
+                        height: 16px;
+                        background: #00000000;
+                        accessible-role: image;
+                        accessible-label: row.preload_done
+                            ? "已预载"
+                            : ("预载 " + (row.preload * 100).to-fixed(0) + "%");
+
+                        Path {
+                            width: 16px;
+                            height: 16px;
+                            viewbox-width: 16;
+                            viewbox-height: 16;
+                            commands: "M 8 1.8 A 6.2 6.2 0 1 1 8 14.2 A 6.2 6.2 0 1 1 8 1.8";
+                            fill: #00000000;
+                            stroke: AppTheme.player-track;
+                            stroke-width: 2px;
+                            opacity: row.preload_done ? 0 : 0.55;
+                            animate opacity { duration: 160ms; easing: ease-out; }
+                        }
+
+                        Path {
+                            width: 16px;
+                            height: 16px;
+                            viewbox-width: 16;
+                            viewbox-height: 16;
+                            commands: root.ring-path(row.preload);
+                            fill: #00000000;
+                            stroke: AppTheme.accent;
+                            stroke-width: 2px;
+                            stroke-line-cap: round;
+                            opacity: row.preload_done ? 0 : 1;
+                            animate opacity { duration: 160ms; easing: ease-out; }
+                        }
+
+                        Path {
+                            width: 16px;
+                            height: 16px;
+                            viewbox-width: 16;
+                            viewbox-height: 16;
+                            commands: "M 3.6 8.4 L 6.8 11.4 L 12.4 5";
+                            fill: #00000000;
+                            stroke: AppTheme.accent;
+                            stroke-width: 1.8px;
+                            stroke-line-cap: round;
+                            stroke-line-join: round;
+                            opacity: row.preload_done ? 1 : 0;
+                            animate opacity { duration: 160ms; easing: ease-out; }
+                        }
                     }
 
                     row_hit := TouchArea {
@@ -12299,8 +12736,6 @@ component PlaylistPanel inherits Rectangle {
 
     // Publish the laid-out metrics (the real width / height / row height, not
     // the design constants) for the QA capture log.
-    changed width => { root.metrics(root.width, root.height, 64.4px); }
-    changed height => { root.metrics(root.width, root.height, 64.4px); }
 
     // Window-rect probe: the row ✕ sits at a fixed offset inside this rect
     // (row 0 centre = x + width - 19, y + 51 + 32.2), so the replay never
@@ -12420,8 +12855,11 @@ export component AppWindow inherits Window {
     // first assignment; there is no capture and no delay, so a window is never a
     // bare tint. The tile is repeated by `WallpaperLayer` at an offset derived
     // from the window's screen position, so the wallpaper is pinned to the
-    // virtual desktop and dragging the window is what moves it.
+    // virtual desktop and dragging the window is what moves it. `wallpaper` is
+    // the DARK variant, `wallpaper-light` the light one; `AppTheme.dark` picks
+    // the layer's source, so a theme switch swaps it in the same frame.
     in property <image> wallpaper;
+    in property <image> wallpaper-light;
     in property <bool> wallpaper_valid: false;
 
     // ---- custom title bar ----
@@ -12755,6 +13193,7 @@ export component AppWindow inherits Window {
     callback playlist_clear();
     callback play_next();
     callback play_prev();
+    callback playlist_toggle_pause();
     callback cycle_play_mode();
 
     // ---- floating page bar ----
@@ -13027,6 +13466,8 @@ export component AppWindow inherits Window {
     out property <length> qa_playlist_row_h: 0px;
     out property <length> qa_playlist_x: 0px;
     out property <length> qa_playlist_y: 0px;
+    out property <length> qa_playlist_gap: 0px;
+    out property <float> qa_playlist_shadow: 0.0;
     out property <length> qa_playlist_probe_w: 0px;
     out property <length> qa_playlist_probe_h: 0px;
     in-out property <int> qa_probe_card: -1;
@@ -13042,6 +13483,11 @@ export component AppWindow inherits Window {
     // from value updates so the "follows the mouse" contract is measurable.
     out property <length> qa_blur_band_h: 0px;
     out property <length> qa_opacity_band_h: 0px;
+    // f147: the hot-search empty state is on screen (the panel's own `active`).
+    out property <bool> qa_hot_panel_open: root.search_open
+        && root.search_text == ""
+        && root.search_items.length == 0
+        && root.hot_items.length > 0;
     out property <length> qa_blur_x: 0px;
     out property <length> qa_blur_y: 0px;
     out property <length> qa_blur_w: 0px;
@@ -13240,6 +13686,9 @@ export component AppWindow inherits Window {
     callback open_video(int);
     callback open_feed_detail(int);
     callback do_search(string);
+    // The field was just opened empty: Rust loads the hot searches that the
+    // panel under the bar shows until a character or a result arrives.
+    callback search_opened();
     callback search_tab_changed(int);
     callback search_page(int);
     callback open_search_item(int);
@@ -13551,7 +14000,7 @@ export component AppWindow inherits Window {
         y: 0;
         width: 100%;
         height: 100%;
-        source: root.wallpaper;
+        source: AppTheme.dark ? root.wallpaper : root.wallpaper-light;
     }
     Rectangle {
         width: root.width;
@@ -14381,43 +14830,8 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 vertical-stretch: 1;
 
-                if root.hot_items.length > 0 : Text {
-                    text: "热搜";
-                    color: AppTheme.text;
-                    font-size: 13px;
-                    font-weight: 700;
-                }
-
-                if root.hot_items.length > 0 : hot_strip := WheelStrip {
-                    height: 32px;
-                    probe: root.wheel_probe == 3;
-                    probe_rect(x, y, w, h) => { root.wheel_probe_rect(x, y, w, h); }
-                    changed offset => { root.qa_hot_offset = self.offset; }
-                    init => { root.qa_hot_offset = self.offset; }
-
-                    for item[index] in root.hot_items : Rectangle {
-                        width: 150px;
-                        height: 28px;
-                        border-radius: 6px;
-                        background: hot_chip.has-hover ? AppTheme.hot-hover : AppTheme.hot-bg;
-
-                        Text {
-                            text: item;
-                            color: AppTheme.hot-fg;
-                            font-size: 12px;
-                            x: 8px;
-                            width: parent.width - 16px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        hot_chip := TouchArea {
-                            accessible-role: button;
-                            accessible-label: item;
-                            clicked => { root.hot_selected(index); }
-                        }
-                    }
-                }
-
+                // Hot searches belong to the empty/open search state only (the
+                // panel under the bar). The result page is cards, nothing else.
                 HorizontalLayout {
                     spacing: 8px;
                     height: 30px;
@@ -14481,8 +14895,17 @@ export component AppWindow inherits Window {
                         page-offset: root.list_offset;
                         page-size: root.list_page_size;
                         people: root.search_tab == 1;
+                        now-ts: root.now_ts;
                         activate(idx) => { root.open_search_item(idx); }
                         card_open(idx, mode) => { root.card_open(idx, mode); }
+                        owner(idx, mid) => {
+                            // The UP name is the card's own link, exactly like
+                            // the home feed's. An empty mid (a user row) keeps
+                            // the current behaviour.
+                            if (mid != "" && mid != "0") {
+                                root.open_up_mid(mid);
+                            }
+                        }
                     }
                 }
             }
@@ -18893,17 +19316,56 @@ export component AppWindow inherits Window {
     // Declared BEFORE the bottom bar and the suggestion panel, so those two -
     // and their own hit areas - keep their presses while a click anywhere else
     // closes what is open AND collapses the search field.
+    //
+    // The catcher also drags the window: a press that becomes a move starts the
+    // normal window drag (the top strip and any gap are above this layer only
+    // via the bar's own drag area), while a press/release without movement is
+    // still an outside click. Without this, opening 播放列表 made the window
+    // undraggable everywhere except the panel itself.
     if root.section_menu_open || root.library_menu_open || root.search_open || root.playlist_open : TouchArea {
         x: 0;
         y: 0;
         width: root.width;
         height: root.height;
 
-        clicked => {
-            root.section_menu_open = false;
-            root.library_menu_open = false;
-            root.search_open = false;
-            root.set-playlist(false, "outside");
+        property <bool> pressing: false;
+        property <bool> drag_moved: false;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                if (event.button != PointerEventButton.left) {
+                    return EventResult.reject;
+                }
+                self.pressing = true;
+                self.drag_moved = false;
+                EventResult.accept
+            } else if (event.kind == PointerEventKind.move) {
+                if (!self.pressing) {
+                    return EventResult.reject;
+                }
+                if (!self.drag_moved) {
+                    // Start only once the press becomes a drag, so a plain
+                    // outside click does not grab the window first.
+                    self.drag_moved = true;
+                    root.window_drag_start();
+                }
+                root.window_drag_move();
+                EventResult.accept
+            } else {
+                if (!self.pressing) {
+                    return EventResult.reject;
+                }
+                if (self.drag_moved) {
+                    root.window_drag_end();
+                } else {
+                    root.section_menu_open = false;
+                    root.library_menu_open = false;
+                    root.search_open = false;
+                    root.set-playlist(false, "outside");
+                }
+                self.pressing = false;
+                EventResult.accept
+            }
         }
     }
 
@@ -19025,6 +19487,7 @@ export component AppWindow inherits Window {
         open_search => {
             root.search_open = true;
             root.set-playlist(false, "search");
+            root.search_opened();
         }
         close_search => { root.search_open = false; }
 
@@ -19043,6 +19506,9 @@ export component AppWindow inherits Window {
         // the home chrome; hover never reaches it (the dwell/away timers are
         // gone, see HomeBar).
         toggle_playlist => { root.toggle_playlist_panel(); }
+        window_drag_start => { root.window_drag_start(); }
+        window_drag_move => { root.window_drag_move(); }
+        window_drag_end => { root.window_drag_end(); }
     }
 
     // ---- avatar popover: identity + level + counts ----
@@ -19165,24 +19631,41 @@ export component AppWindow inherits Window {
         }
     }
 
+    // ===================== 热搜 panel (search empty state) =====================
+    // Hangs 10px above the bar, centred on the animated bar. Shown only while
+    // the field is open AND empty AND no result page is on screen; any typed
+    // character or a landed result hides it (the panel fades/rises 8px).
+    if root.home_bar_shown() : HotSearchPanel {
+        x: root.home_bar_x + (root.home_bar_w - self.width) / 2;
+        y: root.home_bar_y - self.height - 10px;
+        panel-max-width: min(460px, root.home_bar_w);
+        items: root.hot_items;
+        active: root.qa_hot_panel_open;
+        pick(i) => { root.hot_selected(i); }
+    }
+
     // ===================== 播放列表 PANEL =====================
-    // Centred over the bar and opened upward. The panel stays instantiated so
-    // its 180ms slide+fade can play on close too; `visible` drops it (and its
-    // hit areas) out once the fade has finished. The slip is 10px: it rises
-    // into place when opening, sinks as it fades when closing.
+    // Centred over the bar, 26px above it (14px further than the f145 panel).
+    // The panel stays instantiated so its 200ms open / 160ms close can play;
+    // `visible` drops it (and its hit areas) out once the fade has finished. It
+    // rises 12px while the tint gradient sweeps in.
     if root.home_bar_shown() : PlaylistPanel {
         x: root.home_bar_x + (root.home_bar_w - self.width) / 2;
-        y: max(8px, root.home_bar_y - self.height - 12px + (root.playlist_open ? 0px : 10px));
+        y: max(8px, root.home_bar_y - self.height - 26px + (root.playlist_open ? 0px : 12px));
         active: root.playlist_open;
-        panel-max-height: min(420px, root.home_bar_y - 20px);
+        playing: root.now_playing;
+        bar_y: root.home_bar_y;
+        panel-max-height: min(460px, root.home_bar_y - 34px);
         // Never wider than the window: at the 480px minimum the 450px panel
         // still fits with an 8px gutter on each side.
         panel-max-width: max(200px, root.width - 16px);
         probe: root.qa_playlist_probe;
-        metrics(w, h, row_h) => {
+        metrics(w, h, row_h, gap, shadow) => {
             root.qa_playlist_w = w;
             root.qa_playlist_h = h;
             root.qa_playlist_row_h = row_h;
+            root.qa_playlist_gap = gap;
+            root.qa_playlist_shadow = shadow;
         }
         probe_rect(x, y, w, h) => {
             root.qa_playlist_x = x;
@@ -19192,12 +19675,13 @@ export component AppWindow inherits Window {
         }
         visible: root.playlist_open || self.opacity > 0.01;
         opacity: root.playlist_open ? 1 : 0;
-        animate opacity { duration: 180ms; easing: ease-out; }
-        animate y { duration: 180ms; easing: ease-out; }
+        animate opacity { duration: root.playlist_open ? 200ms : 160ms; easing: ease-out; }
+        animate y { duration: root.playlist_open ? 200ms : 160ms; easing: ease-out; }
 
         items: root.playlist;
         play_mode: root.play_mode;
         play_prev => { root.play_prev(); }
+        toggle_pause => { root.playlist_toggle_pause(); }
         play_next => { root.play_next(); }
         cycle_play_mode => {
             // Same local advance the capsule used: the UI stays correct even

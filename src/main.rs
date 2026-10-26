@@ -27,7 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -471,7 +471,16 @@ fn foreground_hwnd() -> isize {
 /// an older window). At open time the queue already learned the video through
 /// `Playlist::on_open`, so that path passes `false`.
 fn focus_player(state: &Rc<PlayerState>, session: &Rc<PlayerSession>, notify_playlist: bool) {
-    let hwnd = session.hwnd.get();
+    // The session is registered before `show()` (its stored hwnd is 0 there);
+    // resolve it once here so the very first focus — and every focus handed
+    // over on a close — is real instead of a silent early return.
+    let mut hwnd = session.hwnd.get();
+    if hwnd == 0 {
+        if let Some(actual) = win::hwnd_of(session.window.window()) {
+            session.hwnd.set(actual);
+            hwnd = actual;
+        }
+    }
     if hwnd == 0 {
         return;
     }
@@ -926,6 +935,63 @@ impl PlaybackQueue {
         self.played.clear();
     }
 
+    /// Make the row at `index` the current one **and move it to index 0**.
+    ///
+    /// The bar's vinyl always shows the first playlist row, so "currently
+    /// playing" and "row 0" must be the same fact. Removing a row before the
+    /// current one shifts the rest; the shuffle bookkeeping is shifted in the
+    /// same pass so a later mode-2 pick still names the right entries.
+    fn make_current(&mut self, index: usize) -> Option<usize> {
+        if index >= self.items.len() {
+            return None;
+        }
+        if index > 0 {
+            let entry = self.items.remove(index);
+            self.items.insert(0, entry);
+            let shift = |value: usize| {
+                if value == index {
+                    0
+                } else if value < index {
+                    value + 1
+                } else {
+                    value
+                }
+            };
+            self.current = self.current.map(shift);
+            self.played = self.played.iter().copied().map(shift).collect();
+        }
+        self.current = Some(0);
+        Some(0)
+    }
+
+    /// Make `entry` the current row, inserting it at the FRONT when the queue
+    /// does not own it yet. This is the "a directly opened video is always in
+    /// 播放列表" rule: a card click / detail 播放 never goes through `enqueue`, so
+    /// `on_open` calls this with the window's video. An existing row is moved to
+    /// index 0 (no duplicate). Returns `(index, inserted)`, and `index` is always
+    /// 0: the currently playing item is the first queue row by contract.
+    fn ensure_current(&mut self, entry: QueueEntry) -> (usize, bool) {
+        if let Some(index) = self.items.iter().position(|item| item.bvid == entry.bvid) {
+            self.make_current(index);
+            return (0, false);
+        }
+        if self.items.len() >= settings::PLAYLIST_MAX {
+            self.items.remove(0);
+            self.shift_after_drop(0);
+        }
+        self.items.insert(0, entry);
+        self.current = Some(0);
+        (0, true)
+    }
+
+    /// Point `current` at an already-queued bvid and move that row to index 0.
+    /// Used when another open player window gains focus: the focused row must
+    /// be the marked one, but focus must never resurrect a row the user deleted.
+    fn mark_current(&mut self, bvid: &str) -> Option<usize> {
+        let index = self.items.iter().position(|item| item.bvid == bvid)?;
+        self.make_current(index)
+    }
+
     /// The next/previous index in queue order, wrapping. `None` on an empty
     /// queue; with no current item it starts at the first (next) or last
     /// (previous) entry.
@@ -969,12 +1035,36 @@ impl PlaybackQueue {
     }
 }
 
-/// What the bar's vinyl and title show: independent of the queue's `current`,
-/// because a card opened directly from the feed also plays.
-struct NowPlaying {
-    bvid: String,
-    title: String,
-    cover: String,
+/// Ring state for one queued item: `(0..1 progress, complete)`.
+///
+/// The preload registry is keyed by the cache key `<bvid>-<cid>-<quality>-
+/// <codecid>`, while a queue row only knows the first two fields. Matching the
+/// prefix keeps the ring independent of which quality/codec the preload chose,
+/// and an audio file (`<bvid>-<cid>-audio-…`) can never make a video ring full
+/// because only video tracks are preloaded by the playlist path.
+fn preload_state(
+    snapshot: &[(String, u64, u64, bool)],
+    bvid: &str,
+    cid: u64,
+) -> (f32, bool) {
+    let prefix = format!("{bvid}-{cid}-");
+    let mut best = (0.0f32, false);
+    for (key, done, total, complete) in snapshot {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        let fraction = if *complete {
+            1.0
+        } else if *total > 0 {
+            (*done as f64 / *total as f64).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        if fraction > best.0 || (*complete && !best.1) {
+            best = (fraction, *complete);
+        }
+    }
+    best
 }
 
 /// The app-wide queue host: model, persistence and all the side effects the
@@ -988,8 +1078,7 @@ struct Playlist {
     feed: Arc<Mutex<Vec<bilibili::FeedVideo>>>,
     browse_bvids: Arc<Mutex<Vec<String>>>,
     space_bvids: Arc<Mutex<Vec<String>>>,
-    now: RefCell<Option<NowPlaying>>,
-    /// The active player reports "playing" (open and not paused).
+    /// The active player reports "playing" (open, not paused, not buffering).
     playing: Cell<bool>,
     /// A track ended in mode 0: nothing plays until the user starts something.
     stopped: Cell<bool>,
@@ -1054,7 +1143,6 @@ impl Playlist {
             feed,
             browse_bvids,
             space_bvids,
-            now: RefCell::new(None),
             playing: Cell::new(false),
             stopped: Cell::new(false),
             end_handled: Cell::new(true),
@@ -1130,34 +1218,50 @@ impl Playlist {
             return;
         };
         let playing = self.playing.get();
+        let preload = prefetch::preload_snapshot();
         let (rows, current, mode, len) = {
             let queue = self.queue.borrow();
             let rows: Vec<PlaylistRow> = queue
                 .items
                 .iter()
                 .enumerate()
-                .map(|(index, entry)| PlaylistRow {
-                    title: entry.title.clone().into(),
-                    owner: entry.owner.clone().into(),
-                    duration: entry.duration.clone().into(),
-                    cover: self.cover_image(&entry.cover),
-                    current: queue.current == Some(index),
-                    playing: queue.current == Some(index) && playing,
+                .map(|(index, entry)| {
+                    let current = queue.current == Some(index);
+                    let (preload, preload_done) = if current {
+                        // The playing item is already here; its row reads full
+                        // rather than pretending a download is still pending.
+                        (1.0, true)
+                    } else {
+                        preload_state(&preload, &entry.bvid, entry.cid)
+                    };
+                    PlaylistRow {
+                        title: entry.title.clone().into(),
+                        owner: entry.owner.clone().into(),
+                        duration: entry.duration.clone().into(),
+                        cover: self.cover_image(&entry.cover),
+                        current,
+                        playing: current && playing,
+                        preload,
+                        preload_done,
+                    }
                 })
                 .collect();
             (rows, queue.current, queue.mode_value(), queue.items.len())
         };
-        // The bar's own title/cover, independent of the queue's current row.
-        let (now_bvid, now_title, now_cover) = match self.now.try_borrow() {
-            Ok(now) => match now.as_ref() {
-                Some(now) => (
-                    now.bvid.clone(),
-                    now.title.clone(),
-                    self.cover_image(&now.cover),
+        // The vinyl shows the FIRST playlist row by contract (`make_current`
+        // keeps the playing item there), never a `now` thumbnail that can
+        // outlive the queue: a close with an empty list must clear the disc
+        // instead of showing the last cover forever.
+        let (now_bvid, now_title, now_cover) = {
+            let queue = self.queue.borrow();
+            match queue.items.first() {
+                Some(entry) => (
+                    entry.bvid.clone(),
+                    entry.title.clone(),
+                    self.cover_image(&entry.cover),
                 ),
                 None => (String::new(), String::new(), Image::default()),
-            },
-            Err(_) => (String::new(), String::new(), Image::default()),
+            }
         };
         ui.set_playlist(ModelRc::from(Rc::new(VecModel::from(rows))));
         ui.set_play_mode(mode);
@@ -1169,6 +1273,39 @@ impl Playlist {
             "playlist publish items={len} current={current:?} mode={mode} playing={playing} now={now_bvid}"
         ));
         self.preload_ahead();
+    }
+
+    /// Patch each row's preload ring **in place** on the existing 250ms tick.
+    /// No timer of its own: the byte counter is cheap and the rows are a
+    /// `VecModel`, so a changed ring repaints one row instead of rebuilding the
+    /// list (which would also drop the hover state under the pointer).
+    fn publish_progress(&self) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let snapshot = prefetch::preload_snapshot();
+        let model = ui.get_playlist();
+        let Some(rows) = model.as_any().downcast_ref::<VecModel<PlaylistRow>>() else {
+            return;
+        };
+        let queue = self.queue.borrow();
+        for index in 0..rows.row_count().min(queue.items.len()) {
+            let entry = &queue.items[index];
+            let current = queue.current == Some(index);
+            let (preload, done) = if current {
+                (1.0, true)
+            } else {
+                preload_state(&snapshot, &entry.bvid, entry.cid)
+            };
+            let Some(mut row) = rows.row_data(index) else {
+                continue;
+            };
+            if (row.preload - preload).abs() > 0.001 || row.preload_done != done {
+                row.preload = preload;
+                row.preload_done = done;
+                rows.set_row_data(index, row);
+            }
+        }
     }
 
     /// Refresh the model-born `queued` flag on every home-feed card.
@@ -1316,6 +1453,16 @@ impl Playlist {
         crate::debug_log(&format!(
             "playlist persist items={len} current={current:?} mode={mode}"
         ));
+    }
+
+    /// Publish an externally toggled play/pause immediately (the playlist
+    /// header's play button). The player's 250ms tick would catch up too, but
+    /// the button's icon and the row meter must answer on the click.
+    fn set_playing(&self, playing: bool) {
+        if self.playing.replace(playing) == playing {
+            return;
+        }
+        self.publish();
     }
 
     /// Fetch one cover (cache miss only) and republish when it lands.
@@ -1490,7 +1637,8 @@ impl Playlist {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        self.queue.borrow_mut().current = Some(index);
+        // The vinyl shows row 0, so playing a row also promotes it to the front.
+        self.queue.borrow_mut().make_current(index);
         self.end_handled.set(false);
         self.stopped.set(false);
         crate::debug_log(&format!(
@@ -1527,6 +1675,9 @@ impl Playlist {
             self.queue.borrow().items.len(),
             self.current()
         ));
+        // The row is gone, so its preloaded bytes are dead weight. Deleting
+        // before `publish` means the fresh preload pass never re-adopts them.
+        prefetch::remove_cached_for(&removed.bvid, removed.cid, "playlist-remove");
         self.publish();
         self.persist();
         true
@@ -1579,8 +1730,19 @@ impl Playlist {
     }
 
     fn clear(&self) {
-        let len = self.queue.borrow().items.len();
+        let entries: Vec<(String, u64)> = {
+            let queue = self.queue.borrow();
+            queue
+                .items
+                .iter()
+                .map(|entry| (entry.bvid.clone(), entry.cid))
+                .collect()
+        };
+        let len = entries.len();
         self.queue.borrow_mut().clear();
+        for (bvid, cid) in &entries {
+            prefetch::remove_cached_for(bvid, *cid, "playlist-clear");
+        }
         crate::debug_log(&format!("playlist clear removed={len}"));
         self.publish();
         self.persist();
@@ -1622,13 +1784,17 @@ impl Playlist {
             return;
         }
         self.last_tick.set(now);
+        // Ring progress rides this same 250ms cadence.
+        self.publish_progress();
         // A mode-0 stop only holds while the track really is over: seeking back
         // (or a fresh session) clears `track_ended`, which lets the bar follow
         // playback again instead of staying stopped forever.
         if self.stopped.get() && !control.paused() && !control.track_ended() {
             self.stopped.set(false);
         }
-        let playing = !control.paused() && !self.stopped.get();
+        // Buffering freezes the vinyl exactly like a pause: the disc follows the
+        // picture, not the transport intent.
+        let playing = !control.paused() && !self.stopped.get() && !control.buffering();
         if playing != self.playing.get() {
             self.playing.set(playing);
             self.publish();
@@ -1637,13 +1803,30 @@ impl Playlist {
             return;
         }
         self.end_handled.set(true);
-        let (mode, current, len) = {
+        let (mode, current, len, ended) = {
             let queue = self.queue.borrow();
-            (queue.mode, queue.current, queue.items.len())
+            (
+                queue.mode,
+                queue.current,
+                queue.items.len(),
+                queue.current.and_then(|index| {
+                    queue
+                        .items
+                        .get(index)
+                        .map(|entry| (entry.bvid.clone(), entry.cid))
+                }),
+            )
         };
         crate::debug_log(&format!(
             "playlist end mode={mode} current={current:?} items={len}"
         ));
+        // Finished playback owns no cache file: drop the ended item's bytes
+        // now. The active player's own close path removes its session file too;
+        // this also covers mode 0, where the window deliberately stays on the
+        // ended frame.
+        if let Some((bvid, cid)) = ended {
+            prefetch::remove_cached_for(&bvid, cid, "end-of-track");
+        }
         match mode {
             0 => {
                 crate::debug_log("playlist end action=stop mode=0");
@@ -1709,11 +1892,19 @@ impl Playlist {
     /// A player window opened (from the queue, the feed or the detail page).
     fn on_open(&self, player: &PlayerWindow, video: &bilibili::FeedVideo) {
         set_active_player(player);
-        *self.now.borrow_mut() = Some(NowPlaying {
-            bvid: video.bvid.clone(),
-            title: video.title.clone(),
-            cover: video.pic.clone(),
-        });
+        // A video opened DIRECTLY (card click / detail 播放) was never in the
+        // queue. Insert it as the current row now; a video opened from the
+        // queue is already there and is only re-pointed at. The row is removed
+        // by the window-close path, never by pause/end/replace.
+        let (index, inserted) = self
+            .queue
+            .borrow_mut()
+            .ensure_current(QueueEntry::from_feed(video));
+        crate::debug_log(&format!(
+            "playlist current bvid={} index={index} inserted={} via=open",
+            video.bvid,
+            u8::from(inserted)
+        ));
         self.playing.set(true);
         self.stopped.set(false);
         self.end_handled.set(false);
@@ -1723,6 +1914,7 @@ impl Playlist {
             "playlist open bvid={} title={}",
             video.bvid, video.title
         ));
+        self.persist();
         self.publish();
     }
 
@@ -1746,13 +1938,17 @@ impl Playlist {
     /// too, so the queue never stays attached to a window that is gone.
     fn on_focus(&self, player: &PlayerWindow, video: &bilibili::FeedVideo) {
         set_active_player(player);
-        *self.now.borrow_mut() = Some(NowPlaying {
-            bvid: video.bvid.clone(),
-            title: video.title.clone(),
-            cover: video.pic.clone(),
-        });
+        // The focused window's row is the marked one. `mark_current` never
+        // inserts: a row the user deleted must stay deleted even if its window
+        // is still open.
+        let index = self.queue.borrow_mut().mark_current(&video.bvid);
+        crate::debug_log(&format!(
+            "playlist current bvid={} index={:?} via=focus",
+            video.bvid, index
+        ));
         self.last_tick.set(Instant::now());
         self.spawn_cover(video.pic.clone());
+        self.persist();
         self.publish();
         crate::debug_log(&format!(
             "playlist focus bvid={} title={}",
@@ -1811,7 +2007,11 @@ fn seek_near_track_end() -> bool {
     if duration == 0 {
         return false;
     }
-    let target = duration.saturating_sub(200);
+    // Two seconds of runway, not 200 ms: the final DASH segment can end a
+    // little before the container duration, and a target past the last
+    // decodable frame leaves the player seeking forever instead of latching
+    // `track_ended`. Two seconds still reaches the end through real playback.
+    let target = duration.saturating_sub(2000);
     control.seek(target);
     crate::debug_log(&format!(
         "playlist test seek duration={duration} target={target}"
@@ -2864,12 +3064,23 @@ fn publish_wallpaper(theme: AppTheme, window: &slint::Window) -> (f32, f32) {
 /// is shown: the first painted frame is already wallpaper + tint.
 fn set_backdrop(ui: &AppWindow, dark: bool) {
     // The wallpaper IS the diffused image: at blur 0 the coloured balls read as
-    // crisp discs, at the default they melt into a mesh gradient.
+    // crisp discs, at the default they melt into a mesh gradient. Both variants
+    // are published: `WallpaperLayer` selects by `AppTheme.dark`, so a theme
+    // switch swaps the tile in the same frame. Generating the second variant
+    // here is cached after the first switch (~one blur pass, UI thread).
     let blur_start = Instant::now();
-    let wallpaper = backdrop::image(dark);
+    let dark_wallpaper = backdrop::image(true);
+    let light_wallpaper = backdrop::image(false);
+    let wallpaper = if dark {
+        dark_wallpaper.clone()
+    } else {
+        light_wallpaper.clone()
+    };
     let blurred = backdrop::blurred(dark);
-    ui.set_wallpaper(wallpaper);
+    ui.set_wallpaper(dark_wallpaper);
+    ui.set_wallpaper_light(light_wallpaper);
     ui.set_wallpaper_valid(true);
+    ui.set_wallpaper(wallpaper);
     // Every GlassPanel in this window paints the SAME pre-blurred copy; the
     // first call per theme pays for the blur (three separable box passes on the
     // cached sharp pixels), every later call gets the cached image. Logged so
@@ -2894,7 +3105,16 @@ fn set_backdrop(ui: &AppWindow, dark: bool) {
 
 /// The same for a player window.
 fn set_player_backdrop(player: &PlayerWindow, dark: bool) {
-    player.set_wallpaper(backdrop::image(dark));
+    let dark_wallpaper = backdrop::image(true);
+    let light_wallpaper = backdrop::image(false);
+    let wallpaper = if dark {
+        dark_wallpaper.clone()
+    } else {
+        light_wallpaper.clone()
+    };
+    player.set_wallpaper(dark_wallpaper);
+    player.set_wallpaper_light(light_wallpaper);
+    player.set_wallpaper(wallpaper);
     player.set_wallpaper_valid(true);
     player.global::<AppTheme>().set_glass_blur(backdrop::blurred(dark));
     player
@@ -2909,7 +3129,16 @@ fn set_player_backdrop(player: &PlayerWindow, dark: bool) {
 
 /// The same for the mini player.
 fn set_mini_backdrop(mini: &MiniPlayerWindow, dark: bool) {
-    mini.set_wallpaper(backdrop::image(dark));
+    let dark_wallpaper = backdrop::image(true);
+    let light_wallpaper = backdrop::image(false);
+    let wallpaper = if dark {
+        dark_wallpaper.clone()
+    } else {
+        light_wallpaper.clone()
+    };
+    mini.set_wallpaper(dark_wallpaper);
+    mini.set_wallpaper_light(light_wallpaper);
+    mini.set_wallpaper(wallpaper);
     mini.set_wallpaper_valid(true);
     mini.global::<AppTheme>().set_glass_blur(backdrop::blurred(dark));
     mini.global::<AppTheme>()
@@ -2942,13 +3171,21 @@ fn republish_wallpaper(image: &slint::Image, dark: bool) {
             return;
         }
         if let Some(ui) = state.main.upgrade() {
-            ui.set_wallpaper(image.clone());
+            if dark {
+                ui.set_wallpaper(image.clone());
+            } else {
+                ui.set_wallpaper_light(image.clone());
+            }
             ui.global::<AppTheme>().set_glass_blur(image.clone());
             ui.global::<AppTheme>()
                 .set_backdrop_blur(backdrop::blur_px() as i32);
         }
         for session in player_sessions(&state) {
-            session.window.set_wallpaper(image.clone());
+            if dark {
+                session.window.set_wallpaper(image.clone());
+            } else {
+                session.window.set_wallpaper_light(image.clone());
+            }
             session
                 .window
                 .global::<AppTheme>()
@@ -2956,7 +3193,11 @@ fn republish_wallpaper(image: &slint::Image, dark: bool) {
         }
         let mini = state.mini.borrow().as_ref().map(|w| w.clone_strong());
         if let Some(mini) = mini {
-            mini.set_wallpaper(image.clone());
+            if dark {
+                mini.set_wallpaper(image.clone());
+            } else {
+                mini.set_wallpaper_light(image.clone());
+            }
             mini.global::<AppTheme>().set_glass_blur(image.clone());
         }
     });
@@ -3429,6 +3670,26 @@ thread_local! {
     /// closure, so the handle is kept alive here for the process (diagnostics
     /// only; nothing is pushed outside a QA run).
     static QA_TIMERS: RefCell<Vec<Rc<slint::Timer>>> = RefCell::new(Vec::new());
+    /// The main window's production drag state, exposed to the f146 replay so
+    /// it can prove that a press starting on the bar (with 播放列表 open) really
+    /// enters the drag path, then drive the drag's own placement math.
+    static MAIN_DRAG: RefCell<Option<Rc<win::WindowDrag>>> = const { RefCell::new(None) };
+    /// QA-only: stand in for a physically held left button during a synthetic
+    /// drag. The drag timer and the end handler read the real VK_LBUTTON, which
+    /// a replay never presses; this flag keeps the drag alive exactly as a held
+    /// button would. Production leaves it false.
+    static QA_DRAG_HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The main window drag handle, if the window has been built.
+fn main_drag_handle() -> Option<Rc<win::WindowDrag>> {
+    MAIN_DRAG.with(|slot| slot.try_borrow().ok().and_then(|drag| drag.clone()))
+}
+
+/// Whether the main drag should treat the button as held: the real Win32 state
+/// or the QA replay's stand-in.
+fn main_drag_button_held() -> bool {
+    win::left_button_down() || QA_DRAG_HOLD.with(std::cell::Cell::get)
 }
 
 /// Keep a harness timer alive after the closure that started it returns.
@@ -3854,6 +4115,13 @@ fn retry_subclass(state: &Rc<PlayerState>) {
                     if let Some(hwnd) = win::hwnd_of(player.window()) {
                         session.hwnd.set(hwnd);
                     }
+                }
+                // The open path ran before this HWND existed, so register the
+                // active window here once it is real. Without this the queue
+                // could not hand focus to a surviving window on close.
+                let focused_missing = state.focused.borrow().is_none();
+                if focused_missing && is_active_player(&session.window) {
+                    focus_player(&state, session, false);
                 }
                 if win::install_subclass(player.window()) {
                     // Compositor alpha + DWM chrome for this HWND (the backdrop
@@ -6087,6 +6355,1664 @@ fn maybe_start_f145_test(weak: Weak<AppWindow>, session_slot: SessionSlot) {
         run_f145_test(weak);
     });
 }
+
+// ===================== f146 QA: wallpaper / popovers / playlist =============
+//
+// One env-driven run (`BILI_F146_TEST=1`) that proves the four f146 contracts:
+// the theme-bound wallpaper (luma per theme), both popover centres, the taller
+// shadowless playlist and its real window drag while open, and the
+// direct-open row lifecycle. Every number is logged with the `f146 ` prefix.
+
+fn f146_log(line: impl AsRef<str>) {
+    crate::debug_log(&format!("f146 {}", line.as_ref()));
+}
+
+/// The main window's wallpaper patch: an empty band of the top strip, above the
+/// feed, with no card or control in it.
+const F146_LUMA_PATCH: (i32, i32, i32, i32) = (560, 8, 160, 40);
+
+fn f146_luma(patch: &[u8]) -> f64 {
+    let mut sum = 0.0;
+    let mut samples = 0.0;
+    for px in patch.chunks_exact(4) {
+        sum += 0.2126 * f64::from(px[0]) + 0.7152 * f64::from(px[1]) + 0.0722 * f64::from(px[2]);
+        samples += 1.0;
+    }
+    if samples > 0.0 {
+        sum / samples
+    } else {
+        0.0
+    }
+}
+
+fn f146_patch_luma(weak: &Weak<AppWindow>) -> Option<f64> {
+    f145_on_ui(weak, |ui| {
+        window_patch(
+            ui.window(),
+            F146_LUMA_PATCH.0,
+            F146_LUMA_PATCH.1,
+            F146_LUMA_PATCH.2,
+            F146_LUMA_PATCH.3,
+        )
+        .map(|patch| f146_luma(&patch))
+    })
+    .flatten()
+}
+
+fn f146_capture(weak: &Weak<AppWindow>, tag: &str) {
+    let tag_owned = tag.to_string();
+    let _ = f145_on_ui(weak, move |ui| {
+        let path = qa_capture_path(&tag_owned);
+        let size = capture_window_png(&ui.window(), &path);
+        f146_log(format!("capture tag={tag_owned} size={size:?}"));
+    });
+}
+
+/// Queue rows as the UI model shows them: titles, the current index and the
+/// per-row `current` flag. UI thread only.
+fn f146_queue() -> (Vec<String>, Option<usize>, Vec<bool>, usize) {
+    let Some(host) = playlist() else {
+        return (Vec::new(), None, Vec::new(), 0);
+    };
+    let (items, current, _mode) = host.snapshot();
+    let flags = host
+        .ui
+        .upgrade()
+        .map(|ui| {
+            let rows = ui.get_playlist();
+            (0..rows.row_count())
+                .filter_map(|index| rows.row_data(index).map(|row| row.current))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let focused = host
+        .state
+        .upgrade()
+        .map(|state| player_sessions(&state).len())
+        .unwrap_or(0);
+    (items, current, flags, focused)
+}
+
+fn f146_close_bvid(bvid: &str) -> bool {
+    let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+        return false;
+    };
+    let Some(session) = player_sessions(&state)
+        .into_iter()
+        .find(|session| session.video.bvid == bvid)
+    else {
+        return false;
+    };
+    crate::debug_log(&format!(
+        "f146 close bvid={bvid} win={}",
+        session.id
+    ));
+    session.window.invoke_player_closed();
+    true
+}
+
+/// QA: give `bvid`'s player window the focus the pointer would give it.
+/// A programmatic `card_open(..., 1)` creates and shows the window without
+/// Windows activation, so without this the queue would keep following the old
+/// window and the pause/close checks would exercise the wrong session.
+fn f146_focus_bvid(bvid: &str) -> bool {
+    let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+        return false;
+    };
+    let Some(session) = player_sessions(&state)
+        .into_iter()
+        .find(|session| session.video.bvid == bvid)
+    else {
+        return false;
+    };
+    focus_player(&state, &session, true);
+    crate::debug_log(&format!(
+        "f146 focus bvid={bvid} win={} via=qa",
+        session.id
+    ));
+    true
+}
+
+fn f146_drag_step(weak: &Weak<AppWindow>, step: i32) -> Option<bool> {
+    f145_on_ui(weak, move |ui| {
+        let drag = main_drag_handle()?;
+        let ((ax, ay), _) = drag.anchor();
+        drag.move_to_cursor((ax + step * 10, ay + step * 4));
+        Some(drag.flush(ui.window()))
+    })
+    .flatten()
+}
+
+fn run_f146_test(weak: Weak<AppWindow>) {
+    // ---- 0: a clean home feed and queue ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_playlist_open(false);
+        ui.invoke_back_to_feed();
+        ui.set_view_mode(0);
+        ui.set_home_tab(0);
+        ui.invoke_playlist_clear();
+    });
+    let mut feed_rows = 0;
+    for _ in 0..80 {
+        feed_rows = f145_on_ui(&weak, |ui| ui.get_feed_items().row_count()).unwrap_or(0);
+        if feed_rows >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let bvids: Vec<String> = f145_on_ui(&weak, |ui| {
+        let rows = ui.get_feed_items();
+        (0..2)
+            .filter_map(|index| rows.row_data(index).map(|row| row.bvid.to_string()))
+            .collect()
+    })
+    .unwrap_or_default();
+    f146_log(format!(
+        "start feed_rows={feed_rows} bvids={bvids:?} players={}",
+        f145_players()
+    ));
+
+    // ---- 1: theme-bound wallpaper, one frame per switch ----
+    // The binding (`WallpaperLayer.source = AppTheme.dark ? …`) is synchronous;
+    // the pixel sample is taken one 60 Hz frame later, because a compositor
+    // frame cannot exist before the property change is committed.
+    let started = Instant::now();
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_settings_theme(1));
+    let light_prop = f145_on_ui(&weak, |ui| ui.global::<AppTheme>().get_dark()).unwrap_or(true);
+    std::thread::sleep(Duration::from_millis(20));
+    let light_luma = f146_patch_luma(&weak).unwrap_or(0.0);
+    let light_ms = started.elapsed().as_secs_f64() * 1000.0;
+    f146_capture(&weak, "f146_light_wallpaper");
+    let started = Instant::now();
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_settings_theme(2));
+    let dark_prop = f145_on_ui(&weak, |ui| ui.global::<AppTheme>().get_dark()).unwrap_or(false);
+    std::thread::sleep(Duration::from_millis(20));
+    let dark_luma = f146_patch_luma(&weak).unwrap_or(0.0);
+    let dark_ms = started.elapsed().as_secs_f64() * 1000.0;
+    f146_capture(&weak, "f146_dark_wallpaper");
+    f146_log(format!(
+        "theme light_prop={} dark_prop={} light_luma={light_luma:.1} dark_luma={dark_luma:.1} light_ms={light_ms:.1} dark_ms={dark_ms:.1} wait_ms=20 frame=1",
+        u8::from(light_prop),
+        u8::from(dark_prop)
+    ));
+    // Back to the light app for the chrome captures.
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_settings_theme(1));
+    std::thread::sleep(Duration::from_millis(40));
+
+    // ---- 2: open feed[0] DIRECTLY (card click, no enqueue) ----
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_card_open(0, 0));
+    std::thread::sleep(Duration::from_millis(2500));
+    let direct = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    f146_log(format!(
+        "direct-open bvid={} items={} current={:?} flags={:?} players={}",
+        bvids.first().map(String::as_str).unwrap_or("-"),
+        direct.0.len(),
+        direct.1,
+        direct.2,
+        direct.3
+    ));
+
+    // Seed enough rows that the panel reaches its full 460px (the old cap was
+    // 420px), so the capture is the intended "taller list" state. These are
+    // enqueue-only: no second player opens and the direct-open row stays current.
+    let _ = f145_on_ui(&weak, |ui| {
+        for index in 2..=7 {
+            ui.invoke_card_enqueue_only(index);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(800));
+    let seeded = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    f146_log(format!(
+        "seeded items={} current={:?} flags={:?}",
+        seeded.0.len(),
+        seeded.1,
+        seeded.2
+    ));
+    // Let the enqueue toasts expire before the chrome captures.
+    std::thread::sleep(Duration::from_millis(2600));
+
+    // ---- 3: volume / danmaku popover centres ----
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_qa_hold_chrome(true);
+            session.window.set_pointer_inside(true);
+            session.window.set_qa_popover_hold(1);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    let vol = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            let w = &session.window;
+            (w.get_qa_vol_btn_x(), w.get_qa_vol_btn_w(), w.get_qa_vol_pop_x(), w.get_qa_vol_pop_w())
+        })
+    })
+    .flatten();
+    if let Some((bx, bw, px, pw)) = vol {
+        f146_log(format!(
+            "volume btn_cx={:.2} pop_cx={:.2} delta={:.2} pop_w={pw:.1}",
+            bx + bw / 2.0,
+            px + pw / 2.0,
+            (px + pw / 2.0) - (bx + bw / 2.0)
+        ));
+    }
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let path = qa_capture_path("f146_volume");
+            let size = capture_window_png(&session.window.window(), &path);
+            f146_log(format!("capture tag=f146_volume size={size:?}"));
+            session.window.set_qa_popover_hold(2);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    let dm = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            let w = &session.window;
+            (w.get_qa_dm_btn_x(), w.get_qa_dm_btn_w(), w.get_qa_dm_pop_x(), w.get_qa_dm_pop_w())
+        })
+    })
+    .flatten();
+    if let Some((bx, bw, px, pw)) = dm {
+        f146_log(format!(
+            "danmaku btn_cx={:.2} pop_cx={:.2} delta={:.2} pop_w={pw:.1}",
+            bx + bw / 2.0,
+            px + pw / 2.0,
+            (px + pw / 2.0) - (bx + bw / 2.0)
+        ));
+    }
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let path = qa_capture_path("f146_danmaku");
+            let size = capture_window_png(&session.window.window(), &path);
+            f146_log(format!("capture tag=f146_danmaku size={size:?}"));
+            session.window.set_qa_popover_hold(0);
+            session.window.set_qa_hold_chrome(false);
+        }
+    });
+
+    // Pause through the playlist header's real callback: the row must stay.
+    let before_pause = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_playlist_toggle_pause());
+    std::thread::sleep(Duration::from_millis(300));
+    let after_pause = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    f146_log(format!(
+        "pause items_before={} items_after={} current_before={:?} current_after={:?} kept={}",
+        before_pause.0.len(),
+        after_pause.0.len(),
+        before_pause.1,
+        after_pause.1,
+        u8::from(
+            before_pause.0.len() == after_pause.0.len()
+                && before_pause.1 == after_pause.1
+        )
+    ));
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_playlist_toggle_pause());
+    std::thread::sleep(Duration::from_millis(200));
+
+    // ---- 4: playlist panel: taller / higher / no shadow / now playing ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_playlist_open(true);
+        ui.set_qa_playlist_probe(true);
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let panel = f145_on_ui(&weak, |ui| {
+        (
+            ui.get_qa_playlist_w(),
+            ui.get_qa_playlist_h(),
+            ui.get_qa_playlist_row_h(),
+            ui.get_qa_playlist_gap(),
+            ui.get_qa_playlist_shadow(),
+            ui.get_qa_playlist_x(),
+            ui.get_qa_playlist_y(),
+        )
+    });
+    if let Some((w, h, row_h, gap, shadow, x, y)) = panel {
+        f146_log(format!(
+            "playlist panel w={w:.1} h={h:.1} row_h={row_h:.1} gap={gap:.1} shadow={shadow:.3} x={x:.1} y={y:.1}"
+        ));
+    }
+    let after_open = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    f146_log(format!(
+        "playlist now-playing items={} current={:?} flags={:?}",
+        after_open.0.len(),
+        after_open.1,
+        after_open.2
+    ));
+    f146_capture(&weak, "f146_playlist");
+
+    // ---- 5: drag the window from the bar WHILE the playlist is open ----
+    let point = f145_on_ui(&weak, |ui| {
+        let scale = ui.window().scale_factor().max(0.2);
+        let width = ui.window().size().width as f32 / scale;
+        let height = ui.window().size().height as f32 / scale;
+        let compact = ui.get_bar_compact_px();
+        let bar_y = height - 56.0 - 28.0;
+        let bar_x = (width - compact) / 2.0;
+        (bar_x + compact / 2.0 - 41.0 - 5.0, bar_y + 28.0)
+    });
+    if let Some((px, py)) = point {
+        let before = f145_on_ui(&weak, |ui| {
+            win::window_origin(ui.window()).map(|(x, y)| (x, y))
+        })
+        .flatten();
+        let _ = f145_on_ui(&weak, move |ui| {
+            if let Some(session) = f145_latest_player() {
+                f145_pointer(&session.window.window(), 0.0, 0.0, false);
+            }
+            // A press on the bar's blank surface, then one move: the bar's own
+            // drag area (above the popup catcher) must start the drag.
+            f145_pointer(&ui.window(), px, py, false);
+            ui.window().dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                position: slint::LogicalPosition::new(px, py),
+                button: slint::platform::PointerEventButton::Left,
+            });
+            QA_DRAG_HOLD.with(|hold| hold.set(true));
+            ui.window().dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                position: slint::LogicalPosition::new(px + 2.0, py + 1.0),
+            });
+            let dragging = main_drag_handle().map(|drag| drag.is_dragging()).unwrap_or(false);
+            if let Some(drag) = main_drag_handle() {
+                // Consume the pending real-cursor move from the synthetic
+                // press so the production 16ms timer cannot later snap the
+                // window back while the replay drives explicit targets.
+                drag.flush(ui.window());
+            }
+            f146_log(format!(
+                "drag press point=({px:.1},{py:.1}) playlist_open={} drag_started={}",
+                ui.get_playlist_open(),
+                u8::from(dragging)
+            ));
+        });
+        let started = Instant::now();
+        let mut placements = 0u32;
+        for step in 1..=12 {
+            if if let Some(moved) = f146_drag_step(&weak, step) {
+                moved
+            } else {
+                false
+            } {
+                placements += 1;
+            }
+            if step == 6 {
+                f146_capture(&weak, "f146_playlist_open_drag");
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let after = f145_on_ui(&weak, move |ui| {
+            let origin = win::window_origin(ui.window());
+            QA_DRAG_HOLD.with(|hold| hold.set(false));
+            ui.window().dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                position: slint::LogicalPosition::new(px, py),
+                button: slint::platform::PointerEventButton::Left,
+            });
+            if main_drag_handle().map(|drag| drag.is_dragging()).unwrap_or(false) {
+                // The synthetic release may miss the captured area after the
+                // window moved; the app's own end callback is the same path.
+                ui.invoke_window_drag_end();
+            }
+            origin
+        })
+        .flatten();
+        let dragging_after = f145_on_ui(&weak, |_ui| {
+            main_drag_handle().map(|drag| drag.is_dragging()).unwrap_or(false)
+        })
+        .unwrap_or(false);
+        let (dx, dy) = match (before, after) {
+            (Some((bx, by)), Some((ax, ay))) => (ax - bx, ay - by),
+            _ => (0, 0),
+        };
+        f146_log(format!(
+            "drag with-panel-open start_dragging=1 moved_px=({dx},{dy}) placements={placements} elapsed_ms={:.1} placements_per_s={:.1} ended={}",
+            elapsed * 1000.0,
+            placements as f64 / elapsed.max(0.001),
+            u8::from(!dragging_after)
+        ));
+    }
+
+    // ---- 6: two videos listed, the focused one marked; close removes one ----
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_card_open(1, 1));
+    std::thread::sleep(Duration::from_millis(2500));
+    let two = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    f146_log(format!(
+        "two-open items={} current={:?} flags={:?} players={}",
+        two.0.len(),
+        two.1,
+        two.2,
+        two.3
+    ));
+    let close_bvid = bvids.first().cloned().unwrap_or_default();
+    let closed = f145_on_ui(&weak, move |_ui| f146_close_bvid(&close_bvid)).unwrap_or(false);
+    std::thread::sleep(Duration::from_millis(1200));
+    let after_close = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    f146_log(format!(
+        "close-direct bvid={} invoked={} items={} current={:?} flags={:?} players={}",
+        bvids.first().map(String::as_str).unwrap_or("-"),
+        u8::from(closed),
+        after_close.0.len(),
+        after_close.1,
+        after_close.2,
+        after_close.3
+    ));
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_playlist_open(false);
+        ui.set_qa_playlist_probe(false);
+        ui.invoke_playlist_clear();
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    request_quit("f146 qa done");
+}
+
+/// Start the f146 chain once the window is up (`BILI_F146_TEST=1`).
+fn maybe_start_f146_test(weak: Weak<AppWindow>) {
+    if !std::env::var("BILI_F146_TEST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        // Give the startup gate / saved login time to bring the feed up; the
+        // feed poll in `run_f146_test` is the real readiness check.
+        std::thread::sleep(Duration::from_millis(8000));
+        run_f146_test(weak);
+    });
+}
+// ===================== f147/f148 QA: UI wave ================================
+//
+// `BILI_F147_TEST=1` or `BILI_F148_TEST=1` drives the real callbacks through
+// one run and captures every contract of the wave (the prefix only names the
+// evidence; the tree under test is identical):
+//   * search empty -> hot panel, then a result page with home cards
+//   * the 180ms morph's UI-thread gap distribution (p95)
+//   * pre-roll scrim: 150ms (no frame) and once a frame exists
+//   * interpolation mode 0..3, read back from the control in the same turn
+//   * 下载分布 playhead invariant while the picture runs at >= 28 fps
+//   * three playlist rows with advancing preload rings; remove deletes cache
+//   * vinyl: B at index 0, close B -> A index 0 + playing, close A -> cleared
+//
+// Every number uses the wave's prefix (`f147 ` / `f148 `), so a run's log can
+// be asserted with grep. Captures land in the shared QA directory
+// (`qa_capture_path`). The f147 code below is parameterised by `QA_WAVE`, so
+// the same chain also produces the f148 evidence without a second copy.
+
+/// 0 = f147, 1 = f148. Read from every thread (the capture and the 4 ms probe
+/// log on the UI thread), so it is an atomic rather than a thread-local.
+static QA_WAVE: AtomicU32 = AtomicU32::new(0);
+
+fn qa_wave() -> &'static str {
+    if QA_WAVE.load(Ordering::SeqCst) == 1 {
+        "f148"
+    } else {
+        "f147"
+    }
+}
+
+fn qa_wave_tag(tag: &str) -> String {
+    tag.replacen("f147", qa_wave(), 1)
+}
+
+fn f147_log(line: impl AsRef<str>) {
+    crate::debug_log(&format!("{} {}", qa_wave(), line.as_ref()));
+}
+
+fn f147_capture_main(weak: &Weak<AppWindow>, tag: &str) {
+    let tag_owned = qa_wave_tag(tag);
+    let _ = f145_on_ui(weak, move |ui| {
+        let path = qa_capture_path(&tag_owned);
+        let size = capture_window_png(&ui.window(), &path);
+        f147_log(format!("capture tag={tag_owned} size={size:?}"));
+    });
+}
+
+fn f147_capture_player(weak: &Weak<AppWindow>, tag: &str) {
+    let tag_owned = qa_wave_tag(tag);
+    let _ = f145_on_ui(weak, move |_ui| {
+        let Some(session) = f145_latest_player() else {
+            f147_log(format!("capture tag={tag_owned} size=None reason=no-player"));
+            return;
+        };
+        let path = qa_capture_path(&tag_owned);
+        let size = capture_window_png(&session.window.window(), &path);
+        f147_log(format!("capture tag={tag_owned} size={size:?}"));
+    });
+}
+
+/// Concatenate PNGs vertically (optionally keeping only each one's bottom
+/// `crop_bottom` rows) into one evidence image. The interp montage needs the
+/// four modes in a single file the owner can compare at a glance; the scrim
+/// montage needs the two instants side by side in one picture.
+fn qa_montage(paths: &[PathBuf], out: &std::path::Path, crop_bottom: Option<u32>) -> Option<(u32, u32)> {
+    let mut images = Vec::with_capacity(paths.len());
+    for path in paths {
+        let image = image::open(path).ok()?.to_rgba8();
+        images.push(image);
+    }
+    if images.is_empty() {
+        return None;
+    }
+    let width = images.iter().map(|image| image.width()).max().unwrap_or(0);
+    let rows: Vec<u32> = images
+        .iter()
+        .map(|image| crop_bottom.unwrap_or(image.height()).min(image.height()))
+        .collect();
+    let gap = 8u32;
+    let height: u32 = rows.iter().sum::<u32>() + gap * (images.len() as u32 - 1);
+    let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba([12, 13, 16, 255]));
+    let mut y = 0u32;
+    for (image, row_h) in images.iter().zip(rows.iter()) {
+        let src_y = image.height().saturating_sub(*row_h);
+        let strip = image::imageops::crop_imm(image, 0, src_y, image.width(), *row_h).to_image();
+        image::imageops::replace(&mut canvas, &strip, 0, i64::from(y));
+        y += *row_h + gap;
+    }
+    if let Some(dir) = out.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match canvas.save(out) {
+        Ok(()) => {
+            crate::debug_log(&format!(
+                "{} montage path={} size={width}x{height} tiles={}",
+                qa_wave(),
+                out.display(),
+                images.len()
+            ));
+            Some((width, height))
+        }
+        Err(err) => {
+            crate::debug_log(&format!(
+                "{} montage path={} err={err}",
+                qa_wave(),
+                out.display()
+            ));
+            None
+        }
+    }
+}
+
+/// One UI-thread clock sample, in ms, taken by a 4ms timer. This is the same
+/// thread that paints: a gap above a display frame is time a frame could not
+/// be submitted. The timer is stopped before the distribution is read.
+struct F147Probe {
+    timer: Rc<slint::Timer>,
+}
+
+thread_local! {
+    static F147_PROBE: RefCell<Option<F147Probe>> = RefCell::new(None);
+    static F147_GAPS: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+    /// Long-gap event lines, buffered: writing them from inside the 4 ms
+    /// timer would put a synchronous file append on the very thread being
+    /// measured and amplify the next gap. They are flushed after the sample.
+    static F147_EVENTS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    static F147_LAST: Cell<Option<Instant>> = Cell::new(None);
+}
+
+fn f147_probe_start(weak: Weak<AppWindow>) {
+    f147_probe_stop();
+    F147_GAPS.with(|gaps| gaps.borrow_mut().clear());
+    F147_EVENTS.with(|events| events.borrow_mut().clear());
+    F147_LAST.with(|last| last.set(Some(Instant::now())));
+    let timer = Rc::new(slint::Timer::default());
+    let started = Instant::now();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(4),
+        move || {
+            let now = Instant::now();
+            let mut long_gap = None;
+            F147_LAST.with(|last| {
+                if let Some(previous) = last.get() {
+                    let gap = now.duration_since(previous).as_secs_f64() * 1000.0;
+                    F147_GAPS.with(|gaps| gaps.borrow_mut().push(gap));
+                    if gap > 16.0 {
+                        long_gap = Some((gap, started.elapsed().as_secs_f64() * 1000.0));
+                    }
+                }
+                last.set(Some(now));
+            });
+            if let (Some((gap, at_ms)), Some(ui)) = (long_gap, weak.upgrade()) {
+                let line = format!(
+                    "morph gap_ms={gap:.2} at_ms={at_ms:.1} search_open={} bar_w={:.1} field_w={:.1} refreshing={} skeleton={}",
+                    u8::from(ui.get_search_open()),
+                    ui.get_home_bar_w(),
+                    ui.get_qa_search_field_w(),
+                    u8::from(ui.get_list_refreshing()),
+                    u8::from(ui.global::<AppTheme>().get_skeletons_on())
+                );
+                F147_EVENTS.with(|events| events.borrow_mut().push(line));
+            }
+        },
+    );
+    F147_PROBE.with(|slot| {
+        *slot.borrow_mut() = Some(F147Probe { timer });
+    });
+}
+
+/// `(samples, p50, p95, max, over_16ms)` in milliseconds. UI thread only.
+fn f147_probe_stop() -> (usize, f64, f64, f64, usize) {
+    if let Some(probe) = F147_PROBE.with(|slot| slot.borrow_mut().take()) {
+        probe.timer.stop();
+    }
+    let events = F147_EVENTS.with(|events| events.borrow_mut().split_off(0));
+    let mut gaps = F147_GAPS.with(|gaps| gaps.borrow().clone());
+    let stats = if gaps.is_empty() {
+        (0, 0.0, 0.0, 0.0, 0)
+    } else {
+        let over = gaps.iter().filter(|gap| **gap > 16.0).count();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |fraction: f64| -> f64 {
+            let index = ((gaps.len() as f64 * fraction) as usize).min(gaps.len() - 1);
+            gaps[index]
+        };
+        (gaps.len(), at(0.50), at(0.95), *gaps.last().unwrap_or(&0.0), over)
+    };
+    // Flush outside the measured window. This runs after the timer stopped, so
+    // the disk latencies cannot contaminate the sample.
+    for event in events {
+        f147_log(event);
+    }
+    stats
+}
+
+/// The vinyl contract as the main window sees it: `(playing,title,cover_w,
+/// queue_len,current)`.
+fn f147_vinyl(ui: &AppWindow) -> (bool, String, u32, usize, Option<usize>) {
+    let rows = ui.get_playlist().row_count();
+    let current = playlist().and_then(|host| host.current());
+    (
+        ui.get_now_playing(),
+        ui.get_now_title().to_string(),
+        ui.get_now_cover().size().width,
+        rows,
+        current,
+    )
+}
+
+/// `(preload, done)` per playlist row, in model order. UI thread only.
+fn f147_rings(ui: &AppWindow) -> Vec<(f32, bool)> {
+    let rows = ui.get_playlist();
+    (0..rows.row_count())
+        .filter_map(|index| rows.row_data(index).map(|row| (row.preload, row.preload_done)))
+        .collect()
+}
+
+fn f147_feed_index(ui: &AppWindow, bvid: &str) -> Option<usize> {
+    let rows = ui.get_feed_items();
+    (0..rows.row_count()).find(|index| {
+        rows.row_data(*index)
+            .map(|row| row.bvid.as_str() == bvid)
+            .unwrap_or(false)
+    })
+}
+
+/// Parse a card's `MM:SS` / `HH:MM:SS` badge into seconds.
+fn f147_badge_secs(badge: &str) -> Option<u64> {
+    let mut secs = 0u64;
+    let mut parts = 0u32;
+    for piece in badge.split(':') {
+        let value: u64 = piece.trim().parse().ok()?;
+        secs = secs * 60 + value;
+        parts += 1;
+    }
+    (parts >= 2).then_some(secs)
+}
+
+/// The shortest feed row in `min_secs..=max_secs`, so the vinyl/end-of-track
+/// leg survives the ring/preload wait but still reaches a real end in seconds
+/// instead of waiting out a 17-minute feature. Falls back to the shortest row
+/// under `max_secs` when the range is empty.
+fn f147_short_feed_index(
+    ui: &AppWindow,
+    min_secs: u64,
+    max_secs: u64,
+) -> Option<(usize, String, u64)> {
+    let rows = ui.get_feed_items();
+    let mut best: Option<(usize, String, u64)> = None;
+    let mut fallback: Option<(usize, String, u64)> = None;
+    for index in 0..rows.row_count().min(24) {
+        let Some(row) = rows.row_data(index) else {
+            continue;
+        };
+        let Some(secs) = f147_badge_secs(row.badge.as_str()) else {
+            continue;
+        };
+        if secs == 0 || secs > max_secs {
+            continue;
+        }
+        if fallback
+            .as_ref()
+            .map(|(_, _, fallback_secs)| secs < *fallback_secs)
+            .unwrap_or(true)
+        {
+            fallback = Some((index, row.badge.to_string(), secs));
+        }
+        if secs < min_secs {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map(|(_, _, best_secs)| secs < *best_secs)
+            .unwrap_or(true)
+        {
+            best = Some((index, row.badge.to_string(), secs));
+        }
+    }
+    best.or(fallback)
+}
+
+/// Up to `count` feed rows in `min_secs..=max_secs`, shortest first, excluding
+/// `exclude`. Used for the two queued ring rows: short files make the
+/// low-priority preload's arc visible inside the capture window.
+fn f147_short_feed_indices(
+    ui: &AppWindow,
+    min_secs: u64,
+    max_secs: u64,
+    exclude: usize,
+    count: usize,
+) -> Vec<usize> {
+    let rows = ui.get_feed_items();
+    let mut candidates: Vec<(usize, u64)> = Vec::new();
+    for index in 0..rows.row_count().min(24) {
+        if index == exclude {
+            continue;
+        }
+        let Some(row) = rows.row_data(index) else {
+            continue;
+        };
+        let Some(secs) = f147_badge_secs(row.badge.as_str()) else {
+            continue;
+        };
+        if secs >= min_secs && secs <= max_secs {
+            candidates.push((index, secs));
+        }
+    }
+    candidates.sort_by_key(|(_, secs)| *secs);
+    let mut picked: Vec<usize> = candidates.into_iter().map(|(index, _)| index).take(count).collect();
+    // Fallback: adjacent rows, so a sparse/SF feed still gets two queued rows.
+    let total = rows.row_count().max(1);
+    let mut offset = 1usize;
+    while picked.len() < count && offset < total {
+        let index = (exclude + offset) % total;
+        if !picked.contains(&index) {
+            picked.push(index);
+        }
+        offset += 1;
+    }
+    picked
+}
+
+/// The cid for a feed bvid, used by QA to drop that video's session cache
+/// before the cold-start scrim capture.
+fn f147_feed_cid(bvid: &str) -> Option<u64> {
+    let host = playlist()?;
+    let feed = host.feed.lock().ok()?;
+    feed.iter().find(|video| video.bvid == bvid).map(|video| video.cid)
+}
+
+fn run_f147_test(weak: Weak<AppWindow>) {
+    run_ui_wave_test(weak, 0);
+}
+
+fn run_f148_test(weak: Weak<AppWindow>) {
+    run_ui_wave_test(weak, 1);
+}
+
+/// Close every open player window through its own close callback. A busy
+/// desktop can leave a player open before the QA chain starts (an accidental
+/// click); a player suppresses cover streaming, so a clean search capture needs
+/// zero players. Returns the number of windows asked to close.
+fn f147_close_players() -> usize {
+    let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+        return 0;
+    };
+    let sessions = player_sessions(&state);
+    let count = sessions.len();
+    for session in sessions {
+        session.window.invoke_player_closed();
+    }
+    count
+}
+
+fn run_ui_wave_test(weak: Weak<AppWindow>, wave: u32) {
+    QA_WAVE.store(wave, Ordering::SeqCst);
+    // ---- 0: clean home, queue, players and search ----
+    let closed_players = f145_on_ui(&weak, |_ui| f147_close_players()).unwrap_or(0);
+    if closed_players > 0 {
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_playlist_open(false);
+        ui.invoke_back_to_feed();
+        ui.set_view_mode(0);
+        ui.set_home_tab(0);
+        ui.invoke_playlist_clear();
+        ui.set_search_open(false);
+        ui.set_search_text(SharedString::from(""));
+    });
+    // A closing player retires on a 200ms timer; wait for the active count to
+    // reach zero before the search covers are requested.
+    for _ in 0..30 {
+        if !player_active() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut feed_rows = 0usize;
+    for _ in 0..80 {
+        feed_rows = f145_on_ui(&weak, |ui| ui.get_feed_items().row_count()).unwrap_or(0);
+        if feed_rows >= 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let hot_rows = f145_on_ui(&weak, |ui| ui.get_hot_items().row_count()).unwrap_or(0);
+    f147_log(format!(
+        "start feed_rows={feed_rows} hot_items={hot_rows} players={}",
+        f145_players()
+    ));
+
+    // ---- 1: search empty state + morph gap distribution ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_search_open(false);
+        ui.set_search_text(SharedString::from(""));
+        ui.set_view_mode(0);
+    });
+    std::thread::sleep(Duration::from_millis(350));
+    let _ = f145_on_ui(&weak, |ui| ui.set_search_open(true));
+    // The open callback loads the hot list; wait for it (network) before the
+    // capture, then let the panel's 160ms fade finish.
+    let _ = f145_on_ui(&weak, |ui| ui.invoke_search_opened());
+    let mut hot_loaded = 0usize;
+    for _ in 0..30 {
+        hot_loaded = f145_on_ui(&weak, |ui| ui.get_hot_items().row_count()).unwrap_or(0);
+        if hot_loaded > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(350));
+    let empty_state = f145_on_ui(&weak, |ui| {
+        (
+            ui.get_qa_hot_panel_open(),
+            ui.get_hot_items().row_count(),
+            ui.get_search_open(),
+            ui.get_search_text().to_string(),
+            ui.get_search_items().row_count(),
+        )
+    })
+    .unwrap_or((false, 0, false, String::new(), 0));
+    f147_log(format!(
+        "search-empty hot_panel={} hot_items={} hot_wait={} open={} text={:?} results={}",
+        u8::from(empty_state.0),
+        empty_state.1,
+        hot_loaded,
+        u8::from(empty_state.2),
+        empty_state.3,
+        empty_state.4
+    ));
+    f147_capture_main(&weak, "f147_search_empty");
+
+    // ---- 2: results page: home cards + covers + UP + heat + date ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_search_text(SharedString::from("bilibili"));
+        ui.invoke_do_search(SharedString::from("bilibili"));
+    });
+    for _ in 0..40 {
+        let rows = f145_on_ui(&weak, |ui| ui.get_search_items().row_count()).unwrap_or(0);
+        if rows > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Covers stream in after the rows; wait until every visible row has one (or
+    // the bounded wait proves the failure).
+    let mut cards = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..30 {
+        cards = f145_on_ui(&weak, |ui| {
+            let rows = ui.get_search_items();
+            let total = rows.row_count();
+            let mut covers = 0usize;
+            let mut owners = 0usize;
+            let mut dates = 0usize;
+            for index in 0..total {
+                let Some(row) = rows.row_data(index) else {
+                    continue;
+                };
+                covers += usize::from(row.thumb.size().width > 0);
+                owners += usize::from(!row.owner.is_empty());
+                dates += usize::from(row.pub_ts > 0);
+            }
+            (total, covers, owners, dates)
+        })
+        .unwrap_or((0, 0, 0, 0));
+        if cards.0 > 0 && cards.1 == cards.0 && cards.2 == cards.0 && cards.3 == cards.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    f147_log(format!(
+        "search-results rows={} covers={}/{} owners={}/{} dates={}/{} hot_panel={}",
+        cards.0,
+        cards.1,
+        cards.0,
+        cards.2,
+        cards.0,
+        cards.3,
+        cards.0,
+        u8::from(f145_on_ui(&weak, |ui| ui.get_qa_hot_panel_open()).unwrap_or(false))
+    ));
+    f147_capture_main(&weak, "f147_search_results");
+
+    // ---- 2b: morph gap distribution on a settled UI ----
+    // Measure the SECOND open: the feed's first cover batches and the hot-list
+    // fetch are done, so the distribution describes the morph itself, not a
+    // startup network patch landing on the same frames.
+    let _ = f145_on_ui(&weak, |ui| ui.set_search_open(false));
+    std::thread::sleep(Duration::from_millis(1800));
+    // Baseline: the same 4 ms probe on the idle chrome, so the morph number can
+    // be read as a delta and not as this machine's minimum timer latency.
+    let weak_probe = weak.clone();
+    let _ = f145_on_ui(&weak, move |_ui| f147_probe_start(weak_probe));
+    std::thread::sleep(Duration::from_millis(420));
+    let idle_gaps = f145_on_ui(&weak, |_ui| f147_probe_stop()).unwrap_or((0, 0.0, 0.0, 0.0, 0));
+    f147_log(format!(
+        "morph idle-baseline probe_samples={} ui_gap_p50_ms={:.2} ui_gap_p95_ms={:.2} ui_gap_max_ms={:.2} over16={}",
+        idle_gaps.0, idle_gaps.1, idle_gaps.2, idle_gaps.3, idle_gaps.4
+    ));
+    let weak_probe = weak.clone();
+    let _ = f145_on_ui(&weak, move |_ui| f147_probe_start(weak_probe));
+    let morph_start = Instant::now();
+    let _ = f145_on_ui(&weak, |ui| ui.set_search_open(true));
+    std::thread::sleep(Duration::from_millis(420));
+    let gaps = f145_on_ui(&weak, |_ui| f147_probe_stop()).unwrap_or((0, 0.0, 0.0, 0.0, 0));
+    let morph_ms = morph_start.elapsed().as_secs_f64() * 1000.0;
+    f147_log(format!(
+        "morph ms={morph_ms:.1} field_animation=180ms probe_samples={} ui_gap_p50_ms={:.2} \
+         ui_gap_p95_ms={:.2} ui_gap_max_ms={:.2} over16={} target_p95_ms=16.00",
+        gaps.0, gaps.1, gaps.2, gaps.3, gaps.4
+    ));
+
+    // ---- 3: open a SHORT feed item; scrim pre-frame and with a frame ----
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_search_open(false);
+        ui.set_view_mode(0);
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    // A 1-2 minute item: its end-of-track leg is reachable later, and its
+    // cold cache leaves the 0-frame scrim window wide enough to capture.
+    let short = f145_on_ui(&weak, |ui| f147_short_feed_index(ui, 55, 100)).flatten();
+    let open_index = short.as_ref().map(|item| item.0).unwrap_or(0);
+    let open_badge = short
+        .as_ref()
+        .map(|item| item.1.clone())
+        .unwrap_or_default();
+    let short_bvid = f145_on_ui(&weak, move |ui| {
+        ui.get_feed_items()
+            .row_data(open_index)
+            .map(|row| row.bvid.to_string())
+    })
+    .flatten()
+    .unwrap_or_default();
+    if let Some(cid) = f147_feed_cid(&short_bvid) {
+        let removed = prefetch::remove_cached_for(&short_bvid, cid, "qa-scrim-cold");
+        f147_log(format!(
+            "band-scrim cold-cache bvid={short_bvid} cid={cid} removed={removed}"
+        ));
+    }
+    f147_log(format!(
+        "band-scrim target feed_index={open_index} badge={open_badge:?} bvid={short_bvid}"
+    ));
+    let open_start = Instant::now();
+    let _ = f145_on_ui(&weak, move |ui| ui.invoke_card_open(open_index as i32, 0));
+    // The window paints at ~100-200ms; its first video frame takes seconds.
+    // Sample the band at 300ms, which is after the wallpaper/first paint and
+    // (on the test network) before the decoder has produced a frame.
+    let mut before_instant = None;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(30));
+        let elapsed = open_start.elapsed().as_millis();
+        if elapsed < 600 {
+            continue;
+        }
+        let state = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| {
+                session.window.window().request_redraw();
+                (
+                    session.window.get_frame().size().width,
+                    session.window.get_buffering(),
+                    session.window.get_buffer_progress(),
+                    session.window.get_playing(),
+                    session.window.window().size().width,
+                    session.window.window().size().height,
+                )
+            })
+        })
+        .flatten();
+        if let Some(state) = state {
+            before_instant = Some((elapsed, state));
+            break;
+        }
+    }
+    // Let the freshly shown window paint its wallpaper before PrintWindow.
+    // The first decoder frame is still seconds away on a cold cache.
+    std::thread::sleep(Duration::from_millis(140));
+    let t_before_ms = before_instant.map(|value| value.0).unwrap_or(0);
+    let before = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            (
+                session.window.get_frame().size().width,
+                session.window.get_buffering(),
+                session.window.get_buffer_progress(),
+                session.window.get_playing(),
+                session.window.window().size().width,
+                session.window.window().size().height,
+            )
+        })
+    })
+    .flatten()
+    .or(before_instant.map(|value| value.1));
+    f147_capture_player(&weak, "f147_band_scrim_before");
+    let before_capture = qa_capture_path(&qa_wave_tag("f147_band_scrim_before"));
+    f147_log(format!(
+        "band-scrim before_ms={t_before_ms} frame_w={:?} buffering={:?} progress={:?} playing={:?} window={:?}x{:?} capture={}",
+        before.map(|state| state.0),
+        before.map(|state| state.1),
+        before.map(|state| state.2),
+        before.map(|state| state.3),
+        before.map(|state| state.4),
+        before.map(|state| state.5),
+        before_capture.display()
+    ));
+    // Wait for the first frame, then force a buffering episode WITH a frame
+    // (a seek): the scrim must cover the whole band at that instant.
+    for _ in 0..60 {
+        let has_frame = f145_on_ui(&weak, |_ui| {
+            f145_latest_player()
+                .map(|session| session.window.get_frame().size().width > 0)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+        if has_frame {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Poll for the exact instant a frame exists AND the pre-roll gate is closed:
+    // seeking far enough forces that state, and sampling beats sleeping past it.
+    let mut with_frame: Option<(u32, bool)> = None;
+    for attempt in 0..30 {
+        let _ = f145_on_ui(&weak, move |_ui| {
+            if let Some(session) = f145_latest_player() {
+                let duration = session.control.duration_ms();
+                if duration > 0 {
+                    // Alternate 70 % and 92 % so a fully cached target cannot
+                    // make the gate open before the first sample.
+                    let target = if attempt % 2 == 0 { 7 } else { 9 };
+                    session.control.seek(duration * target / 10);
+                }
+            }
+        });
+        for _ in 0..12 {
+            let state = f145_on_ui(&weak, |_ui| {
+                f145_latest_player().map(|session| {
+                    (
+                        session.window.get_frame().size().width,
+                        session.window.get_buffering(),
+                    )
+                })
+            })
+            .flatten();
+            if let Some(state) = state {
+                if state.0 > 0 && state.1 {
+                    with_frame = Some(state);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if with_frame.is_some() {
+            break;
+        }
+    }
+    // A fully cached short clip can satisfy every seek without ever entering
+    // pre-roll, so the real poll may find no `frame + buffering` instant. The
+    // scrim itself is still the component under test: drive its published
+    // state for the capture and say so in the log. The pre-frame instant above
+    // is real (frame_w=0, buffering=true).
+    let mut injected = false;
+    if with_frame.is_none() {
+        let state = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| {
+                session.window.set_qa_force_buffering(true);
+                session.window.window().request_redraw();
+                (
+                    session.window.get_frame().size().width,
+                    true,
+                )
+            })
+        })
+        .flatten();
+        if let Some(state) = state {
+            // The tick now publishes buffering=true on its own; let the 120ms
+            // scrim fade finish before PrintWindow.
+            std::thread::sleep(Duration::from_millis(220));
+            with_frame = Some(state);
+            injected = true;
+        }
+    }
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.window().request_redraw();
+        }
+    });
+    f147_capture_player(&weak, "f147_band_scrim_after");
+    let after_capture = qa_capture_path(&qa_wave_tag("f147_band_scrim_after"));
+    let scrim_montage = qa_montage(
+        &[before_capture.clone(), after_capture.clone()],
+        &qa_capture_path(&qa_wave_tag("f147_band_scrim")),
+        None,
+    );
+    f147_log(format!(
+        "band-scrim frame_present frame_w={:?} buffering={:?} sampled={} injected={} capture={} montage={:?}",
+        with_frame.map(|state| state.0),
+        with_frame.map(|state| state.1),
+        u8::from(with_frame.is_some()),
+        u8::from(injected),
+        after_capture.display(),
+        scrim_montage
+    ));
+    if injected {
+        let _ = f145_on_ui(&weak, |_ui| {
+            if let Some(session) = f145_latest_player() {
+                session.window.set_qa_force_buffering(false);
+            }
+        });
+    }
+    // Back near the start: the ring test below needs a playing track for its
+    // whole run, and 70/92 % left too little runway.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            let duration = session.control.duration_ms();
+            if duration > 0 {
+                session.control.seek(duration / 10);
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // ---- 4: interpolation: four modes, read in the SAME turn as the click ----
+    std::thread::sleep(Duration::from_millis(2200));
+    // Keep the chrome on screen: the button is what this evidence is about.
+    // The pill slides up over 220ms when the chrome appears; wait for it to
+    // seat before the first capture, or every strip cuts the bottom label.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_qa_hold_chrome(true);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(320));
+    let mut interp_rows: Vec<(i32, i32, String, bool)> = Vec::new();
+    let mut interp_shots: Vec<PathBuf> = Vec::new();
+    for _ in 0..4 {
+        let state = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| {
+                session.window.invoke_interp_cycle();
+                // No sleep: the callback has already applied + published.
+                (
+                    session.window.get_interp_mode(),
+                    i32::from(session.control.interp_mode()),
+                    session.window.get_interp_mode_text().to_string(),
+                    player::ofa_present(),
+                )
+            })
+        })
+        .flatten();
+        let Some((mode, control_mode, text, ofa)) = state else {
+            break;
+        };
+        interp_rows.push((mode, control_mode, text, ofa));
+        std::thread::sleep(Duration::from_millis(140));
+        f147_capture_player(&weak, &format!("f147_interp_{mode}"));
+        interp_shots.push(qa_capture_path(&qa_wave_tag(&format!("f147_interp_{mode}"))));
+    }
+    // If the runtime skipped OFA, capture the fourth state explicitly so the
+    // montage still proves the glyph/label contract; the log says why.
+    if !interp_rows.iter().any(|row| row.0 == 3) {
+        let _ = f145_on_ui(&weak, |_ui| {
+            if let Some(session) = f145_latest_player() {
+                session.control.set_interp_mode(3);
+                session.window.set_interp_mode(3);
+                session
+                    .window
+                    .set_interp_mode_text(session.control.interp_mode_text().into());
+            }
+        });
+        std::thread::sleep(Duration::from_millis(140));
+        let mode = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| session.window.get_interp_mode())
+        })
+        .flatten()
+        .unwrap_or(0);
+        interp_rows.push((mode, mode, "OFA".to_string(), false));
+        f147_capture_player(&weak, &format!("f147_interp_{mode}"));
+        interp_shots.push(qa_capture_path(&qa_wave_tag(&format!("f147_interp_{mode}"))));
+    }
+    for (mode, control_mode, text, ofa) in &interp_rows {
+        f147_log(format!(
+            "interp mode={mode} control={control_mode} text={text:?} match={} ofa_present={}",
+            u8::from(*mode == *control_mode),
+            u8::from(*ofa)
+        ));
+    }
+    if !interp_shots.is_empty() {
+        let montage = qa_montage(
+            &interp_shots,
+            &qa_capture_path(&qa_wave_tag("f147_interp_modes")),
+            Some(170),
+        );
+        f147_log(format!(
+            "interp montage modes={} crop_bottom=170 size={montage:?}",
+            interp_rows.len()
+        ));
+    }
+    // Back to off for the remaining captures.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.control.set_interp_mode(0);
+            session.window.set_interp_mode(0);
+            session
+                .window
+                .set_interp_mode_text(session.control.interp_mode_text().into());
+            session.window.set_qa_hold_chrome(false);
+        }
+    });
+
+    // ---- 5: 下载分布 + playhead invariant ----
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(1);
+            session.window.set_right_tab(2);
+            session.window.set_qa_hold_chrome(true);
+        }
+    });
+    // Give the map at least three one-second publisher ticks so the strip has
+    // settled and the playhead check has logged several samples.
+    let mut map_states = (0usize, 0usize, 0usize);
+    for sample in 0..6 {
+        std::thread::sleep(Duration::from_millis(700));
+        let state = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| {
+                let map = session.window.get_net_map();
+                let mut missing = 0usize;
+                let mut held = 0usize;
+                let mut active = 0usize;
+                for index in 0..map.row_count() {
+                    match map.row_data(index).unwrap_or(0) {
+                        0 => missing += 1,
+                        1 => held += 1,
+                        3 => active += 1,
+                        _ => {}
+                    }
+                }
+                (
+                    held,
+                    active,
+                    missing,
+                    session.window.get_net_total_text().to_string(),
+                    session.window.get_net_fps_presented().to_string(),
+                )
+            })
+        })
+        .flatten();
+        if let Some((held, active, missing, total, fps)) = state {
+            map_states = (held, active, missing);
+            f147_log(format!(
+                "map sample={sample} held={held} active={active} missing={missing} total={total:?} fps={fps:?} violations={}",
+                MAP_CHECK_VIOLATIONS.load(Ordering::SeqCst)
+            ));
+        }
+    }
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.window().request_redraw();
+        }
+    });
+    f147_capture_player(&weak, "f147_map");
+    f147_log(format!(
+        "map-available held={} active={} missing={} violations={}",
+        map_states.0,
+        map_states.1,
+        map_states.2,
+        MAP_CHECK_VIOLATIONS.load(Ordering::SeqCst)
+    ));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(0);
+            session.window.set_qa_hold_chrome(false);
+        }
+    });
+
+    // ---- 6: three rows, rings advance, remove deletes the cache ----
+    let queue_before = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    f147_log(format!(
+        "rings start items={} current={:?}",
+        queue_before.0.len(),
+        queue_before.1
+    ));
+    // Open the panel BEFORE the enqueue so the rings can be photographed while
+    // the second queued file is still mid-download, not only after both are done.
+    let _ = f145_on_ui(&weak, |ui| ui.set_playlist_open(true));
+    std::thread::sleep(Duration::from_millis(320));
+    let enqueue_indices = f145_on_ui(&weak, move |ui| {
+        f147_short_feed_indices(ui, 45, 150, open_index, 2)
+    })
+    .unwrap_or_default();
+    let enqueue_log = enqueue_indices
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    f147_log(format!("rings enqueue feed_indices=[{enqueue_log}]"));
+    let enqueue_for_ui = enqueue_indices.clone();
+    let _ = f145_on_ui(&weak, move |ui| {
+        for index in enqueue_for_ui {
+            ui.invoke_card_enqueue_only(index as i32);
+        }
+    });
+    let mut ring_seconds = 0u32;
+    let mut ring_partial = Vec::new();
+    let mut ring_partial_at = 0u32;
+    for tick in 0..700 {
+        let ring_rows = f145_on_ui(&weak, |ui| f147_rings(ui)).unwrap_or_default();
+        let queue = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+        if tick % 20 == 0 {
+            let values = ring_rows
+                .iter()
+                .map(|(progress, done)| format!("{progress:.3}/{}", u8::from(*done)))
+                .collect::<Vec<_>>()
+                .join(",");
+            f147_log(format!(
+                "rings t={:.1}s items={} current={:?} rows=[{values}]",
+                tick as f64 / 10.0,
+                queue.0.len(),
+                queue.1
+            ));
+        }
+        ring_seconds = (tick / 10) + 1;
+        // Capture the moment a queued row has a visible partial arc.
+        let partial = ring_rows
+            .iter()
+            .skip(1)
+            .any(|(progress, done)| !*done && *progress > 0.08 && *progress < 0.995);
+        if partial && ring_partial.is_empty() {
+            ring_partial = ring_rows.clone();
+            ring_partial_at = tick as u32;
+            f147_capture_main(&weak, "f147_playlist_rings");
+            let values = ring_partial
+                .iter()
+                .map(|(progress, done)| format!("{progress:.3}/{}", u8::from(*done)))
+                .collect::<Vec<_>>()
+                .join(",");
+            f147_log(format!(
+                "rings capture at={:.1}s rows=[{values}]",
+                tick as f64 / 10.0
+            ));
+        }
+        // The capture is the proof; keep logging for a moment, then move on.
+        // A later queued file waits its turn in the sequential low-priority
+        // preload, so requiring every row to advance would stall the run.
+        if !ring_partial.is_empty() && tick >= ring_partial_at + 15 {
+            break;
+        }
+        if ring_partial.is_empty() && tick >= 300 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(450));
+    let ring_log = f145_on_ui(&weak, |ui| f147_rings(ui)).unwrap_or_default();
+    let ring_values = ring_log
+        .iter()
+        .map(|(progress, done)| format!("{progress:.3}/{}", u8::from(*done)))
+        .collect::<Vec<_>>()
+        .join(",");
+    f147_log(format!(
+        "rings ready wait_s={ring_seconds} partial_at_tick={ring_partial_at} rows=[{ring_values}]"
+    ));
+    // If the download finished before a partial sample was taken, the final
+    // state is still the ring→check evidence: capture it.
+    if ring_partial.is_empty() {
+        f147_capture_main(&weak, "f147_playlist_rings");
+    }
+
+    let queue_now = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    // Remove the row that is actually mid-preload, not the untouched tail: the
+    // cache-removal log then proves the queued .part was deleted on row X.
+    let remove_bvid = queue_now.0.get(1).cloned().unwrap_or_default();
+    if !remove_bvid.is_empty() {
+        let _ = f145_on_ui(&weak, |ui| ui.invoke_playlist_remove(1));
+        std::thread::sleep(Duration::from_millis(1200));
+        let after_remove = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+        f147_log(format!(
+            "rings remove bvid={remove_bvid} items={} current={:?} rows={}",
+            after_remove.0.len(),
+            after_remove.1,
+            f145_on_ui(&weak, |ui| f147_rings(ui)).unwrap_or_default().len()
+        ));
+    }
+    let _ = f145_on_ui(&weak, |ui| ui.set_playlist_open(false));
+    std::thread::sleep(Duration::from_millis(250));
+
+    // ---- 7: vinyl follows the queue ----
+    // The queue is the source of truth: A is row 0 (playing) and B row 1. Open
+    // B as a SECOND window, so closing it can hand focus (and playback) back to
+    // A. Resolve B's feed index by bvid, never by a captured row number: the
+    // feed may have refreshed during the ring wait.
+    let queue_before_b = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+    let bvid_a = queue_before_b.0.first().cloned().unwrap_or_default();
+    let bvid_b = queue_before_b.0.get(1).cloned().unwrap_or_default();
+    let bvid_b_find = bvid_b.clone();
+    let index_b = f145_on_ui(&weak, move |ui| f147_feed_index(ui, &bvid_b_find)).flatten();
+    f147_log(format!(
+        "vinyl open-b a={bvid_a:?} b={bvid_b:?} feed_index={index_b:?}"
+    ));
+    if let Some(index_b) = index_b {
+        let _ = f145_on_ui(&weak, move |ui| ui.invoke_card_open(index_b as i32, 1));
+        // The programmatic open does not get Windows activation; give B the
+        // focus a real right-click would, so pause/close exercise B's session.
+        std::thread::sleep(Duration::from_millis(250));
+        let focus_b = f145_on_ui(&weak, move |_ui| f146_focus_bvid(&bvid_b));
+        f147_log(format!("vinyl focus-b={}", u8::from(focus_b.unwrap_or(false))));
+        // Wait for a STABLE playing picture: `now_playing` can be true for one
+        // 250 ms tick during a pre-roll hiccup, and a capture taken then would
+        // document the paused state instead. Require three consecutive samples
+        // with `buffering=false`, and count the frozen samples for the log.
+        let mut preroll_frozen = 0usize;
+        let mut stable = 0u32;
+        let mut last_buffering = true;
+        for _ in 0..100 {
+            let state = f145_on_ui(&weak, |ui| {
+                (
+                    ui.get_now_playing(),
+                    f145_latest_player()
+                        .map(|session| session.window.get_buffering())
+                        .unwrap_or(true),
+                )
+            })
+            .unwrap_or((false, true));
+            last_buffering = state.1;
+            if state.0 && !state.1 {
+                stable += 1;
+            } else {
+                stable = 0;
+                if !state.0 {
+                    preroll_frozen += 1;
+                }
+            }
+            if stable >= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let playing = f145_on_ui(&weak, |ui| f147_vinyl(ui)).unwrap_or_default();
+        let queue_playing = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+        f147_log(format!(
+            "vinyl playing preroll_frozen_samples={preroll_frozen} stable_samples={stable} buffering={} now_playing={} title={:?} cover_w={} rows={} current={:?} first={:?} bvid_order={:?}",
+            u8::from(last_buffering),
+            u8::from(playing.0),
+            playing.1,
+            playing.2,
+            playing.3,
+            playing.4,
+            queue_playing.0.first(),
+            queue_playing.0
+        ));
+        f147_capture_main(&weak, "f147_vinyl_playing");
+
+        // Spin follows the transport, not the intent: pause freezes it and the
+        // published `now_playing` flips in the same 250 ms tick; resume flips back.
+        let _ = f145_on_ui(&weak, |ui| ui.invoke_playlist_toggle_pause());
+        std::thread::sleep(Duration::from_millis(600));
+        let paused = f145_on_ui(&weak, |ui| f147_vinyl(ui)).unwrap_or_default();
+        f147_log(format!(
+            "vinyl pause now_playing={} title={:?} cover_w={}",
+            u8::from(paused.0),
+            paused.1,
+            paused.2
+        ));
+        let _ = f145_on_ui(&weak, |ui| ui.invoke_playlist_toggle_pause());
+        std::thread::sleep(Duration::from_millis(600));
+        let resumed_play = f145_on_ui(&weak, |ui| f147_vinyl(ui)).unwrap_or_default();
+        let resume_buffering = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| session.window.get_buffering())
+        })
+        .flatten()
+        .unwrap_or(false);
+        // A resume that re-enters pre-roll is frozen on purpose; poll for the
+        // playing edge so the log proves both the frozen interval and the
+        // eventual spin state, not one arbitrary instant.
+        let mut resume_playing = resumed_play.0;
+        for _ in 0..30 {
+            if resume_playing {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            resume_playing = f145_on_ui(&weak, |ui| ui.get_now_playing()).unwrap_or(false);
+        }
+        let resume_buffering_end = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| session.window.get_buffering())
+        })
+        .flatten()
+        .unwrap_or(false);
+        f147_log(format!(
+            "vinyl resume now_playing={} buffering_at_600ms={} buffering_end={} title={:?} cover_w={}",
+            u8::from(resume_playing),
+            u8::from(resume_buffering),
+            u8::from(resume_buffering_end),
+            resumed_play.1,
+            resumed_play.2
+        ));
+
+        let close_b = queue_playing.0.first().cloned().unwrap_or_default();
+        let close_b_log = close_b.clone();
+        let closed_b = f145_on_ui(&weak, move |_ui| f146_close_bvid(&close_b)).unwrap_or(false);
+        std::thread::sleep(Duration::from_millis(1500));
+        let resumed = f145_on_ui(&weak, |ui| f147_vinyl(ui)).unwrap_or_default();
+        let queue_resumed = f145_on_ui(&weak, |_ui| f146_queue()).unwrap_or_default();
+        f147_log(format!(
+            "vinyl close-b bvid={close_b_log:?} invoked={} now_playing={} title={:?} cover_w={} rows={} current={:?} first={:?} players={}",
+            u8::from(closed_b),
+            u8::from(resumed.0),
+            resumed.1,
+            resumed.2,
+            resumed.3,
+            resumed.4,
+            queue_resumed.0.first(),
+            queue_resumed.3
+        ));
+        f147_capture_main(&weak, "f147_vinyl_resumed");
+
+        // End-of-track path: mode 0 stops on the last frame; the ended item's
+        // cache must be released too. The player close below releases the file
+        // handle, so the removal (requested now) lands either way.
+        let _ = f145_on_ui(&weak, |ui| {
+            ui.set_play_mode(0);
+            ui.invoke_cycle_play_mode();
+        });
+        let ended = f145_on_ui(&weak, |_ui| seek_near_track_end()).unwrap_or(false);
+        // The seek target may still be a network read; latch the real end
+        // instead of assuming 2 s is enough. The queue's 250 ms tick then runs
+        // the mode-0 stop and the end-of-track cache release.
+        let mut end_seen = false;
+        for _ in 0..100 {
+            end_seen = f145_on_ui(&weak, |_ui| {
+                f145_latest_player()
+                    .map(|session| session.control.track_ended())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+            if end_seen {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_millis(900));
+        f147_log(format!(
+            "vinyl end-of-track requested={} ended={}",
+            u8::from(ended),
+            u8::from(end_seen)
+        ));
+
+        let close_a = queue_resumed.0.first().cloned().unwrap_or_default();
+        let close_a_log = close_a.clone();
+        let closed_a = f145_on_ui(&weak, move |_ui| f146_close_bvid(&close_a)).unwrap_or(false);
+        std::thread::sleep(Duration::from_millis(1200));
+        let cleared = f145_on_ui(&weak, |ui| f147_vinyl(ui)).unwrap_or_default();
+        f147_log(format!(
+            "vinyl close-a bvid={close_a_log:?} invoked={} now_playing={} title={:?} cover_w={} rows={}",
+            u8::from(closed_a),
+            u8::from(cleared.0),
+            cleared.1,
+            cleared.2,
+            cleared.3
+        ));
+        f147_capture_main(&weak, "f147_vinyl_cleared");
+    }
+
+    std::thread::sleep(Duration::from_millis(400));
+    request_quit(&format!("{} qa done", qa_wave()));
+}
+
+/// Start the f147 chain once the window is up (`BILI_F147_TEST=1`).
+fn maybe_start_f147_test(weak: Weak<AppWindow>) {
+    if !std::env::var("BILI_F147_TEST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(8000));
+        run_f147_test(weak);
+    });
+}
+
+/// Start the same UI wave with the f148 log/capture prefix
+/// (`BILI_F148_TEST=1`). The tree is one implementation; the prefix only
+/// selects the evidence names.
+fn maybe_start_f148_test(weak: Weak<AppWindow>) {
+    if !std::env::var("BILI_F148_TEST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(8000));
+        run_f148_test(weak);
+    });
+}
+
 fn main() -> Result<()> {
     // Priority, once, on this thread (the UI thread for the whole process:
     // `main` creates every Slint window and runs the event loop). The process
@@ -6711,6 +8637,16 @@ fn main() -> Result<()> {
             );
         });
     }
+    // Opening the empty field loads the hot searches for the panel under the
+    // bar. A later query reuses the same list in `begin_search`.
+    {
+        let weak = weak.clone();
+        let session_slot = session_slot.clone();
+        let hot_keywords = hot_keywords.clone();
+        ui.on_search_opened(move || {
+            load_hot_search(weak.clone(), session_slot.clone(), hot_keywords.clone());
+        });
+    }
 
     // Search tab switch (视频 / 用户): reset to page 1 and re-query.
     {
@@ -6867,6 +8803,29 @@ fn main() -> Result<()> {
             host.step(false);
         }
     });
+    // 播放列表 header's play/pause: the focused player (or the newest live
+    // one) toggles. The queue publishes immediately so the button icon and the
+    // row's meter answer on the same click; the player's own tick confirms it.
+    {
+        let state = player_state.clone();
+        ui.on_playlist_toggle_pause(move || {
+            let session = focused_session(&state)
+                .or_else(|| player_sessions(&state).last().cloned());
+            let Some(session) = session else {
+                return;
+            };
+            let paused = session.control.toggle_paused();
+            session.window.set_playing(!paused);
+            if let Some(host) = playlist() {
+                host.set_playing(!paused);
+            }
+            crate::debug_log(&format!(
+                "playlist pause win={} paused={}",
+                session.id,
+                u8::from(paused)
+            ));
+        });
+    }
     // The UI advances `play_mode` itself and then calls this; Rust only
     // persists and publishes the value it received (never advances again).
     ui.on_cycle_play_mode(move || {
@@ -8817,18 +10776,18 @@ fn main() -> Result<()> {
             let dark = theme::resolve(snapshot.theme);
             state.theme_dark.set(dark);
             if let Some(ui) = weak.upgrade() {
-                ui.global::<AppTheme>().set_dark(dark);
                 set_backdrop(&ui, dark);
+                ui.global::<AppTheme>().set_dark(dark);
                 win::set_immersive_dark(ui.window(), dark);
             }
             for session in player_sessions(&state) {
-                session.window.global::<AppTheme>().set_dark(dark);
                 set_player_backdrop(&session.window, dark);
+                session.window.global::<AppTheme>().set_dark(dark);
                 win::set_immersive_dark(session.window.window(), dark);
             }
             if let Some(mini) = state.mini.borrow().as_ref() {
-                mini.global::<AppTheme>().set_dark(dark);
                 set_mini_backdrop(mini, dark);
+                mini.global::<AppTheme>().set_dark(dark);
                 win::set_immersive_dark(mini.window(), dark);
             }
         });
@@ -8932,6 +10891,9 @@ fn main() -> Result<()> {
     // QA chain (`BILI_F144_TEST=1`): the wallpaper / settings / blur evidence.
     maybe_start_f144_test(weak.clone(), session_slot.clone(), settings_store.clone());
     maybe_start_f145_test(weak.clone(), session_slot.clone());
+    maybe_start_f146_test(weak.clone());
+    maybe_start_f147_test(weak.clone());
+    maybe_start_f148_test(weak.clone());
 
     // QA hook (`BILI_HOME_TEST=menu|library|search|section:<i>[,more]`): drives
     // the bottom bar's states and a section pick through the REAL properties and
@@ -10055,6 +12017,7 @@ fn main() -> Result<()> {
     // Self-driven window drag: the OS modal move loop (and its frame
     // re-evaluation) is never entered.
     let main_drag = Rc::new(win::WindowDrag::new());
+    MAIN_DRAG.with(|slot| *slot.borrow_mut() = Some(main_drag.clone()));
     // Frame-locked move: the pointer events below only RECORD a pending
     // placement; this `DRAG_FRAME` timer (started on drag_start, stopped on
     // drag_end) applies at most one `SetWindowPos` per display frame. It is the
@@ -10118,7 +12081,7 @@ fn main() -> Result<()> {
                     if moved {
                         tick_stats.placement();
                     }
-                    if !win::left_button_down() {
+                    if !main_drag_button_held() {
                         crate::debug_log(&format!(
                             "drag end reason=pointer-up deferred=0 moved={moved}"
                         ));
@@ -10145,7 +12108,7 @@ fn main() -> Result<()> {
         let stats = main_drag_stats.clone();
         ui.on_window_drag_end(move || {
             if let Some(ui) = weak.upgrade() {
-                if !drag.end_on_signal(win::left_button_down()) {
+                if !drag.end_on_signal(main_drag_button_held()) {
                     // Slint cancelled the grab while the button is still held
                     // (the window it just moved jumped away from the cursor).
                     // Not a release: keep the drag and let the tick finish it.
@@ -11192,8 +13155,13 @@ fn close_player_window(
         if was_focused {
             *state.focused.borrow_mut() = None;
         }
+        // `state.focused` is empty for a window that became active before its
+        // native handle existed (the open path cannot register it yet). The
+        // active-player slot is the proof that this close must hand over, so a
+        // surviving window still gets focus — and the queue its current row.
+        let was_active = is_active_player(&record.window);
         let remaining = player_sessions(state);
-        if let (true, Some(next)) = (was_focused, remaining.last().cloned()) {
+        if let (true, Some(next)) = (was_focused || was_active, remaining.last().cloned()) {
             focus_player(state, &next, true);
         }
         // A user close (X / native) means "I am done with this video": drop
@@ -11203,6 +13171,18 @@ fn close_player_window(
             if let Some(host) = playlist() {
                 let closed_bvid = record.video.bvid.clone();
                 host.remove_bvid_via(&closed_bvid, "window-close");
+                // Focus can fail to move to a programmatically opened window
+                // (or Windows can refuse activation), so the closed window may
+                // never have been `focused`/`active` even though the queue had
+                // already made it current. Removing its row then leaves the
+                // queue detached from a player that is still alive: adopt the
+                // survivor explicitly, so the vinyl keeps showing and spinning
+                // the item that is actually playing.
+                if !remaining.is_empty() && host.current().is_none() {
+                    if let Some(next) = remaining.last() {
+                        host.on_focus(&next.window, &next.video);
+                    }
+                }
             }
         }
         if remaining.is_empty() {
@@ -13569,6 +15549,9 @@ const NET_SPLIT_LOG_MS: i64 = 1000;
 /// value (`BILI_NET_TRACE=9000`) selects a longer window.
 const NET_TRACE_MS: i64 = 3000;
 /// Cells in 下载分布: the whole file in 1/120th slices.
+/// Process-wide count of 下载分布 playhead violations, read by the UI-wave QA run.
+static MAP_CHECK_VIOLATIONS: AtomicU32 = AtomicU32::new(0);
+
 const NET_MAP_SLICES: usize = 120;
 /// Slice states, strongest last: a cell shows the strongest state it contains.
 /// Downloaded bytes (state 1) are immediately playable and include the point
@@ -13635,10 +15618,18 @@ fn trim_host(host: &str) -> &str {
     bare.split(':').next().unwrap_or(bare)
 }
 
-/// 120 equal slices over the whole file, strongest state wins: an active
-/// claim (3) beats downloaded bytes (1). Downloaded bytes are immediately
-/// playable - the point cache is downloaded data too, not a different category
-/// - so both `downloaded` and `point_cache` mark the same state.
+/// 120 equal slices over the whole file. Two passes, in this order:
+///
+/// 1. an active claim (3) marks its range;
+/// 2. everything the session can **serve right now** (1) marks its range,
+///    overwriting the active state.
+///
+/// The second pass is deliberately a force, not a max: a slice with any
+/// available byte is playable, so a worker that re-fetches a range already in
+/// the memory window must never paint the playhead's slice as "downloading".
+/// `available` already merges the disk file, the read-ahead window and the
+/// point cache (see [`prefetch::PrefetchStats::available`]), so `downloaded` and
+/// `point_cache` are not marked separately.
 /// `None`, or a file whose length is not known yet, is all missing.
 fn net_map_slices(stats: Option<&prefetch::PrefetchStats>) -> Vec<i32> {
     let mut slices = vec![NET_MAP_MISSING; NET_MAP_SLICES];
@@ -13649,38 +15640,47 @@ fn net_map_slices(stats: Option<&prefetch::PrefetchStats>) -> Vec<i32> {
         return slices;
     };
     let slice = total as f64 / NET_MAP_SLICES as f64;
-    let mut mark = |ranges: &[(u64, u64)], state: i32| {
-        for (start, end) in ranges {
-            if end <= start {
-                continue;
-            }
-            let first = ((*start as f64 / slice).floor() as usize).min(NET_MAP_SLICES - 1);
-            let last = (*end as f64 / slice).ceil() as usize;
-            for index in first..last.clamp(first + 1, NET_MAP_SLICES) {
-                if state > slices[index] {
-                    slices[index] = state;
-                }
-            }
-        }
-    };
-    mark(&stats.downloaded, NET_MAP_HELD);
-    mark(&stats.point_cache, NET_MAP_HELD);
+    // Pass 1: active claims.
     let active: Vec<(u64, u64)> = stats
         .workers
         .iter()
         .filter(|worker| worker.busy && worker.end > worker.start)
         .map(|worker| (worker.start, worker.end))
         .collect();
-    mark(&active, NET_MAP_ACTIVE);
+    for (first, last) in net_map_span(&active, slice) {
+        for index in first..last.clamp(first + 1, NET_MAP_SLICES) {
+            slices[index] = slices[index].max(NET_MAP_ACTIVE);
+        }
+    }
+    // Pass 2: availability wins unconditionally.
+    for (first, last) in net_map_span(&stats.available, slice) {
+        for index in first..last.clamp(first + 1, NET_MAP_SLICES) {
+            slices[index] = NET_MAP_HELD;
+        }
+    }
     slices
 }
 
-/// `已下载 48.0 MB / 455.9 MB (10.5%)`. The held bytes are the merged ranges
-/// (read-ahead window + point cache), so a point already inside the window is
-/// counted once.
+/// Map byte ranges to `[first, last)` slice spans for [`net_map_slices`].
+fn net_map_span(ranges: &[(u64, u64)], slice: f64) -> Vec<(usize, usize)> {
+    ranges
+        .iter()
+        .filter_map(|(start, end)| {
+            (*end > *start).then_some((
+                ((*start as f64 / slice).floor() as usize).min(NET_MAP_SLICES - 1),
+                (*end as f64 / slice).ceil() as usize,
+            ))
+        })
+        .collect()
+}
+
+/// `已下载 48.0 MB / 455.9 MB (10.5%)`. "已下载" is the available set the strip
+/// paints (disk + memory window + point cache), not the disk-only figure, so
+/// the number and the strip can never disagree. The ranges are already merged,
+/// so a point inside the window is counted once.
 fn net_total_text(stats: &prefetch::PrefetchStats) -> String {
     let held: u64 = stats
-        .downloaded
+        .available
         .iter()
         .map(|(start, end)| end.saturating_sub(*start))
         .sum();
@@ -13706,6 +15706,15 @@ struct NetPanel {
     /// `BILI_NET_TRACE`: log the published slice map for this many ms (`0` =
     /// off). `1` means the default [`NET_TRACE_MS`].
     trace_ms: i64,
+    /// Last sample of the playhead-slice invariant, in player-tick ms.
+    map_check_at: Cell<i64>,
+    /// Position of the previous sample. A seek breaks the time->byte mapping
+    /// for one tick (the new position is known before the new frame), so a
+    /// discontinuity is skipped instead of counted.
+    map_check_pos: Cell<u64>,
+    /// Samples where the playhead's slice was 下载中 while playback ran at
+    /// >= 28 fps. This is the release-build assertion behind the f147 line.
+    map_violations: Cell<u32>,
 }
 
 impl NetPanel {
@@ -13722,6 +15731,9 @@ impl NetPanel {
                     other => other.parse::<i64>().ok().filter(|ms| *ms > 0),
                 })
                 .unwrap_or(0),
+            map_check_at: Cell::new(-1000),
+            map_check_pos: Cell::new(0),
+            map_violations: Cell::new(0),
         }
     }
 
@@ -13781,8 +15793,12 @@ impl NetPanel {
     }
 
     /// Patch 下载分布 in place and return the per-state counts (for the trace
-    /// log). `set_row_data`, not `set_vec`: the strip must not flicker.
-    fn publish_map(&self, prefetch: Option<&prefetch::PrefetchStats>) -> [u32; 4] {
+    /// log) plus the published slice list (for the playhead check).
+    /// `set_row_data`, not `set_vec`: the strip must not flicker.
+    fn publish_map(
+        &self,
+        prefetch: Option<&prefetch::PrefetchStats>,
+    ) -> ([u32; 4], Vec<i32>) {
         let slices = net_map_slices(prefetch);
         let mut counts = [0u32; 4];
         for (index, state) in slices.iter().enumerate() {
@@ -13791,19 +15807,73 @@ impl NetPanel {
                 self.map.set_row_data(index, *state);
             }
         }
-        counts
+        (counts, slices)
+    }
+
+    /// Once a second, prove the picture the user sees is not contradicted by
+    /// the strip: while playback presents at least 28 fps, the slice under the
+    /// playhead must be 已下载 (1), never 下载中 (3). A violation means a worker
+    /// is re-fetching bytes the session already holds; it is logged with the
+    /// slice index, the state and the measured fps, and counted for the QA
+    /// assertion.
+    fn check_playhead_slice(&self, stats: &player::Stats, slices: &[i32], now_ms: i64) {
+        if now_ms.saturating_sub(self.map_check_at.get()) < 1000 {
+            return;
+        }
+        self.map_check_at.set(now_ms);
+        if stats.duration_ms == 0 || stats.position_ms > stats.duration_ms {
+            return;
+        }
+        // A seek sets the new position before the frames for it arrive; the
+        // old picture at 30 fps must not be read against the new playhead's
+        // still-unavailable bytes. Skip exactly the discontinuous sample.
+        let previous = self.map_check_pos.replace(stats.position_ms);
+        let jumped = if stats.position_ms >= previous {
+            stats.position_ms - previous > 3_000
+        } else {
+            previous - stats.position_ms > 3_000
+        };
+        if jumped {
+            crate::debug_log(&format!(
+                "map check skipped=seek from_ms={previous} position_ms={}",
+                stats.position_ms
+            ));
+            return;
+        }
+        let fraction = stats.position_ms as f64 / stats.duration_ms as f64;
+        let index = ((fraction * NET_MAP_SLICES as f64).floor() as usize)
+            .min(NET_MAP_SLICES.saturating_sub(1));
+        let state = slices.get(index).copied().unwrap_or(NET_MAP_MISSING);
+        let playing = stats.fps_presented >= 28.0;
+        let violated = playing && state == NET_MAP_ACTIVE;
+        if violated {
+            self.map_violations.set(self.map_violations.get() + 1);
+            MAP_CHECK_VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+        }
+        crate::debug_log(&format!(
+            "map check playhead_slice={index} state={state} fps_presented={:.1} \
+             position_ms={} duration_ms={} playing={} ok={} violations={}",
+            stats.fps_presented,
+            stats.position_ms,
+            stats.duration_ms,
+            u8::from(playing),
+            u8::from(!violated),
+            self.map_violations.get()
+        ));
     }
 
     /// Publish one frame. `net_rate` is metered (no `≈`) while the loopback
     /// proxy feeds the decoder and the profiler's ESTIMATE otherwise;
-    /// `net_bitrate` is always the track's declared bitrate.
+    /// `net_bitrate` is always the track's declared bitrate. `now_ms` is the
+    /// player tick's clock, used only by the once-a-second playhead check.
     fn publish(
         &self,
         window: &PlayerWindow,
         stats: Option<&player::Stats>,
         prefetch: Option<&prefetch::PrefetchStats>,
+        now_ms: i64,
     ) -> [u32; 4] {
-        let counts = self.publish_map(prefetch);
+        let (counts, slices) = self.publish_map(prefetch);
         self.publish_workers(prefetch);
         let Some(stats) = stats else {
             // No track yet: clear everything so every row reads "-".
@@ -13823,6 +15893,7 @@ impl NetPanel {
             self.rate_window.borrow_mut().clear();
             return counts;
         };
+        self.check_playhead_slice(stats, &slices, now_ms);
         window.set_net_fps_presented(format!("{:.1} fps", stats.fps_presented).into());
         window.set_net_fps_decoded(format!("{:.1} fps", stats.fps_decoded).into());
         window.set_net_first_frame(
@@ -15500,6 +17571,7 @@ fn open_player_inner(
     // The three interpolation labels are republished by the tick on change; seed
     // them now so the row never shows a stale/blank mode for the first frames.
     player.set_interp_mode_text(control.interp_mode_text().into());
+    player.set_interp_mode(i32::from(control.interp_mode()));
     player.set_interp_stats_text(control.interp_stats_text().into());
     player.set_interp_gpu_text(gpu_utilization_text().into());
     // `interp_cycle()` (the row and the shortcut menu item) advances
@@ -15528,6 +17600,9 @@ fn open_player_inner(
             control.set_interp_mode(next);
             update_settings(&store, |prefs| prefs.interp_mode = next);
             window.set_interp_mode_text(control.interp_mode_text().into());
+            // Same turn as the state change: the badge's int can never lag the
+            // control by a tick.
+            window.set_interp_mode(i32::from(control.interp_mode()));
             window.set_interp_stats_text(control.interp_stats_text().into());
             crate::debug_log(&format!(
                 "interp cycle mode={next} text={} source=ui",
@@ -15734,6 +17809,10 @@ fn open_player_inner(
             if window.get_interp_mode_text().as_str() != interp_mode_text {
                 window.set_interp_mode_text(interp_mode_text.into());
             }
+            let interp_mode = i32::from(control.interp_mode());
+            if window.get_interp_mode() != interp_mode {
+                window.set_interp_mode(interp_mode);
+            }
             let interp_stats_text = control.interp_stats_text();
             if window.get_interp_stats_text().as_str() != interp_stats_text {
                 window.set_interp_stats_text(interp_stats_text.into());
@@ -15773,7 +17852,7 @@ fn open_player_inner(
             let net_now = clock.elapsed().as_millis() as i64;
             let has_picture = control.audio_only() || window.get_frame().size().width > 0;
             let gate = control.buffering();
-            let buffering = gate || !has_picture;
+            let buffering = gate || !has_picture || window.get_qa_force_buffering();
             window.set_buffering(buffering);
             window.set_buffer_progress(if gate {
                 control.buffer_progress()
@@ -15822,7 +17901,8 @@ fn open_player_inner(
                 // estimate); sampled here, at the publish rate.
                 let stats = control.play_stats();
                 let prefetch_stats = control.prefetch_stats();
-                let counts = net_panel.publish(&window, stats.as_ref(), prefetch_stats.as_ref());
+                let counts =
+                    net_panel.publish(&window, stats.as_ref(), prefetch_stats.as_ref(), net_now);
                 // `BILI_NET_TRACE=1`: prove the strip is driven by the live
                 // proxy - the published slice counts, once per publish tick,
                 // for the first 3 s.
@@ -19717,6 +21797,13 @@ struct SearchRowData {
     meta: String,
     sub: String,
     badge: String,
+    /// The home card's own fields, so a search result is not a second layout:
+    /// UP name (clickable), exact play count for the heat bulb, and the publish
+    /// stamp for the freshness chip.
+    owner: String,
+    owner_mid: i64,
+    view_count: u64,
+    pub_ts: i64,
 }
 
 struct SearchOutcome {
@@ -24499,6 +26586,10 @@ fn run_search(
                                         meta,
                                         sub: item.description.clone(),
                                         badge: item.duration.clone(),
+                                        owner: item.author.clone(),
+                                        owner_mid: item.mid,
+                                        view_count: item.play,
+                                        pub_ts: item.pub_ts,
                                     },
                                 )
                             })
@@ -24529,6 +26620,10 @@ fn run_search(
                                         meta,
                                         sub: item.usign.clone(),
                                         badge: String::new(),
+                                        owner: String::new(),
+                                        owner_mid: item.mid,
+                                        view_count: 0,
+                                        pub_ts: 0,
                                     },
                                 )
                             })
@@ -24604,6 +26699,10 @@ fn run_search(
                             meta: row.meta.clone().into(),
                             sub: row.sub.clone().into(),
                             badge: row.badge.clone().into(),
+                            owner: row.owner.clone().into(),
+                            owner_mid: row.owner_mid.to_string().into(),
+                            view_count: saturating_i32(row.view_count as i64),
+                            pub_ts: saturating_i32(row.pub_ts),
                         })
                         .collect();
                     // One API page per screen: the client page restarts at 0
@@ -24631,18 +26730,50 @@ fn run_search(
             });
             let mut pics = pics;
             pics.truncate(covers);
+            let seq_guard = search_seq.clone();
             stream_cover_list(
                 &weak,
                 &session,
                 pics,
                 Vec::new(),
                 0,
-                move |_index, _key| ThumbGuard::Seq(search_seq.clone(), seq),
+                move |_index, _key| ThumbGuard::Seq(seq_guard.clone(), seq),
                 |ui| ui.get_search_items(),
                 |row, image| row.thumb = image,
                 format!("search tab={tab} page={page}"),
             )
             .await;
+            // One card-health line after the patches have landed: covers are
+            // the same shared cache + decode path as the feed, and the home
+            // card fields (UP / heat / date) must be populated for every row.
+            let weak_cards = weak.clone();
+            let seq_cards = search_seq.clone();
+            let label = format!("search tab={tab} page={page}");
+            let _ = slint::invoke_from_event_loop(move || {
+                slint::Timer::single_shot(Duration::from_millis(250), move || {
+                    if seq_cards.load(Ordering::SeqCst) != seq {
+                        return;
+                    }
+                    if let Some(ui) = weak_cards.upgrade() {
+                        let rows = ui.get_search_items();
+                        let total = rows.row_count();
+                        let mut covers = 0usize;
+                        let mut owners = 0usize;
+                        let mut dates = 0usize;
+                        for index in 0..total {
+                            let Some(row) = rows.row_data(index) else {
+                                continue;
+                            };
+                            covers += usize::from(row.thumb.size().width > 0);
+                            owners += usize::from(!row.owner.is_empty());
+                            dates += usize::from(row.pub_ts > 0);
+                        }
+                        crate::debug_log(&format!(
+                            "search cards {label} covers={covers}/{total} owners={owners}/{total} dates={dates}/{total}"
+                        ));
+                    }
+                });
+            });
         });
     }));
 }
@@ -26909,6 +29040,56 @@ mod playlist_tests {
         assert!(queue.remove(1).is_some());
         assert_eq!(queue.current, None);
         assert!(queue.remove(5).is_none());
+    }
+
+    /// A directly opened video (card click / detail 播放) becomes the current
+    /// row at index 0 even though it never went through `enqueue`; opening it
+    /// again moves the existing row to the front instead of duplicating it.
+    #[test]
+    fn direct_open_inserts_one_current_row() {
+        let mut queue = queue(&["BV1", "BV2"]);
+        queue.current = Some(0);
+        let (index, inserted) = queue.ensure_current(entry("BV3"));
+        assert!(inserted);
+        assert_eq!(index, 0);
+        assert_eq!(queue.current, Some(0));
+        assert_eq!(queue.items.len(), 3);
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.bvid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BV3", "BV1", "BV2"]
+        );
+        // A second open of the same video only re-points at the existing row,
+        // which the contract keeps at index 0.
+        queue.current = Some(2);
+        let (index, inserted) = queue.ensure_current(entry("BV3"));
+        assert!(!inserted);
+        assert_eq!(index, 0);
+        assert_eq!(queue.current, Some(0));
+        assert_eq!(queue.items.len(), 3);
+    }
+
+    /// Focus marks an existing row (and promotes it to the front) but never
+    /// resurrects one the user deleted.
+    #[test]
+    fn focus_marks_without_inserting() {
+        let mut queue = queue(&["BV1", "BV2", "BV3"]);
+        queue.current = Some(0);
+        assert_eq!(queue.mark_current("BV2"), Some(0));
+        assert_eq!(queue.current, Some(0));
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.bvid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BV2", "BV1", "BV3"]
+        );
+        assert_eq!(queue.mark_current("BV9"), None);
+        assert_eq!(queue.current, Some(0));
     }
 
     #[test]

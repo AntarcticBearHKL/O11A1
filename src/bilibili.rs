@@ -1429,6 +1429,7 @@ impl Session {
                 mid: item.mid,
                 play: item.play,
                 duration: item.duration,
+                pub_ts: item.pubdate,
             })
             .collect();
         Ok(SearchPage {
@@ -7279,6 +7280,9 @@ pub struct SearchVideo {
     pub play: u64,
     /// Ready to display as `mm:ss`.
     pub duration: String,
+    /// Publish stamp (Unix seconds, `0` when the payload omits it). The search
+    /// result card's freshness chip reads this, exactly like a feed card.
+    pub pub_ts: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -7510,7 +7514,6 @@ struct SearchVideoItem {
     duration: String,
     /// Publish stamp (Unix seconds) the search item carries.
     #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
     pubdate: i64,
 }
 

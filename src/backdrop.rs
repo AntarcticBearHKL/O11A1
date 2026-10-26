@@ -340,19 +340,26 @@ fn blur_core(dark: bool, with_grain: bool, px: u32) -> SharedPixelBuffer<Rgba8Pi
     }
     // Bilinear upsample back to 1024. The weights are precomputed once per axis
     // (they do not vary by row/column), so the 1M-pixel loop is just four reads
-    // and two lerps per channel.
+    // and two lerps per channel. Both axes WRAP: output pixel 0 samples between
+    // the last low cell and cell 0 (f = -0.125), not a clamped copy of cell 0.
+    // Clamping here would have kept the seam even after the box passes wrapped.
     let mut xmap = [(0usize, 0usize, 0.0f32); SIZE];
     let mut ymap = [(0usize, 0usize, 0.0f32); SIZE];
     let scale = BLUR_SCALE as f32;
+    let low_i = low as isize;
     for (i, slot) in xmap.iter_mut().enumerate() {
-        let f = ((i as f32 + 0.5) / scale - 0.5).clamp(0.0, (low - 1) as f32);
-        let i0 = f.floor() as usize;
-        *slot = (i0, (i0 + 1).min(low - 1), f - i0 as f32);
+        let f = (i as f32 + 0.5) / scale - 0.5;
+        let floor = f.floor();
+        let i0 = (floor as isize).rem_euclid(low_i) as usize;
+        let i1 = ((floor as isize) + 1).rem_euclid(low_i) as usize;
+        *slot = (i0, i1, f - floor);
     }
     for (i, slot) in ymap.iter_mut().enumerate() {
-        let f = ((i as f32 + 0.5) / scale - 0.5).clamp(0.0, (low - 1) as f32);
-        let i0 = f.floor() as usize;
-        *slot = (i0, (i0 + 1).min(low - 1), f - i0 as f32);
+        let f = (i as f32 + 0.5) / scale - 0.5;
+        let floor = f.floor();
+        let i0 = (floor as isize).rem_euclid(low_i) as usize;
+        let i1 = ((floor as isize) + 1).rem_euclid(low_i) as usize;
+        *slot = (i0, i1, f - floor);
     }
     let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(SIZE as u32, SIZE as u32);
     let dst = buffer.make_mut_bytes();
@@ -388,7 +395,14 @@ fn blur_only(dark: bool) -> SharedPixelBuffer<Rgba8Pixel> {
     blur_core(dark, false, blur_px())
 }
 
-/// One separable horizontal box pass, radius `radius`, edges clamped.
+/// One separable horizontal box pass, radius `radius`, **wrapped** at the tile
+/// edges.
+///
+/// The wallpaper is a torus: its left edge is the continuation of its right
+/// edge. Clamping here was the seam - the blur averaged in the border pixel
+/// instead of the pixels on the far side, so the first and last column stopped
+/// matching and a repeated tile showed a hard step. Every read below is
+/// `(x + k) mod width`, exactly the source's own toroidal blob distance.
 ///
 /// A sliding window keeps this O(pixels) per pass instead of O(pixels x radius):
 /// one add and one subtract per output pixel per channel, no allocation.
@@ -402,20 +416,20 @@ fn box_horizontal(planes: &mut [Vec<f32>; 3], width: usize, height: usize, radiu
             let row = y * width;
             let mut sum = 0.0;
             for offset in -(radius as isize)..=(radius as isize) {
-                let x = offset.clamp(0, width as isize - 1) as usize;
+                let x = offset.rem_euclid(width as isize) as usize;
                 sum += source[row + x];
             }
             for x in 0..width {
                 plane[row + x] = sum * inv_window;
-                let leaving = x.saturating_sub(radius);
-                let entering = (x + radius + 1).min(width - 1);
+                let leaving = (x + width - radius) % width;
+                let entering = (x + radius + 1) % width;
                 sum += source[row + entering] - source[row + leaving];
             }
         }
     }
 }
 
-/// One separable vertical box pass, mirroring [`box_horizontal`].
+/// One separable vertical box pass, mirroring [`box_horizontal`] (wrapped).
 fn box_vertical(planes: &mut [Vec<f32>; 3], width: usize, height: usize, radius: usize) {
     let inv_window = 1.0 / (2 * radius + 1) as f32;
     let mut source = planes[0].clone();
@@ -425,13 +439,13 @@ fn box_vertical(planes: &mut [Vec<f32>; 3], width: usize, height: usize, radius:
         for x in 0..width {
             let mut sum = 0.0;
             for offset in -(radius as isize)..=(radius as isize) {
-                let y = offset.clamp(0, height as isize - 1) as usize;
+                let y = offset.rem_euclid(height as isize) as usize;
                 sum += source[y * width + x];
             }
             for y in 0..height {
                 plane[y * width + x] = sum * inv_window;
-                let leaving = y.saturating_sub(radius);
-                let entering = (y + radius + 1).min(height - 1);
+                let leaving = (y + height - radius) % height;
+                let entering = (y + radius + 1) % height;
                 sum += source[entering * width + x] - source[leaving * width + x];
             }
         }
@@ -629,6 +643,109 @@ mod tests {
             assert!(soft_mean < 1.0, "dark={dark} soft neighbour step {soft_mean}");
         }
     }
+
+    /// The finished tile is a true torus: the step from the last column to the
+    /// first is the same order as a typical interior step and is not a local
+    /// maximum against its two neighbours. This is the regression test for the
+    /// old clamped box passes + clamped bilinear upsample, which left a visible
+    /// line wherever the wallpaper repeated. It runs on the SHIPPED pixels (the
+    /// grain included), not a smoothed proxy.
+    #[test]
+    fn blurred_tile_wraps_without_a_seam() {
+        for dark in [true, false] {
+            let buffer = blur_pixels(dark);
+            let (boundary, interior, neighbours) = seam_stats(buffer.as_bytes());
+            assert!(
+                boundary < interior * 2.0 + 0.1,
+                "dark={dark} boundary={boundary:.4} interior={interior:.4}"
+            );
+            assert!(
+                boundary <= neighbours * 1.05 + 0.05,
+                "dark={dark} boundary={boundary:.4} neighbour_max={neighbours:.4}"
+            );
+            eprintln!(
+                "seam dark={} boundary={boundary:.4} interior={interior:.4} neighbour_max={neighbours:.4}",
+                u8::from(dark)
+            );
+        }
+    }
+
+    /// QA: write the finished light wallpaper as a 2x2 tiling, so the tile edge
+    /// can be inspected as it actually repeats. `F146_CAPTURE_DIR` selects the
+    /// folder (default: the harness temp folder).
+    #[test]
+    #[ignore]
+    fn dump_seam_tiling() {
+        // Match the owner's stored 背景模糊 (145 px), so the 2x2 capture is the
+        // finished image the window actually repeats, not the 60 px default.
+        set_blur(145);
+        let buffer = blur_pixels(false);
+        let source = buffer.as_bytes();
+        let size = SIZE * 2;
+        let mut tiled = vec![0u8; size * size * 4];
+        for ty in 0..2 {
+            for tx in 0..2 {
+                for y in 0..SIZE {
+                    let src = y * SIZE * 4;
+                    let dst = ((ty * SIZE + y) * size + tx * SIZE) * 4;
+                    tiled[dst..dst + SIZE * 4].copy_from_slice(&source[src..src + SIZE * 4]);
+                }
+            }
+        }
+        let dir = std::env::var_os("F146_CAPTURE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("opencode").join("f146"));
+        std::fs::create_dir_all(&dir).expect("create capture dir");
+        let path = dir.join("f146_seam.png");
+        image::save_buffer(
+            &path,
+            &tiled,
+            size as u32,
+            size as u32,
+            image::ColorType::Rgba8,
+        )
+        .expect("write seam tiling");
+        let (boundary, interior, neighbours) = seam_stats(source);
+        eprintln!(
+            "seam tiling blur=145 {} boundary={boundary:.4} interior={interior:.4} neighbour_max={neighbours:.4}",
+            path.display()
+        );
+        set_blur(DEFAULT_BLUR_PX);
+    }
+
+    /// Boundary step (last column -> first column), the mean interior step and
+    /// the larger of the two columns adjacent to the boundary. All values are
+    /// mean absolute luma differences over all rows, so the units are 8-bit
+    /// steps per pixel.
+    fn seam_stats(bytes: &[u8]) -> (f64, f64, f64) {
+        let luma = |x: usize, y: usize| -> f64 {
+            let i = (y * SIZE + x) * 4;
+            0.2126 * f64::from(bytes[i])
+                + 0.7152 * f64::from(bytes[i + 1])
+                + 0.0722 * f64::from(bytes[i + 2])
+        };
+        let mut boundary = 0.0;
+        let mut interior = 0.0;
+        let mut interior_samples = 0.0;
+        let mut first = 0.0;
+        let mut last = 0.0;
+        for y in 0..SIZE {
+            boundary += (luma(0, y) - luma(SIZE - 1, y)).abs();
+            first += (luma(1, y) - luma(0, y)).abs();
+            last += (luma(SIZE - 1, y) - luma(SIZE - 2, y)).abs();
+            for x in 0..SIZE - 1 {
+                interior += (luma(x + 1, y) - luma(x, y)).abs();
+                interior_samples += 1.0;
+            }
+        }
+        let rows = SIZE as f64;
+        (
+            boundary / rows,
+            interior / interior_samples,
+            (first / rows).max(last / rows),
+        )
+    }
+
 
     /// The baked grain is centred and stays inside ±2/255, so it can break
     /// banding without moving the panel's measured tint.

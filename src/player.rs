@@ -12592,11 +12592,15 @@ fn nv12_to_rgba(dst: &mut [u8], src: &[u8], w: usize, h: usize) {
 /// The size is chosen once per session, so a resize never restarts the decoder;
 /// `BILI_FRAME_SCALE=0` keeps the full decode size (the A/B knob).
 fn reader_output_size(decode: FrameSize, display: (u32, u32)) -> FrameSize {
+    // Decoding follows the stream, not the window: the picture is presented at
+    // the resolution the media actually carries, so resizing or maximising the
+    // window never changes what the decoder produces (and never softens it).
+    // The old window-sized path survives only as an explicit A/B switch.
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         !frame_path_legacy()
-            && !std::env::var("BILI_FRAME_SCALE")
-                .map(|value| value.trim() == "0")
+            && std::env::var("BILI_FRAME_SCALE")
+                .map(|value| value.trim() == "1")
                 .unwrap_or(false)
     });
     if !enabled || display.0 == 0 || display.1 == 0 {
