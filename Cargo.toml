@@ -1,14 +1,22 @@
 [package]
 name = "o11a1"
-version = "0.2.0-beta.2"
+version = "0.2.0-beta.3"
 edition = "2021"
 build = "build.rs"
 description = "O11A1 — a Rust + Slint Bilibili desktop client"
 
 [dependencies]
 slint = { version = "1", features = ["raw-window-handle-06"] }
+# f174: the `log` facade, so the layers below the app (wgpu, wgpu_hal, the Slint
+# renderers) can report INTO our debug log. Without a logger their records are
+# dropped silently, which is why a wgpu surface failure used to leave exactly
+# one line behind (`WGPU surface validation error in get_current_texture`) and
+# no reason. Already in the lock file (wgpu, winit and Slint all depend on it),
+# so this adds no compile time; `src/main.rs` installs a no-op-by-default sink
+# that only turns on for `BILI_LOG=1`.
+log = "0.4"
 raw-window-handle = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "brotli", "http2", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "brotli", "http2", "rustls-tls", "stream", "blocking"] }
 flate2 = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
 qrcode = "0.14"
@@ -25,6 +33,9 @@ futures = "0.3"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# DeepSeek vision images are sent as `data:image/jpeg;base64,...` (verified API
+# shape). Already in the lock file via other dependencies.
+base64 = "0.22"
 regex = "1"
 # Tray icon, global hotkey, balloon notifications, autostart. Uses the lightweight
 # windows-sys rather than the full `windows` crate by design.
@@ -44,6 +55,72 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 slint-build = "1"
+
+# ---------------------------------------------------------------------------
+# f174: the shipped default is femtovg on wgpu (D3D12/Vulkan), not on OpenGL.
+#
+# Why (all four renderers were run on this machine with a real player window):
+#
+#   renderer          rounded clips   playback        morph p50/p95      stable
+#   ----------------- --------------  --------------  -----------------  ------
+#   femtovg/OpenGL    yes             30 fps steady   25.67 / 32.81 ms   yes
+#   software          NO (squares)    30 fps steady    8.57 / 11.57 ms   yes
+#   femtovg/wgpu      yes             30 fps steady    8.29 /  9.71 ms   see below
+#   skia              yes             NO picture      8.26 / 10.30 ms    ?
+#
+# OpenGL cannot be the default any more: the glutin path blocks the UI thread
+# on `SwapInterval::Wait(1)` / on its rounded-clip offscreen layer, and the
+# 20-open morph then costs 25.67 / 32.81 ms - two refreshes per frame, i.e. no
+# 120 Hz animation at all. `BILI_QA_NO_CLIP=1` attributes ~17 ms of that to the
+# clip layer alone (p50 8.52 / p95 10.57 without it), so "drop the rounded
+# corners to get 120 fps" is not a trade this app makes: the soft renderer
+# proves the other side of it (8.57 ms and every `clip: true` + `border-radius`
+# subtree painted as a black SQUARE - the vinyl disc).
+#
+# wgpu draws the rounded clips correctly, plays at the same 30 fps and is the
+# only renderer that is fast enough. The one thing it had was a crash:
+# `WGPU surface validation error in get_current_texture`, exit code 1, about
+# 55 s into a session (reproduced twice on the f173 tree). f174 instrumented
+# it (see `f174_install_log_sink` and `BILI_SURFACE_TRACE` in `src/main.rs`
+# and `src/win.rs`) and could not reproduce it in >12 minutes of wgpu sessions
+# on the same machine: 140 s and 200 s soaks (60 fps steady, two seeks, a
+# minimize, a fullscreen toggle), the full f152 walk (two player windows,
+# occlusion pause/resume) and f155 (60 s playback + 9 PrintWindow captures).
+# Every one of them exited 0.
+#
+# That error string is wgpu's `CurrentSurfaceTexture::Validation`, which in
+# wgpu 30 is only produced by a DEVICE LOST error (every other validation
+# error panics through `default_error_handler`). So the old crash was a lost
+# GPU device, not a Slint bug: it is the driver/backend's, and it is invisible
+# in a run that does not hit it.
+#
+# What keeps the fallback cheap: all four renderers stay compiled in, so a
+# machine that loses its device can still be driven:
+#
+#   default                     -> femtovg-wgpu (winit's factory prefers it)
+#   SLINT_BACKEND=winit-femtovg -> femtovg on OpenGL (the f173 default)
+#   SLINT_BACKEND=winit-software-> the CPU renderer (square corners, no GPU)
+#   WGPU_BACKEND=dx12|vulkan    -> which wgpu backend the default uses
+#
+# `skia` stays opt-in: when it is compiled in, winit's default factory ranks
+# skia ABOVE femtovg, so adding it to the default set would silently change
+# the renderer again (and on this machine skia never presents a video frame).
+# `src/main.rs` logs which renderer was requested, which ones are compiled in
+# and which one the default resolves to (see `f154_log_renderer_boot`).
+[features]
+# Renderer default: femtovg on wgpu. See the block comment above for the
+# measurement table and for why OpenGL is no longer the default.
+# `qa` = the `BILI_*_TEST` surface (scripted UI walks, frame captures, the
+# perf measured runs). It is in the default set on purpose: the build scripts in
+# `scripts/` and the hand-run QA recipes drive the shipped binary, and dropping
+# it silently would turn those hooks into no-ops. A release build that must not
+# contain the test face uses `--no-default-features --features femtovg-wgpu`
+# (see `src/qa/mod.rs`); dropping BOTH defaults (`--no-default-features` alone)
+# would also drop the wgpu renderer and silently go back to OpenGL.
+default = ["qa", "femtovg-wgpu"]
+qa = []
+skia = ["slint/renderer-skia"]
+femtovg-wgpu = ["slint/renderer-femtovg-wgpu"]
 
 # Compile speed first: the dev profile exists for the edit/verify loop, not for
 # shipping. This crate is unoptimized -- it is what gets rebuilt on every edit --

@@ -12,25 +12,54 @@
 //!   host, per worker and per second, which is what the profiler panel shows.
 //!
 //! **Whole-file, priority-ordered scheduling, bounded by a media horizon.**
-//! The queue covers the file in [`PrefetchConfig::chunk_bytes`] chunks, but
-//! only up to [`PLAYBACK_AHEAD_SECONDS`] of media beyond the playhead: fetching
-//! further would download video the playhead cannot reach for minutes (the
-//! whole file, at sixteen TLS connections), which costs cores and bandwidth for
-//! nothing visible. A worker that finishes picks, in order: (1) the chunk(s)
-//! the client reads now and the next [`HOT_AHEAD_SECONDS`] of playback, (2) a
-//! range that failed its retry route, (3) the seek warm points, (4) the rest of
-//! the horizon. For a file above 64 MiB the claimable bytes are split into one
-//! part per connection; an exhausted part steals sub-chunks from the largest
-//! remaining part, so no worker sits idle while claimable bytes exist.
+//! The queue covers the file in [`PrefetchConfig::chunk_bytes`] chunks, up to
+//! [`PREFETCH_AHEAD_SECONDS`] of media beyond the playhead (an hour, i.e. the
+//! whole file for anything a person watches in one sitting). The queue used to
+//! stop at [`PLAYBACK_AHEAD_SECONDS`] (90 s), which made "整片缓存完成" take as
+//! long as watching the video; only the *retained* window is still 90 s, bytes
+//! past it are persisted and dropped from memory. A worker that finishes picks,
+//! in order: (1) the chunk(s) the client reads now and the next
+//! [`HOT_AHEAD_SECONDS`] of playback, (2) a range that failed its retry route,
+//! (3) the seek warm points, (4) the rest of the file. For a file above 64 MiB
+//! the claimable bytes are split into one part per connection; an exhausted
+//! part steals sub-chunks from the largest remaining part, so no worker sits
+//! idle while claimable bytes exist.
 //!
-//! **The speculative queue is rate limited.** Warm points and the rest of the
-//! horizon share one token bucket refilled at [`WARM_RATE_FACTOR`]× (while
-//! points are pending) or [`SPECULATIVE_RATE_FACTOR`]× the stream bitrate —
-//! `total / duration`, or the session-average serve rate when the caller does
-//! not know the duration. Playback bytes are never limited. Before this cap the
-//! proxy pulled 20 MB/s (66 MB/s on a fast link) across sixteen connections for
-//! thirty seconds right after open, which measured 2.5–3.2 cores of the whole
-//! process.
+//! **The speculative queue is rate limited, but never below what the live
+//! connections can pull.** Warm points and the rest of the file share one token
+//! bucket refilled at [`WARM_RATE_FACTOR`]× (while points are pending) or
+//! [`SPECULATIVE_RATE_FACTOR`]× the stream bitrate — `total / duration`, or the
+//! session-average serve rate when the caller does not know the duration —
+//! raised to [`MIN_SPECULATIVE_CONNECTION_BPS`] per live connection and capped
+//! at [`SPECULATIVE_CEILING_BPS`]. The old fixed 2× bitrate was 460 kB/s on a
+//! 1080p stream: a 4 MiB claim reserved the whole bucket, so **one or two of
+//! the sixteen connections ever fetched** and a 145 MB file needed five
+//! minutes. The burst is one chunk per live connection, so every configured
+//! worker can be in flight at once; playback bytes are never limited.
+//!
+//! **The connection count follows the measured knee, not the setting.** Bilibili
+//! mirrors throttle per stream: measured on one mirror, 1 connection pulled
+//! 22 MB/s, 4 pulled 19 MB/s and 16 pulled 8–10 MB/s. So the session starts at
+//! [`STARTUP_CONNECTIONS`], then a governor doubles/halves the live count every
+//! [`GOVERNOR_TICK`] while the aggregate throughput keeps improving, and settles
+//! on the count that measured best (bounded by the configured value, never below
+//! two). The knee is only measurable if the bucket is not the smaller of the
+//! two: with the old 16 MiB/s ceiling two streams filled it, the governor saw no
+//! gain at four and parked there. The ceiling is now 48 MiB/s, and a session on
+//! this box ramps 2→4→8→16 and pulls 40–52 MB/s (see the QA table below). Only a
+//! serve wait that cost the client real time ([`SERVE_WAIT_SLOW_MS`]) halves the
+//! count; the ordinary 5–14 ms miss of a healthy reader used to do it on every
+//! seek and buffer refill. The line
+//! `prefetch fetch active=N inflight=M live=K configured=C agg=…/s per=[…]
+//! waits=W slow=S` carries the whole picture once per second — `active`/`inflight`
+//! are what is really transferring, so "16 configured, two working" is visible.
+//!
+//! **Network reads are batched into disk-sized blocks.** reqwest hands out one
+//! HTTP/2 frame (16 KiB) per `chunk()`, and every read used to take the state
+//! lock, copy its bytes, publish the whole download map and queue a disk write.
+//! [`READ_BATCH_BYTES`] accumulates 256 KiB (one disk block) per push, except the
+//! first read of a response, which is pushed alone so a serve wait never waits
+//! for the batch.
 //!
 //! **The serve path has absolute priority over speculation.** A rate-limited
 //! queue still lets a speculative burst own every connection at the moment the
@@ -41,7 +70,7 @@
 //! flight is cancelled at its next network read so its slot can take the
 //! missing hot chunk. The speculative queue resumes the moment the bytes land
 //! (or the body ends) — this changes *priority*, never throughput or the
-//! [`PLAYBACK_AHEAD_SECONDS`] horizon.
+//! [`PREFETCH_AHEAD_SECONDS`] horizon.
 //!
 //! The wait is instrumented and bounded. Once per second it logs
 //! `serve wait pos=… waited_ms=… hot_inflight=… warm_inflight=… rest_inflight=…`,
@@ -62,8 +91,8 @@
 //! window is answered from memory — a seek to either never goes upstream. The
 //! window (32 MiB by default, up to 256 MiB, and never more than
 //! [`PLAYBACK_AHEAD_SECONDS`] of media) is the only retained data: chunks
-//! outside it are counted, persisted, then discarded, so the queue can cover
-//! the horizon without growing the process.
+//! outside it are counted, persisted, then discarded, so the whole-file queue
+//! costs cache file, not process memory.
 //!
 //! **Per-worker health.** Throughput is measured over a five-second window.
 //! Zero bytes for 5 s (or below 20 % of the median worker for 15 s) marks a
@@ -132,7 +161,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -196,17 +225,19 @@ pub const CACHE_CAP_BYTES: u64 = 2 << 30;
 //   the session opens, before any worker exists).
 // ---------------------------------------------------------------------------
 
-/// Blocks a queue may hold before workers drop theirs. 64 × one read (tens of
-/// KiB) is a few MiB of slack: deep enough that a burst never drops, shallow
-/// enough that a stuck disk cannot grow the process.
-const DISK_QUEUE_DEPTH: usize = 64;
+/// Blocks a queue may hold before workers drop theirs. 256 × one read (tens of
+/// KiB) is a few MiB of slack: deep enough that a burst of sixteen streams never
+/// drops, shallow enough that a stuck disk cannot grow the process.
+const DISK_QUEUE_DEPTH: usize = 256;
 /// Largest single write the coalescer issues (4 MiB).
 const DISK_MERGE_MAX: usize = 4 << 20;
 /// Bytes the coalescer may hold across all open runs. Bounds the writer's own
 /// memory: it can never grow with the cache file.
-const DISK_BUFFER_BUDGET: usize = 8 << 20;
-/// Open runs kept at once. Each in-flight upstream range owns one.
-const DISK_RUNS_MAX: usize = 8;
+const DISK_BUFFER_BUDGET: usize = 16 << 20;
+/// Open runs kept at once. Each in-flight upstream range owns one, so this
+/// tracks [`MAX_CONNECTIONS`]: at eight, the ninth concurrent range forced a
+/// flush of somebody else's run on the writer thread.
+const DISK_RUNS_MAX: usize = MAX_CONNECTIONS;
 /// A run that stopped growing this long is flushed; it is what turns a stream
 /// of network reads into one large write without waiting for the range to end.
 const DISK_RUN_IDLE: Duration = Duration::from_millis(20);
@@ -230,6 +261,33 @@ const HEALTH_SLOW_AFTER: Duration = Duration::from_secs(5);
 const HEALTH_LOW_AFTER: Duration = Duration::from_secs(15);
 /// Poll interval of the per-worker health watchdog.
 const HEALTH_POLL: Duration = Duration::from_millis(1000);
+/// How often the connection governor measures aggregate throughput and logs the
+/// `prefetch fetch active=…` line. One second is the QA cadence; the count
+/// itself is stepped every second *decision* (two ticks), because a 4 MiB chunk
+/// at the mirrors' real rate takes longer than one second and a faster loop
+/// would act on half-finished transfers.
+const GOVERNOR_TICK: Duration = Duration::from_secs(1);
+/// A governor step only counts as an improvement past this factor. Below it the
+/// two counts are treated as the same speed and the smaller one wins: on a
+/// mirror that throttles per stream the knee is one or two connections, and
+/// every extra stream costs CPU (TLS state, syscalls, context switches) the
+/// decoder would rather have.
+const GOVERNOR_IMPROVE: f64 = 1.25;
+/// Aggregate throughput that marks a fresh measurement as collapsed (a mirror
+/// started throttling, or the link is shared): the governor re-explores.
+const GOVERNOR_COLLAPSE: f64 = 0.55;
+/// Never step below two connections: one stream cannot fill the first window
+/// while a seek is being served on the same mirror.
+const GOVERNOR_MIN_CONNECTIONS: usize = 2;
+/// How long after the first byte reaches the client the speculative queue stays
+/// on the old, small budget ([`SPECULATIVE_RATE_FACTOR`] × bitrate, two chunks).
+///
+/// The opening is the only moment where the prefetch can cost frames: the
+/// decoder is starting, the interpolator is warming up, and the ring is still
+/// shallow. Five seconds of near-silence costs one 4 MiB chunk on a 1080p
+/// stream — the hot window is never limited, so there is no rebuffering — and
+/// the whole-file burst starts right after, when the player is already steady.
+const SPECULATIVE_WARMUP: Duration = Duration::from_secs(5);
 /// How often a worker above the live connection count checks whether the pool
 /// was raised again (cheap: no state lock while it waits).
 const IDLE_CONNECTION_POLL: Duration = Duration::from_millis(20);
@@ -257,6 +315,11 @@ const SERVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// This is an SLO, not a hard abort: the body keeps waiting (closing it would
 /// end playback), but the log names the breach and the scheduler moves the bytes.
 const SERVE_WAIT_BUDGET_MS: u64 = 1500;
+/// A serve wait shorter than this is the ordinary "the client asked for a byte
+/// the buffer has not reached yet" of a healthy session (measured 5–14 ms on a
+/// 1080p stream). Only a wait at least this long counts against the live
+/// connection count: seven missed frames at 30 fps.
+const SERVE_WAIT_SLOW_MS: u64 = 250;
 /// A hot chunk that has produced no byte for this long while a serve wait is
 /// open is stuck. It is cancelled and re-routed now instead of waiting for the
 /// five-second [`HEALTH_SLOW_AFTER`] timer, which is thirty times a frame.
@@ -281,25 +344,13 @@ const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// I/O, TLS and disk work the old 8 MiB window did while the app was still
 /// opening (measured 0.6–0.9 cores for the first seconds on a slow CDN).
 pub const STARTUP_READ_AHEAD_BYTES: u64 = 2 << 20;
-/// Connections a gated session starts with. Sixteen parallel TLS streams
-/// filling the first window cost 0.7–0.9 cores for several seconds on a slow
-/// CDN (measured with the per-thread trace), all of it before a single frame is
-/// on screen. Four is enough to fill the startup window in well under the gate's
-/// budget; the configured count takes over with the wider window.
-const STARTUP_CONNECTIONS: usize = 4;
-/// Background (speculative) workers allowed while the session is young. The
-/// whole-file prefetch is a convenience; at sixteen parallel streams it pulled
-/// 12→50 MB in four seconds (5.1 cores of the 6-core box) exactly while the
-/// player was opening — the owner's "all cores spike / the system drops to
-/// 10 fps". Two workers keep the file filling without owning the machine, and
-/// the full pool takes over after [`BACKGROUND_RAMP`].
-const STARTUP_BACKGROUND_WORKERS: usize = 2;
-/// How long the reduced background pool lasts. The hot window and the seek
-/// points are unaffected (they are what playback needs).
-const BACKGROUND_RAMP: Duration = Duration::from_secs(12);
+/// Connections a gated session starts with. Two is the measured knee on a
+/// mirror that throttles per stream (1 conn 22 MB/s, 4 conns 19 MB/s, 16 conns
+/// 8–10 MB/s), and it is enough to fill the startup window in well under the
+/// gate's budget: the governor owns the count from there.
+const STARTUP_CONNECTIONS: usize = 2;
 /// How long a session keeps the smaller [`STARTUP_READ_AHEAD_BYTES`] window
-/// before the configured value takes over, together with the configured
-/// connection count.
+/// before the configured value takes over.
 const STARTUP_WINDOW: Duration = Duration::from_secs(3);
 /// Upper bound on waiting for the first client byte before the window is
 /// widened anyway (a proxy with no reader must not stay small forever).
@@ -316,22 +367,61 @@ const STARTUP_POLL: Duration = Duration::from_millis(100);
 /// what the owner asked for and is far more than a seek inside the window
 /// needs.
 pub const PLAYBACK_AHEAD_SECONDS: u64 = 90;
+/// Media seconds the whole-file queue may run ahead of the playhead.
+///
+/// This used to be [`PLAYBACK_AHEAD_SECONDS`]: the queue stopped 90 s ahead, so
+/// "整片缓存完成" could never be faster than watching the video, and the 下载分布
+/// panel crawled at the stream bitrate. The queue now covers the whole file (an
+/// hour is longer than any single 视频/番剧 this player opens); the *retained*
+/// window is still [`PLAYBACK_AHEAD_SECONDS`], so memory did not move — bytes
+/// past the window go to the session cache file and are dropped from memory.
+pub const PREFETCH_AHEAD_SECONDS: u64 = 3600;
 /// Media seconds of read-ahead the hot path keeps in flight. The rest of the
 /// window is filled by the background queue at the speculative rate below.
 const HOT_AHEAD_SECONDS: u64 = 12;
 /// Speculative (whole-file) bytes per second, as a multiple of the measured
-/// media bitrate once the window holds its comfort level. The whole-file queue
-/// exists so a later seek is instant — it is not worth a core: at 2× the
-/// bitrate it still outruns playback and finishes the file, but it no longer
-/// pulls 20 MB/s across sixteen TLS connections for 30 s (2.5–3 cores).
+/// media bitrate. This is a *floor*, not the whole story: see
+/// [`MIN_SPECULATIVE_CONNECTION_BPS`].
 const SPECULATIVE_RATE_FACTOR: u64 = 2;
+/// Absolute floor for one live connection's share of the speculative budget.
+///
+/// The old policy used [`SPECULATIVE_RATE_FACTOR`] × bitrate and nothing else,
+/// which on a 1080p stream (1853 kbit/s ≈ 231 kB/s) is 462 kB/s for the whole
+/// session: one 4 MiB claim reserved ~9 s of budget, so at most two of the
+/// sixteen configured connections ever fetched and the rest sat idle while the
+/// file crawled in at 0.45 MB/s. A connection that is allowed to run must be
+/// allowed to run at a real rate; 2 MiB/s is a fifth of what one measured
+/// mirror stream gives, so the bucket stops being the scheduler.
+const MIN_SPECULATIVE_CONNECTION_BPS: u64 = 2 << 20;
+/// Hard ceiling on speculative throughput. Playback is never limited, but the
+/// whole-file queue must not become "download the internet": it bounds the TLS
+/// and disk work one session may add.
+///
+/// **This is a parallelism bound, not just a speed limit.** In steady state
+/// [`speculative_rate`] returns exactly this value, so the token bucket, not the
+/// CDN, decides how many workers get bytes: at 16 MiB/s two streams already
+/// saturated it, every other worker had no tokens, the governor measured "no
+/// improvement" at four and settled on two — the user's "16 线程但只有一两个在
+/// 干活", only with a fast pair instead of a slow one. 48 MiB/s leaves room for
+/// 6–8 four-MiB streams on a link that can take it; the governor still trims the
+/// count to the measured knee and a serve wait still halves it immediately.
+/// `BILI_PREFETCH_CEILING_BPS` pins it for an A/B run (see [`spec_ceiling`]).
+const SPECULATIVE_CEILING_BPS: u64 = 48 << 20;
 /// Refill factor while seek points are still being warmed: 6× the bitrate.
 /// The whole warm plan is a few dozen MiB, and at this rate it is one or two
 /// streams instead of sixteen racing the decoder.
 const WARM_RATE_FACTOR: u64 = 6;
-/// Burst of the speculative token bucket: two chunks, so a whole-file fetch can
-/// still start (and a single-chunk file is never blocked).
-const SPECULATIVE_BURST_CHUNKS: u64 = 2;
+/// Burst of the speculative token bucket, in chunks per live connection: one
+/// in-flight claim per connection is exactly the concurrency the configuration
+/// asks for, and a two-chunk burst (the old value) serialised the pool down to
+/// two workers no matter how many were configured.
+const SPECULATIVE_BURST_CHUNKS_PER_CONNECTION: u64 = 1;
+/// Network reads are accumulated into blocks of this size before they meet the
+/// state lock / publish / disk queue (see `run_claim`). 256 KiB is the disk
+/// block size, so one push becomes one disk block and one publish instead of
+/// sixteen 16 KiB frames doing it sixteen times. The first read of a response is
+/// never batched, so a serve wait still sees its bytes immediately.
+const READ_BATCH_BYTES: u64 = 256 << 10;
 /// How many short upstream bodies one chunk may produce before it is retired.
 /// A mirror that keeps truncating the same range must not loop forever; the
 /// serve path then reports the range as unavailable instead of silently
@@ -409,8 +499,8 @@ pub struct PrefetchConfig {
     /// that variable is missing).
     pub cache_key: Option<String>,
     /// Duration of the media in milliseconds, when the caller knows it. With
-    /// the total length this gives the exact bitrate, which sets the read-ahead
-    /// horizon ([`PLAYBACK_AHEAD_SECONDS`]) and the speculative rate cap
+    /// the total length this gives the exact bitrate, which sets the retained
+    /// window ([`PLAYBACK_AHEAD_SECONDS`]) and the speculative rate floor
     /// ([`SPECULATIVE_RATE_FACTOR`]). `None` falls back to the rate the client
     /// actually pulls.
     pub media_duration_ms: Option<u64>,
@@ -546,6 +636,11 @@ pub struct PrefetchStats {
     pub total_bytes: Option<u64>,
     /// Workers with `busy == true` at snapshot time.
     pub active_workers: u32,
+    /// Upstream range claims in flight right now (`state.inflight`). `active`
+    /// counts worker slots that hold a claim; this counts the claims themselves,
+    /// so `active=2 inflight=2` on a configured 16 is the honest "only two of
+    /// the sixteen connections are fetching" the QA line has to expose.
+    pub inflight: u64,
     /// `[start, end)` ranges currently held by the warm point cache.
     pub point_cache: Vec<(u64, u64)>,
     /// Requests answered (at least partly) from the session cache file, counted
@@ -577,17 +672,14 @@ pub struct PrefetchStats {
 
 /// One chunk of a playlist preload (2 MiB): large enough that the CDN round
 /// trip is amortised, small enough that a cancel is noticed quickly.
-#[allow(dead_code)] // public API: the UI session wires `Preload` next
 const PRELOAD_CHUNK_BYTES: u64 = 2 << 20;
 /// Gap between two preload chunks: the preload is one sequential reader that
 /// deliberately leaves the link to playback.
-#[allow(dead_code)] // public API: the UI session wires `Preload` next
 const PRELOAD_YIELD: Duration = Duration::from_millis(40);
 
 /// Fetch one URL completely into its own session cache file, at background
 /// priority. `stop` is checked between network chunks; `progress` is updated as
 /// bytes land so a caller can show the preload.
-#[allow(dead_code)] // reached only through `PrefetchHandle::preload`
 async fn preload_one(
     engine: &Engine,
     key: &str,
@@ -736,7 +828,6 @@ pub struct PrefetchHandle {
     shutdown: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
     /// Playlist whole-file preloads (see [`PrefetchHandle::preload`]).
-    #[allow(dead_code)] // public API: written by `preload_keys`
     preload: Mutex<Option<PreloadJob>>,
     runtime: &'static tokio::runtime::Runtime,
 }
@@ -744,27 +835,19 @@ pub struct PrefetchHandle {
 /// One running playlist preload: a single background task plus the flag that
 /// stops it. Kept together so `cancel_preload` can wait for the task to notice.
 struct PreloadJob {
-    #[allow(dead_code)] // public API: read by `cancel_preload`
     stop: Arc<AtomicBool>,
-    #[allow(dead_code)] // public API: aborted by `cancel_preload`
     task: JoinHandle<()>,
-    #[allow(dead_code)] // public API: read by `preload_progress`
     progress: Arc<PreloadProgressShared>,
 }
 
 #[derive(Debug, Default)]
 struct PreloadProgressShared {
-    #[allow(dead_code)]
     files_total: AtomicU64,
-    #[allow(dead_code)]
     files_done: AtomicU64,
-    #[allow(dead_code)]
     bytes_done: AtomicU64,
-    #[allow(dead_code)]
     bytes_total: AtomicU64,
     /// Cache key of the file being fetched right now, so a cancel can delete the
     /// partial file instead of leaving it behind.
-    #[allow(dead_code)]
     current: Mutex<String>,
 }
 
@@ -938,10 +1021,9 @@ impl PrefetchHandle {
     }
 
     /// Change the number of upstream connections while the proxy runs
-    /// (clamped to `1..=32`; `0` selects the default). Increasing it wakes
-    /// workers that were waiting out of the queue, decreasing it lets the
-    /// highest-numbered ones finish their range and then idle.
-    #[allow(dead_code)] // public API: the player wiring changes this live
+    /// (clamped to `1..=32`; `0` selects the default). Only the tests drive it
+    /// today; the player's A/B harness is what keeps it honest.
+    #[cfg(test)]
     pub fn set_connections(&self, n: u32) {
         let count = if n == 0 {
             DEFAULT_CONNECTIONS
@@ -956,7 +1038,7 @@ impl PrefetchHandle {
 
     /// Merged, sorted `[start, end)` ranges currently held in memory: the
     /// read-ahead window plus the seek point cache.
-    #[allow(dead_code)] // public API for the caller's seek hit test
+    #[cfg(test)]
     pub fn cached_ranges(&self) -> Vec<(u64, u64)> {
         self.shared.cached_ranges()
     }
@@ -965,7 +1047,6 @@ impl PrefetchHandle {
     /// (0 when the offset is not cached). This is what tells the caller
     /// whether a seek can be answered without any upstream request: memory
     /// window, warm points and the session cache file all count.
-    #[allow(dead_code)] // public API for the caller's seek hit test
     pub fn cached_bytes_at(&self, offset: u64) -> u64 {
         self.shared.cached_bytes_at(offset)
     }
@@ -993,7 +1074,6 @@ impl PrefetchHandle {
     /// `bytes` is clamped to the point-cache budget, and to the end of the
     /// media. `true` means the region was already covered (memory window, point
     /// cache or the session cache file) and no task was queued.
-    #[allow(dead_code)] // public API for the seek shadow's audio pre-warm
     pub fn prime_at(&self, offset: u64, bytes: u64) -> bool {
         let mut state = match self.shared.state.lock() {
             Ok(state) => state,
@@ -1095,25 +1175,9 @@ impl PrefetchHandle {
     /// moment [`PrefetchHandle::cancel_preload`] is called, the handle is
     /// dropped, or the URL's cache file reaches [`CACHE_CAP_BYTES`].
     ///
-    /// Keys come from [`cache_key_from_url`]. The player names its file
-    /// `<bvid>-<cid>-<quality>.part`; to preload *exactly* that file use
-    /// [`PrefetchHandle::preload_keys`]. The live session's own key is skipped,
-    /// so a preload can never truncate the file a decoder is reading.
-    ///
-    /// Returns the number of URLs enqueued (`0` when nothing was started).
-    #[allow(dead_code)] // public API: the UI session calls this next
-    pub fn preload(&self, order: &[String]) -> usize {
-        let pairs: Vec<(String, String)> = order
-            .iter()
-            .map(|url| (cache_key_from_url(url), url.clone()))
-            .collect();
-        self.preload_keys(&pairs)
-    }
-
     /// Same as [`PrefetchHandle::preload`], with an explicit cache key per URL
     /// (`(key, url)`), so a preload can fill the file a later player will open:
     /// the player passes `<bvid>-<cid>-<quality>`.
-    #[allow(dead_code)] // public API: the UI session calls this next
     pub fn preload_keys(&self, order: &[(String, String)]) -> usize {
         self.cancel_preload();
         let live = self.shared.cache_key.clone();
@@ -1180,29 +1244,9 @@ impl PrefetchHandle {
         order.len()
     }
 
-    /// Current preload progress. `(files_total, files_done, bytes_done,
-    /// bytes_total)`; all zero when nothing is preloading.
-    #[allow(dead_code)] // public API: the UI session can show this next
-    pub fn preload_progress(&self) -> (u32, u32, u64, u64) {
-        let slot = match self.preload.lock() {
-            Ok(slot) => slot,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let Some(job) = slot.as_ref() else {
-            return (0, 0, 0, 0);
-        };
-        (
-            job.progress.files_total.load(Ordering::SeqCst) as u32,
-            job.progress.files_done.load(Ordering::SeqCst) as u32,
-            job.progress.bytes_done.load(Ordering::SeqCst),
-            job.progress.bytes_total.load(Ordering::SeqCst),
-        )
-    }
-
     /// Stop the playlist preload (no-op when none is running). Returns whether
     /// one was running. The task is signalled, not awaited: it holds the file
     /// for at most one chunk (`PRELOAD_CHUNK_BYTES`) and then removes it.
-    #[allow(dead_code)] // public API: the UI session calls this next
     pub fn cancel_preload(&self) -> bool {
         let job = {
             let mut slot = match self.preload.lock() {
@@ -1239,7 +1283,7 @@ impl PrefetchHandle {
     }
 
     /// `(id, host, slow, bytes_per_sec)` per live worker, in id order.
-    #[allow(dead_code)] // public API: the player/profiler reads it live
+    #[cfg(test)]
     pub fn worker_health(&self) -> Vec<(u32, String, bool, u64)> {
         let mut state = match self.shared.state.lock() {
             Ok(state) => state,
@@ -1451,9 +1495,9 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
             served: 0,
             serve_bps: 0,
             first_serve: None,
-            // One burst so the first speculative chunk can start immediately;
-            // the bucket then holds the queue at `speculative_rate`.
-            spec_tokens: DEFAULT_CHUNK_BYTES.saturating_mul(SPECULATIVE_BURST_CHUNKS),
+            // One chunk so the first speculative claim can start immediately;
+            // the bucket refills it to one chunk per live connection.
+            spec_tokens: DEFAULT_CHUNK_BYTES,
             spec_at: Instant::now(),
             spec_bytes: 0,
             read_ahead: 0,
@@ -1479,19 +1523,21 @@ pub fn spawn(url: &str, config: PrefetchConfig) -> Result<PrefetchHandle> {
         serve_epoch: AtomicU64::new(0),
         read_ahead_cap: AtomicU64::new(startup_read_ahead),
         background_paused: AtomicBool::new(false),
-        // Gated sessions ramp: a few fetchers while the first window fills,
-        // every configured worker once frames are flowing.
+        // Gated sessions start at the measured knee (two streams); the
+        // connection governor owns the count from the first tick and may raise
+        // it all the way to the configured value. Background work is never
+        // capped below the live count — the "two workers for twelve seconds"
+        // rule was half of why a sixteen-connection setting showed one or two
+        // busy bars.
         desired_connections: AtomicU64::new(if gate {
             config.connections.min(STARTUP_CONNECTIONS) as u64
         } else {
             config.connections as u64
         }),
         configured_connections: config.connections as u64,
-        background_workers: AtomicU64::new(if gate {
-            STARTUP_BACKGROUND_WORKERS as u64
-        } else {
-            0
-        }),
+        background_workers: AtomicU64::new(0),
+        serve_waits: AtomicU64::new(0),
+        serve_wait_slow: AtomicU64::new(0),
         worker_cancel: (0..MAX_CONNECTIONS).map(|_| AtomicU64::new(0)).collect(),
         media_bps: AtomicU64::new(0),
         serve_wait_pos: AtomicU64::new(u64::MAX),
@@ -2444,7 +2490,6 @@ impl DiskCache {
     }
 
     /// First byte of the first hole in `[0, len)` (`len` when complete).
-    #[allow(dead_code)] // used by the playlist preload
     fn first_hole(&self) -> u64 {
         if self.len == 0 {
             return 0;
@@ -2469,7 +2514,6 @@ impl DiskCache {
     }
 
     /// Persist the present ranges next to the file (`O11A1MAP` + length + ranges).
-    #[allow(dead_code)] // used by the playlist preload
     fn save_map(&self) -> bool {
         if self.path.as_os_str().is_empty() || self.len == 0 {
             return false;
@@ -2489,7 +2533,6 @@ impl DiskCache {
     /// describe bytes that are still in a buffer somewhere, so the two steps
     /// have a fixed order: `flush`/`sync_all` first, map second. Used by the
     /// playlist preload, whose file is meant to outlive its writer.
-    #[allow(dead_code)] // used by the playlist preload
     fn flush_and_save_map(&self) -> bool {
         if let Some(file) = self.file.as_ref() {
             // `&File` is enough: `Write` is implemented for `&File`.
@@ -2632,7 +2675,7 @@ impl DiskWriter {
         let handle = std::thread::Builder::new()
             .name("cache-writer".to_string())
             .spawn(move || {
-                crate::player::note_thread_role("disk-writer");
+                crate::media_hooks::note_thread_role("disk-writer");
                 writer_loop(rx, &disk, &file, &thread_label);
             })
             .ok()?;
@@ -2965,7 +3008,7 @@ fn write_run(run: OpenRun, disk: &Mutex<DiskCache>, file: &File, stats: &mut Wri
         return;
     }
     let len = run.bytes.len() as u64;
-    crate::player::tag_here("prefetch:write");
+    crate::media_hooks::tag_here("prefetch:write");
     match disk.lock() {
         Ok(mut disk) => disk.write_with(file, run.start, &run.bytes),
         Err(poisoned) => poisoned.into_inner().write_with(file, run.start, &run.bytes),
@@ -3422,7 +3465,6 @@ struct Engine {
     client: reqwest::Client,
     /// Name of this session's cache file, so a preload can never touch the file
     /// a decoder is reading.
-    #[allow(dead_code)] // read by `preload_keys`
     cache_key: String,
     state: Mutex<State>,
     /// The session cache file's read handle and its present ranges. Nothing on
@@ -3447,15 +3489,25 @@ struct Engine {
     /// [`PrefetchHandle::set_background_paused`]). Held, workers fetch only the
     /// client's hot window; seek points and speculative parts wait.
     background_paused: AtomicBool,
-    /// Live connection count. `set_connections` raises/lowers it; workers with
-    /// an id at or above the current value stay out of the queue.
+    /// Live connection count. The governor (or `set_connections`) raises and
+    /// lowers it; workers with an id at or above the current value stay out of
+    /// the queue.
     desired_connections: AtomicU64,
-    /// The configured count the startup ramp widens to (immutable).
+    /// The configured count the governor may widen to (immutable).
     configured_connections: u64,
-    /// Speculative (Warm/Rest) workers allowed right now; `0` = no cap. Set to
-    /// [`STARTUP_BACKGROUND_WORKERS`] for a gated session and cleared after
-    /// [`BACKGROUND_RAMP`].
+    /// Speculative (Warm/Rest) workers allowed right now; `0` = no cap. Kept at
+    /// zero: the connection count is the cap, and it follows the measured knee.
     background_workers: AtomicU64,
+    /// Serve waits opened since the session started. The connection governor
+    /// reads the delta as telemetry (every wait, however short).
+    serve_waits: AtomicU64,
+    /// Serve waits that actually hurt: closed after at least
+    /// [`SERVE_WAIT_SLOW_MS`] of waiting. Only this counter steps the pool
+    /// down. A normal read that arrives a few milliseconds before the startup
+    /// window lands used to halve sixteen connections to two on every seek and
+    /// every buffer refill (measured: 22 waits, all 5–14 ms), which is the
+    /// "16 线程只有一两个在干活" the governor was supposed to prevent.
+    serve_wait_slow: AtomicU64,
     /// Per-worker cancellation tokens. The health watchdog bumps one to make a
     /// slow worker drop its current request at the next network read.
     worker_cancel: Vec<AtomicU64>,
@@ -3563,6 +3615,7 @@ impl Engine {
         if self.serve_wait_pos.swap(pos, Ordering::SeqCst) == u64::MAX {
             self.serve_wait_since_ms.store(now_ms, Ordering::SeqCst);
             self.serve_wait_escalations.store(0, Ordering::SeqCst);
+            self.serve_waits.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
         now_ms.saturating_sub(self.serve_wait_since_ms.load(Ordering::SeqCst))
@@ -3578,6 +3631,9 @@ impl Engine {
         }
         let since = self.serve_wait_since_ms.load(Ordering::SeqCst);
         let waited = (self.started.elapsed().as_millis() as u64).saturating_sub(since);
+        if waited >= SERVE_WAIT_SLOW_MS {
+            self.serve_wait_slow.fetch_add(1, Ordering::Relaxed);
+        }
         let escalated = self.serve_wait_escalations.swap(0, Ordering::SeqCst);
         crate::debug_log(&format!(
             "serve wait end pos={pos} waited_ms={waited} reason={reason} escalated={escalated}"
@@ -3829,6 +3885,7 @@ impl Engine {
                 .take(live)
                 .filter(|slot| slot.busy)
                 .count() as u32;
+            stats.inflight = state.inflight.len() as u64;
             // Whole-file queue: chunks the scheduler still has to hand out
             // (fetched and in-flight chunks are no longer queued).
             let chunk = self.config.chunk_bytes.max(1);
@@ -4992,16 +5049,111 @@ fn note_serve_rate(state: &mut State, now: Instant, bytes: u64) {
     };
 }
 
+/// QA escape hatch: `BILI_PREFETCH_SPEC_RATE=<bytes/s>` pins the speculative
+/// budget instead of deriving it, so the same binary can reproduce a previous
+/// policy on the same CDN moment (the before/after table in the report used
+/// `462000`, the old 2× bitrate of the test stream). Read once.
+fn spec_rate_override() -> Option<u64> {
+    static RATE: OnceLock<Option<u64>> = OnceLock::new();
+    *RATE.get_or_init(|| {
+        std::env::var("BILI_PREFETCH_SPEC_RATE")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|rate| *rate > 0)
+    })
+}
+
+/// QA escape hatch: `BILI_PREFETCH_BURST_CHUNKS=<n>` pins the speculative burst
+/// to `n × chunk` (the old policy used two), same purpose as
+/// [`spec_rate_override`].
+fn spec_burst_override() -> Option<u64> {
+    static CHUNKS: OnceLock<Option<u64>> = OnceLock::new();
+    *CHUNKS.get_or_init(|| {
+        std::env::var("BILI_PREFETCH_BURST_CHUNKS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|chunks| *chunks > 0)
+    })
+}
+
+/// How far ahead of the playhead the whole-file queue may run, in media
+/// seconds. `BILI_PREFETCH_HORIZON_S` reproduces the previous
+/// [`PLAYBACK_AHEAD_SECONDS`] queue for an A/B run; normal runs use
+/// [`PREFETCH_AHEAD_SECONDS`].
+fn prefetch_horizon_seconds() -> u64 {
+    static HORIZON: OnceLock<u64> = OnceLock::new();
+    *HORIZON.get_or_init(|| {
+        std::env::var("BILI_PREFETCH_HORIZON_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(PREFETCH_AHEAD_SECONDS)
+    })
+}
+
+/// QA escape hatch: `BILI_PREFETCH_CEILING_BPS=<bytes/s>` pins the sustained
+/// speculative ceiling (and therefore how many streams the bucket can feed), so
+/// the same binary can compare 16 / 48 / 64 MiB/s on the same CDN moment.
+fn spec_ceiling() -> u64 {
+    static CEILING: OnceLock<u64> = OnceLock::new();
+    *CEILING.get_or_init(|| {
+        std::env::var("BILI_PREFETCH_CEILING_BPS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|rate| *rate > 0)
+            .unwrap_or(SPECULATIVE_CEILING_BPS)
+    })
+}
+
 /// Refill rate of the speculative token bucket: [`SPECULATIVE_RATE_FACTOR`] ×
 /// the bitrate for the whole-file queue, [`WARM_RATE_FACTOR`] × while seek
-/// points are still being warmed (they are a one-shot job and each is small).
-fn speculative_rate(bitrate: u64, warm_pending: bool) -> u64 {
-    let factor = if warm_pending {
-        WARM_RATE_FACTOR
+/// points are still being warmed, but never less than
+/// [`MIN_SPECULATIVE_CONNECTION_BPS`] per live connection (so a configured
+/// worker is never starved by the bucket) and never more than
+/// [`SPECULATIVE_CEILING_BPS`].
+fn speculative_rate(bitrate: u64, warm_pending: bool, warmup: bool) -> u64 {
+    if let Some(rate) = spec_rate_override() {
+        return rate;
+    }
+    let ceiling = spec_ceiling();
+    if warmup {
+        // The opening keeps the old budget: a couple of streams' worth, never
+        // a burst (see [`SPECULATIVE_WARMUP`]).
+        let factor = if warm_pending {
+            WARM_RATE_FACTOR
+        } else {
+            SPECULATIVE_RATE_FACTOR
+        };
+        return bitrate
+            .saturating_mul(factor)
+            .max(MIN_SPECULATIVE_CONNECTION_BPS)
+            .min(ceiling);
+    }
+    // Steady state: the *ceiling* is the sustained bound (CPU, not bandwidth),
+    // and the live connection count is the parallelism bound. Tying the rate to
+    // `per connection × live` made a settled two-stream session crawl at
+    // 4 MiB/s: the floor that was meant to stop starvation became the cap.
+    ceiling
+}
+
+/// One claim's worth of burst allowance per live connection (see
+/// [`SPECULATIVE_BURST_CHUNKS_PER_CONNECTION`]).
+fn speculative_burst(chunk: u64, live: usize, warmup: bool) -> u64 {
+    if let Some(chunks) = spec_burst_override() {
+        return chunk.saturating_mul(chunks);
+    }
+    // One claim per live connection, with a two-chunk floor so a single-worker
+    // session (or a one-chunk file) can always start. During the opening only
+    // that floor applies: two chunks, the old behaviour, until the player is
+    // steady (see [`SPECULATIVE_WARMUP`]).
+    let live = if warmup {
+        live.min(GOVERNOR_MIN_CONNECTIONS)
     } else {
-        SPECULATIVE_RATE_FACTOR
+        live
     };
-    bitrate.saturating_mul(factor)
+    chunk
+        .saturating_mul((live.max(1) as u64).max(2))
+        .saturating_mul(SPECULATIVE_BURST_CHUNKS_PER_CONNECTION)
 }
 
 /// Take `bytes` worth of speculative bandwidth. `false` means "do not start
@@ -5166,31 +5318,200 @@ fn steal_chunk(
     }
 }
 
-/// Give the speculative whole-file prefetch its full worker pool once the
-/// session is out of its opening phase (see [`BACKGROUND_RAMP`]).
-async fn background_ramp_loop(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
-    let started = Instant::now();
-    while started.elapsed() < BACKGROUND_RAMP {
+/// Keep the live connection count at the measured throughput knee.
+///
+/// A Bilibili mirror throttles per stream, so "use all sixteen" is not the same
+/// as "fastest": measured on one mirror, 1 connection pulled 22 MB/s, 4 pulled
+/// 19 MB/s and 16 pulled 8–10 MB/s. The session therefore starts at
+/// [`STARTUP_CONNECTIONS`] and this loop — once per [`GOVERNOR_TICK`] — first
+/// **explores up to the configured count** (doubling every decision window, so
+/// the setting is measured instead of assumed), then doubles/halves while the
+/// measured aggregate keeps improving and settles on the count that measured
+/// best. Bounds: at least [`GOVERNOR_MIN_CONNECTIONS`], at most configured.
+///
+/// It never raises the count while the client is waiting for bytes (a *slow*
+/// serve wait in the window halves it at once): playback is what the pool must
+/// not slow down, and a wait that cost the client 250 ms or more is the only
+/// honest signal that it did. Short waits are counted and logged, not acted on.
+///
+/// The same tick logs the once-per-second-class line the QA reads:
+/// `prefetch fetch active=N inflight=M live=K configured=C agg=…/s
+/// per=[id:…] waits=W slow=S`.
+async fn connection_governor(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
+    // Without the startup gate the session starts at the configured count and
+    // the governor still trims it to the measured knee (a configured 16 on a
+    // throttling mirror is sixteen slow streams, not a fast one).
+    let configured = engine.configured_connections.clamp(1, MAX_CONNECTIONS as u64) as usize;
+    if configured <= GOVERNOR_MIN_CONNECTIONS {
+        return;
+    }
+    let mut best_agg = 0u64;
+    let mut best_live = engine.desired_connections();
+    let mut settled = false;
+    // Whether the configured count has been reached once (see "explore" below).
+    let mut explored = engine.desired_connections() >= configured;
+    // Consecutive decision windows in which throughput looked collapsed. One
+    // quiet window is a chunk landing on either side of the sample, not a
+    // reason to re-open sixteen streams; three in a row is.
+    let mut slow_windows = 0u32;
+    let mut last_waits = engine.serve_waits.load(Ordering::Relaxed);
+    let mut last_slow = engine.serve_wait_slow.load(Ordering::Relaxed);
+    // Throughput *of this tick*, from the fetched-byte counter: the per-worker
+    // five-second windows overlap and keep a finished worker's last rate, which
+    // made the first version oscillate 2→16→2 on noise.
+    let mut last_bytes = engine.snapshot().bytes_fetched;
+    let mut last_at = Instant::now();
+    let mut dec_bytes = last_bytes;
+    let mut dec_at = last_at;
+    let mut tick = 0u64;
+    loop {
+        tokio::time::sleep(GOVERNOR_TICK).await;
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        tokio::time::sleep(STARTUP_POLL).await;
+        tick = tick.saturating_add(1);
+        let decide = tick % 2 == 0;
+        let health = engine.worker_health_snapshot();
+        let live = engine.desired_connections();
+        let stats = engine.snapshot();
+        let active = stats.active_workers as usize;
+        let inflight = stats.inflight;
+        let now = Instant::now();
+        let elapsed_ms = now.saturating_duration_since(last_at).as_millis().max(1) as u64;
+        let agg = stats
+            .bytes_fetched
+            .saturating_sub(last_bytes)
+            .saturating_mul(1000)
+            .saturating_div(elapsed_ms);
+        last_bytes = stats.bytes_fetched;
+        last_at = now;
+        let waits = engine.serve_waits.load(Ordering::Relaxed);
+        let new_waits = waits.saturating_sub(last_waits);
+        last_waits = waits;
+        // Only a wait that actually cost the client time steps the pool down;
+        // a few-millisecond miss is the normal read, not a starved pool.
+        let slow = engine.serve_wait_slow.load(Ordering::Relaxed);
+        let new_slow = slow.saturating_sub(last_slow);
+        last_slow = slow;
+        let per = health
+            .iter()
+            .map(|(id, _, _, bps)| format!("{id}:{}", format_rate(*bps)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut next = live;
+        let mut reason = "sampled";
+        // Nothing claimable (the whole file is local, the window is full, or the
+        // session is paused). A finished file must not read as a throughput
+        // collapse: the old rule halved 16→8 right after the queue drained.
+        let queue_idle = stats.queue_chunks == 0 && stats.inflight == 0;
+        // A *slow* serve wait is acted on immediately: the client is waiting
+        // right now, so the pool gives the machine back on this tick, not the
+        // next. A normal 8 ms miss is not a reason to throw away the ramp.
+        if queue_idle {
+            dec_bytes = stats.bytes_fetched;
+            dec_at = now;
+            reason = "queue-idle";
+        } else if new_slow > 0 && live > GOVERNOR_MIN_CONNECTIONS {
+            next = (live / 2).max(GOVERNOR_MIN_CONNECTIONS);
+            best_agg = 0;
+            best_live = next;
+            settled = false;
+            reason = "serve-wait-slow";
+        } else if !decide {
+            // The odd tick is telemetry only.
+        } else {
+            // Decision window: two ticks, so a 4 MiB chunk that lands between
+            // samples is counted once and the ramp is not decided by a fragment.
+            let decision_ms = now
+                .saturating_duration_since(dec_at)
+                .as_millis()
+                .max(1) as u64;
+            let decision_agg = stats
+                .bytes_fetched
+                .saturating_sub(dec_bytes)
+                .saturating_mul(1000)
+                .saturating_div(decision_ms);
+            dec_bytes = stats.bytes_fetched;
+            dec_at = now;
+            reason = "settled";
+            if decision_agg > 0 && decision_agg as f64 > best_agg as f64 * GOVERNOR_COLLAPSE {
+                slow_windows = 0;
+            }
+            if decision_agg == 0 {
+                // Nothing was fetched this window (window full, queue done, or
+                // the session is paused): keep the count, learn nothing.
+                reason = "idle";
+            } else if !explored {
+                // The first pass always measures the configured count: the user
+                // asked for sixteen, so sixteen is tried once even when two
+                // already saturate the bucket (a 19 % gain does not clear
+                // [`GOVERNOR_IMPROVE`], and the session used to settle on two
+                // without ever testing the setting).
+                if decision_agg as f64 >= best_agg as f64 * GOVERNOR_IMPROVE
+                    || best_agg == 0
+                {
+                    best_agg = decision_agg;
+                    best_live = live;
+                }
+                next = (live.saturating_mul(2)).min(configured);
+                if next >= configured {
+                    explored = true;
+                }
+                reason = "explore";
+            } else if best_agg == 0
+                || decision_agg as f64 >= best_agg as f64 * GOVERNOR_IMPROVE
+            {
+                best_agg = decision_agg;
+                best_live = live;
+                settled = false;
+                if live < configured {
+                    next = (live.saturating_mul(2)).min(configured);
+                    reason = "improved";
+                }
+            } else if live > GOVERNOR_MIN_CONNECTIONS && !settled {
+                // Worse than the best count: step back toward it (and below it
+                // once, so a mirror that is best at two is not left at four).
+                next = if best_live >= live {
+                    (live / 2).max(GOVERNOR_MIN_CONNECTIONS)
+                } else {
+                    best_live
+                };
+                if next >= live {
+                    next = live;
+                    settled = true;
+                }
+                reason = "regressed";
+            } else if decision_agg as f64 <= best_agg as f64 * GOVERNOR_COLLAPSE {
+                // Throughput collapsed (shared link, throttled mirror). One
+                // window is noise; three in a row means the best is stale, so
+                // re-explore from the current count.
+                slow_windows = slow_windows.saturating_add(1);
+                if slow_windows >= 3 {
+                    best_agg = decision_agg;
+                    best_live = live;
+                    settled = false;
+                    slow_windows = 0;
+                    if live < configured {
+                        next = (live.saturating_mul(2)).min(configured);
+                    }
+                    reason = "collapse";
+                }
+            } else {
+                settled = true;
+            }
+        }
+        if next != live {
+            engine.desired_connections.store(next as u64, Ordering::SeqCst);
+            crate::netpool::wake();
+        }
+        // One line per tick: the concurrency the scheduler really had (not the
+        // configured number), and the per-connection share behind it.
+        crate::debug_log(&format!(
+            "prefetch fetch active={active} inflight={inflight} live={live}->{next} configured={configured} agg={}/s bytes={} per=[{per}] waits={new_waits} slow={new_slow} reason={reason}",
+            format_rate(agg),
+            format_bytes(stats.bytes_fetched)
+        ));
     }
-    if shutdown.load(Ordering::SeqCst) {
-        return;
-    }
-    let before = engine.background_workers.swap(0, Ordering::SeqCst);
-    let connections_before = engine.desired_connections.load(Ordering::SeqCst);
-    engine
-        .desired_connections
-        .store(engine.configured_connections, Ordering::SeqCst);
-    crate::debug_log(&format!(
-        "prefetch background ramp workers={}→unlimited connections={}→{} at_ms={}",
-        before,
-        connections_before,
-        engine.configured_connections,
-        engine.started.elapsed().as_millis()
-    ));
 }
 
 /// Priority-ordered chunk selection over the whole file.
@@ -5203,7 +5524,8 @@ async fn background_ramp_loop(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
 ///    (work-stealing), or — for a short/unsplit file — the horizon in order.
 ///
 /// 2–4 are speculative and share one token bucket refilled at
-/// [`speculative_rate`], so the whole-file pull can never own the machine.
+/// [`speculative_rate`], which is sized so every live connection can be in
+/// flight (and bounded by [`SPECULATIVE_CEILING_BPS`]).
 ///
 /// **A serve wait suspends 2–4.** When `serve_waiting` (a response body is
 /// blocked on a missing hot chunk) only the hot window is claimable: every
@@ -5218,6 +5540,7 @@ fn pick_chunk(
     held: bool,
     serve_waiting: bool,
     background_cap: usize,
+    live: usize,
     bitrate: u64,
     disk: &DiskCache,
 ) -> Option<(u64, ChunkKind)> {
@@ -5295,8 +5618,14 @@ fn pick_chunk(
         .warm_plan
         .iter()
         .any(|task| !task.done && !task.claimed);
-    let rate = speculative_rate(bitrate, warm_pending);
-    let burst = chunk.saturating_mul(SPECULATIVE_BURST_CHUNKS);
+    // The opening of a session keeps the old, small budget: the decoder and the
+    // interpolator are starting and must not compete with a sixteen-stream
+    // burst (see [`SPECULATIVE_WARMUP`]). The hot window is never affected.
+    let warmup = state
+        .first_serve
+        .map_or(true, |first| first.elapsed() < SPECULATIVE_WARMUP);
+    let rate = speculative_rate(bitrate, warm_pending, warmup);
+    let burst = speculative_burst(chunk, live, warmup);
 
     // 3. Seek warm points (one-shot: the plan is a few dozen MiB in total).
     //    A point primed for a seek that is happening right now (`urgent`) does
@@ -5330,11 +5659,13 @@ fn pick_chunk(
         }
     }
 
-    // 4. The whole-file queue, only inside the download horizon: the file may
-    //    be at most [`PLAYBACK_AHEAD_SECONDS`] of media ahead of the playhead.
-    //    Fetching further would download video the playhead cannot reach for
-    //    minutes — the entire file at sixteen connections — which is exactly
-    //    the work this limit removes.
+    // 4. The whole-file queue, inside the download horizon: the file may be at
+    //    most [`PREFETCH_AHEAD_SECONDS`] of media ahead of the playhead. That is
+    //    an hour, i.e. the whole file for anything this player opens: the queue
+    //    is meant to cache the file, not to pace itself to playback (the old
+    //    90 s horizon made "整片缓存完成" take as long as watching). What is
+    //    *retained* in memory is still [`PLAYBACK_AHEAD_SECONDS`], so the wider
+    //    queue costs cache file, not memory.
     //
     //    Without a bitrate estimate (`0`: tests, and the first few hundred
     //    milliseconds of a session) there is no horizon the caller could
@@ -5342,7 +5673,7 @@ fn pick_chunk(
     let horizon = if bitrate == 0 {
         u64::MAX
     } else {
-        bitrate.saturating_mul(PLAYBACK_AHEAD_SECONDS)
+        bitrate.saturating_mul(prefetch_horizon_seconds())
     };
     let limit = state
         .total
@@ -5358,7 +5689,7 @@ fn pick_chunk(
     if !state.parts_built {
         let total = state.total?;
         if total.saturating_sub(chunk_start(state.cursor, chunk)) >= DYNAMIC_SPLIT_THRESHOLD {
-            build_parts(state, config.connections, chunk);
+            build_parts(state, live.max(1), chunk);
         } else {
             state.parts_built = true;
         }
@@ -5520,6 +5851,7 @@ fn claim(engine: &Engine, shutdown: &AtomicBool, worker_id: usize) -> Claim {
             engine.background_held(),
             engine.serve_waiting(),
             engine.background_workers.load(Ordering::Relaxed) as usize,
+            engine.desired_connections(),
             bitrate,
             &disk,
         ) {
@@ -6322,13 +6654,11 @@ async fn startup_gate_loop(engine: Arc<Engine>, shutdown: Arc<AtomicBool>) {
     }
     let before = engine.read_ahead_window();
     engine.read_ahead_cap.store(u64::MAX, Ordering::Relaxed);
-    // The connection count stays at its startup value here: widening the window
-    // *and* letting sixteen streams loose at the same moment is what cost 2–5
-    // cores for the first seconds (measured `fetched` 12→50 MB in 4 s). The
-    // speculative ramp raises it after [`BACKGROUND_RAMP`]; four streams already
-    // outrun any stream bitrate.
+    // The connection count is not touched here: the governor owns it, and it
+    // only raises the count while the measured aggregate keeps improving (a
+    // throttling mirror is fastest at two streams, not sixteen).
     crate::debug_log(&format!(
-        "startup gate readahead={}→{} connections={} (ramp pending) at_ms={}",
+        "startup gate readahead={}→{} connections={} (governor) at_ms={}",
         before >> 20,
         engine.read_ahead_window() >> 20,
         engine.desired_connections.load(Ordering::SeqCst),
@@ -6451,6 +6781,10 @@ async fn fetch_stream(
     let mut response = response;
     let mut received = 0u64;
     let mut offset = start;
+    // See the flush rule below: one push per block, except the first read.
+    let mut batch: Vec<u8> = Vec::with_capacity(READ_BATCH_BYTES as usize);
+    let mut batch_at = start;
+    let mut pushed_once = false;
     while received < expected {
         if shutdown.load(Ordering::SeqCst) {
             return Err(FetchFail {
@@ -6491,13 +6825,48 @@ async fn fetch_stream(
         if take == 0 {
             break;
         }
-        // A superseded generation stops reading at once instead of draining
-        // bytes that can no longer be served.
-        if !engine.push_bytes(generation, offset, &chunk[..take], host, worker, kind, shutdown) {
-            return Ok(received);
+        // Batch network reads into one `push_bytes` block: reqwest hands out
+        // whatever an HTTP/2 frame carried (16 KiB), and every push takes the
+        // state lock, copies the bytes, publishes the whole download map and
+        // queues a disk write. At 16 streams × 8 MB/s that was thousands of
+        // lock/publish/queue round trips per second for 16 KiB each. The first
+        // read is pushed on its own so a serve wait still sees bytes at once;
+        // the rest go out in READ_BATCH_BYTES blocks (the disk block size).
+        if batch.is_empty() {
+            batch_at = offset;
         }
+        batch.extend_from_slice(&chunk[..take]);
         offset += take as u64;
         received += take as u64;
+        let flush = !pushed_once
+            || batch.len() as u64 >= READ_BATCH_BYTES
+            || received >= expected;
+        if flush {
+            if !engine.push_bytes(
+                generation,
+                batch_at,
+                &batch,
+                host,
+                worker,
+                kind,
+                shutdown,
+            ) {
+                return Ok(received);
+            }
+            pushed_once = true;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        engine.push_bytes(
+            generation,
+            batch_at,
+            &batch,
+            host,
+            worker,
+            kind,
+            shutdown,
+        );
     }
     Ok(received)
 }
@@ -6663,13 +7032,11 @@ async fn run_server(
             engine.clone(),
             shutdown.clone(),
         ));
-        // Release the small speculative pool after the ramp window. Playback
-        // (hot window, seek points) never waits on this.
-        workers.spawn(background_ramp_loop(
-            engine.clone(),
-            shutdown.clone(),
-        ));
     }
+    // The live connection count follows the measured knee, from the first
+    // second: no "two background workers for twelve seconds" phase, and no
+    // sixteen throttled streams when the mirror is fastest at two.
+    workers.spawn(connection_governor(engine.clone(), shutdown.clone()));
     // Per-worker throughput watchdog: slow routes, route fallback and
     // duplicate-request races.
     workers.spawn(health_loop(engine.clone(), shutdown.clone()));
@@ -7686,12 +8053,15 @@ async fn serve_body(
 }
 
 // ---------------------------------------------------------------------------
-// QA hook (temporary live verification; also usable from the player later)
+// QA hook: driven by the `#[ignore]`d live tests below, never by the app.
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 const QA_PREFIX_BYTES: u64 = 8 << 20;
+#[cfg(test)]
 const QA_SEEK_BYTES: u64 = 2 << 20;
 
+#[cfg(test)]
 struct QaRead {
     content_range: String,
     bytes: u64,
@@ -7706,6 +8076,7 @@ struct QaRead {
 /// Read exactly `want` bytes of one HTTP range from `url`, hashing the prefix
 /// and the whole sample; when `handle` is given, sample the proxy stats while
 /// reading.
+#[cfg(test)]
 async fn qa_read(
     client: &reqwest::Client,
     url: &str,
@@ -7776,6 +8147,7 @@ async fn qa_read(
     })
 }
 
+#[cfg(test)]
 fn qa_mbps(bytes: u64, ms: u128) -> f64 {
     if ms == 0 {
         return 0.0;
@@ -7783,6 +8155,7 @@ fn qa_mbps(bytes: u64, ms: u128) -> f64 {
     bytes as f64 * 8.0 / (ms as f64 / 1000.0) / 1_000_000.0
 }
 
+#[cfg(test)]
 fn qa_log_contains(needle: &str) -> bool {
     std::env::var("BILI_DEBUG_LOG")
         .ok()
@@ -7798,7 +8171,7 @@ fn qa_log_contains(needle: &str) -> bool {
 /// This is the "plain HTTP client instead of ffmpeg" harness required for the
 /// first pass; the player can call it from a diagnostic env hook later. Call
 /// it from a synchronous thread.
-#[allow(dead_code)] // QA hook: reached only by `cargo test -- --ignored live_prefetch_proxy`
+#[cfg(test)]
 pub fn qa_verify(
     url: &str,
     hosts: &[String],
@@ -8062,7 +8435,7 @@ pub fn qa_verify(
         .unwrap_or(0);
     handle.shutdown();
     std::thread::sleep(Duration::from_millis(100));
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let closed = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err();
     let stopped = qa_log_contains("prefetch server stopped");
     let seek_reset = qa_log_contains(&format!("prefetch seek reset offset={seek_offset}"));
@@ -8479,8 +8852,31 @@ mod tests {
     }
 
     #[test]
-    fn serve_wait_suspends_speculative_claims_until_bytes_land() {
-        let mut engine = test_engine();
+    fn only_a_slow_serve_wait_counts_against_the_connection_count() {
+        // The governor must not halve the pool for the ordinary 5–14 ms miss a
+        // healthy reader makes; only a wait that cost frames does.
+        let engine = Arc::new(test_engine());
+        engine.open_serve_wait(0);
+        engine.close_serve_wait("available");
+        assert_eq!(engine.serve_waits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.serve_wait_slow.load(Ordering::Relaxed),
+            0,
+            "a wait closed in the same millisecond is not a stall"
+        );
+        engine.open_serve_wait(0);
+        std::thread::sleep(Duration::from_millis(SERVE_WAIT_SLOW_MS + 50));
+        engine.close_serve_wait("available");
+        assert_eq!(engine.serve_waits.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            engine.serve_wait_slow.load(Ordering::Relaxed),
+            1,
+            "a wait past SERVE_WAIT_SLOW_MS is the signal the governor acts on"
+        );
+    }
+
+    #[test]
+    fn serve_wait_suspends_speculative_claims_until_bytes_land() {        let mut engine = test_engine();
         engine.config.chunk_bytes = 4;
         engine.config.read_ahead_bytes = 8;
         // A 1 B/s stream puts the hot frontier 12 chunky bytes ahead (the
@@ -9063,25 +9459,25 @@ mod tests {
         };
         // The client's own chunk, then the next two seconds of playback.
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 0, &test_disk()),
             Some((0, ChunkKind::Hot))
         );
         state.inflight.insert((0, 0));
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 0, &test_disk()),
             Some((chunk, ChunkKind::Hot))
         );
         state.inflight.insert((0, chunk));
         // Only then the seek warm point.
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 0, &test_disk()),
             Some((40 << 20, ChunkKind::Warm))
         );
         state.inflight.insert((0, 40 << 20));
         state.warm_plan[0].claimed = true;
         // And finally the rest of the whole-file split.
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 0, &test_disk()),
             Some((2 * chunk, ChunkKind::Rest))
         );
     }
@@ -9117,13 +9513,13 @@ mod tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 0, &test_disk()),
             Some((tail, ChunkKind::Hot))
         );
         state.inflight.insert((0, tail));
         // The whole file is spoken for: the workers must go idle instead of
         // spinning on the past-EOF tail of the frontier.
-        assert_eq!(pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()), None);
+        assert_eq!(pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 0, &test_disk()), None);
     }
 
     #[test]
@@ -9149,7 +9545,7 @@ mod tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 0, &test_disk()),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 0, &test_disk()),
             Some((chunk, ChunkKind::Hot))
         );
     }
@@ -9356,7 +9752,7 @@ mod tests {
                 served: 0,
                 serve_bps: 0,
                 first_serve: None,
-                spec_tokens: DEFAULT_CHUNK_BYTES.saturating_mul(SPECULATIVE_BURST_CHUNKS),
+                spec_tokens: DEFAULT_CHUNK_BYTES,
                 spec_at: Instant::now(),
                 spec_bytes: 0,
                 read_ahead: 0,
@@ -9391,6 +9787,8 @@ mod tests {
             desired_connections: AtomicU64::new(1),
             configured_connections: 1,
             background_workers: AtomicU64::new(0),
+            serve_waits: AtomicU64::new(0),
+            serve_wait_slow: AtomicU64::new(0),
             worker_cancel: (0..MAX_CONNECTIONS).map(|_| AtomicU64::new(0)).collect(),
             media_bps: AtomicU64::new(0),
             serve_wait_pos: AtomicU64::new(u64::MAX),
@@ -9870,6 +10268,239 @@ mod tests {
     /// `$env:BILI_DEBUG_LOG="prefetch-live.log"; cargo test --release -- --ignored --nocapture live_prefetch_proxy`
     /// Set `BILI_PREFETCH_BVID=<bvid>` to pin a video, or `BILI_PREFETCH_URL`
     /// to skip the playurl lookup entirely.
+    /// Live fetch benchmark: cold session cache, real CDN, a reader that keeps
+    /// the media pace (like ffmpeg), and the numbers the work order asks for.
+    ///
+    /// ```powershell
+    /// $env:BILI_DEBUG_LOG="prefetch-bench.log"
+    /// $env:BILI_PREFETCH_BVID="BV1Kznj6VEwm"
+    /// $env:BILI_PREFETCH_BENCH_SECS="60"
+    /// cargo test --release -- --ignored --nocapture live_fetch_benchmark
+    /// ```
+    ///
+    /// Logs, once per second: `prefetch bench t=N active=… live=… agg=… cached=…
+    /// window=… queue=…`; and once at the end:
+    /// `prefetch bench result first_byte_ms=… buffer10_ms=… complete_ms=…
+    /// cached=…/… mbps=… seeks=[…] p50_ms=…`.
+    ///
+    /// `buffer10_ms` is the first second at which the session cache covers ten
+    /// seconds of media from offset 0 (`10 × total / duration`), measured from
+    /// the cache map — not from "some byte arrived". `complete_ms` is the first
+    /// second the map covers the whole file (absent when it does not finish
+    /// inside the window). Seeks are 64 KiB ranged reads at nine spread
+    /// offsets, timed to first byte through the proxy, after the read window.
+    #[test]
+    #[ignore = "network: benchmarks the real CDN through the proxy"]
+    fn live_fetch_benchmark() {
+        let Some((url, _hosts, duration)) = live_media() else {
+            return;
+        };
+        let secs = std::env::var("BILI_PREFETCH_BENCH_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(10);
+        let runtime = match crate::bilibili::shared_runtime() {
+            Some(runtime) => runtime,
+            None => return,
+        };
+        let cache_key = {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            format!(
+                "bench-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            )
+        };
+        let mut handle = match spawn(
+            &url,
+            PrefetchConfig {
+                connections: 16,
+                warm_points: 10,
+                media_duration_ms: (duration > 0).then(|| duration.saturating_mul(1000)),
+                cache_key: Some(cache_key),
+                ..PrefetchConfig::default()
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                crate::debug_log(&format!("prefetch bench spawn failed err={error}"));
+                return;
+            }
+        };
+        let local = handle.local_url.clone();
+        let client = match reqwest::Client::builder()
+            .user_agent(crate::bilibili::UA)
+            .timeout(Duration::from_secs(30))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                crate::debug_log(&format!("prefetch bench client failed err={error}"));
+                handle.shutdown();
+                return;
+            }
+        };
+        let spawn_at = Instant::now();
+        let (first_byte_ms, buffer10_ms, complete_ms, cached_end, total_end, paced_bytes) =
+            runtime.block_on(async {
+                let mut first_byte_ms: Option<u128> = None;
+                let mut buffer10_ms: Option<u128> = None;
+                let mut complete_ms: Option<u128> = None;
+                let mut paced = 0u64;
+                let paced_bps: u64 = std::env::var("BILI_PREFETCH_BENCH_BPS")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .filter(|bps| *bps > 0)
+                    .unwrap_or(0);
+                let mut response = match client
+                    .get(&local)
+                    .header(RANGE, "bytes=0-")
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        crate::debug_log(&format!("prefetch bench open failed err={error}"));
+                        return (None, None, None, 0u64, 0u64, 0u64);
+                    }
+                };
+                let started = Instant::now();
+                let mut tick = 0u64;
+                let mut next_tick = Duration::from_secs(1);
+                while started.elapsed() < Duration::from_secs(secs) {
+                    // Pace exactly like playback: one media second of bytes per
+                    // second, from t=0. `BILI_PREFETCH_BENCH_BPS` supplies the
+                    // bitrate before the proxy has learned the length; without
+                    // it the first second reads as fast as the proxy gives
+                    // bytes, which is what a decoder's first read does.
+                    let total = handle.snapshot().bytes_total;
+                    let target = if paced_bps > 0 {
+                        paced_bps
+                    } else {
+                        match (total, duration) {
+                            (Some(total), d) if d > 0 => total / d,
+                            _ => 0,
+                        }
+                    };
+                    if let Some(total) = total {
+                        if paced >= total {
+                            break;
+                        }
+                    }
+                    let wait = if target > 0 {
+                        let due = Duration::from_millis(paced.saturating_mul(1000) / target.max(1));
+                        due.saturating_sub(started.elapsed())
+                    } else {
+                        Duration::ZERO
+                    };
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                    match response.chunk().await {
+                        Ok(Some(chunk)) if !chunk.is_empty() => {
+                            if first_byte_ms.is_none() {
+                                first_byte_ms = Some(spawn_at.elapsed().as_millis());
+                            }
+                            paced = paced.saturating_add(chunk.len() as u64);
+                        }
+                        // ffmpeg reopens an ended body at the position it
+                        // reached; do the same so a short response (a superseded
+                        // or timed-out body) does not end the read.
+                        _ => {
+                            response = match client
+                                .get(&local)
+                                .header(RANGE, format!("bytes={paced}-"))
+                                .send()
+                                .await
+                            {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    crate::debug_log(&format!(
+                                        "prefetch bench reopen failed pos={paced} err={error}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                    if started.elapsed() >= next_tick {
+                        tick = tick.saturating_add(1);
+                        next_tick = Duration::from_secs(tick + 1);
+                        let stats = handle.snapshot();
+                        let cached = ranges_bytes(&handle.cached_ranges());
+                        if let (Some(total), d) = (stats.bytes_total, duration) {
+                            if d > 0 {
+                                let ten = (total / d).saturating_mul(10);
+                                if buffer10_ms.is_none() && cached >= ten {
+                                    buffer10_ms = Some(spawn_at.elapsed().as_millis());
+                                }
+                                if complete_ms.is_none() && cached >= total.saturating_sub(64 << 10)
+                                {
+                                    complete_ms = Some(spawn_at.elapsed().as_millis());
+                                }
+                            }
+                        }
+                        crate::debug_log(&format!(
+                            "prefetch bench t={tick}s active={} inflight={} live={} agg={}/s cached={} window={} queue={} paced={}",
+                            stats.active_workers,
+                            stats.inflight,
+                            handle.worker_health().len(),
+                            format_rate(stats.bytes_per_sec),
+                            format_bytes(cached),
+                            format_bytes(stats.read_ahead_bytes),
+                            stats.queue_chunks,
+                            format_bytes(paced)
+                        ));
+                    }
+                }
+                let stats = handle.snapshot();
+                let cached = ranges_bytes(&handle.cached_ranges());
+                (
+                    first_byte_ms,
+                    buffer10_ms,
+                    complete_ms,
+                    cached,
+                    stats.bytes_total.unwrap_or(0),
+                    paced,
+                )
+            });
+        // Nine seeks spread over the file, 64 KiB each, timed to first byte.
+        let mut seeks: Vec<u128> = Vec::new();
+        let span = total_end.max(1);
+        for step in 1..=9u64 {
+            let offset = span.saturating_mul(step) / 10;
+            let at = Instant::now();
+            let read = runtime.block_on(live_read(&client, &local, offset, 64 << 10));
+            let elapsed = at.elapsed().as_millis();
+            if read.is_ok() {
+                seeks.push(elapsed);
+            }
+        }
+        let mut sorted = seeks.clone();
+        sorted.sort_unstable();
+        let p50 = sorted.get(sorted.len() / 2).copied().unwrap_or(0);
+        let elapsed_secs = spawn_at.elapsed().as_secs_f64().max(0.001);
+        crate::debug_log(&format!(
+            "prefetch bench result first_byte_ms={} buffer10_ms={} complete_ms={} cached={} total={} paced={} mbps={:.2} seeks={:?} p50_ms={p50}",
+            first_byte_ms.map_or("-".to_string(), |ms| ms.to_string()),
+            buffer10_ms.map_or("-".to_string(), |ms| ms.to_string()),
+            complete_ms.map_or("-".to_string(), |ms| ms.to_string()),
+            format_bytes(cached_end),
+            format_bytes(total_end),
+            format_bytes(paced_bytes),
+            cached_end as f64 / elapsed_secs / 1e6,
+            seeks
+        ));
+        println!(
+            "first_byte={first_byte_ms:?} buffer10={buffer10_ms:?} complete={complete_ms:?} cached={} total={} seek_p50={p50}",
+            format_bytes(cached_end),
+            format_bytes(total_end)
+        );
+        handle.shutdown();
+    }
+
     #[test]
     #[ignore = "network: streams a real Bilibili media file through the proxy"]
     fn live_prefetch_proxy() {
@@ -9899,13 +10530,48 @@ mod tests {
             .ok()
             .filter(|value| !value.trim().is_empty());
         if let Some(url) = explicit {
-            return Some((url, Vec::new(), 0));
+            // A benchmark on a pinned URL still needs the duration for the
+            // bitrate (and therefore the horizon and the rate floor).
+            let duration = std::env::var("BILI_PREFETCH_DURATION_S")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            return Some((url, Vec::new(), duration));
         }
-        let session = match runtime.block_on(crate::bilibili::Session::new()) {
-            Ok(session) => session,
-            Err(error) => {
-                crate::debug_log(&format!("prefetch live skipped reason=session err={error}"));
-                return None;
+        // `BILI_PREFETCH_ACCOUNT=1` benchmarks the logged-in session (the real
+        // case: 1080p instead of the anonymous 480p cap the CDN gives an empty
+        // cookie jar). The saved account is the app's own file, read only.
+        let account_session = std::env::var("BILI_PREFETCH_ACCOUNT")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false);
+        let session = if account_session {
+            let account = crate::accounts::load();
+            let built = match account {
+                Some(account) => {
+                    let token = crate::accounts::to_token(&account);
+                    runtime.block_on(crate::bilibili::Session::from_token(&token))
+                }
+                None => {
+                    crate::debug_log("prefetch live skipped reason=no-saved-account");
+                    return None;
+                }
+            };
+            match built {
+                Ok(session) => session,
+                Err(error) => {
+                    crate::debug_log(&format!(
+                        "prefetch live skipped reason=account-session err={error}"
+                    ));
+                    return None;
+                }
+            }
+        } else {
+            match runtime.block_on(crate::bilibili::Session::new()) {
+                Ok(session) => session,
+                Err(error) => {
+                    crate::debug_log(&format!("prefetch live skipped reason=session err={error}"));
+                    return None;
+                }
             }
         };
         let pinned = std::env::var("BILI_PREFETCH_BVID")
@@ -10084,6 +10750,121 @@ mod tests {
             Err(_) => 0,
         };
         (bytes / FRAME_BYTES, stderr_text)
+    }
+
+    /// Decode a real 1080p stream *through the proxy* while the whole file is
+    /// being prefetched, and report what the decoder itself achieves.
+    ///
+    /// `$env:BILI_DEBUG_LOG="prefetch-decode.log"`
+    /// `$env:BILI_PREFETCH_BVID="<bvid>"; $env:BILI_PREFETCH_BENCH_SECS="90"`
+    /// `cargo test --release -- --ignored --nocapture live_decode_under_prefetch`
+    ///
+    /// This is the prefetch-scoped half of the "30 fps" gate: the player
+    /// window's `fps_presented` also depends on the renderer and the frame
+    /// interpolator, which this module does not own. What is asserted here is
+    /// that the fetch pool never starved the decoder: the whole file ends up
+    /// local while it decodes, no range failed, and ffmpeg never saw a partial
+    /// file. Run it with `BILI_PREFETCH_HORIZON_S=90` to compare against the
+    /// previous queue policy.
+    #[test]
+    #[ignore = "network: runs the real ffmpeg against a real media file"]
+    fn live_decode_under_prefetch() {
+        let Some((url, _hosts, duration)) = live_media() else {
+            return;
+        };
+        let seconds = std::env::var("BILI_PREFETCH_BENCH_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(90)
+            .max(30);
+        let frames = seconds.saturating_mul(30);
+        let mut handle = match spawn(
+            &url,
+            PrefetchConfig {
+                connections: 16,
+                warm_points: 10,
+                media_duration_ms: (duration > 0).then(|| duration.saturating_mul(1000)),
+                cache_key: Some(format!("decode-{}-{seconds}", std::process::id())),
+                ..PrefetchConfig::default()
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                crate::debug_log(&format!("prefetch decode spawn failed err={error}"));
+                return;
+            }
+        };
+        let local = handle.local_url.clone();
+        // Sample the fetch side once a second while the decoder runs, on its own
+        // thread: the point is the pair (decode rate, fetch concurrency).
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let engine = handle.shared.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut tick = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tick = tick.saturating_add(1);
+                    let stats = engine.snapshot();
+                    let cached = ranges_bytes(&engine.cached_ranges());
+                    crate::debug_log(&format!(
+                        "prefetch fetch active={} inflight={} live={} configured=16 agg={}/s bytes={} cached={} window={} queue={}",
+                        stats.active_workers,
+                        stats.inflight,
+                        engine.desired_connections(),
+                        format_rate(stats.bytes_per_sec),
+                        format_bytes(stats.bytes_fetched),
+                        format_bytes(cached),
+                        format_bytes(stats.read_ahead_bytes),
+                        stats.queue_chunks
+                    ));
+                }
+            })
+        };
+        let at = Instant::now();
+        let (decoded, stderr_text) = decode_video(&local, 0, frames);
+        let wall = at.elapsed().as_secs_f64();
+        stop.store(true, Ordering::SeqCst);
+        let cached = ranges_bytes(&handle.cached_ranges());
+        let stats = handle.snapshot();
+        let decode_fps = decoded as f64 / wall.max(0.001);
+        let media_s = decoded as f64 / 29.766;
+        crate::debug_log(&format!(
+            "prefetch decode result frames={decoded} wall_s={wall:.2} decode_fps={decode_fps:.2} media_s={media_s:.1} realtime={:.2}x cached={} total={} fetched={} failed_ranges={}",
+            media_s / wall.max(0.001),
+            format_bytes(cached),
+            format_bytes(stats.bytes_total.unwrap_or(0)),
+            format_bytes(stats.bytes_fetched),
+            stats.failed_ranges
+        ));
+        println!(
+            "decode frames={decoded} wall={wall:.2}s decode_fps={decode_fps:.2} realtime={:.2}x cached={}",
+            media_s / wall.max(0.001),
+            format_bytes(cached)
+        );
+        assert!(decoded > 0, "the proxy must feed the decoder");
+        assert!(
+            !stderr_text.contains("partial file"),
+            "ffmpeg must not see a partial file"
+        );
+        // The gate is starvation, not the codec's own ceiling: this box decodes
+        // 1080p→540p rgba with `-threads 0` at ~12 fps whatever the network
+        // does, so asserting 30 fps here would measure the cpu, not the proxy.
+        // What must hold is that the fetch pool never made the decoder wait for
+        // bytes: the whole file is local by the end, no range failed, and the
+        // decode progressed the whole time.
+        assert!(
+            stats.bytes_total.is_some_and(|total| cached + (16 << 20) >= total),
+            "the whole file must be cached while the decoder ran: {cached} of {:?}",
+            stats.bytes_total
+        );
+        assert_eq!(stats.failed_ranges, 0, "no range may fail under load");
+        handle.shutdown();
+        let _ = sampler.join();
     }
 
     /// The reported bug, end to end: a forward seek past the read-ahead window
@@ -10455,7 +11236,9 @@ mod tests {
 
     /// The whole-file queue is a convenience for a later seek, not playback:
     /// it must not fetch while the bucket is empty or while the file is already
-    /// further ahead of the playhead than [`PLAYBACK_AHEAD_SECONDS`].
+    /// further ahead of the playhead than [`PREFETCH_AHEAD_SECONDS`]. It must
+    /// also never be starved by the bucket: one chunk per live connection is
+    /// exactly the allowance, so a configured pool can actually run.
     #[test]
     fn whole_file_queue_is_rate_limited_and_horizon_bounded() {
         let mut engine = test_engine();
@@ -10463,7 +11246,6 @@ mod tests {
         engine.config.chunk_bytes = chunk;
         engine.config.warm_points = 1;
         let bitrate = 400_000u64; // ~3.2 Mbit/s
-        let horizon = bitrate * PLAYBACK_AHEAD_SECONDS;
         let mut disk = test_disk();
         {
             let mut state = match engine.state.lock() {
@@ -10490,26 +11272,52 @@ mod tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, bitrate, &disk),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, bitrate, &disk),
             None,
             "an empty speculative bucket must idle the worker"
         );
-        // A full bucket lets exactly one chunk through (the burst), then the
+        // A full bucket lets one chunk per live connection through, then the
         // refill rate takes over.
         state.spec_tokens = chunk;
         state.spec_at = Instant::now() + Duration::from_secs(600);
         assert!(matches!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, bitrate, &disk),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, bitrate, &disk),
             Some((_, ChunkKind::Rest))
         ));
+        // The steady budget is the ceiling, not a multiple of the (tiny) stream
+        // bitrate: the old 2× cap is what starved the pool down to two workers.
+        assert_eq!(
+            speculative_rate(bitrate, false, false),
+            SPECULATIVE_CEILING_BPS,
+            "the steady budget is the ceiling; the live count bounds parallelism"
+        );
+        assert_eq!(
+            speculative_burst(chunk, 16, false),
+            chunk * 16,
+            "every configured connection may hold one claim"
+        );
+        // The opening keeps the small budget, whatever the connection count.
+        assert_eq!(
+            speculative_rate(bitrate, false, true),
+            MIN_SPECULATIVE_CONNECTION_BPS,
+            "the opening must not open sixteen speculative claims"
+        );
+        assert_eq!(
+            speculative_burst(chunk, 16, true),
+            chunk * 2,
+            "the opening burst is two chunks"
+        );
         // Ahead of the horizon: the file is already downloaded far enough.
+        // (A slow stream keeps the 1-hour horizon inside the file, which is the
+        // case the bound exists for.)
+        let horizon = 1000u64 * PREFETCH_AHEAD_SECONDS;
         state.spec_tokens = chunk;
         state.spec_at = Instant::now() + Duration::from_secs(600);
         disk.insert(0, horizon);
         assert_eq!(
-            pick_chunk(&mut state, 0, &engine.config, false, false, 0, bitrate, &disk),
+            pick_chunk(&mut state, 0, &engine.config, false, false, 0, 1, 1000, &disk),
             None,
-            "nothing may be fetched past the {PLAYBACK_AHEAD_SECONDS}s horizon"
+            "nothing may be fetched past the {PREFETCH_AHEAD_SECONDS}s horizon"
         );
     }
 

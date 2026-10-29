@@ -13,11 +13,18 @@ tools/*.log
 /settings.json
 /settings.json.*
 /token.json.*
+# 继续观看 (which episode of a season was last watched): local progress, same
+# class of data as settings.json.
+/continue.json
+/continue.json.*
 
 # 养鱼 database: local analysis history, regenerated per user.
 /fish.db
 /fish.db-shm
 /fish.db-wal
+
+# Runtime caches (downloaded audio, QA wavs): never part of the product.
+/cache/
 
 # Editor / OS noise
 .DS_Store
@@ -35,3 +42,10 @@ Thumbs.db
 # Stray QA logs at the repo root and unrelated local projects
 /*.txt
 /site/
+
+# whisper.cpp: built locally by scripts/build-whisper-cuda.ps1, never committed
+/tools/whisper.cpp/
+/tools/whisper-cli/
+
+# Whisper models (460 MB - 1.5 GB): downloaded on demand, never in git
+/models/

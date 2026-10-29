@@ -86,7 +86,35 @@ const TOVIEW_ADD_URL: &str = "https://api.bilibili.com/x/v2/history/toview/add";
 const TOVIEW_DEL_URL: &str = "https://api.bilibili.com/x/v2/history/toview/del";
 const REGION_URL: &str = "https://api.bilibili.com/x/web-interface/dynamic/region";
 const REGION_NEWLIST_URL: &str = "https://api.bilibili.com/x/web-interface/newlist";
-#[allow(dead_code)] // reached by download.rs's benchmark helper (cfg(test))
+// -- 番剧 / PGC ---------------------------------------------------------------
+/// 每日放送 (7-day timeline). `types=1,4,2,3,5,7` covers 番剧/国创/电影/纪录片/
+/// 电视剧/综艺; `before=3&after=3` yields exactly 7 days around today.
+const PGC_TIMELINE_URL: &str = "https://api.bilibili.com/pgc/web/timeline";
+/// 分区索引, one page per request (`page`/`pagesize` 1-based).
+///
+/// `order` is the sort, and every value below was checked against the live
+/// endpoint (same `season_type`, same page, 2026-10) by reading the returned
+/// `order` strings down a whole page and across the page boundary:
+///
+/// | order | `order` field 文案        | sort                |
+/// |-------|---------------------------|---------------------|
+/// | 0     | `8月14日更新` / `今天17:59更新` | 更新时间 (newest first) |
+/// | 1     | *(empty)*                 | 弹幕数 (from `pgc/view/web/season` stats) |
+/// | 2     | `1.6亿次播放`              | 播放量               |
+/// | 3     | `553.2万追番`              | 追番人数 (the site's default) |
+/// | 4     | `9.9分`                    | 评分                 |
+/// | 5     | `6月26日开播`              | 开播时间             |
+const PGC_INDEX_URL: &str = "https://api.bilibili.com/pgc/season/index/result";
+/// 排行榜 (99 rows, no paging).
+const PGC_RANK_URL: &str = "https://api.bilibili.com/pgc/web/rank/list";
+/// One season's detail: episodes + section groups + evaluate/rating/areas.
+const PGC_SEASON_URL: &str = "https://api.bilibili.com/pgc/view/web/season";
+/// PGC playurl. Only used as a REGION GATE (its non-zero code names the
+/// reason); playback itself goes through [`PLAYURL_URL`]'s unsigned fallback.
+const PGC_PLAYURL_URL: &str = "https://api.bilibili.com/pgc/player/web/playurl";
+/// Unsigned playurl. PGC episodes have a real `bvid`+`cid`, so the plain
+/// `x/player/playurl` answers for them where the WBI variant is risk-controlled.
+const PLAYURL_PLAIN_URL: &str = "https://api.bilibili.com/x/player/playurl";
 const RANKING_URL: &str = "https://api.bilibili.com/x/web-interface/ranking/v2";
 const SUGGEST_URL: &str = "https://s.search.bilibili.com/main/suggest";
 const HOTWORD_URL: &str = "https://s.search.bilibili.com/main/hotword";
@@ -107,7 +135,6 @@ const RELATION_MODIFY_URL: &str = "https://api.bilibili.com/x/relation/modify";
 const LOGOUT_URL: &str = "https://passport.bilibili.com/login/exit/v2";
 /// `ranking/v2` is rejected (risk control `-352`) unless the request carries the
 /// ranking page as `Referer`; the shared client's default `bilibili.com/` fails.
-#[allow(dead_code)] // used with RANKING_URL
 const RANK_REFERER: &str = "https://www.bilibili.com/v/popular/rank/all";
 
 // -- 视频评论 (comments) ------------------------------------------------------
@@ -1512,36 +1539,11 @@ impl Session {
         let data = resp
             .data
             .ok_or_else(|| anyhow!("获取视频详情失败：响应缺少 data"))?;
-        let (owner_name, owner_mid) = match data.owner {
-            Some(owner) => (owner.name, owner.mid),
-            None => (String::new(), 0),
-        };
-        let stat = data.stat.unwrap_or_default();
-        let pages = data
-            .pages
-            .into_iter()
-            .map(|page| VideoPart { cid: page.cid })
-            .collect();
-        let native_height = data.dimension.as_ref().map(|size| size.height).unwrap_or(0);
         // The upload's own resolution is the only evidence `playurl` cannot see
         // (it reports what this account may play, not what the source has), so
         // it is kept for the tier fallback of the very next `playurl` call.
-        remember_native_height(&data.bvid, native_height);
-        Ok(VideoDetail {
-            bvid: data.bvid,
-            aid: data.aid,
-            cid: data.cid,
-            title: data.title,
-            pic: normalize_url(&data.pic),
-            duration: data.duration,
-            pubdate: data.pubdate,
-            owner_name,
-            owner_mid,
-            stat_view: stat.view,
-            pages,
-            width: data.dimension.as_ref().map(|size| size.width).unwrap_or(0),
-            height: native_height,
-        })
+        remember_native_height(&data.bvid, data.dimension.as_ref().map(|size| size.height).unwrap_or(0));
+        Ok(detail_from_view(data))
     }
 
     // -- 视频评论 (comments) ------------------------------------------------
@@ -2196,16 +2198,47 @@ impl Session {
     /// keys; if it still fails the API code and HTTP status are reported.
     pub async fn playurl(&self, bvid: &str, cid: u64) -> Result<PlayInfo> {
         let params = playurl_params(bvid, cid);
-        let (mut status, mut body) = self.playurl_request(&params, false).await?;
+        let (mut status, mut body) = match self.playurl_request(&params, false).await {
+            Ok(result) => result,
+            Err(err) => {
+                // A PGC episode (or a risk-controlled request) can answer the
+                // WBI endpoint with a non-JSON 412. The plain endpoint takes the
+                // same bvid/cid and is the path 番剧 playback is verified on.
+                crate::debug_log(&format!("playurl wbi failed bvid={bvid} err={err:#}"));
+                self.playurl_plain_request(&params).await?
+            }
+        };
         if body.code != 0 {
-            let (retry_status, retry_body) = self.playurl_request(&params, true).await?;
-            status = retry_status;
-            body = retry_body;
+            let (retry_status, retry_body) = self
+                .playurl_request(&params, true)
+                .await
+                .unwrap_or((0, PlayUrlResp { code: -1, data: None }));
+            if retry_body.code == 0 {
+                status = retry_status;
+                body = retry_body;
+            }
+        }
+        if body.code != 0 {
+            // PGC: `x/player/wbi/playurl` is refused for 番剧 episodes, while
+            // the unsigned `x/player/playurl` answers with a real DASH tree.
+            let (plain_status, plain_body) = self.playurl_plain_request(&params).await?;
+            crate::debug_log(&format!(
+                "playurl plain fallback bvid={bvid} wbi_code={} code={} http={plain_status}",
+                body.code, plain_body.code
+            ));
+            status = plain_status;
+            body = plain_body;
         }
 
         crate::debug_log(&format!("playurl code={} http={status}", body.code));
 
         if body.code != 0 {
+            // Name the site's refusal in Chinese when the code has a known
+            // meaning (-404 内容不存在, -10403 地区限制, 87007 大会员). The
+            // player's toast shows this text verbatim.
+            if let Some(reason) = pgc_reason(body.code) {
+                bail!("{reason}（code={}）", body.code);
+            }
             bail!("获取播放地址失败（code={}, HTTP {status}）", body.code);
         }
         let data = body
@@ -2332,6 +2365,34 @@ impl Session {
                     "playurl parse fail http={status} ct={content_type} len={} starts_json={} err={err}",
                     text.len(),
                     cleaned.starts_with('{')
+                ));
+                bail!("播放地址响应解析失败（HTTP {status}）")
+            }
+        }
+    }
+
+    /// Unsigned `x/player/playurl`. Same params, no WBI signature: the path
+    /// that answers for PGC episodes (their `bvid` + `cid` are real archive
+    /// ids) when the WBI endpoint risk-controls the request.
+    async fn playurl_plain_request(
+        &self,
+        params: &[(String, String)],
+    ) -> Result<(u16, PlayUrlResp)> {
+        let resp = self
+            .client
+            .get(PLAYURL_PLAIN_URL)
+            .query(params)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        let cleaned = text.trim_start_matches('\u{feff}').trim();
+        match serde_json::from_str::<PlayUrlResp>(cleaned) {
+            Ok(body) => Ok((status, body)),
+            Err(err) => {
+                crate::debug_log(&format!(
+                    "playurl plain parse fail http={status} len={} err={err}",
+                    text.len()
                 ));
                 bail!("播放地址响应解析失败（HTTP {status}）")
             }
@@ -2857,6 +2918,104 @@ impl Session {
         }
     }
 
+    /// 每日放送: exactly 7 days around today (`before=3&after=3`).
+    pub async fn pgc_timeline(&self) -> Result<Vec<PgcTimelineDay>> {
+        let params = [
+            ("types", "1,4,2,3,5,7".to_string()),
+            ("before", "3".to_string()),
+            ("after", "3".to_string()),
+        ];
+        let body: PgcTimelineResp = self.get_query_json(PGC_TIMELINE_URL, &params, None).await?;
+        if body.code != 0 {
+            bail!("每日放送加载失败（code={}）", body.code);
+        }
+        Ok(body.result.into_iter().map(timeline_day_from).collect())
+    }
+
+    /// 分区索引: one page (20 rows) for `season_type`, sorted by `order` (see
+    /// [`PGC_INDEX_URL`] for the verified meaning of each value; `3` = 追番人数,
+    /// the site's own default and the pre-existing behaviour here).
+    pub async fn pgc_index(
+        &self,
+        season_type: i64,
+        page: i64,
+        pagesize: i64,
+        order: i64,
+    ) -> Result<PgcIndexPage> {
+        let page = page.max(1);
+        let pagesize = pagesize.clamp(1, 50);
+        let order = order.clamp(0, 5);
+        let params = [
+            ("season_type", season_type.to_string()),
+            ("page", page.to_string()),
+            ("pagesize", pagesize.to_string()),
+            ("order", order.to_string()),
+            ("st", "1".to_string()),
+            ("sort", "0".to_string()),
+            ("type", "1".to_string()),
+        ];
+        let body: PgcIndexResp = self.get_query_json(PGC_INDEX_URL, &params, None).await?;
+        if body.code != 0 {
+            bail!("番剧索引加载失败（code={}）", body.code);
+        }
+        let data = body.data.unwrap_or_default();
+        let page_no = if data.num > 0 { data.num } else { page };
+        Ok(PgcIndexPage {
+            page: page_no,
+            total: data.total,
+            has_next: data.has_next,
+            items: data.list.into_iter().map(index_item_from).collect(),
+        })
+    }
+
+    /// 排行榜 for one season type (99 rows, no paging).
+    pub async fn pgc_rank(&self, season_type: i64, day: i64) -> Result<Vec<PgcRankItem>> {
+        let params = [
+            ("season_type", season_type.to_string()),
+            ("day", day.max(1).to_string()),
+        ];
+        let body: PgcRankResp = self.get_query_json(PGC_RANK_URL, &params, None).await?;
+        if body.code != 0 {
+            bail!("番剧排行榜加载失败（code={}）", body.code);
+        }
+        Ok(body
+            .result
+            .unwrap_or_default()
+            .list
+            .into_iter()
+            .map(rank_item_from)
+            .collect())
+    }
+
+    /// One season's detail (episodes, section groups, evaluate, rating, areas).
+    pub async fn pgc_season(&self, season_id: i64) -> Result<PgcSeason> {
+        let params = [("season_id", season_id.to_string())];
+        let body: PgcSeasonResp = self.get_query_json(PGC_SEASON_URL, &params, None).await?;
+        if body.code != 0 {
+            bail!("番剧详情加载失败（code={}）", body.code);
+        }
+        body.result
+            .map(season_from)
+            .ok_or_else(|| anyhow!("番剧详情加载失败：响应缺少 result"))
+    }
+
+    /// Region / availability gate for one episode. Never errors on a non-zero
+    /// API code - the code IS the answer, and the caller shows it.
+    pub async fn pgc_gate(&self, ep_id: i64, cid: u64) -> Result<PgcGate> {
+        let params = [
+            ("ep_id", ep_id.to_string()),
+            ("cid", cid.to_string()),
+            ("qn", "80".to_string()),
+            ("fnval", "16".to_string()),
+            ("fourk", "1".to_string()),
+        ];
+        let body: PgcGateResp = self.get_query_json(PGC_PLAYURL_URL, &params, None).await?;
+        Ok(PgcGate {
+            code: body.code,
+            message: body.message,
+        })
+    }
+
     async fn archive_page(&self, url: &str, params: &[(&str, String)]) -> Result<CardPage> {
         let body: ArchiveResp = self.get_query_json(url, params, None).await?;
         if body.code != 0 {
@@ -2875,7 +3034,6 @@ impl Session {
     }
 
     /// The 全站 (`rid = 0`) or one region's ranking list (single page).
-    #[allow(dead_code)] // the 排行 UI is gone; the download benchmark still picks a target here
     pub async fn ranking(&self, rid: i64) -> Result<Vec<VideoCard>> {
         let params = [("rid", rid.to_string()), ("type", "all".to_string())];
         let body: RankingResp = self
@@ -3569,10 +3727,13 @@ fn quality_flags(qn: i64) -> (bool, bool, bool) {
     (matches!(qn, 125 | 129), qn == 126, qn == 127)
 }
 
-/// Quality to start with: 480P when present, otherwise the lowest available.
-/// The user-facing default (1080P at the lowest bitrate of the preferred codec)
-/// comes from the saved preference first; this is only the fallback used when
-/// the preferred `qn` was not returned.
+/// Quality to start with when nothing better is known: 480P when present,
+/// otherwise the lowest available.
+///
+/// This is only the decoder's last-resort fallback for a `qn` with no stream.
+/// The quality a video actually opens on is [`crate::player::initial_quality`]:
+/// the stored 默认画质 when it is playable, otherwise `min(highest playable,
+/// 1080P)`.
 fn default_quality(tracks: &[VideoTrack]) -> i64 {
     tracks
         .iter()
@@ -5118,8 +5279,6 @@ pub struct VideoCard {
     pub pic: String,
     pub owner: String,
     pub view: u64,
-    #[allow(dead_code)] // card metadata (kept for the API shape)
-    pub like: u64,
     pub duration: u64,
 }
 
@@ -5135,6 +5294,195 @@ pub struct CardPage {
 pub struct HotSearch {
     pub keyword: String,
     pub show_name: String,
+}
+
+// ---- 番剧 / PGC ------------------------------------------------------------
+//
+// Everything here is already normalised: URLs are absolute, the 追番/评分
+// strings are the site's own text, and `duration_ms` is milliseconds exactly as
+// the API reports it. The UI never parses an API payload.
+
+/// One row of 每日放送.
+#[derive(Clone, Debug, Default)]
+pub struct PgcTimelineEpisode {
+    pub season_id: i64,
+    pub title: String,
+    pub pub_index: String,
+    pub pub_time: String,
+    /// 9:00-style air time, already formatted.
+    pub cover: String,
+    /// "12.3万追番" when the API names a number; empty when it answers "-".
+    pub follows: String,
+}
+
+/// One day of the 7-day timeline.
+#[derive(Clone, Debug, Default)]
+pub struct PgcTimelineDay {
+    /// "10-27".
+    pub date: String,
+    /// 1 = 周一 … 7 = 周日 (0 is mapped to 7).
+    pub day_of_week: i64,
+    pub is_today: bool,
+    pub episodes: Vec<PgcTimelineEpisode>,
+}
+
+/// One card of the 分区索引 list.
+#[derive(Clone, Debug, Default)]
+pub struct PgcIndexItem {
+    pub season_id: i64,
+    pub title: String,
+    pub cover: String,
+    /// "全11话" / "更新至第197话".
+    pub index_show: String,
+    /// The site's own "553.2万追番".
+    pub order: String,
+    /// "大会员" / "独播" / empty.
+    pub badge: String,
+    /// "9.7" or empty.
+    pub score: String,
+}
+
+/// One page of the 分区索引 list.
+#[derive(Clone, Debug, Default)]
+pub struct PgcIndexPage {
+    pub page: i64,
+    pub total: i64,
+    pub has_next: bool,
+    pub items: Vec<PgcIndexItem>,
+}
+
+/// One row of the 排行榜 (99 rows, no paging).
+#[derive(Clone, Debug, Default)]
+pub struct PgcRankItem {
+    pub rank: i64,
+    pub season_id: i64,
+    pub title: String,
+    pub cover: String,
+    /// "8.8分" or empty.
+    pub rating: String,
+    pub badge: String,
+    pub index_show: String,
+    /// Follow count as the site reports it (raw number, 0 = unknown).
+    pub follow: u64,
+}
+
+/// One episode of a season. `id` in the API is the ep_id.
+#[derive(Clone, Debug, Default)]
+pub struct PgcEpisode {
+    pub ep_id: i64,
+    pub aid: i64,
+    pub bvid: String,
+    pub cid: u64,
+    pub title: String,
+    pub long_title: String,
+    /// Milliseconds, as the API returns it.
+    pub duration_ms: u64,
+    pub pub_time: i64,
+}
+
+impl PgcEpisode {
+    /// The line the player's 选集 shows: `long_title` wins, then `title`,
+    /// then a stable "第 N 话" fallback.
+    pub fn display_title(&self) -> String {
+        if !self.long_title.trim().is_empty() {
+            self.long_title.trim().to_string()
+        } else if !self.title.trim().is_empty() {
+            self.title.trim().to_string()
+        } else {
+            "正片".to_string()
+        }
+    }
+
+    pub fn duration_secs(&self) -> u64 {
+        self.duration_ms / 1000
+    }
+
+    /// Whether the episode is already out at `now` (unix seconds). An unknown
+    /// `pub_time` (0) counts as released: the API omits it on some old seasons.
+    pub fn released_at(&self, now: i64) -> bool {
+        self.pub_time <= 0 || self.pub_time <= now
+    }
+}
+
+/// One 花絮 / PV group of a season (the API's `section`).
+#[derive(Clone, Debug, Default)]
+pub struct PgcSection {
+    pub title: String,
+    pub episodes: Vec<PgcEpisode>,
+}
+
+/// One season's detail, as the 番剧 page and the player's 选集 need it.
+#[derive(Clone, Debug, Default)]
+pub struct PgcSeason {
+    pub season_id: i64,
+    pub title: String,
+    pub cover: String,
+    pub evaluate: String,
+    /// 0 when the season has no score (the API sends `rating: null`).
+    pub score: f64,
+    pub score_count: u64,
+    pub areas: Vec<String>,
+    pub styles: Vec<String>,
+    /// "2022年10月31日18:00" (already human readable).
+    pub pub_time: String,
+    pub is_finish: bool,
+    /// "全11话" / "更新至第197话".
+    pub index_show: String,
+    pub episodes: Vec<PgcEpisode>,
+    pub sections: Vec<PgcSection>,
+}
+
+impl PgcSeason {
+    /// First playable episode at `now`: the first aired one, else the first
+    /// listed (so a fully unreleased season still opens on episode 1).
+    pub fn first_episode(&self, now: i64) -> Option<&PgcEpisode> {
+        self.episodes
+            .iter()
+            .find(|episode| episode.released_at(now))
+            .or_else(|| self.episodes.first())
+    }
+
+    /// "番剧 · 日本 · 奇幻" style classification line.
+    pub fn classify(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for area in &self.areas {
+            if !area.trim().is_empty() {
+                parts.push(area.trim());
+                break;
+            }
+        }
+        for style in self.styles.iter().take(2) {
+            if !style.trim().is_empty() {
+                parts.push(style.trim());
+            }
+        }
+        parts.join(" · ")
+    }
+
+    pub fn all_episodes(&self) -> impl Iterator<Item = &PgcEpisode> {
+        self.episodes
+            .iter()
+            .chain(self.sections.iter().flat_map(|section| section.episodes.iter()))
+    }
+}
+
+/// The gate answer for one episode. `code == 0` means the region check passed;
+/// anything else is the site's own refusal, mapped by [`pgc_reason`].
+#[derive(Clone, Debug, Default)]
+pub struct PgcGate {
+    pub code: i64,
+    pub message: String,
+}
+
+/// A short Chinese reason for a PGC refusal code. `None` = the code carries no
+/// specific meaning we can honestly display.
+pub fn pgc_reason(code: i64) -> Option<&'static str> {
+    match code {
+        -10403 => Some("本地区不可观看"),
+        -10402 | -404 => Some("内容不存在或已下架"),
+        87007 | 87008 => Some("该内容需要大会员"),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -6904,7 +7252,6 @@ mod comment_tests {
         let first = page.comments.first();
         assert_eq!(first.map(|c| c.rpid), Some(100));
         assert_eq!(first.map(|c| c.user.mid), Some(7));
-        assert_eq!(first.map(|c| c.like), Some(5));
         assert_eq!(first.map(|c| c.ctime), Some(1600000100));
         assert_eq!(first.map(|c| c.rcount), Some(2));
         assert_eq!(first.map(|c| c.replies.len()), Some(1));
@@ -7308,18 +7655,62 @@ pub struct VideoDetail {
     pub owner_mid: i64,
     pub stat_view: u64,
     pub pages: Vec<VideoPart>,
+    /// 合集 / 视频列表 (`ugc_season`), `None` when this video has no list.
+    pub season: Option<Season>,
     /// Native picture size from `dimension` (`0` when the API omitted it). Used
     /// to derive which tiers a video can possibly offer.
     pub width: u32,
     pub height: u32,
 }
 
+/// One 分P of a video.
 #[derive(Clone, Debug, Default)]
-// The fields mirror the 分P payload from `video_view`; only `cid` has a
-// consumer today (the player resolves parts by cid).
 pub struct VideoPart {
+    /// The part's own `cid` (the danmaku/playurl id).
     pub cid: i64,
+    /// 1-based page number the payload reports (`P1`, `P2`, ...).
+    pub page: i64,
+    /// The upload's own part name (`part`); never empty (`P{n}` fallback).
+    pub title: String,
+    /// Part duration in seconds (`0` when the payload omitted it).
+    pub duration: u64,
 }
+
+/// 合集 / 视频列表 (`data.ugc_season`). Episodes are grouped in sections;
+/// `ep_count` is the site's own total (which may count episodes this parser
+/// truncated away).
+#[derive(Clone, Debug, Default)]
+pub struct Season {
+    pub title: String,
+    /// The site's own total (`ep_count`); the parser may have truncated the
+    /// section list, so this can be larger than the episodes kept.
+    pub ep_count: u32,
+    pub sections: Vec<SeasonSection>,
+}
+
+/// One section of a 合集 (`ugc_season.sections[]`).
+#[derive(Clone, Debug, Default)]
+pub struct SeasonSection {
+    /// The section title is what the header row shows.
+    pub title: String,
+    pub episodes: Vec<SeasonEpisode>,
+}
+
+/// One episode of a 合集. `cid` is what the player switches to; `bvid` is the
+/// episode's own video id (older episodes of a 合集 are separate videos).
+#[derive(Clone, Debug, Default)]
+pub struct SeasonEpisode {
+    pub bvid: String,
+    pub aid: i64,
+    pub cid: i64,
+    pub title: String,
+    pub duration: u64,
+}
+
+/// Hard caps for a 合集 payload: the site allows far more, but a season list is
+/// a *picker*, not a library, and the player's flat model must stay cheap.
+const SEASON_MAX_SECTIONS: usize = 20;
+const SEASON_MAX_EPISODES: usize = 500;
 
 /// Which order a UP主's 投稿 list is asked for.
 ///
@@ -7531,18 +7922,68 @@ struct SearchUserItem {
     videos: u64,
     #[serde(default)]
     usign: String,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    level: i64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    official_verify: Option<OfficialVerify>,
 }
 
 #[derive(Deserialize)]
 struct OfficialVerify {
     #[serde(default)]
     desc: String,
+}
+
+/// Turn the parsed `view` payload into the [`VideoDetail`] the rest of the app
+/// consumes. Split out so the season/分P rules can be unit-tested against
+/// synthetic payloads without any network.
+fn detail_from_view(data: ViewData) -> VideoDetail {
+    let (owner_name, owner_mid) = match data.owner {
+        Some(owner) => (owner.name, owner.mid),
+        None => (String::new(), 0),
+    };
+    let stat = data.stat.unwrap_or_default();
+    // 分P: every page keeps the payload's own numbering; the title falls back to
+    // `P{n}` only when the upload left `part` empty.
+    let pages: Vec<VideoPart> = data
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(index, page)| {
+            let number = if page.page > 0 {
+                page.page
+            } else {
+                index as i64 + 1
+            };
+            VideoPart {
+                cid: page.cid.max(0),
+                page: number,
+                title: if page.part.is_empty() {
+                    format!("P{number}")
+                } else {
+                    page.part.clone()
+                },
+                duration: page.duration,
+            }
+        })
+        .collect();
+    // 合集 / 视频列表 (ugc_season): `None` when the video has none (or the
+    // payload is malformed), so "no list" is a single, explicit state.
+    let season = data.ugc_season.as_ref().and_then(parse_season);
+    let width = data.dimension.as_ref().map(|size| size.width).unwrap_or(0);
+    let height = data.dimension.as_ref().map(|size| size.height).unwrap_or(0);
+    VideoDetail {
+        bvid: data.bvid,
+        aid: data.aid,
+        cid: data.cid,
+        title: data.title,
+        pic: normalize_url(&data.pic),
+        duration: data.duration,
+        pubdate: data.pubdate,
+        owner_name,
+        owner_mid,
+        stat_view: stat.view,
+        pages,
+        season,
+        width,
+        height,
+    }
 }
 
 #[derive(Deserialize)]
@@ -7564,7 +8005,6 @@ struct ViewData {
     #[serde(default)]
     title: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
-    #[allow(dead_code)] // serde field (payload shape)
     desc: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
     pic: String,
@@ -7573,7 +8013,6 @@ struct ViewData {
     #[serde(default)]
     pubdate: i64,
     #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
     tname: String,
     #[serde(default)]
     owner: Option<ViewOwner>,
@@ -7581,6 +8020,11 @@ struct ViewData {
     stat: Option<ViewStat>,
     #[serde(default)]
     pages: Vec<ViewPage>,
+    /// 合集 / 视频列表. Kept as raw JSON: every list of the payload is parsed
+    /// leniently by [`parse_season`], so one wrong field can never fail the
+    /// whole video (a missing list is the normal case).
+    #[serde(default)]
+    ugc_season: Option<serde_json::Value>,
     #[serde(default)]
     dimension: Option<ViewDimension>,
 }
@@ -7599,49 +8043,26 @@ struct ViewOwner {
     mid: i64,
     #[serde(default)]
     name: String,
-    #[serde(default, deserialize_with = "de_string_lenient")]
-    #[allow(dead_code)] // serde field (payload shape)
-    face: String,
 }
 
 #[derive(Deserialize, Default)]
 struct ViewStat {
     #[serde(default)]
     view: u64,
-    // The remaining counters stay as the payload's shape; only `view` is shown.
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    danmaku: u64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    reply: u64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    favorite: u64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    coin: u64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    like: u64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    share: u64,
 }
 
 #[derive(Deserialize)]
 struct ViewPage {
     #[serde(default)]
     cid: i64,
-    // 分P metadata: only `cid` is consumed (the player resolves parts by cid).
+    /// 1-based part number (`0` when the payload omitted it).
     #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
     page: i64,
+    /// The upload's part name.
     #[serde(default, deserialize_with = "de_string_lenient")]
-    #[allow(dead_code)] // serde field (payload shape)
     part: String,
+    /// Part duration in seconds.
     #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
     duration: u64,
 }
 
@@ -7656,9 +8077,6 @@ struct SpaceInfoResp {
 
 #[derive(Deserialize)]
 struct SpaceInfoData {
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    mid: i64,
     #[serde(default)]
     name: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
@@ -7811,7 +8229,6 @@ struct ArchivePageInfo {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)] // payload of `ranking` (see above)
 struct RankingResp {
     #[serde(default)]
     code: i64,
@@ -7820,7 +8237,6 @@ struct RankingResp {
 }
 
 #[derive(Deserialize, Default)]
-#[allow(dead_code)] // payload of RankingResp
 struct RankingData {
     #[serde(default)]
     list: Vec<CardItem>,
@@ -7837,12 +8253,6 @@ struct CardItem {
     #[serde(default)]
     duration: u64,
     #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    pubdate: i64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    score: i64,
-    #[serde(default)]
     owner: Option<CardOwner>,
     #[serde(default)]
     stat: Option<CardStat>,
@@ -7858,11 +8268,6 @@ struct CardOwner {
 struct CardStat {
     #[serde(default)]
     view: u64,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    danmaku: u64,
-    #[serde(default)]
-    like: u64,
 }
 
 #[derive(Deserialize)]
@@ -7911,9 +8316,6 @@ struct SquareItem {
     keyword: String,
     #[serde(default)]
     show_name: String,
-    #[serde(default, deserialize_with = "de_string_lenient")]
-    #[allow(dead_code)] // serde field (payload shape)
-    icon: String,
 }
 
 #[derive(Deserialize)]
@@ -7928,9 +8330,6 @@ struct HotwordItem {
     keyword: String,
     #[serde(default)]
     show_name: String,
-    #[serde(default, deserialize_with = "de_string_lenient")]
-    #[allow(dead_code)] // serde field (payload shape)
-    icon: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -8052,9 +8451,6 @@ struct DynamicFeedData {
 struct DynamicRawItem {
     #[serde(default)]
     id_str: String,
-    #[serde(default, rename = "type")]
-    #[allow(dead_code)] // serde field: dynamic `type` discriminator, unused
-    kind: String,
     #[serde(default)]
     modules: Option<DynamicModules>,
 }
@@ -8075,9 +8471,6 @@ struct DynamicAuthor {
     name: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
     face: String,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    mid: i64,
     #[serde(default)]
     pub_time: String,
 }
@@ -8107,15 +8500,9 @@ struct DynamicMajor {
 #[derive(Deserialize, Default)]
 struct DynamicArchiveRaw {
     #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    bvid: String,
-    #[serde(default)]
     title: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
     cover: String,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    desc: String,
     #[serde(default)]
     duration_text: String,
     #[serde(default)]
@@ -8180,16 +8567,6 @@ struct MsgFeedResp {
 struct MsgFeedData {
     #[serde(default)]
     items: Vec<MsgFeedItem>,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field: paging cursor, not consumed today
-    cursor: Option<MsgCursor>,
-}
-
-#[derive(Deserialize, Default)]
-struct MsgCursor {
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (reached only through `MsgFeedData::cursor`)
-    is_end: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -8206,9 +8583,6 @@ struct MsgFeedItem {
 
 #[derive(Deserialize, Default)]
 struct MsgUser {
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    mid: i64,
     #[serde(default)]
     nickname: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
@@ -8239,9 +8613,6 @@ struct DmSessionRaw {
     unread_count: i64,
     #[serde(default)]
     last_msg: Option<serde_json::Value>,
-    #[serde(default)]
-    #[allow(dead_code)] // serde field (payload shape)
-    system_msg_type: i64,
 }
 
 #[derive(Deserialize)]
@@ -8759,7 +9130,6 @@ fn card_from(item: CardItem) -> VideoCard {
         pic: normalize_url(&item.pic),
         owner: item.owner.map(|owner| owner.name).unwrap_or_default(),
         view: item.stat.as_ref().map(|stat| stat.view).unwrap_or(0),
-        like: item.stat.map(|stat| stat.like).unwrap_or(0),
         duration: item.duration,
     }
 }
@@ -8902,20 +9272,558 @@ where
     })
 }
 
-/// A boolean flag the payload may send as `true`, `1`, `"true"` or `null`.
-fn de_option_bool_flexible<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+/// Bilibili's booleans flip between `true`/`false` and `1`/`0` across
+/// endpoints (and even between payload versions of the same endpoint), so a
+/// flag field accepts both.
+fn de_flag<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(match value {
-        serde_json::Value::Bool(flag) => Some(flag),
-        serde_json::Value::Number(number) => number.as_i64().map(|number| number != 0),
+        serde_json::Value::Bool(flag) => flag,
+        serde_json::Value::Number(number) => number.as_i64().unwrap_or(0) != 0,
         serde_json::Value::String(text) => {
-            let text = text.trim().to_ascii_lowercase();
-            Some(!(text.is_empty() || text == "0" || text == "false" || text == "null"))
+            let text = text.trim();
+            text == "1" || text.eq_ignore_ascii_case("true")
+        }
+        _ => false,
+    })
+}
+
+// -- 番剧 / PGC payloads -----------------------------------------------------
+
+#[derive(Deserialize)]
+struct PgcTimelineResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    result: Vec<PgcTimelineDayRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcTimelineDayRaw {
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    date: String,
+    #[serde(default)]
+    day_of_week: i64,
+    #[serde(default, deserialize_with = "de_flag")]
+    is_today: bool,
+    #[serde(default)]
+    episodes: Vec<PgcTimelineEpisodeRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcTimelineEpisodeRaw {
+    #[serde(default)]
+    season_id: i64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    pub_index: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    pub_time: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    cover: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    follows: String,
+}
+
+#[derive(Deserialize)]
+struct PgcIndexResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    data: Option<PgcIndexDataRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcIndexDataRaw {
+    #[serde(default)]
+    total: i64,
+    #[serde(default)]
+    num: i64,
+    #[serde(default, deserialize_with = "de_flag")]
+    has_next: bool,
+    #[serde(default)]
+    list: Vec<PgcIndexItemRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcIndexItemRaw {
+    #[serde(default)]
+    season_id: i64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    cover: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    index_show: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    order: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    badge: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    score: String,
+}
+
+#[derive(Deserialize)]
+struct PgcRankResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    result: Option<PgcRankResultRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcRankResultRaw {
+    #[serde(default)]
+    list: Vec<PgcRankItemRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcRankItemRaw {
+    #[serde(default)]
+    rank: i64,
+    #[serde(default)]
+    season_id: i64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    cover: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    rating: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    badge: String,
+    #[serde(default)]
+    new_ep: Option<PgcNewEpRaw>,
+    #[serde(default)]
+    stat: Option<PgcRankStatRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcRankStatRaw {
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    follow: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcNewEpRaw {
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    index_show: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct PgcSeasonResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    result: Option<PgcSeasonRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcSeasonRaw {
+    #[serde(default)]
+    season_id: i64,
+    #[serde(default)]
+    media_id: i64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    cover: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    evaluate: String,
+    #[serde(default)]
+    rating: Option<PgcRatingRaw>,
+    #[serde(default)]
+    areas: Vec<PgcNameRaw>,
+    #[serde(default)]
+    styles: Vec<String>,
+    #[serde(default)]
+    publish: Option<PgcPublishRaw>,
+    #[serde(default)]
+    new_ep: Option<PgcNewEpRaw>,
+    #[serde(default)]
+    total: i64,
+    #[serde(default)]
+    episodes: Vec<PgcEpisodeRaw>,
+    #[serde(default)]
+    section: Vec<PgcSectionRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcRatingRaw {
+    #[serde(default)]
+    score: f64,
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    count: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcNameRaw {
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    name: String,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcPublishRaw {
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    pub_time_show: String,
+    #[serde(default, deserialize_with = "de_flag")]
+    is_finish: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcEpisodeRaw {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    ep_id: i64,
+    #[serde(default)]
+    aid: i64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    bvid: String,
+    #[serde(default)]
+    cid: u64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    long_title: String,
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    duration: u64,
+    #[serde(default)]
+    pub_time: i64,
+}
+
+#[derive(Deserialize, Default)]
+struct PgcSectionRaw {
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    title: String,
+    #[serde(default)]
+    episodes: Vec<PgcEpisodeRaw>,
+}
+
+#[derive(Deserialize)]
+struct PgcGateResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    message: String,
+}
+
+fn timeline_day_from(raw: PgcTimelineDayRaw) -> PgcTimelineDay {
+    let day_of_week = if raw.day_of_week <= 0 {
+        7
+    } else {
+        raw.day_of_week
+    };
+    PgcTimelineDay {
+        date: raw.date,
+        day_of_week,
+        is_today: raw.is_today,
+        episodes: raw
+            .episodes
+            .into_iter()
+            .filter(|episode| episode.season_id > 0)
+            .map(|episode| PgcTimelineEpisode {
+                season_id: episode.season_id,
+                title: episode.title,
+                pub_index: episode.pub_index,
+                pub_time: episode.pub_time,
+                cover: normalize_url(&episode.cover),
+                follows: if episode.follows.trim() == "-" {
+                    String::new()
+                } else {
+                    episode.follows
+                },
+            })
+            .collect(),
+    }
+}
+
+fn index_item_from(raw: PgcIndexItemRaw) -> PgcIndexItem {
+    PgcIndexItem {
+        season_id: raw.season_id,
+        title: raw.title,
+        cover: normalize_url(&raw.cover),
+        index_show: raw.index_show,
+        order: raw.order,
+        badge: raw.badge,
+        score: raw.score,
+    }
+}
+
+fn rank_item_from(raw: PgcRankItemRaw) -> PgcRankItem {
+    PgcRankItem {
+        rank: raw.rank,
+        season_id: raw.season_id,
+        title: raw.title,
+        cover: normalize_url(&raw.cover),
+        rating: raw.rating,
+        badge: raw.badge,
+        index_show: raw
+            .new_ep
+            .map(|episode| episode.index_show)
+            .unwrap_or_default(),
+        follow: raw.stat.map(|stat| stat.follow).unwrap_or(0),
+    }
+}
+
+fn episode_from(raw: PgcEpisodeRaw) -> PgcEpisode {
+    let ep_id = if raw.ep_id > 0 { raw.ep_id } else { raw.id };
+    PgcEpisode {
+        ep_id,
+        aid: raw.aid,
+        bvid: raw.bvid,
+        cid: raw.cid,
+        title: raw.title,
+        long_title: raw.long_title,
+        duration_ms: raw.duration,
+        pub_time: raw.pub_time,
+    }
+}
+
+fn season_from(raw: PgcSeasonRaw) -> PgcSeason {
+    let is_finish = raw.publish.as_ref().map(|p| p.is_finish).unwrap_or(false);
+    let pub_time = raw
+        .publish
+        .map(|publish| publish.pub_time_show)
+        .unwrap_or_default();
+    let (new_index, new_title) = raw
+        .new_ep
+        .map(|episode| (episode.index_show, episode.title))
+        .unwrap_or_default();
+    let index_show = if !new_index.trim().is_empty() {
+        new_index
+    } else if is_finish && raw.total > 0 {
+        format!("全{}话", raw.total)
+    } else if !new_title.trim().is_empty() {
+        format!("更新至第{}话", new_title.trim())
+    } else {
+        String::new()
+    };
+    PgcSeason {
+        season_id: if raw.season_id > 0 {
+            raw.season_id
+        } else {
+            raw.media_id
+        },
+        title: raw.title,
+        cover: normalize_url(&raw.cover),
+        evaluate: raw.evaluate,
+        score: raw.rating.as_ref().map(|rating| rating.score).unwrap_or(0.0),
+        score_count: raw.rating.map(|rating| rating.count).unwrap_or(0),
+        areas: raw
+            .areas
+            .into_iter()
+            .map(|area| area.name)
+            .filter(|name| !name.trim().is_empty())
+            .collect(),
+        styles: raw
+            .styles
+            .into_iter()
+            .map(|style| style.trim().to_string())
+            .filter(|style| !style.is_empty())
+            .collect(),
+        pub_time,
+        is_finish,
+        index_show,
+        episodes: raw.episodes.into_iter().map(episode_from).collect(),
+        sections: raw
+            .section
+            .into_iter()
+            .map(|section| PgcSection {
+                title: section.title,
+                episodes: section.episodes.into_iter().map(episode_from).collect(),
+            })
+            .collect(),
+    }
+}
+
+// -- 合集 / 视频列表 (ugc_season) --------------------------------------------
+//
+// `video_view` keeps `data.ugc_season` as raw JSON and this parser decides what
+// is usable. The shape the site returns is
+//
+//   data.ugc_season = { id, title, cover, mid, intro, ep_count, season_type,
+//     sections: [ { id, title, episodes: [ { aid, bvid, cid, title,
+//       attribute, arc: { duration, pic, title, stat },
+//       page: { cid, part, duration }, pages: [...] } ] } ] }
+//
+// Every field is optional in practice (episodes of old seasons have no `page`,
+// some accounts get no `arc`, counters arrive as strings), so each value is
+// read through the helpers below: a missing/negative/non-string scalar becomes
+// `0`/empty instead of failing the response.
+
+/// `0` for missing, negative or non-numeric numbers; the payload may send the
+/// same id as a string.
+fn season_i64(value: Option<&serde_json::Value>) -> i64 {
+    match value {
+        Some(serde_json::Value::Number(number)) => {
+            number.as_i64().unwrap_or(0).max(0)
+        }
+        Some(serde_json::Value::String(text)) => text.trim().parse::<i64>().unwrap_or(0).max(0),
+        _ => 0,
+    }
+}
+
+/// `None` when the field is absent (so "fall through to the next source" is
+/// distinguishable from a real `0`), `Some(0)` for a present zero.
+fn season_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    match value {
+        Some(serde_json::Value::Number(number)) => {
+            let secs = number.as_f64().unwrap_or(0.0);
+            Some(if secs > 0.0 { secs.round() as u64 } else { 0 })
+        }
+        Some(serde_json::Value::String(text)) => {
+            Some(text.trim().parse::<f64>().unwrap_or(0.0).max(0.0).round() as u64)
         }
         _ => None,
+    }
+}
+
+/// Only a string counts; anything else is empty (never `"null"`, never a
+/// serialised number).
+fn season_str(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        _ => String::new(),
+    }
+}
+
+fn season_obj(value: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value.and_then(serde_json::Value::as_object)
+}
+
+/// Parse `data.ugc_season` into a [`Season`].
+///
+/// Returns `None` when the value is not an object, carries no section array or
+/// no usable episode at all — the player then treats the video as "no list".
+/// Sections are capped at [`SEASON_MAX_SECTIONS`], episodes at
+/// [`SEASON_MAX_EPISODES`] (truncation is logged, never silent).
+fn parse_season(raw: &serde_json::Value) -> Option<Season> {
+    let obj = raw.as_object()?;
+    let sections_raw = obj.get("sections").and_then(serde_json::Value::as_array)?;
+    if sections_raw.is_empty() {
+        return None;
+    }
+    if sections_raw.len() > SEASON_MAX_SECTIONS {
+        crate::debug_log(&format!(
+            "season truncated sections={} kept={SEASON_MAX_SECTIONS}",
+            sections_raw.len()
+        ));
+    }
+    let mut total = 0usize;
+    let mut sections: Vec<SeasonSection> = Vec::new();
+    for raw_section in sections_raw.iter().take(SEASON_MAX_SECTIONS) {
+        let Some(section_obj) = raw_section.as_object() else {
+            continue;
+        };
+        let episodes_raw = section_obj
+            .get("episodes")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut episodes: Vec<SeasonEpisode> = Vec::new();
+        for raw_episode in episodes_raw {
+            if total >= SEASON_MAX_EPISODES {
+                break;
+            }
+            let Some(episode) = parse_season_episode(raw_episode) else {
+                continue;
+            };
+            total += 1;
+            episodes.push(episode);
+        }
+        if episodes.is_empty() {
+            continue;
+        }
+        sections.push(SeasonSection {
+            title: season_str(section_obj.get("title")),
+            episodes,
+        });
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    let listed: usize = sections_raw
+        .iter()
+        .take(SEASON_MAX_SECTIONS)
+        .filter_map(|section| {
+            section
+                .get("episodes")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+        .sum();
+    if listed > total {
+        crate::debug_log(&format!(
+            "season truncated episodes={listed} kept={total} max={SEASON_MAX_EPISODES}"
+        ));
+    }
+    Some(Season {
+        title: season_str(obj.get("title")),
+        ep_count: season_i64(obj.get("ep_count")).min(u32::MAX as i64) as u32,
+        sections,
+    })
+}
+
+/// One episode. `cid` falls back from `page.cid` to the episode's own `cid`,
+/// `duration` from `page.duration` to `arc.duration`. An episode without any
+/// `cid` is unusable (the player could not switch to it), so it is dropped.
+fn parse_season_episode(raw: &serde_json::Value) -> Option<SeasonEpisode> {
+    let obj = raw.as_object()?;
+    let page = season_obj(obj.get("page"));
+    let arc = season_obj(obj.get("arc"));
+    let cid = page
+        .and_then(|page| page.get("cid"))
+        .map(|value| season_i64(Some(value)))
+        .filter(|cid| *cid > 0)
+        .unwrap_or_else(|| season_i64(obj.get("cid")));
+    if cid <= 0 {
+        return None;
+    }
+    let duration = page
+        .and_then(|page| season_u64(page.get("duration")))
+        .or_else(|| arc.and_then(|arc| season_u64(arc.get("duration"))))
+        .unwrap_or(0);
+    let title = {
+        let own = season_str(obj.get("title"));
+        if own.is_empty() {
+            let arc_title = arc
+                .map(|arc| season_str(arc.get("title")))
+                .unwrap_or_default();
+            if arc_title.is_empty() {
+                let part = page
+                    .map(|page| season_str(page.get("part")))
+                    .unwrap_or_default();
+                if part.is_empty() {
+                    crate::debug_log("season episode without title");
+                }
+                part
+            } else {
+                arc_title
+            }
+        } else {
+            own
+        }
+    };
+    let aid = {
+        let own = season_i64(obj.get("aid"));
+        if own > 0 {
+            own
+        } else {
+            arc.map(|arc| season_i64(arc.get("aid"))).unwrap_or(0)
+        }
+    };
+    Some(SeasonEpisode {
+        bvid: season_str(obj.get("bvid")),
+        aid,
+        cid,
+        title,
+        duration,
     })
 }
 
@@ -8928,7 +9836,6 @@ const CONCLUSION_URL: &str = "https://api.bilibili.com/x/web-interface/view/conc
 
 /// 一条视频的 AI 提纲小节。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
 pub struct OutlineSection {
     /// 小节开始时间（秒，取自 `timestamp`）。
     pub timestamp: u64,
@@ -8939,7 +9846,6 @@ pub struct OutlineSection {
 
 /// AI 提纲里的一个要点。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
 pub struct OutlinePoint {
     pub timestamp: u64,
     pub content: String,
@@ -8947,7 +9853,6 @@ pub struct OutlinePoint {
 
 /// AI 字幕的一小段（`part_subtitle[]`），时间单位是秒。
 #[derive(Clone, Debug, Default, PartialEq)]
-#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
 pub struct Cue {
     pub start_s: u64,
     pub end_s: u64,
@@ -8963,15 +9868,11 @@ pub struct Cue {
 /// (measured: 3 of 13 sampled videos answered `-1` with a full
 /// `part_subtitle`). Callers therefore always inspect [`Conclusion::cues`].
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
 pub struct Conclusion {
     pub summary: String,
     pub outline: Vec<OutlineSection>,
     pub cues: Vec<Cue>,
     pub data_code: i32,
-    /// Whether Bilibili says a summary may be shown for this video. When the
-    /// payload omits the flag it is derived from `data_code` (`-1` = false).
-    pub allow_summary: bool,
 }
 
 /// Everything the fish engine needs about one video in a single request.
@@ -8980,9 +9881,7 @@ pub struct Conclusion {
 /// `tname`, `desc` or the `aid` the comment endpoint wants, so the engine asks
 /// `x/web-interface/wbi/view` once per video for this shape.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
 pub struct FishMeta {
-    pub bvid: String,
     pub aid: i64,
     pub cid: u64,
     pub title: String,
@@ -9008,7 +9907,6 @@ impl Session {
     ///
     /// Rate limiting belongs to the caller: the fish engine keeps at least
     /// 1.5 s between calls and backs off on `-352` / `-412`.
-    #[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
     pub async fn conclusion(&self, bvid: &str, cid: u64, up_mid: u64) -> Result<Conclusion> {
         let params = vec![
             ("bvid".to_string(), bvid.trim().to_string()),
@@ -9043,7 +9941,6 @@ impl Session {
     }
 
     /// Full metadata for one video, shaped for the fish engine.
-    #[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
     pub async fn fish_meta(&self, bvid: &str) -> Result<FishMeta> {
         let params = vec![("bvid".to_string(), bvid.trim().to_string())];
         let mut resp: ViewResp = self.wbi_call(VIEW_URL, &params, false).await?.1;
@@ -9065,11 +9962,6 @@ impl Session {
             .collect::<Vec<_>>()
             .join(" ");
         Ok(FishMeta {
-            bvid: if data.bvid.trim().is_empty() {
-                bvid.trim().to_string()
-            } else {
-                data.bvid
-            },
             aid: data.aid,
             cid: data.cid.max(0) as u64,
             title: data.title,
@@ -9090,7 +9982,6 @@ impl Session {
 /// Those two codes mean "you are going too fast" (or the fingerprint/signature
 /// was rejected), not "this video has no data", so the fish engine backs off
 /// and retries instead of burning the queue entry.
-#[allow(dead_code)] // consumed by the fish engine, wired to the UI in a later pass
 pub fn is_risk_control(err: &anyhow::Error) -> bool {
     let text = format!("{err:#}");
     text.contains("-352") || text.contains("-412")
@@ -9113,8 +10004,6 @@ struct ConclusionData {
     /// `0` summary, `1` no summary, `-1` unsupported.
     #[serde(default)]
     code: Option<i32>,
-    #[serde(default, deserialize_with = "de_option_bool_flexible")]
-    allow_summary: Option<bool>,
     #[serde(default)]
     model_result: Option<ConclusionModel>,
 }
@@ -9230,13 +10119,652 @@ fn conclusion_from(data: ConclusionData) -> Conclusion {
         .filter(|cue| !cue.text.is_empty())
         .collect::<Vec<_>>();
     let data_code = data.code.unwrap_or(if summary.is_empty() { 1 } else { 0 });
-    let allow_summary = data.allow_summary.unwrap_or(data_code != -1);
     Conclusion {
         summary,
         outline,
         cues,
         data_code,
-        allow_summary,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 直播 (live rooms)
+//
+// Three endpoints, all on `api.live.bilibili.com`:
+//   * `xlive/web-interface/v1/index/getList`  - homepage aggregate: the
+//     decorated module rows + the 24 area entrances (no signature, works).
+//   * `room/v1/Room/get_info`                 - one room's status / online /
+//     area / title (no signature, works).
+//   * `xlive/web-room/v2/index/getRoomPlayInfo` - the playable FLV + HLS URLs.
+//   * `room/v1/area/getRoomList`               - a 分区's rooms, the endpoint
+//     the area grid uses (measured: `code: 0`, 30 rooms/page, no signature and
+//     no cookie needed).
+//   * `xlive/web-interface/v1/second/getList` - the newer 分区 list. It answers
+//     `-352` (risk control) for this account/IP even when WBI-signed with keys
+//     proven good against `wbi/index/top/feed/rcmd` (`code: 0`); kept as the
+//     fallback, and its (`code`, `source`, `signed`) triple is reported so a
+//     refusal is diagnosed instead of hidden.
+// ---------------------------------------------------------------------------
+
+const LIVE_INDEX_URL: &str = "https://api.live.bilibili.com/xlive/web-interface/v1/index/getList";
+/// The legacy 分区 list. `room/v1/area/getList` names its areas; this one lists
+/// the rooms (`data` is a bare array of rooms, not `{ list: [] }`).
+const LIVE_AREA_LEGACY_URL: &str = "https://api.live.bilibili.com/room/v1/area/getRoomList";
+const LIVE_AREA_LEGACY_PATH: &str = "room/v1/area/getRoomList";
+const LIVE_AREA_URL: &str = "https://api.live.bilibili.com/xlive/web-interface/v1/second/getList";
+const LIVE_AREA_SIGNED_PATH: &str = "second/getList";
+const LIVE_ROOM_URL: &str = "https://api.live.bilibili.com/room/v1/Room/get_info";
+const LIVE_PLAY_URL: &str =
+    "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo";
+const LIVE_REFERER: &str = "https://live.bilibili.com/";
+/// Rooms kept per module / area page. The module rows carry 10 each; the area
+/// endpoint's own page size is 30 (`page_size` is honoured when present).
+const LIVE_MODULE_MAX: usize = 10;
+
+/// The live relay's own HTTP client (see [`Session::open_stream`]).
+fn live_stream_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(UA));
+    headers.insert(REFERER, HeaderValue::from_static(LIVE_REFERER));
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .build()?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+const LIVE_AREA_PAGE: usize = 30;
+
+/// One live room, as the index cards and the player need it. `status` in the
+/// index payload is a bool (`live_status` appears in other endpoints), so both
+/// spellings land in [`LiveRoom::live_status`].
+#[derive(Clone, Debug, Default)]
+pub struct LiveRoom {
+    pub room_id: i64,
+    pub uid: i64,
+    pub title: String,
+    pub uname: String,
+    pub online: u64,
+    pub cover: String,
+    pub area_name: String,
+    pub parent_area_name: String,
+    pub live_status: i64,
+}
+
+/// One 推荐 module of the live homepage (关注 / 推荐直播 / 手游 / …).
+#[derive(Clone, Debug, Default)]
+pub struct LiveModule {
+    pub title: String,
+    pub rooms: Vec<LiveRoom>,
+}
+
+/// One 分区 entrance (`area_entrance_v2`). `id` is the `area_v2_id` the
+/// second-level list wants; `parent_id` is the top-level area.
+#[derive(Clone, Debug, Default)]
+pub struct LiveArea {
+    pub id: i64,
+    pub parent_id: i64,
+    pub title: String,
+}
+
+/// The live homepage aggregate, parsed.
+#[derive(Clone, Debug, Default)]
+pub struct LiveIndex {
+    pub modules: Vec<LiveModule>,
+    pub areas: Vec<LiveArea>,
+}
+
+/// One page of a 分区's rooms. `code` is the API's own code (`0` = ok), `source`
+/// the endpoint that answered, `elapsed_ms` the wall time of the whole request
+/// (both attempts included). A non-zero code with an empty `rooms` is the
+/// documented risk-control case.
+#[derive(Clone, Debug, Default)]
+pub struct LiveAreaPage {
+    pub rooms: Vec<LiveRoom>,
+    pub has_more: bool,
+    pub code: i64,
+    /// `room/v1/area/getRoomList` (normal) or `second/getList` (the signed
+    /// fallback this client only reaches when the legacy endpoint refuses).
+    pub source: &'static str,
+    pub signed: bool,
+    pub elapsed_ms: u128,
+}
+
+/// `room/v1/Room/get_info`'s fields the player uses.
+#[derive(Clone, Debug, Default)]
+pub struct LiveRoomInfo {
+    pub room_id: i64,
+    pub title: String,
+    pub live_status: i64,
+    pub online: u64,
+    pub area_name: String,
+    pub is_portrait: bool,
+    /// The room's own 头图 (`keyframe`, else `user_cover`). The player shows it
+    /// while the stream is still buffering.
+    pub cover: String,
+}
+
+/// The playable URLs for one room, split by delivery so the player can order
+/// them itself: FLV (`http_stream`), HLS-fmp4 and HLS-ts (`http_hls`). `hls`
+/// keeps the old "ts first" choice for callers that only have one slot.
+#[derive(Clone, Debug, Default)]
+pub struct LivePlay {
+    pub hls: Option<String>,
+    pub hls_fmp4: Option<String>,
+    pub hls_ts: Option<String>,
+    pub flv: Option<String>,
+    pub live_status: i64,
+    pub locked: bool,
+}
+
+fn live_str(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn live_i64(value: &serde_json::Value, key: &str) -> i64 {
+    match value.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn live_u64(value: &serde_json::Value, key: &str) -> u64 {
+    match value.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// `http://` → `https://` and a size suffix for the live covers (they are
+/// served without one, so the full-size JPEG would be the whole card).
+fn live_pic(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return String::new();
+    }
+    let url = if let Some(rest) = url.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else {
+        url.to_string()
+    };
+    if url.contains('@') {
+        url
+    } else {
+        format!("{url}@320w_180h_1c.webp")
+    }
+}
+
+fn live_room_from(value: &serde_json::Value) -> Option<LiveRoom> {
+    let room_id = live_i64(value, "roomid");
+    if room_id <= 0 {
+        return None;
+    }
+    let mut live_status = live_i64(value, "live_status");
+    if live_status == 0 {
+        live_status = match value.get("status") {
+            Some(serde_json::Value::Bool(true)) => 1,
+            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+            _ => 0,
+        };
+    }
+    Some(LiveRoom {
+        room_id,
+        uid: live_i64(value, "uid"),
+        title: live_str(value, "title"),
+        uname: live_str(value, "uname"),
+        online: live_u64(value, "online"),
+        cover: live_pic(&live_str(value, "cover")),
+        area_name: live_str(value, "area_v2_name"),
+        parent_area_name: live_str(value, "area_v2_parent_name"),
+        live_status,
+    })
+}
+
+/// Parse one room of a 分区 list. `room/v1/area/getRoomList` omits `live_status`,
+/// and every row it returns is a room it lists as live (checked against
+/// `Room/get_info`: even rows whose `online` counter reads 0 answer
+/// `live_status: 1`), so the 直播中 pill stays truthful on this path.
+fn live_area_room_from(value: &serde_json::Value) -> Option<LiveRoom> {
+    let mut room = live_room_from(value)?;
+    if room.live_status == 0 && value.get("live_status").is_none() {
+        room.live_status = 1;
+    }
+    Some(room)
+}
+
+/// The room array of a 分区 response: `data` is a bare array on the legacy
+/// endpoint and `{ list: [...] }` on `second/getList`.
+fn live_area_list(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    match body.get("data") {
+        Some(serde_json::Value::Array(list)) => list.clone(),
+        Some(data) => data
+            .get("list")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+impl Session {
+    /// Open one streaming GET for the live relay. The caller owns the body and
+    /// copies it to a local socket.
+    ///
+    /// A **separate client**: the shared one carries a 25 s total timeout, which
+    /// is right for a JSON call and fatal for a live body (measured: the relay
+    /// died at ~25 s with `operation timed out`). This client has no total
+    /// timeout, so the stream lives as long as the room.
+    pub async fn open_stream(&self, url: &str, referer: &str) -> Result<reqwest::Response> {
+        let response = live_stream_client()?
+            .get(url)
+            .header(REFERER, referer)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response)
+    }
+
+    async fn live_json(&self, url: &str, params: &[(&str, String)]) -> Result<serde_json::Value> {
+        self.get_query_json::<serde_json::Value>(url, params, Some(LIVE_REFERER))
+            .await
+    }
+
+    /// The live homepage: the decorated module rows (each with its rooms) and
+    /// the 24 area entrances.
+    pub async fn live_index(&self) -> Result<LiveIndex> {
+        let params = [("platform", "web".to_string())];
+        let body = self.live_json(LIVE_INDEX_URL, &params.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>()).await?;
+        let code = live_i64(&body, "code");
+        if code != 0 {
+            bail!("直播首页加载失败（code={code}）");
+        }
+        let data = body.get("data").cloned().unwrap_or_default();
+
+        let mut modules: Vec<LiveModule> = Vec::new();
+        if let Some(list) = data.get("room_list").and_then(|v| v.as_array()) {
+            for module in list {
+                let title = module
+                    .get("module_info")
+                    .map(|info| live_str(info, "title"))
+                    .unwrap_or_default();
+                let rooms: Vec<LiveRoom> = module
+                    .get("list")
+                    .and_then(|v| v.as_array())
+                    .map(|rooms| {
+                        rooms
+                            .iter()
+                            .filter_map(live_room_from)
+                            .take(LIVE_MODULE_MAX)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !title.is_empty() && !rooms.is_empty() {
+                    modules.push(LiveModule { title, rooms });
+                }
+            }
+        }
+
+        let mut areas: Vec<LiveArea> = Vec::new();
+        if let Some(list) = data
+            .get("area_entrance_v2")
+            .and_then(|v| v.get("list"))
+            .and_then(|v| v.as_array())
+        {
+            for area in list {
+                // `id` and `area_v2_id` are the same number; prefer the former.
+                let id = live_i64(area, "id").max(live_i64(area, "area_v2_id"));
+                let title = live_str(area, "title");
+                if id <= 0 || title.is_empty() {
+                    continue;
+                }
+                areas.push(LiveArea {
+                    id,
+                    parent_id: live_i64(area, "area_v2_parent_id"),
+                    title,
+                });
+            }
+        }
+        if modules.is_empty() && areas.is_empty() {
+            bail!("直播首页没有返回内容");
+        }
+        crate::debug_log(&format!(
+            "live index modules={} rooms={} areas={}",
+            modules.len(),
+            modules.iter().map(|m| m.rooms.len()).sum::<usize>(),
+            areas.len()
+        ));
+        Ok(LiveIndex { modules, areas })
+    }
+
+    /// One page of a 分区's rooms.
+    ///
+    /// Order (measured 2026-10-28, `parent_area_id=2&area_id=86`):
+    /// 1. `room/v1/area/getRoomList` — `code: 0`, 30 rooms, ~0.65–1.1 s. This is
+    ///    the path the grid uses; it needs neither a cookie nor a signature.
+    /// 2. `xlive/.../second/getList`, WBI-signed — only reached when (1) refuses.
+    ///    That endpoint answers `-352` for this account/IP even with keys proven
+    ///    good (`wbi/index/top/feed/rcmd` → `code: 0`), so the refusal is
+    ///    reported with its own `code` and `source` instead of being hidden.
+    ///
+    /// `has_more` is derived from a full page (`>= 30`): the legacy payload has
+    /// no `has_more` field (measured: page 20 of 英雄联盟 returns 6 rooms, the
+    /// list's end).
+    pub async fn live_area_rooms(
+        &self,
+        parent_area_id: i64,
+        area_id: i64,
+        page: i64,
+    ) -> Result<LiveAreaPage> {
+        let started = Instant::now();
+        let page = page.max(1);
+        let params: Vec<(&str, String)> = vec![
+            ("platform", "web".to_string()),
+            ("parent_area_id", parent_area_id.to_string()),
+            ("area_id", area_id.to_string()),
+            ("sort_type", "online".to_string()),
+            ("page", page.to_string()),
+            ("page_size", LIVE_AREA_PAGE.to_string()),
+        ];
+        let mut code = 0i64;
+        let mut source = "";
+        let mut signed = false;
+        let mut list: Vec<serde_json::Value> = Vec::new();
+        let mut has_more_field = false;
+
+        match self.live_json(LIVE_AREA_LEGACY_URL, &params).await {
+            Ok(body) => {
+                code = live_i64(&body, "code");
+                if code == 0 {
+                    source = LIVE_AREA_LEGACY_PATH;
+                    list = live_area_list(&body);
+                } else {
+                    crate::debug_log(&format!(
+                        "live area legacy refused parent={parent_area_id} area={area_id} page={page} code={code}"
+                    ));
+                }
+            }
+            Err(err) => {
+                crate::debug_log(&format!(
+                    "live area legacy err parent={parent_area_id} area={area_id} page={page} err={err:#}"
+                ));
+            }
+        }
+
+        if source.is_empty() {
+            let owned: Vec<(String, String)> =
+                params.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+            match self
+                .wbi_call_referer::<serde_json::Value>(
+                    LIVE_AREA_URL,
+                    &owned,
+                    true,
+                    Some(LIVE_REFERER),
+                )
+                .await
+            {
+                Ok((_, signed_body)) => {
+                    signed = true;
+                    source = LIVE_AREA_SIGNED_PATH;
+                    code = live_i64(&signed_body, "code");
+                    has_more_field = signed_body
+                        .get("data")
+                        .and_then(|data| data.get("has_more"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        != 0;
+                    list = live_area_list(&signed_body);
+                }
+                Err(err) => {
+                    source = LIVE_AREA_SIGNED_PATH;
+                    if code == 0 {
+                        code = -1;
+                    }
+                    crate::debug_log(&format!(
+                        "live area signed err parent={parent_area_id} area={area_id} page={page} err={err:#}"
+                    ));
+                }
+            }
+        }
+
+        let rooms: Vec<LiveRoom> = list
+            .iter()
+            .filter_map(live_area_room_from)
+            .take(LIVE_AREA_PAGE)
+            .collect();
+        let has_more =
+            code == 0 && (has_more_field || rooms.len() >= LIVE_AREA_PAGE);
+        let elapsed_ms = started.elapsed().as_millis();
+        crate::debug_log(&format!(
+            "live area parent={parent_area_id} area={area_id} page={page} n={} ms={elapsed_ms} source={source} code={code} signed={}",
+            rooms.len(),
+            u8::from(signed)
+        ));
+        Ok(LiveAreaPage {
+            rooms,
+            has_more,
+            code,
+            source,
+            signed,
+            elapsed_ms,
+        })
+    }
+
+    /// One room's live status and viewer count (`uname` is not in this payload).
+    pub async fn live_room_info(&self, room_id: i64) -> Result<LiveRoomInfo> {
+        let params = [("room_id", room_id.to_string())];
+        let body = self.live_json(LIVE_ROOM_URL, &params).await?;
+        let code = live_i64(&body, "code");
+        if code != 0 {
+            bail!("直播间信息加载失败（code={code}）");
+        }
+        let data = body.get("data").cloned().unwrap_or_default();
+        let cover = {
+            let keyframe = live_str(&data, "keyframe");
+            if keyframe.trim().is_empty() {
+                live_str(&data, "user_cover")
+            } else {
+                keyframe
+            }
+        };
+        Ok(LiveRoomInfo {
+            room_id: live_i64(&data, "room_id").max(room_id),
+            title: live_str(&data, "title"),
+            live_status: live_i64(&data, "live_status"),
+            online: live_i64(&data, "online").max(0) as u64,
+            area_name: live_str(&data, "area_name"),
+            is_portrait: data
+                .get("is_portrait")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            cover,
+        })
+    }
+
+    /// The playable URLs of one room: the `http_hls` stream first (ts then
+    /// fmp4), `http_stream` (FLV) as the fallback. `host + base_url + extra` is
+    /// the complete, signed URL — the three parts are never reassembled later.
+    pub async fn live_play_url(&self, room_id: i64) -> Result<LivePlay> {
+        let params = [
+            ("room_id", room_id.to_string()),
+            ("protocol", "0,1".to_string()),
+            ("format", "0,1,2".to_string()),
+            ("codec", "0,1".to_string()),
+            ("qn", "10000".to_string()),
+            ("platform", "web".to_string()),
+            ("ptype", "8".to_string()),
+        ];
+        let body = self.live_json(LIVE_PLAY_URL, &params).await?;
+        let code = live_i64(&body, "code");
+        if code != 0 {
+            bail!("直播地址加载失败（code={code}）");
+        }
+        let data = body.get("data").cloned().unwrap_or_default();
+        let live_status = live_i64(&data, "live_status");
+        let locked = data
+            .get("is_locked")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut hls: Option<String> = None;
+        let mut hls_fmp4: Option<String> = None;
+        let mut flv: Option<String> = None;
+        if let Some(streams) = data
+            .get("playurl_info")
+            .and_then(|v| v.get("playurl"))
+            .and_then(|v| v.get("stream"))
+            .and_then(|v| v.as_array())
+        {
+            for stream in streams {
+                let protocol = live_str(stream, "protocol_name");
+                let Some(formats) = stream.get("format").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for format in formats {
+                    let format_name = live_str(format, "format_name");
+                    let Some(codecs) = format.get("codec").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    for codec in codecs {
+                        let Some(url_info) = codec
+                            .get("url_info")
+                            .and_then(|v| v.as_array())
+                            .and_then(|list| list.first())
+                        else {
+                            continue;
+                        };
+                        let url = format!(
+                            "{}{}{}",
+                            live_str(url_info, "host"),
+                            live_str(codec, "base_url"),
+                            live_str(url_info, "extra")
+                        );
+                        if url.len() < 12 {
+                            continue;
+                        }
+                        if protocol == "http_hls" {
+                            // fmp4 first: the ts rendition of this CDN is the
+                            // one that stalls (measured: 0 bytes in 6 s while
+                            // fmp4 answers 200 in ~0.8 s).
+                            if format_name == "fmp4" && hls_fmp4.is_none() {
+                                hls_fmp4 = Some(url);
+                            } else if hls.is_none() {
+                                hls = Some(url);
+                            }
+                        } else if flv.is_none() {
+                            flv = Some(url);
+                        }
+                    }
+                }
+            }
+        }
+        let hls_ts = hls;
+        let hls = hls_ts.clone().or_else(|| hls_fmp4.clone());
+        if hls.is_none() && flv.is_none() {
+            bail!("这个直播间没有可用的播放地址（live_status={live_status}）");
+        }
+        crate::debug_log(&format!(
+            "live play room={room_id} status={live_status} locked={} hls_ts={} hls_fmp4={} flv={}",
+            u8::from(locked),
+            u8::from(hls_ts.is_some()),
+            u8::from(hls_fmp4.is_some()),
+            u8::from(flv.is_some())
+        ));
+        Ok(LivePlay {
+            hls,
+            hls_fmp4,
+            hls_ts,
+            flv,
+            live_status,
+            locked,
+        })
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::{live_area_list, live_area_room_from, live_pic, live_room_from};
+    use serde_json::json;
+
+    #[test]
+    fn room_parses_bool_status_and_prefixed_ids() {
+        let value = json!({
+            "roomid": "22116362", "uid": 531381429, "title": "五行气功跟练",
+            "uname": "武当袁师懋", "online": "1091", "status": true,
+            "cover": "https://i0.hdslb.com/bfs/live/a.jpg",
+            "area_v2_name": "运动体育", "area_v2_parent_name": "生活"
+        });
+        let room = live_room_from(&value).expect("room");
+        assert_eq!(room.room_id, 22116362);
+        assert_eq!(room.uid, 531381429);
+        assert_eq!(room.online, 1091);
+        assert_eq!(room.live_status, 1);
+        assert_eq!(room.area_name, "运动体育");
+        assert!(room.cover.ends_with("@320w_180h_1c.webp"));
+    }
+
+    #[test]
+    fn room_without_id_is_dropped_and_http_is_upgraded() {
+        assert!(live_room_from(&json!({ "roomid": 0 })).is_none());
+        assert_eq!(
+            live_pic("http://i0.hdslb.com/bfs/live/x.png"),
+            "https://i0.hdslb.com/bfs/live/x.png@320w_180h_1c.webp"
+        );
+    }
+
+    /// Captured from `room/v1/area/getRoomList?parent_area_id=2&area_id=86`:
+    /// `data` is a bare array, and the row has no `live_status` — yet
+    /// `Room/get_info` answers `live_status: 1` for it, so the card keeps its
+    /// 直播中 pill.
+    #[test]
+    fn legacy_area_page_is_a_bare_array_without_live_status() {
+        let body = json!({
+            "code": 0, "msg": "success",
+            "data": [
+                {
+                    "roomid": 545068, "uid": 8739477, "title": "德云色 上分如喝汤",
+                    "uname": "老实憨厚的笑笑", "online": 389934,
+                    "cover": "https://i0.hdslb.com/bfs/live/a.jpg",
+                    "area_v2_id": 86, "area_v2_name": "英雄联盟",
+                    "area_v2_parent_id": 2, "area_v2_parent_name": "网游"
+                },
+                { "roomid": 0 }
+            ]
+        });
+        let list = live_area_list(&body);
+        assert_eq!(list.len(), 2);
+        let room = live_area_room_from(&list[0]).expect("room");
+        assert_eq!(room.room_id, 545068);
+        assert_eq!(room.online, 389934);
+        assert_eq!(room.area_name, "英雄联盟");
+        assert_eq!(room.parent_area_name, "网游");
+        assert_eq!(room.live_status, 1);
+        assert!(room.cover.ends_with("@320w_180h_1c.webp"));
+    }
+
+    /// `second/getList` nests the array and carries a real `live_status`; a
+    /// finished room must stay 0 (no invented 直播中).
+    #[test]
+    fn nested_area_page_keeps_its_live_status() {
+        let body = json!({
+            "code": 0,
+            "data": { "list": [{ "roomid": 7, "title": "t", "live_status": 0 }], "has_more": 1 }
+        });
+        let list = live_area_list(&body);
+        let room = live_area_room_from(&list[0]).expect("room");
+        assert_eq!(room.live_status, 0);
     }
 }
 
@@ -9289,7 +10817,6 @@ mod conclusion_tests {
         }"#;
         let conclusion = parse(json);
         assert_eq!(conclusion.data_code, 0);
-        assert!(conclusion.allow_summary);
         assert_eq!(conclusion.summary, "这是一个讲 Rust 所有权的视频。");
         assert_eq!(conclusion.outline.len(), 2);
         assert_eq!(conclusion.outline[0].timestamp, 0);
@@ -9330,7 +10857,6 @@ mod conclusion_tests {
         }"#;
         let conclusion = parse(json);
         assert_eq!(conclusion.data_code, -1);
-        assert!(!conclusion.allow_summary);
         assert!(conclusion.summary.is_empty());
         assert!(conclusion.outline.is_empty());
         assert_eq!(conclusion.cues.len(), 3);
@@ -9344,7 +10870,6 @@ mod conclusion_tests {
         let json = r#"{ "code": 0, "message": "0", "data": { "code": 1 } }"#;
         let conclusion = parse(json);
         assert_eq!(conclusion.data_code, 1);
-        assert!(conclusion.allow_summary);
         assert!(conclusion.cues.is_empty());
     }
 
@@ -9415,5 +10940,219 @@ mod up_tests {
         assert_eq!(length_seconds("90"), 90);
         assert_eq!(length_seconds(""), 0);
         assert_eq!(length_seconds("n/a"), 0);
+    }
+}
+
+#[cfg(test)]
+mod season_tests {
+    use super::{detail_from_view, ViewData, VideoDetail, SEASON_MAX_EPISODES};
+
+    /// Synthetic `x/web-interface/view` payloads only: placeholder ids, never a
+    /// real BV号.
+    fn detail(payload: &str) -> VideoDetail {
+        let data: ViewData = serde_json::from_str(payload).expect("fixture parses");
+        detail_from_view(data)
+    }
+
+    const ONLY_PAGES: &str = r#"{
+        "bvid": "BV0000000001",
+        "aid": 1001,
+        "cid": 5001,
+        "title": "三分P示例",
+        "pages": [
+            { "cid": 5001, "page": 1, "part": "第一段", "duration": 61 },
+            { "cid": 5002, "page": 2, "part": "", "duration": 62 },
+            { "cid": 5003, "page": 3, "part": "第三段" }
+        ]
+    }"#;
+
+    const ONLY_SEASON: &str = r#"{
+        "bvid": "BV0000000002",
+        "aid": 1002,
+        "cid": 6001,
+        "title": "合集示例",
+        "ugc_season": {
+            "id": 9001,
+            "title": "示例合集",
+            "cover": "//i0.hdslb.com/season.jpg",
+            "mid": 77,
+            "ep_count": 3,
+            "sections": [
+                { "id": 1, "title": "第一话", "episodes": [
+                    { "aid": 2001, "bvid": "BV0000000011", "cid": 6001,
+                      "title": "第一集", "arc": { "duration": 120, "pic": "//i0.hdslb.com/e1.jpg" },
+                      "page": { "cid": 6001, "part": "第一集", "duration": 121 } },
+                    { "aid": 2002, "bvid": "BV0000000012", "cid": 6002,
+                      "title": "第二集", "arc": { "duration": 122 } }
+                ] },
+                { "id": 2, "title": "第二话", "episodes": [
+                    { "aid": 2003, "bvid": "BV0000000013", "cid": 6003, "title": "第三集" }
+                ] }
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn pages_only_keeps_每p_metadata() {
+        let detail = detail(ONLY_PAGES);
+        assert!(detail.season.is_none());
+        assert_eq!(detail.pages.len(), 3);
+        assert_eq!(detail.pages[0].cid, 5001);
+        assert_eq!(detail.pages[0].page, 1);
+        assert_eq!(detail.pages[0].title, "第一段");
+        assert_eq!(detail.pages[0].duration, 61);
+        // An empty `part` still has a usable label, and its duration defaults
+        // to 0 rather than a guess.
+        assert_eq!(detail.pages[1].title, "P2");
+        assert_eq!(detail.pages[1].duration, 62);
+        assert_eq!(detail.pages[2].duration, 0);
+    }
+
+    #[test]
+    fn season_only_is_parsed_with_fallbacks() {
+        let detail = detail(ONLY_SEASON);
+        let season = detail.season.expect("ugc_season is parsed");
+        assert_eq!(season.title, "示例合集");
+        assert_eq!(season.ep_count, 3);
+        assert_eq!(season.sections.len(), 2);
+        assert_eq!(season.sections[0].title, "第一话");
+        let first = &season.sections[0].episodes[0];
+        assert_eq!(first.cid, 6001);
+        assert_eq!(first.duration, 121);
+        assert_eq!(first.bvid, "BV0000000011");
+        assert_eq!(first.aid, 2001);
+        // `page.duration` wins over `arc.duration`; a missing `page` falls back
+        // to `arc.duration` and to the season cover.
+        assert_eq!(season.sections[0].episodes[1].duration, 122);
+        // No `page` and no `arc` at all: duration 0, season cover.
+        assert_eq!(season.sections[1].episodes[0].duration, 0);
+        assert_eq!(season.sections[1].episodes[0].cid, 6003);
+    }
+
+    #[test]
+    fn pages_and_season_both_are_kept() {
+        let payload = r#"{
+            "bvid": "BV0000000003",
+            "aid": 1003,
+            "cid": 7000,
+            "title": "两者都有",
+            "pages": [ { "cid": 7000, "page": 1, "part": "上", "duration": 10 },
+                       { "cid": 7001, "page": 2, "part": "下", "duration": 20 } ],
+            "ugc_season": {
+                "id": 12, "title": "合集", "cover": "", "mid": 1, "ep_count": 1,
+                "sections": [ { "id": 3, "title": "唯一一节", "episodes": [
+                    { "aid": 3001, "bvid": "BV0000000021", "cid": 7000,
+                      "page": { "cid": 7000, "part": "上", "duration": 10 } }
+                ] } ]
+            }
+        }"#;
+        let detail = detail(payload);
+        assert_eq!(detail.pages.len(), 2);
+        let season = detail.season.expect("season stays available");
+        assert_eq!(season.sections[0].episodes.len(), 1);
+        // The episode had no `arc`: the title falls back to `page.part`.
+        assert_eq!(season.sections[0].episodes[0].title, "上");
+    }
+
+    #[test]
+    fn empty_ugc_season_is_none() {
+        let payload = r#"{
+            "bvid": "BV0000000004",
+            "aid": 1004,
+            "cid": 8000,
+            "pages": [ { "cid": 8000, "page": 1, "part": "唯一", "duration": 30 } ],
+            "ugc_season": []
+        }"#;
+        assert!(detail(payload).season.is_none());
+    }
+
+    #[test]
+    fn season_without_sections_is_none() {
+        let payload = r#"{
+            "bvid": "BV0000000005",
+            "aid": 1005,
+            "cid": 8100,
+            "ugc_season": { "id": 1, "title": "空合集", "sections": [] }
+        }"#;
+        assert!(detail(payload).season.is_none());
+    }
+
+    #[test]
+    fn episode_without_page_uses_cid_and_arc() {
+        let payload = r#"{
+            "bvid": "BV0000000006",
+            "aid": 1006,
+            "cid": 8200,
+            "ugc_season": {
+                "id": 4, "title": "缺 page", "cover": "//cover", "mid": 2, "ep_count": 1,
+                "sections": [ { "id": 5, "title": "", "episodes": [
+                    { "aid": 4001, "bvid": "BV0000000031", "cid": 8201, "title": "只有 cid",
+                      "arc": { "duration": 45, "pic": "//arc-pic" } }
+                ] } ]
+            }
+        }"#;
+        let season = detail(payload).season.expect("season exists");
+        let episode = &season.sections[0].episodes[0];
+        assert_eq!(episode.cid, 8201);
+        assert_eq!(episode.duration, 45);
+        assert_eq!(episode.title, "只有 cid");
+    }
+
+    #[test]
+    fn malformed_values_degrade_to_zero_or_empty() {
+        let payload = r#"{
+            "bvid": "BV0000000007",
+            "aid": 1007,
+            "cid": 8300,
+            "ugc_season": {
+                "id": "12", "title": 7, "cover": null, "mid": -3, "ep_count": "2",
+                "sections": [ { "id": "8", "title": null, "episodes": [
+                    { "aid": "4002", "bvid": 42, "cid": "8301", "title": "字符串 id",
+                      "page": { "cid": -1, "duration": -5 } }
+                ] }, "not-an-object" ]
+            }
+        }"#;
+        let season = detail(payload).season.expect("string ids still parse");
+        assert_eq!(season.title, "");
+        assert_eq!(season.ep_count, 2);
+        assert_eq!(season.sections.len(), 1);
+        let episode = &season.sections[0].episodes[0];
+        // `page.cid` is negative -> falls through to the episode's own string id.
+        assert_eq!(episode.cid, 8301);
+        assert_eq!(episode.aid, 4002);
+        assert_eq!(episode.bvid, "");
+        assert_eq!(episode.duration, 0);
+    }
+
+    #[test]
+    fn sections_and_episodes_are_capped() {
+        let mut episodes = String::new();
+        for index in 0..(SEASON_MAX_EPISODES + 5) {
+            if index > 0 {
+                episodes.push(',');
+            }
+            episodes.push_str(&format!(
+                r#"{{ "aid": {}, "bvid": "BV{:010}", "cid": {}, "title": "e{index}",
+                     "page": {{ "cid": {}, "duration": 1 }} }}"#,
+                5000 + index,
+                10000 + index,
+                9000 + index,
+                9000 + index,
+            ));
+        }
+        let payload = format!(
+            r#"{{ "bvid": "BV0000000008", "aid": 1008, "cid": 8400,
+                 "ugc_season": {{ "id": 1, "title": "超长", "cover": "", "mid": 1,
+                   "ep_count": 505, "sections": [
+                     {{ "id": 1, "title": "一节", "episodes": [{}] }} ] }} }}"#,
+            episodes
+        );
+        let season = detail(&payload).season.expect("season exists");
+        let total: usize = season
+            .sections
+            .iter()
+            .map(|section| section.episodes.len())
+            .sum();
+        assert_eq!(total, SEASON_MAX_EPISODES);
     }
 }

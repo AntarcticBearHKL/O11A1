@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// One queued video in the app-wide 播放列表 (see `PlaybackQueue` in `main.rs`).
 ///
@@ -77,10 +77,21 @@ pub struct Settings {
     /// Invalid patterns are ignored at compile time.
     #[serde(default)]
     pub blocked_regex: Vec<String>,
-    /// Starting playback quality (`qn`). Defaults to 1080P; the track selector
-    /// then takes the lowest-bitrate codec available at that quality.
+    /// Starting playback quality (`qn`), i.e. 设置 → 播放 → 默认画质: one of
+    /// `0` (自动 = `min(highest playable, 1080P)`), 1080P, 720P or 480P. The
+    /// track selector then takes the sharpest stream (highest bitrate, or the
+    /// preferred codec) at that quality. A stored value outside that set is
+    /// normalised to 自动, so a stale 4K pick can never be every video's default
+    /// (4K/8K are only opened from the 画质 menu).
     #[serde(default = "default_player_quality")]
     pub player_quality: i64,
+    /// Decode at the source's own resolution instead of the picture the window
+    /// actually shows. `false` (default) asks the decoder for the window-sized
+    /// picture — a 1080p source in a 1216×684 window decodes 1216×684, which is
+    /// a third of the pipe bytes and the same picture on screen. `true` is the
+    /// "原始分辨率" switch: the old behaviour, at the old cost.
+    #[serde(default)]
+    pub player_native_size: bool,
     #[serde(default = "default_player_speed")]
     pub player_speed: u32,
     #[serde(default = "default_hwaccel")]
@@ -194,7 +205,7 @@ pub struct Settings {
     /// [`mask_key`] 的脱敏结果。
     #[serde(default)]
     pub deepseek_key: String,
-    /// 养鱼使用的 DeepSeek 模型（默认 `deepseek-chat`）。空串在加载时回落到
+    /// 养鱼使用的 DeepSeek 模型（默认 `deepseek-flash`）。空串在加载时回落到
     /// [`default_fish_model`]。
     #[serde(default = "default_fish_model")]
     pub fish_model: String,
@@ -230,6 +241,63 @@ pub struct Settings {
     /// [`normalise_audio_quality`]。
     #[serde(default)]
     pub audio_quality: u32,
+    /// 防干扰：隐藏首页工具栏的「直播」入口。默认关闭 = 与改动前完全一致
+    /// （推荐 / 收藏 / 分区 / 番剧 / 直播 / 养鱼 六个 pill）。打开后只渲染五个
+    /// pill，左侧胶囊簇的宽度推导同步收窄；若当前正停在直播页（view_mode 23）
+    /// 打开本开关，会退回推荐页——那是它唯一的入口。见
+    /// [`normalise_hide_live_tab`]。
+    #[serde(default)]
+    pub hide_live_tab: bool,
+    /// 防干扰：搜索框展开时不显示热搜列表。默认关闭 = 空输入显示热搜。
+    /// 打开后空输入直接显示联想（没有联想就什么都不显示），不再出现一块空白
+    /// 的热搜面板。见 [`normalise_hide_hot_search`]。
+    #[serde(default)]
+    pub hide_hot_search: bool,
+    /// 看片力度：`0..=4` 是 T0–T4 预设，`5` = 自定义（下面六个开关为准）。
+    /// 未知值在加载时回落到 T1。见 [`normalise_fish_tier`]。
+    #[serde(default = "default_fish_tier")]
+    pub fish_tier: u32,
+    /// 自定义档位下的步骤开关。预设档位（`fish_tier < 5`）忽略这六个值，
+    /// 由 `fish.rs` 按档位展开，避免手改文件后档位与开关互相矛盾。
+    #[serde(default = "default_true")]
+    pub fish_step_meta: bool,
+    #[serde(default = "default_true")]
+    pub fish_step_subtitle: bool,
+    #[serde(default)]
+    pub fish_step_outline: bool,
+    #[serde(default = "default_true")]
+    pub fish_step_comments: bool,
+    #[serde(default)]
+    pub fish_step_asr: bool,
+    #[serde(default)]
+    pub fish_step_frames: bool,
+    /// ASR 总开关。关闭时 T3/T4 的 asr 步骤记 `skipped(ASR 未开启)`，不下载音频。
+    #[serde(default)]
+    pub fish_asr_enabled: bool,
+    /// `auto` | `faster-whisper` | `whisper.cpp`。见 [`normalise_fish_asr_engine`]。
+    #[serde(default = "default_fish_asr_engine")]
+    pub fish_asr_engine: String,
+    /// `gpu` | `cpu`。见 [`normalise_fish_asr_device`]。
+    #[serde(default = "default_fish_asr_device")]
+    pub fish_asr_device: String,
+    /// `small` | `turbo` | `medium`。见 [`normalise_fish_asr_model`]。
+    #[serde(default = "default_fish_asr_model")]
+    pub fish_asr_model: String,
+    /// whisper.cpp / faster-whisper 的线程数（`1..=FISH_ASR_THREADS_MAX`）。
+    #[serde(default = "default_fish_asr_threads")]
+    pub fish_asr_threads: u32,
+    /// 模型目录；空串 = 项目根下的 `models/whisper`。
+    #[serde(default)]
+    pub fish_asr_model_dir: String,
+    /// DeepSeek 视觉的图片精度：`low`（先缩到 512×512，省 token）或 `original`。
+    #[serde(default = "default_fish_vision_detail")]
+    pub fish_vision_detail: String,
+    /// 番剧索引的排序，按 season_type 分别记住：`{"1": "follows", "4": "score"}`
+    /// （键是 `pgc_season_type` 的十进制 season_type，值是 [`PGC_SORT_KEYS`] 之一）。
+    /// 缺省 = 该分区沿用 B站 的「追番人数」排序（`order=3`），即改动前的行为。
+    /// 见 [`normalise_pgc_sorts`]。
+    #[serde(default)]
+    pub pgc_sorts: BTreeMap<String, String>,
 }
 
 /// Number of remappable player actions.
@@ -239,6 +307,60 @@ pub const PLAYER_KEY_CANDIDATES: usize = 15;
 /// Cards-per-page steps offered by the 设置 menu and accepted by
 /// [`normalise_page_size`].
 pub const PAGE_SIZES: [i64; 4] = [12, 24, 36, 48];
+/// 番剧索引的排序键，按这个顺序就是 UI 下拉里的顺序（见 [`Settings::pgc_sorts`]）。
+///
+/// 每一个键都对应 `pgc/season/index/result` 的一个 `order` 值，而且语义是对着
+/// 真实响应逐条核对过的（首条 + 整页的 `order` 文案单调递减、翻页接续不断）：
+///
+/// | key       | order | 该页 `order` 文案      | 真实含义 |
+/// |-----------|-------|------------------------|----------|
+/// | `follows` | 3     | `553.2万追番`          | 追番人数 |
+/// | `update`  | 0     | `8月14日更新`          | 最近更新 |
+/// | `views`   | 2     | `1.6亿次播放`          | 播放量   |
+/// | `score`   | 4     | `9.9分`                | 评分     |
+///
+/// `order=1`（响应里 `order` 为空，实际按弹幕数降序）和 `order=5`（`X月X日
+/// 开播`，按开播时间）也验证过，但没有做进 UI：前者不是用户能理解的排序，后者
+/// 的「敬请期待」行混在日期序列里，语义不够干净。
+pub const PGC_SORT_KEYS: [&str; 4] = ["follows", "update", "views", "score"];
+/// 一个 season_type 没存过排序时用的键（B站 的「追番人数」，`order=3`）。
+pub const PGC_SORT_DEFAULT: &str = "follows";
+
+/// Snap a stored 番剧排序 key to one of [`PGC_SORT_KEYS`], else empty.
+///
+/// The value arrives from JSON and may be hand-edited: an unknown string is
+/// dropped by [`normalise_pgc_sorts`] instead of being kept and later mapped to
+/// a guessed API `order`.
+pub fn normalise_pgc_sort(value: &str) -> String {
+    let value = value.trim();
+    if PGC_SORT_KEYS.contains(&value) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Clean a stored `season_type -> sort key` map.
+///
+/// Keys are the decimal season_type (B站's own numbers: 1 番剧, 4 国创, ...);
+/// anything that is not a positive integer is dropped, and a value that is not
+/// in [`PGC_SORT_KEYS`] is dropped too, so the page falls back to
+/// [`PGC_SORT_DEFAULT`] for that tab rather than to a wrong sort.
+pub fn normalise_pgc_sorts(stored: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    stored
+        .into_iter()
+        .filter_map(|(season_type, key)| {
+            let season_type = season_type.trim().to_string();
+            if season_type.parse::<i64>().map(|id| id > 0).unwrap_or(false) {
+                let key = normalise_pgc_sort(&key);
+                if !key.is_empty() {
+                    return Some((season_type, key));
+                }
+            }
+            None
+        })
+        .collect()
+}
 /// 关闭主窗口后的行为（见 [`Settings::close_action`]）：0 = 最小化到任务栏,
 /// 1 = 隐藏到系统托盘, 2 = 直接退出程序.
 pub const CLOSE_ACTIONS: [u32; 3] = [0, 1, 2];
@@ -287,6 +409,18 @@ pub const FISH_SOURCE_FOLLOW: u32 = 2;
 pub const FISH_SOURCE_FAV: u32 = 4;
 /// 已知喂食来源的全部位。
 pub const FISH_SOURCES_ALL: u32 = FISH_SOURCE_HOME | FISH_SOURCE_FOLLOW | FISH_SOURCE_FAV;
+/// 看片力度里的「自定义」档位值；`0..=4` 是 T0–T4。
+pub const FISH_TIER_CUSTOM: u32 = 5;
+/// ASR 引擎的可选值。
+pub const FISH_ASR_ENGINES: [&str; 3] = ["auto", "faster-whisper", "whisper.cpp"];
+/// ASR 设备。
+pub const FISH_ASR_DEVICES: [&str; 2] = ["gpu", "cpu"];
+/// ASR 模型档位。
+pub const FISH_ASR_MODELS: [&str; 3] = ["small", "turbo", "medium"];
+/// ASR 线程数上限（whisper.cpp 的 `-t`，faster-whisper 的 `cpu_threads`）。
+pub const FISH_ASR_THREADS_MAX: u32 = 16;
+/// DeepSeek 视觉的两种图片精度。
+pub const FISH_VISION_DETAILS: [&str; 2] = ["low", "original"];
 
 /// Default mapping, one candidate index per action:
 /// 播放/暂停, 快退, 快进, 音量+, 音量-, 静音, 全屏, 退出全屏, 弹幕, 点赞, 截图.
@@ -330,9 +464,19 @@ fn default_hwaccel() -> bool {
     true
 }
 
-/// Default starting quality: 1080P (`qn` 80).
+/// Default starting quality: 自动 (`0`) = the highest tier the source offers.
+/// f176: the owner asked for "open on the best source", so 4K is no longer
+/// something you have to pick by hand.
 fn default_player_quality() -> i64 {
-    80
+    0
+}
+
+pub fn normalise_player_quality(qn: i64) -> i64 {
+    if qn < 0 {
+        0
+    } else {
+        qn
+    }
 }
 
 /// 背景透明度 default: 45 % see-through. The window tint keeps 55 % alpha
@@ -459,7 +603,10 @@ pub fn normalise_interp_mode(value: u8) -> u8 {
 }
 
 fn default_fish_model() -> String {
-    "deepseek-chat".to_string()
+    // The model the API docs serve for `deepseek-flash` (text + vision). The
+    // legacy `deepseek-chat` name is an alias for the same model and is folded
+    // into this one so the field never has to be typed by hand.
+    "deepseek-flash".to_string()
 }
 
 /// 默认的鱼主人指令：只说材料里有的内容。
@@ -481,6 +628,91 @@ fn default_fish_budget_videos() -> u32 {
     40
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// 默认档位 T1：字幕 + 评论，等于改动前的能力。
+pub fn default_fish_tier() -> u32 {
+    1
+}
+
+pub fn default_fish_asr_engine() -> String {
+    "auto".to_string()
+}
+
+pub fn default_fish_asr_device() -> String {
+    "gpu".to_string()
+}
+
+pub fn default_fish_asr_model() -> String {
+    "small".to_string()
+}
+
+pub fn default_fish_asr_threads() -> u32 {
+    4
+}
+
+pub fn default_fish_vision_detail() -> String {
+    "low".to_string()
+}
+
+/// Normalise the 看片力度 tier: `0..=4` presets and `5` custom; anything else
+/// falls back to T1 (the shipped default, never "no steps at all").
+pub fn normalise_fish_tier(value: u32) -> u32 {
+    if value <= FISH_TIER_CUSTOM {
+        value
+    } else {
+        default_fish_tier()
+    }
+}
+
+pub fn normalise_fish_asr_engine(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_ASR_ENGINES.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_asr_engine()
+    }
+}
+
+pub fn normalise_fish_asr_device(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_ASR_DEVICES.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_asr_device()
+    }
+}
+
+pub fn normalise_fish_asr_model(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_ASR_MODELS.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_asr_model()
+    }
+}
+
+/// Threads: 0 means "unset" and falls back to the default; anything else is
+/// clamped into `1..=FISH_ASR_THREADS_MAX`.
+pub fn normalise_fish_asr_threads(value: u32) -> u32 {
+    if value == 0 {
+        default_fish_asr_threads()
+    } else {
+        value.clamp(1, FISH_ASR_THREADS_MAX)
+    }
+}
+
+pub fn normalise_fish_vision_detail(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_VISION_DETAILS.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_vision_detail()
+    }
+}
+
 fn default_fish_interval_ms() -> u64 {
     1500
 }
@@ -492,7 +724,9 @@ fn default_fish_interval_ms() -> u64 {
 /// name typed into `settings.json` is never silently replaced.
 pub fn normalise_fish_model(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.is_empty() {
+    // `deepseek-chat` is the retired alias for the same model the docs now
+    // call `deepseek-flash`; fold it in so old settings.json files migrate.
+    if trimmed.is_empty() || trimmed == "deepseek-chat" {
         default_fish_model()
     } else {
         trimmed.to_string()
@@ -581,8 +815,33 @@ pub fn normalise_audio_quality(value: u32) -> u32 {
     }
 }
 
+/// 隐藏直播默认关闭：工具栏保持改动前的六个 pill。
+pub fn default_hide_live_tab() -> bool {
+    false
+}
+
+/// Normalise the 防干扰 隐藏直播 switch.
+///
+/// A `bool` has only two states, so there is nothing to clamp — the function
+/// exists so [`load`] routes every persisted flag through a named normaliser
+/// (the project convention) and so tests can pin the default: a file written
+/// before this field existed parses through `#[serde(default)]` and lands here
+/// as [`default_hide_live_tab`] (off).
+pub fn normalise_hide_live_tab(value: bool) -> bool {
+    value
+}
+
+/// 隐藏搜索热搜默认关闭：空输入时热搜面板照旧出现。
+pub fn default_hide_hot_search() -> bool {
+    false
+}
+
+/// Normalise the 防干扰 隐藏热搜 switch (see [`normalise_hide_live_tab`]).
+pub fn normalise_hide_hot_search(value: bool) -> bool {
+    value
+}
+
 /// Human-readable name of one audio tier (see [`AUDIO_QUALITIES`]).
-#[allow(dead_code)] // the player/设置 UI (another change) is the consumer
 pub fn audio_tier_name(id: u32) -> &'static str {
     match id {
         30216 => "64K",
@@ -599,7 +858,6 @@ pub fn audio_tier_name(id: u32) -> &'static str {
 /// Only the `sk-` prefix and the last four characters are shown, so a
 /// screenshot or a shared log never leaks a usable key. Short or blank values
 /// degrade to `sk-…` instead of revealing themselves.
-#[allow(dead_code)] // the 设置 UI (another change) is the consumer
 pub fn mask_key(key: &str) -> String {
     let key = key.trim();
     let last: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
@@ -758,6 +1016,8 @@ impl Default for Settings {
             blocked_keywords: Vec::new(),
             blocked_regex: Vec::new(),
             player_quality: default_player_quality(),
+            // f176: decode at the stream's own size unless the owner opts out.
+            player_native_size: true,
             player_speed: default_player_speed(),
             hwaccel: default_hwaccel(),
             codec_pref: 0,
@@ -792,6 +1052,23 @@ impl Default for Settings {
             fish_feed_time: default_fish_feed_time(),
             fish_sources: default_fish_sources(),
             audio_quality: 0,
+            hide_live_tab: default_hide_live_tab(),
+            hide_hot_search: default_hide_hot_search(),
+            fish_tier: default_fish_tier(),
+            fish_step_meta: true,
+            fish_step_subtitle: true,
+            fish_step_outline: false,
+            fish_step_comments: true,
+            fish_step_asr: false,
+            fish_step_frames: false,
+            fish_asr_enabled: false,
+            fish_asr_engine: default_fish_asr_engine(),
+            fish_asr_device: default_fish_asr_device(),
+            fish_asr_model: default_fish_asr_model(),
+            fish_asr_threads: default_fish_asr_threads(),
+            fish_asr_model_dir: String::new(),
+            fish_vision_detail: default_fish_vision_detail(),
+            pgc_sorts: BTreeMap::new(),
         }
     }
 }
@@ -828,7 +1105,8 @@ pub fn load() -> Settings {
         blocked_senders: settings.blocked_senders,
         blocked_keywords: settings.blocked_keywords,
         blocked_regex: settings.blocked_regex,
-        player_quality: settings.player_quality,
+        player_quality: normalise_player_quality(settings.player_quality),
+        player_native_size: settings.player_native_size,
         player_speed: settings.player_speed.clamp(500, 2000),
         hwaccel: settings.hwaccel,
         codec_pref: match settings.codec_pref {
@@ -871,6 +1149,23 @@ pub fn load() -> Settings {
         fish_feed_time: normalise_fish_time(&settings.fish_feed_time),
         fish_sources: normalise_fish_sources(settings.fish_sources),
         audio_quality: normalise_audio_quality(settings.audio_quality),
+        hide_live_tab: normalise_hide_live_tab(settings.hide_live_tab),
+        hide_hot_search: normalise_hide_hot_search(settings.hide_hot_search),
+        fish_tier: normalise_fish_tier(settings.fish_tier),
+        fish_step_meta: settings.fish_step_meta,
+        fish_step_subtitle: settings.fish_step_subtitle,
+        fish_step_outline: settings.fish_step_outline,
+        fish_step_comments: settings.fish_step_comments,
+        fish_step_asr: settings.fish_step_asr,
+        fish_step_frames: settings.fish_step_frames,
+        fish_asr_enabled: settings.fish_asr_enabled,
+        fish_asr_engine: normalise_fish_asr_engine(&settings.fish_asr_engine),
+        fish_asr_device: normalise_fish_asr_device(&settings.fish_asr_device),
+        fish_asr_model: normalise_fish_asr_model(&settings.fish_asr_model),
+        fish_asr_threads: normalise_fish_asr_threads(settings.fish_asr_threads),
+        fish_asr_model_dir: settings.fish_asr_model_dir.trim().to_string(),
+        fish_vision_detail: normalise_fish_vision_detail(&settings.fish_vision_detail),
+        pgc_sorts: normalise_pgc_sorts(settings.pgc_sorts),
     };
     if loaded.theme != stored_theme {
         let _ = save(&loaded);
@@ -903,9 +1198,283 @@ pub fn save(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+// ---- 继续观看 (PGC progress) -----------------------------------------------
+//
+// `settings.json` carries preferences, and rewriting it for every episode
+// watched would make the file churn for something that is pure progress. This
+// is a separate small table in its own file instead, one row per season:
+//
+//   { "seasons": { "835": { "ep_id": 216351, "bvid": "BV1…", "cid": 12345,
+//                           "index": 4, "title": "第 4 话 …", "at": 1761… } } }
+//
+// `index` is the 1-based position of that episode inside the season's 正片 list
+// at the time it was watched, so the 番剧 page can print 「看到第 N 集」 from the
+// table alone (no season fetch on the card path). The whole table is capped at
+// [`CONTINUE_MAX_SEASONS`] rows, oldest `at` dropped first.
+
+/// Where one season was last watched (the episode that actually reached its
+/// first frame).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinueEntry {
+    /// The episode's `ep_id`.
+    #[serde(default)]
+    pub ep_id: i64,
+    #[serde(default)]
+    pub bvid: String,
+    #[serde(default)]
+    pub cid: u64,
+    /// 1-based position in the season's 正片 list (0 = unknown).
+    #[serde(default)]
+    pub index: u32,
+    /// The episode line the 选集 shows (`long_title` first).
+    #[serde(default)]
+    pub title: String,
+    /// Unix seconds of the write.
+    #[serde(default)]
+    pub at: i64,
+}
+
+impl ContinueEntry {
+    /// 「看到第 N 集」 for the card badge; empty when `index` is unknown.
+    pub fn badge_text(&self) -> String {
+        if self.index > 0 {
+            format!("看到第 {} 集", self.index)
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// The whole 继续观看 table, keyed by season_id.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContinueStore {
+    #[serde(default)]
+    pub seasons: BTreeMap<i64, ContinueEntry>,
+}
+
+/// One row per season; the table is a convenience, not a history.
+pub const CONTINUE_MAX_SEASONS: usize = 200;
+
+impl ContinueStore {
+    /// `continue.json` beside `settings.json`.
+    pub fn path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("continue.json")
+    }
+
+    pub fn load() -> Self {
+        Self::load_from(&Self::path())
+    }
+
+    /// Read one table. A missing or corrupt file is an empty table, never an
+    /// error: losing progress must not break the 番剧 page.
+    pub fn load_from(path: &Path) -> Self {
+        let Some(data) = std::fs::read_to_string(path).ok() else {
+            return Self::default();
+        };
+        let store: Self = serde_json::from_str(&data).unwrap_or_default();
+        store.pruned()
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    /// Write the table atomically: a temp file in the same directory, then a
+    /// rename over the destination, so a crash mid-write can never leave a
+    /// truncated table behind.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let data = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn get(&self, season_id: i64) -> Option<&ContinueEntry> {
+        self.seasons.get(&season_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.seasons.len()
+    }
+
+    /// Record one season's episode and drop the oldest rows over the cap.
+    pub fn set(&mut self, season_id: i64, entry: ContinueEntry) {
+        if season_id <= 0 {
+            return;
+        }
+        self.seasons.insert(season_id, entry);
+        while self.seasons.len() > CONTINUE_MAX_SEASONS {
+            let Some(oldest) = self
+                .seasons
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.seasons.remove(&oldest);
+        }
+    }
+
+    /// Same, then persist. A failed write is logged by the caller, not here.
+    pub fn set_and_save(&mut self, season_id: i64, entry: ContinueEntry) -> Result<()> {
+        self.set(season_id, entry);
+        self.save()
+    }
+
+    fn pruned(mut self) -> Self {
+        self.seasons.retain(|id, entry| *id > 0 && entry.ep_id > 0);
+        while self.seasons.len() > CONTINUE_MAX_SEASONS {
+            let Some(oldest) = self
+                .seasons
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.seasons.remove(&oldest);
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_continue_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "o11a1-continue-{}-{tag}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn pgc_sort_keys_are_the_verified_ones() {
+        // The four keys the dropdown offers, in dropdown order. Every one of
+        // them was checked against the live index endpoint; see PGC_SORT_KEYS.
+        assert_eq!(PGC_SORT_KEYS, ["follows", "update", "views", "score"]);
+        for key in PGC_SORT_KEYS {
+            assert_eq!(normalise_pgc_sort(key), key);
+        }
+        assert_eq!(normalise_pgc_sort("  score "), "score");
+    }
+
+    #[test]
+    fn pgc_sort_normalisation_drops_unknown_keys_and_values() {
+        assert_eq!(normalise_pgc_sort("danmaku"), "");
+        assert_eq!(normalise_pgc_sort(""), "");
+        let mut stored = BTreeMap::new();
+        stored.insert("1".to_string(), "update".to_string());
+        stored.insert("4".to_string(), "nonsense".to_string());
+        stored.insert("anime".to_string(), "score".to_string());
+        stored.insert("-3".to_string(), "score".to_string());
+        let clean = normalise_pgc_sorts(stored);
+        assert_eq!(clean.len(), 1);
+        assert_eq!(clean.get("1").map(String::as_str), Some("update"));
+    }
+
+    #[test]
+    fn pgc_sorts_survive_a_json_round_trip() {
+        let mut settings = Settings::default();
+        assert!(settings.pgc_sorts.is_empty());
+        settings
+            .pgc_sorts
+            .insert("1".to_string(), "views".to_string());
+        settings
+            .pgc_sorts
+            .insert("4".to_string(), "score".to_string());
+        let json = serde_json::to_string(&settings).expect("serialise settings");
+        let back: Settings = serde_json::from_str(&json).expect("parse settings");
+        assert_eq!(back.pgc_sorts, settings.pgc_sorts);
+        // A file written before this field existed still loads.
+        let old: Settings = serde_json::from_str(r#"{ "page_size": 24 }"#).expect("old file");
+        assert!(old.pgc_sorts.is_empty());
+    }
+
+    #[test]
+    fn continue_store_round_trips_through_a_file() {
+        let path = temp_continue_path("roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let mut store = ContinueStore::default();
+        store.set(
+            835,
+            ContinueEntry {
+                ep_id: 216351,
+                bvid: "BV1xx411c7mD".to_string(),
+                cid: 4321,
+                index: 4,
+                title: "第 4 话 秘密基地".to_string(),
+                at: 1_760_000_000,
+            },
+        );
+        store.save_to(&path).expect("save");
+        // Real read-back from the file, not the in-memory value.
+        let back = ContinueStore::load_from(&path);
+        assert_eq!(back.len(), 1);
+        let entry = back.get(835).expect("season 835");
+        assert_eq!(entry.ep_id, 216351);
+        assert_eq!(entry.cid, 4321);
+        assert_eq!(entry.index, 4);
+        assert_eq!(entry.badge_text(), "看到第 4 集");
+        assert_eq!(entry.at, 1_760_000_000);
+        assert_eq!(
+            serde_json::from_str::<ContinueStore>(&std::fs::read_to_string(&path).unwrap())
+                .map(|store| store.len())
+                .unwrap_or(0),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn continue_store_drops_the_oldest_rows_over_the_cap() {
+        let mut store = ContinueStore::default();
+        for index in 0..(CONTINUE_MAX_SEASONS as i64 + 5) {
+            store.set(
+                index + 1,
+                ContinueEntry {
+                    ep_id: index + 1,
+                    at: index,
+                    ..ContinueEntry::default()
+                },
+            );
+        }
+        assert_eq!(store.len(), CONTINUE_MAX_SEASONS);
+        assert!(store.get(1).is_none(), "oldest row must be dropped");
+        assert!(store.get(5).is_none(), "the five oldest rows are gone");
+        assert!(store.get(6).is_some());
+        assert!(store.get(CONTINUE_MAX_SEASONS as i64 + 5).is_some());
+    }
+
+    #[test]
+    fn continue_store_tolerates_a_missing_or_corrupt_file() {
+        let missing = temp_continue_path("missing");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(ContinueStore::load_from(&missing).len(), 0);
+
+        let corrupt = temp_continue_path("corrupt");
+        std::fs::write(&corrupt, "{ not json").expect("write corrupt file");
+        assert_eq!(ContinueStore::load_from(&corrupt).len(), 0);
+
+        // A row without an ep_id can never be resumed, so it is dropped.
+        let partial = temp_continue_path("partial");
+        std::fs::write(
+            &partial,
+            r#"{ "seasons": { "1": { "bvid": "BV1" }, "2": { "ep_id": 9, "index": 2 } } }"#,
+        )
+        .expect("write partial file");
+        let store = ContinueStore::load_from(&partial);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(2).map(|entry| entry.index), Some(2));
+        let _ = std::fs::remove_file(&corrupt);
+        let _ = std::fs::remove_file(&partial);
+    }
 
     #[test]
     fn close_action_accepts_every_offered_value() {
@@ -1366,13 +1935,13 @@ mod tests {
         let defaults = Settings::default();
         assert!(defaults.deepseek_key.is_empty());
         assert!(!defaults.fish_enabled);
-        assert_eq!(defaults.fish_model, "deepseek-chat");
+        assert_eq!(defaults.fish_model, "deepseek-flash");
         assert_eq!(defaults.fish_instruction, default_fish_instruction());
         assert_eq!(defaults.fish_budget_videos, 40);
         assert_eq!(defaults.fish_interval_ms, 1500);
         let legacy = r#"{ "page_size": 36 }"#;
         let decoded = serde_json::from_str::<Settings>(legacy).expect("legacy file parses");
-        assert_eq!(decoded.fish_model, "deepseek-chat");
+        assert_eq!(decoded.fish_model, "deepseek-flash");
         assert_eq!(decoded.fish_instruction, default_fish_instruction());
         assert_eq!(decoded.fish_budget_videos, 40);
         assert_eq!(decoded.fish_interval_ms, 1500);
@@ -1394,7 +1963,8 @@ mod tests {
 
     #[test]
     fn fish_model_and_instruction_never_stay_blank() {
-        assert_eq!(normalise_fish_model("  "), "deepseek-chat");
+        assert_eq!(normalise_fish_model("  "), "deepseek-flash");
+        assert_eq!(normalise_fish_model("deepseek-chat"), "deepseek-flash");
         assert_eq!(normalise_fish_model("deepseek-reasoner"), "deepseek-reasoner");
         assert_eq!(normalise_fish_instruction("   "), default_fish_instruction());
         assert_eq!(normalise_fish_instruction(" 只看教程 "), "只看教程");
@@ -1408,5 +1978,144 @@ mod tests {
         assert_eq!(mask_key("sk-"), "sk-…");
         assert_eq!(mask_key("sk-1234"), "sk-…");
         assert!(!mask_key("sk-1234567890abcd").contains("1234567890"));
+    }
+
+    #[test]
+    fn guard_switches_default_off() {
+        let defaults = Settings::default();
+        assert!(!defaults.hide_live_tab);
+        assert!(!defaults.hide_hot_search);
+        assert!(!default_hide_live_tab());
+        assert!(!default_hide_hot_search());
+        // A settings.json written before 防干扰 existed: the missing fields take
+        // the serde default, so both switches come up off (the pre-change app).
+        let legacy = r#"{ "page_size": 36, "theme": 2 }"#;
+        let decoded = serde_json::from_str::<Settings>(legacy).expect("legacy file parses");
+        assert_eq!(decoded.hide_live_tab, default_hide_live_tab());
+        assert_eq!(decoded.hide_hot_search, default_hide_hot_search());
+        assert!(!decoded.hide_live_tab);
+        assert!(!decoded.hide_hot_search);
+    }
+
+    #[test]
+    fn guard_switches_keep_both_boolean_states() {
+        for value in [false, true] {
+            assert_eq!(normalise_hide_live_tab(value), value);
+            assert_eq!(normalise_hide_hot_search(value), value);
+        }
+    }
+
+    #[test]
+    fn guard_switches_round_trip_through_json() -> Result<()> {
+        let settings = Settings {
+            hide_live_tab: true,
+            hide_hot_search: true,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        assert!(encoded.contains("\"hide_live_tab\":true"), "{encoded}");
+        assert!(encoded.contains("\"hide_hot_search\":true"), "{encoded}");
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert!(
+            normalise_hide_live_tab(decoded.hide_live_tab),
+            "隐藏直播 survives a round trip"
+        );
+        assert!(
+            normalise_hide_hot_search(decoded.hide_hot_search),
+            "隐藏热搜 survives a round trip"
+        );
+        let encoded_default = serde_json::to_string(&Settings::default())?;
+        assert!(
+            encoded_default.contains("\"hide_live_tab\":false"),
+            "{encoded_default}"
+        );
+        assert!(
+            encoded_default.contains("\"hide_hot_search\":false"),
+            "{encoded_default}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn watch_tier_defaults_to_t1_and_normalises() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.fish_tier, 1);
+        assert!(defaults.fish_step_meta);
+        assert!(defaults.fish_step_subtitle);
+        assert!(defaults.fish_step_comments);
+        assert!(!defaults.fish_step_outline);
+        assert!(!defaults.fish_step_asr);
+        assert!(!defaults.fish_step_frames);
+        for tier in 0..=FISH_TIER_CUSTOM {
+            assert_eq!(normalise_fish_tier(tier), tier);
+        }
+        for tier in [6u32, 99, u32::MAX] {
+            assert_eq!(normalise_fish_tier(tier), default_fish_tier());
+        }
+        let legacy = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(legacy.fish_tier, 1);
+    }
+
+    #[test]
+    fn asr_settings_default_to_small_gpu_and_normalise() {
+        let defaults = Settings::default();
+        assert!(!defaults.fish_asr_enabled);
+        assert_eq!(defaults.fish_asr_engine, "auto");
+        assert_eq!(defaults.fish_asr_device, "gpu");
+        assert_eq!(defaults.fish_asr_model, "small");
+        assert_eq!(defaults.fish_asr_threads, 4);
+        assert_eq!(defaults.fish_vision_detail, "low");
+        for engine in FISH_ASR_ENGINES {
+            assert_eq!(normalise_fish_asr_engine(engine), engine);
+        }
+        for device in FISH_ASR_DEVICES {
+            assert_eq!(normalise_fish_asr_device(device), device);
+        }
+        for model in FISH_ASR_MODELS {
+            assert_eq!(normalise_fish_asr_model(model), model);
+        }
+        for detail in FISH_VISION_DETAILS {
+            assert_eq!(normalise_fish_vision_detail(detail), detail);
+        }
+        assert_eq!(normalise_fish_asr_engine("nope"), "auto");
+        assert_eq!(normalise_fish_asr_device("tpu"), "gpu");
+        assert_eq!(normalise_fish_asr_model("large"), "small");
+        assert_eq!(normalise_fish_vision_detail("high"), "low");
+        assert_eq!(normalise_fish_asr_threads(0), 4);
+        assert_eq!(normalise_fish_asr_threads(99), FISH_ASR_THREADS_MAX);
+    }
+
+    #[test]
+    fn watch_and_asr_settings_survive_a_json_round_trip() -> Result<()> {
+        let settings = Settings {
+            fish_tier: FISH_TIER_CUSTOM,
+            fish_step_meta: true,
+            fish_step_subtitle: false,
+            fish_step_outline: true,
+            fish_step_comments: true,
+            fish_step_asr: true,
+            fish_step_frames: false,
+            fish_asr_enabled: true,
+            fish_asr_engine: "faster-whisper".to_string(),
+            fish_asr_device: "cpu".to_string(),
+            fish_asr_model: "medium".to_string(),
+            fish_asr_threads: 8,
+            fish_vision_detail: "original".to_string(),
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert_eq!(decoded.fish_tier, FISH_TIER_CUSTOM);
+        assert!(decoded.fish_step_asr);
+        assert!(!decoded.fish_step_subtitle);
+        assert_eq!(decoded.fish_asr_engine, "faster-whisper");
+        assert_eq!(decoded.fish_asr_device, "cpu");
+        assert_eq!(decoded.fish_asr_model, "medium");
+        assert_eq!(decoded.fish_asr_threads, 8);
+        assert_eq!(decoded.fish_vision_detail, "original");
+        Ok(())
     }
 }

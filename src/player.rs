@@ -119,14 +119,14 @@ pub type MiniSlot = Arc<std::sync::Mutex<Option<slint::Weak<MiniPlayerWindow>>>>
 // within one 60 Hz tick.
 
 /// Cap on a decoded frame, independent of the window or the source.
-const FRAME_MAX_W: u32 = 1920;
-const FRAME_MAX_H: u32 = 1080;
+// f176: decode follows the stream, so the cap is the largest tier this
+// client offers (4K). Anything bigger is still scaled down to keep the raw
+// NV12 pipe from growing past ~50 MB/s at 30 fps.
+const FRAME_MAX_W: u32 = 3840;
+const FRAME_MAX_H: u32 = 2160;
 /// Display fallback before the UI has published a window size.
 const DEFAULT_DISPLAY_W: u32 = 1280;
 const DEFAULT_DISPLAY_H: u32 = 720;
-/// Largest window (physical px, both axes) whose picture the reader downscales
-/// before handing it to the UI. Above this the decoded frame is what is drawn.
-const SMALL_PICTURE_MAX: (u32, u32) = (1280, 720);
 /// How much faster than realtime the reader may fill the ring once it is above
 /// its low-water mark. 1.25× keeps a decoded reserve growing (the ring starts
 /// half full) while capping the post-open/post-seek burst that used to run at
@@ -158,7 +158,47 @@ impl FrameSize {
 /// * aspect preserved, even width and height.
 ///
 /// A zero source (unknown / audio-only) falls back to the 720p default.
-pub fn target_frame_size(source_w: u32, source_h: u32) -> FrameSize {
+///
+/// f176: automatic opens are no longer capped. The old `AUTO_QUALITY_CAP`
+/// (1080P) is gone with the request "open a video on the best source"; the
+/// stream list already only carries tiers this account may open.
+
+/// The 画质 a player starts one video on.
+///
+/// `preferred` is 设置 → 播放 → 默认画质: a concrete `qn` the user chose
+/// (honoured as-is, 4K included — that is an explicit instruction) or `0` for
+/// 自动.
+///
+/// 自动 is `min(highest playable, 1080P)`, not "the best stream": a 4K/8K source
+/// would otherwise open at 4K on every video by itself, which is both a much
+/// heavier decode and a picture this window cannot show. A tier above the cap
+/// is used only when the video has nothing at or below it (so a 1080P60-only
+/// source still plays).
+pub fn initial_quality(info: &bilibili::PlayInfo, preferred: i64) -> i64 {
+    if preferred != 0 && info.video_tracks.iter().any(|track| track.id == preferred) {
+        return preferred;
+    }
+    auto_quality(&info.video_tracks)
+}
+
+/// The **highest playable qn** in the stream list.
+///
+/// f176: the owner asked for "open a video on the best source available", so
+/// auto no longer caps at 1080P. The list only contains tracks this account may
+/// actually open (locked 大会员 tiers have no `dash.video[]` entry), so the max
+/// is by construction playable; `AUTO_QUALITY_CAP` stays as documentation of
+/// the old ceiling and is no longer used for selection.
+fn auto_quality(tracks: &[bilibili::VideoTrack]) -> i64 {
+    tracks
+        .iter()
+        .map(|track| track.id)
+        .filter(|id| *id > 0)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The frame size a session decodes at: the source, capped at 1080p.
+fn target_frame_size(source_w: u32, source_h: u32) -> FrameSize {
     // Even floor/round: integer sizes keep the byte stride exact.
     fn even_down(value: u32) -> u32 {
         (value & !1).max(2)
@@ -552,15 +592,11 @@ const AUDIO_CLOCK_CONFIRM_MS: u64 = 150;
 /// process). Confirmation is deliberately not offered here: two device samples
 /// in a row must never re-seed the clock either.
 const AUDIO_CLOCK_RESUME_QUIET_MS: u64 = 800;
-/// A seek into data the prefetch proxy has NOT fetched yet is buffering from the
-/// first moment: the overlay is published before the decoder is even spawned.
+/// A seek's silent window used to be decided from the proxy's read-ahead while
+/// the old picture kept playing. f151 freezes the picture on the release, so the
+/// overlay is now published purely by time (`SEEK_FREEZE_OVERLAY_MS`) and the
+/// old 450ms read-ahead grace is gone.
 ///
-/// A seek the proxy can still serve from its read-ahead keeps the current
-/// picture instead, so a buffered seek never flashes the overlay (< 1 frame).
-/// When there is no proxy (direct CDN read) the target's bufferedness cannot be
-/// known up front: the overlay is published only once the new picture is still
-/// missing after this grace, which keeps the common fast seek silent.
-const SEEK_BUFFER_GRACE: Duration = Duration::from_millis(450);
 /// Seconds of video the seek overlay treats as "enough buffered to start".
 /// Used only to turn the proxy's measured read-ahead bytes into an honest
 /// percentage; it is not a claim about the network.
@@ -632,9 +668,15 @@ const SEEK_DEDUPE_MS: u64 = 400;
 /// How long a seek shadow may pre-roll before the seek falls back to the hard
 /// restart. A seek must always land, so the shadow can never own the wait.
 const SEEK_SHADOW_TIMEOUT_MS: u64 = 3_000;
-/// Poll period while a shadow pre-rolls. The pacer keeps presenting the old
-/// picture in between; this is only how often the shadow is inspected.
-const SEEK_SHADOW_POLL_MS: u64 = 10;
+/// f151: how long a release's picture stays frozen **silently** before the
+/// buffering overlay is published. A shadow that is ready inside this window
+/// swaps straight in and the user never sees the overlay; after it, the wait
+/// needs to be visible (`§1`).
+const SEEK_FREEZE_OVERLAY_MS: u64 = 300;
+/// How often the frozen seek loop re-polls its shadow. The picture is not being
+/// presented, so this only trades a few wakeups for a swap that starts within a
+/// frame of the shadow becoming ready.
+const SEEK_FREEZE_POLL_MS: u64 = 4;
 /// Longest A/V hold the pacer may sleep while a seek shadow is pre-rolling.
 ///
 /// The normal hold is up to 500 ms, which also delayed the *poll* that would
@@ -672,12 +714,15 @@ const SEEK_SHADOW_PREROLL_FRAMES: usize = 6;
 /// `ffplay -ss` has the sound laid down by construction, but its first `-stats`
 /// sample is 500–800 ms away even on a cache file (the device buffer has to
 /// fill); that would become the whole seek latency once the ring only waits for
-/// six frames. A cached seek is picture-bound, so after the ring is ready and
-/// this short grace the shadow freezes the sound where it is (or at the target
-/// when it never reported) and the session seeds its clock from the request.
-/// Network shadows keep [`SEEK_SHADOW_AUDIO_WAIT_MS`]: there the connection
-/// warm-up is real work and the A/V relation is worth the longer wait.
-const SEEK_SHADOW_LOCAL_AUDIO_WAIT_MS: u64 = 300;
+/// six frames. A cached seek is picture-bound, so once the picture is ready (and
+/// the sound is provably muted) the shadow freezes the sound where it is (or at
+/// the target when it never reported) and the session seeds its clock from the
+/// request. The grace is only long enough for a sample that was already in
+/// flight; f151 cut it from 300 ms to 40 ms so a local shadow can actually land
+/// inside the release's 300 ms silent window. Network shadows keep
+/// [`SEEK_SHADOW_AUDIO_WAIT_MS`]: there the connection warm-up is real work and
+/// the A/V relation is worth the longer wait.
+const SEEK_SHADOW_LOCAL_AUDIO_WAIT_MS: u64 = 40;
 
 /// Monotonic milliseconds since the first call, for cross-thread freshness
 /// checks (`Instant` itself cannot live in an atomic).
@@ -1625,9 +1670,29 @@ fn install_panic_log() {
 
 /// `THREAD_PRIORITY_BELOW_NORMAL` (winbase.h).
 const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
-/// `BELOW_NORMAL_PRIORITY_CLASS` (winbase.h): the class a decode child runs in.
-const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-/// `NORMAL_PRIORITY_CLASS` (winbase.h): a local seek decoder's class.
+/// `NORMAL_PRIORITY_CLASS` (winbase.h): the class every media child runs in.
+///
+/// `main` puts the whole process in `BELOW_NORMAL_PRIORITY_CLASS` (see
+/// `win::tune_priorities`), and a child inherits that class. For ffmpeg/ffplay
+/// that inheritance is fatal on a loaded machine: the decoder is a **deadline**
+/// task (it owes 30 or 60 frames per second), not throughput work, and a
+/// below-normal thread only runs when nothing at normal priority is ready.
+///
+/// Measured on this host while 13 normal-priority `UnityShaderCompiler`
+/// processes kept all 12 logical CPUs busy (Windows perf counters:
+/// `_Total=1174` of `1200`):
+///   * the same 1080p input, `-frames:v 1`: normal priority → 1st frame in
+///     4.0 s (`cpu=0.50 s`); below-normal → **0.34 s of CPU in 65 s**, still
+///     sitting in `Stream mapping`, no frame, no stderr. And the app's own log
+///     showed `pacer beat frames=0 pushes=0 ring=0 gate=1`,
+///     `fps_decoded=0.0` for the whole session.
+/// That is the "player window opens but never shows a picture" report: the
+/// decoder was not broken, it was scheduled out of existence.
+///
+/// Normal class keeps the media children at the same base priority (8) as the
+/// UI thread (`highest` inside the below-normal class is also 8), so neither
+/// starves the other; only the non-deadline helpers (pipe read, NV12
+/// conversion, net pool) stay below.
 const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
 /// `PROCESS_SET_INFORMATION`: the access `SetPriorityClass` needs.
 const PROCESS_SET_INFORMATION: u32 = 0x0200;
@@ -1650,19 +1715,15 @@ fn lower_current_thread_priority() {
     }
 }
 
-/// Put a decoder/audio child process into the below-normal class, so its
-/// threads yield to the UI on the cores they share. Bounded and idempotent; a
-/// process that is already gone simply gets no change.
-fn lower_process_priority(pid: u32) {
-    set_process_priority(pid, BELOW_NORMAL_PRIORITY_CLASS);
-}
-
-/// A local cache-file decoder is latency-bound, not throughput-bound: it reads
-/// from disk and decodes a few frames for a seek, so it must not be scheduled
-/// behind the streaming child (or the prefetch workers) by the below-normal
-/// class. `NORMAL_PRIORITY_CLASS` keeps the seek's spawn→first-frame time out
-/// of the background class while the decode itself stays cheap.
-fn normal_process_priority(pid: u32) {
+/// Put a decoder/audio child process into the normal class.
+///
+/// Bounded and idempotent; a process that is already gone simply gets no
+/// change. See [`NORMAL_PRIORITY_CLASS`] for why this is not below-normal:
+/// ffmpeg owes a fixed frame rate, so on a busy host it must not be scheduled
+/// behind background work. The pipe reader/converter thread keeps calling
+/// [`lower_current_thread_priority`] inside the reader, so the work that can
+/// afford to yield still does.
+fn raise_process_priority(pid: u32) {
     set_process_priority(pid, NORMAL_PRIORITY_CLASS);
 }
 
@@ -2015,7 +2076,7 @@ pub(crate) fn install_stall_trace(mut sample: impl FnMut() -> StallSample + 'sta
                 FISH_STEPS.load(Ordering::Relaxed),
                 COVER_DECODES.load(Ordering::Relaxed),
                 table.len(),
-                crate::prefetch::disk_queue_depth(),
+                crate::media_hooks::disk_queue_depth(),
                 last_stage(),
             ));
             let mut rows: Vec<(u32, f64)> = table
@@ -2262,6 +2323,13 @@ pub struct PlaybackControl {
     /// keeps that restart from opening a second reporter for the same session.
     history_claimed: AtomicBool,
     paused: AtomicBool,
+    /// f152: the window is completely covered, so Windows stops compositing it
+    /// and the picture cannot advance. This is a HOLD, not the user's pause
+    /// latch: the pacer freezes the picture and suspends the audio exactly like
+    /// a user pause, but the transport intent is untouched, so uncovering the
+    /// window resumes by itself. A user pause always wins: clearing this flag
+    /// never clears `paused`.
+    occluded: AtomicBool,
     position_ms: AtomicU64,
     /// Duration the API declared for the cid being played (playurl), ms.
     /// [`Self::duration_ms`] prefers the decoder's own value when the two
@@ -2336,6 +2404,12 @@ pub struct PlaybackControl {
     speed_milli: AtomicU64,
     /// Selected DASH video quality (`qn`).
     quality_qn: AtomicU64,
+    /// Monotonic ms of the newest 画质 switch request that has not presented a
+    /// frame yet (`0` = none). Read by the pacer at the first frame of a
+    /// session, which logs the switch's own latency (`session first present`).
+    quality_switch_at_ms: AtomicU64,
+    /// The `qn` that switch asked for (log line only).
+    quality_switch_qn: AtomicU64,
     /// 画质 menu catalogue: one entry per raw DASH stream, in the same order as
     /// the `quality_rows` model published to the UI, so `quality_pick(index)`
     /// can name an exact stream.
@@ -2359,6 +2433,10 @@ pub struct PlaybackControl {
     block_rules: std::sync::Mutex<BlockRules>,
     /// Whether hardware decoding (d3d11va) is requested.
     hwaccel: AtomicBool,
+    /// 原始分辨率: decode at the source's own frame size instead of the
+    /// window-sized picture ([`reader_output_size`]). Read once per session, so
+    /// toggling it restarts the decoder at the current position.
+    native_frame_size: AtomicBool,
     /// Preferred video codec (`0` = 自动, else a DASH `codecid`).
     codec_pref: AtomicU64,
     /// 仅音频 mode: video decode is stopped, audio keeps playing.
@@ -2438,6 +2516,34 @@ pub struct PlaybackControl {
     seek_buffering: AtomicBool,
     /// Monotonic ms at which that seek was issued (for the duration log line).
     seek_buffering_at: AtomicU64,
+    /// f151: monotonic ms of the release whose picture is frozen, `0` = the
+    /// picture follows the decoder. Set by [`PlaybackControl::seek`] the instant
+    /// the UI calls it, so the **next** old-session frame is refused by the
+    /// mailbox: the frame on screen at the release stays there until the new
+    /// position's first frame replaces it. Cleared by that first frame.
+    ///
+    /// This is what makes a release read as "the picture stops where I let go"
+    /// instead of "the number changed and the video kept playing for 0.6 s".
+    seek_freeze_at: AtomicU64,
+    /// Content position (ms) of the most recently presented picture frame.
+    /// Unlike `position_ms` (which the release immediately points at the
+    /// target) this is where the pixels on screen really are: the frozen
+    /// picture's position while a seek is in flight, the target after the swap.
+    /// The f151 log line and the end-of-track rules read it.
+    presented_ms: AtomicU64,
+    /// The video this window is playing. A 选集 pick replaces it **in place**:
+    /// same window, same control, only the decode thread re-arms on the new
+    /// `bvid`/`cid` (see [`PlaybackControl::switch_to`]).
+    source: std::sync::Mutex<PlaybackSource>,
+    /// Bumped on every 选集 switch; the history reporter starts a new record
+    /// for the new video on a change.
+    source_seq: AtomicU64,
+    /// A switch the running `run` loop has to perform. Written by
+    /// [`PlaybackControl::switch_to`] (UI thread), taken by the decode thread.
+    switch_request: std::sync::Mutex<Option<PlaybackSource>>,
+    /// Monotonic ms the pending switch was requested (`0` = none), read once by
+    /// the `series switch first_frame_ms` receipt.
+    switch_at_ms: AtomicU64,
     /// Physical size of the player window last published by the UI's 60 Hz
     /// watch, and whether it was fullscreen. `0x0` means "not measured yet".
     display_w: AtomicU64,
@@ -2490,9 +2596,15 @@ pub struct PlaybackControl {
     /// one is up. Separate from [`PlaybackControl::prefetch`] for the same
     /// reason it is separate from another window's: its own port, its own read
     /// cursor and its own session cache file.
-    audio_prefetch: std::sync::Mutex<Option<AudioPrefetchSession>>,    /// Whether the running decode session reads through the proxy (false when
-    /// a quality switch selected a track the proxy was not opened for).
+    audio_prefetch: std::sync::Mutex<Option<AudioPrefetchSession>>,    /// Whether the running decode session reads through the proxy. A session
+    /// only reads through the engine bound to **its own** stream: a 画质 switch
+    /// installs one for the new tier before the session spawns (see
+    /// `switch_prefetch`), so this is false only while there is no proxy at all.
     prefetch_in_use: AtomicBool,
+    /// A stream whose proxy spawn already failed (`qn`, `codecid`). No second
+    /// attempt for this player, so a broken mirror costs one failure instead of
+    /// one spawn per session restart.
+    prefetch_failed_stream: std::sync::Mutex<Option<(i64, i64)>>,
     /// Sticky "this track has finished" flag for the current playback session,
     /// latched by [`PlaybackControl::track_ended`] and the decode loop and
     /// cleared by a seek, a quality switch or a new control (see
@@ -2532,6 +2644,18 @@ pub struct PlaybackControl {
     /// or when the display is not faster than the track). Published to the UI
     /// as `<hz> fps` beside the measured cost.
     interp_out_hz: AtomicU64,
+}
+
+/// The video one player window is on. A 选集 pick replaces this in place; the
+/// window itself never closes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaybackSource {
+    pub bvid: String,
+    pub cid: u64,
+    /// Archive id (comments / history); `0` when the caller does not know it.
+    pub aid: i64,
+    /// Display title for the window's own title strip.
+    pub title: String,
 }
 
 /// One row of the 画质 menu: a single raw DASH stream (not a `qn`).
@@ -2773,6 +2897,7 @@ impl PlaybackControl {
             closed: AtomicBool::new(false),
             history_claimed: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            occluded: AtomicBool::new(false),
             position_ms: AtomicU64::new(0),
             api_duration_ms: AtomicU64::new(0),
             decoder_duration_ms: AtomicU64::new(0),
@@ -2802,6 +2927,8 @@ impl PlaybackControl {
             first_frame_at_ms: AtomicU64::new(0),
             speed_milli: AtomicU64::new(1000),
             quality_qn: AtomicU64::new(0),
+            quality_switch_at_ms: AtomicU64::new(0),
+            quality_switch_qn: AtomicU64::new(0),
             quality_catalog: std::sync::Mutex::new(Vec::new()),
             quality_exact: std::sync::Mutex::new(None),
             danmaku_font: AtomicU64::new(1),
@@ -2813,6 +2940,7 @@ impl PlaybackControl {
             blocked_senders: std::sync::Mutex::new(Vec::new()),
             block_rules: std::sync::Mutex::new(BlockRules::default()),
             hwaccel: AtomicBool::new(true),
+            native_frame_size: AtomicBool::new(false),
             codec_pref: AtomicU64::new(0),
             audio_only: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
@@ -2844,6 +2972,12 @@ impl PlaybackControl {
             position_hold_ms: AtomicU64::new(u64::MAX),
             seek_buffering: AtomicBool::new(false),
             seek_buffering_at: AtomicU64::new(0),
+            seek_freeze_at: AtomicU64::new(0),
+            presented_ms: AtomicU64::new(0),
+            source: std::sync::Mutex::new(PlaybackSource::default()),
+            source_seq: AtomicU64::new(0),
+            switch_request: std::sync::Mutex::new(None),
+            switch_at_ms: AtomicU64::new(0),
             display_w: AtomicU64::new(0),
             display_h: AtomicU64::new(0),
             display_fullscreen: AtomicBool::new(false),
@@ -2869,6 +3003,7 @@ impl PlaybackControl {
             prefetch: std::sync::Mutex::new(None),
             audio_prefetch: std::sync::Mutex::new(None),
             prefetch_in_use: AtomicBool::new(false),
+            prefetch_failed_stream: std::sync::Mutex::new(None),
             ended: AtomicBool::new(false),
             interp_mode: AtomicU64::new(0),
             interp_generated: AtomicU64::new(0),
@@ -2891,6 +3026,11 @@ impl PlaybackControl {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        // f151: a close during a frozen seek must not leave the flag set for a
+        // window that never presents again (the mailbox would refuse every
+        // frame of the mini player it mirrors).
+        self.seek_freeze_at.store(0, Ordering::SeqCst);
+        self.position_hold_ms.store(u64::MAX, Ordering::SeqCst);
         // The proxy owns a listener, a runtime task and up to six fetch
         // workers. `PrefetchHandle::shutdown` waits (bounded) for the server
         // task on a non-runtime thread, and both close paths run on the UI
@@ -2911,7 +3051,7 @@ impl PlaybackControl {
         // pacer's 4 Hz sampler releases it through
         // [`PlaybackControl::set_prefetch_background_paused`] once playback has
         // been healthy long enough (and holds it again during a stall).
-        if crate::prefetch::startup_gate_enabled() {
+        if crate::media_hooks::startup_gate_enabled() {
             handle.set_background_paused(true);
         }
         let previous = {
@@ -2939,7 +3079,12 @@ impl PlaybackControl {
                 "prefetch disabled reason=replaced host={} bytes_fetched={}",
                 previous.host, stats.bytes_fetched
             ));
-            drop(previous);
+            // `shutdown` joins the server task (bounded) and then deletes the
+            // session cache file: up to a few seconds the new stream must not
+            // wait for. A 画质 switch calls this on the decode thread, right
+            // before the first frame of the new tier is due, so the old engine
+            // is retired on its own thread.
+            std::thread::spawn(move || drop(previous));
         }
     }
 
@@ -2958,7 +3103,7 @@ impl PlaybackControl {
         // Same startup gate as the picture's proxy: a fresh engine starts with
         // its speculative (whole-file) queue held, so nothing competes with the
         // first frames. The sound's hot window is never gated.
-        if crate::prefetch::startup_gate_enabled() {
+        if crate::media_hooks::startup_gate_enabled() {
             session.handle.set_background_paused(true);
         }
         let previous = {
@@ -3093,7 +3238,7 @@ impl PlaybackControl {
     /// never from the UI thread. A no-op when no proxy is installed, and cheap
     /// enough to call every tick: one uncontended lock plus an atomic store.
     pub fn set_prefetch_background_paused(&self, paused: bool) {
-        if !crate::prefetch::startup_gate_enabled() {
+        if !crate::media_hooks::startup_gate_enabled() {
             return;
         }
         let guard = match self.prefetch.lock() {
@@ -3321,7 +3466,6 @@ impl PlaybackControl {
     /// The key must match the one `player::run` names its cache file with, which
     /// is exactly this format, so the preloaded file is *reused* when that item
     /// is opened (and removed when its own player closes).
-    #[allow(dead_code)] // public API: the playlist host calls this next
     pub fn preload_playlist(&self, order: &[(String, String)]) -> usize {
         let guard = match self.prefetch.lock() {
             Ok(guard) => guard,
@@ -3331,19 +3475,6 @@ impl PlaybackControl {
             .as_ref()
             .map(|session| session.handle.preload_keys(order))
             .unwrap_or(0)
-    }
-
-    /// Stop the playlist preload, if one is running.
-    #[allow(dead_code)] // public API: the playlist host calls this next
-    pub fn cancel_preload(&self) -> bool {
-        let guard = match self.prefetch.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard
-            .as_ref()
-            .map(|session| session.handle.cancel_preload())
-            .unwrap_or(false)
     }
 
     /// Stop using the proxy: log why, then drop the handle (server task,
@@ -3479,6 +3610,23 @@ impl PlaybackControl {
 
     fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Whether the window is held because it is completely covered (f152).
+    ///
+    /// Read by the pacer's hold and by the occlusion watchdog. It is public
+    /// because the QA run reports it; production only writes it from the
+    /// watchdog in `main.rs`.
+    pub fn occluded(&self) -> bool {
+        self.occluded.load(Ordering::SeqCst)
+    }
+
+    /// Set or clear the occlusion hold. Returns whether the flag changed.
+    ///
+    /// Distinct from [`Self::set_paused`] on purpose: the watchdog must be able
+    /// to release only its own hold and never a pause the user asked for.
+    pub fn set_occluded(&self, on: bool) -> bool {
+        self.occluded.swap(on, Ordering::SeqCst) != on
     }
 
     /// Whether the buffer guard is holding playback (auto pause).
@@ -3668,6 +3816,16 @@ impl PlaybackControl {
     /// "where did this jump come from" must read the picture that is on screen,
     /// never the position the user just asked for.
     fn engine_position_ms(&self) -> u64 {
+        // f151: a release freezes the picture where it was let go. The audio
+        // clock and `position_ms` both already point at the target, so neither
+        // may answer for the frame on screen until the new position's first
+        // frame is presented.
+        if self.seek_freeze() {
+            let presented = self.presented_ms.load(Ordering::SeqCst);
+            if presented != 0 {
+                return presented;
+            }
+        }
         // A paused picture is a held position: the audio clock is suspended
         // with it (see the A/V guard), so extrapolating it would creep forward
         // while nothing moves.
@@ -3675,6 +3833,29 @@ impl PlaybackControl {
             return self.position_ms();
         }
         self.audio_clock().unwrap_or_else(|| self.position_ms())
+    }
+
+    /// f151: the release froze the picture; no old-session frame may replace
+    /// the one on screen until the new position's first frame.
+    pub fn seek_freeze(&self) -> bool {
+        self.seek_freeze_at.load(Ordering::SeqCst) != 0
+    }
+
+    /// Monotonic ms of the release that froze the picture (`0` = not frozen).
+    fn seek_freeze_at_ms(&self) -> u64 {
+        self.seek_freeze_at.load(Ordering::SeqCst)
+    }
+
+    /// The new position's first frame is about to be shown: the picture follows
+    /// the decoder again. The mailbox reads [`Self::seek_freeze`], so this must
+    /// happen immediately before that frame is pushed.
+    fn end_picture_freeze(&self) {
+        self.seek_freeze_at.store(0, Ordering::SeqCst);
+    }
+
+    /// Content position of the frame currently on screen (f151 `pos_real`).
+    pub fn presented_position_ms(&self) -> u64 {
+        self.presented_ms.load(Ordering::SeqCst)
     }
 
     /// Claim the readout for the seek target: the playhead and the time label
@@ -4186,6 +4367,29 @@ impl PlaybackControl {
         // The readout follows the release, not the old picture that keeps
         // playing until the shadow is ready.
         self.hold_position(target);
+        // f151: **freeze the picture in this event.** The readout already
+        // jumps; the pixels must stop with it. The pacer stops presenting and
+        // the mailbox refuses the old session's next frame (see
+        // [`FrameMailbox`]), so the frame on screen at the release is the one
+        // that stays there until the new position's first frame. The pacer
+        // arms the buffering overlay after `SEEK_FREEZE_OVERLAY_MS` if the
+        // swap has not happened by then.
+        //
+        // 仅音频 has no picture, and a session that has not presented one yet
+        // has nothing to freeze; both keep the old restart path and its
+        // startup/seek overlay.
+        let has_picture = self.presented_ms.load(Ordering::SeqCst) != 0 && !self.audio_only();
+        if has_picture {
+            let release_ms = monotonic_ms().max(1);
+            let was_frozen = self.seek_freeze_at.swap(release_ms, Ordering::SeqCst) != 0;
+            if !was_frozen {
+                crate::debug_log(&format!(
+                    "seek freeze target_ms={target} from_ms={} presented_ms={}",
+                    self.pending_seek_from_ms.load(Ordering::SeqCst),
+                    self.presented_ms.load(Ordering::SeqCst),
+                ));
+            }
+        }
         // Hand the target to the decode loop: it decides whether the proxy
         // still has that region, and therefore whether the buffering overlay
         // belongs on screen until the first frame of the new position.
@@ -4445,7 +4649,130 @@ impl PlaybackControl {
         if let Ok(mut guard) = self.quality_exact.lock() {
             *guard = None;
         }
+        // A per-video failure memo: the next video's streams are new URLs.
+        if let Ok(mut guard) = self.prefetch_failed_stream.lock() {
+            *guard = None;
+        }
         self.clear_track_ended();
+    }
+
+    // -- 选集 (episode switch, same window) ---------------------------------
+
+    /// Seed the video this player is on. Called once at open (and again by the
+    /// decode thread as it arms), never a restart.
+    pub fn set_source(&self, bvid: &str, cid: u64, aid: i64, title: &str) {
+        if let Ok(mut source) = self.source.lock() {
+            *source = PlaybackSource {
+                bvid: bvid.to_string(),
+                cid,
+                aid,
+                title: title.to_string(),
+            };
+        }
+    }
+
+    /// The video this player is on right now (updated the instant a switch is
+    /// requested, so the UI and the worker agree).
+    pub fn source(&self) -> PlaybackSource {
+        self.source
+            .lock()
+            .map(|source| source.clone())
+            .unwrap_or_default()
+    }
+
+    /// Monotonic generation of the current video (changes on every switch).
+    pub fn source_seq(&self) -> u64 {
+        self.source_seq.load(Ordering::SeqCst)
+    }
+
+    /// A switch is waiting for the decode thread to pick it up.
+    pub fn switch_pending(&self) -> bool {
+        self.switch_request
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Take the pending switch (the decode thread's side of the handoff).
+    pub fn take_switch_request(&self) -> Option<PlaybackSource> {
+        self.switch_request
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Switch this player to another episode **in the same window**.
+    ///
+    /// The semantics are the quality-restart path, extended to a different
+    /// video: the seek generation is bumped so the running decode session
+    /// retires (old worker exits), the last picture is frozen with the seek
+    /// gate (so nothing goes black and no old frame is replaced by a new one
+    /// before the new stream's first frame), duration and progress go back to
+    /// zero, and the decode thread re-arms on the new `bvid`/`cid` (which also
+    /// refetches danmaku for the new cid). Window, geometry, toolbar state and
+    /// the queue are untouched.
+    ///
+    /// Returns `false` when the pick is the episode already playing (or the
+    /// player is closed), so the caller does not touch its title/comments.
+    pub fn switch_to(&self, bvid: String, cid: u64, aid: i64, title: String) -> bool {
+        if cid == 0 || self.is_closed() {
+            return false;
+        }
+        let next = PlaybackSource {
+            bvid,
+            cid,
+            aid,
+            title,
+        };
+        let same = self
+            .source
+            .lock()
+            .map(|source| source.cid == next.cid && source.bvid == next.bvid)
+            .unwrap_or(false);
+        if same {
+            return false;
+        }
+        if let Ok(mut source) = self.source.lock() {
+            *source = next.clone();
+        }
+        if let Ok(mut slot) = self.switch_request.lock() {
+            *slot = Some(next);
+        }
+        self.source_seq.fetch_add(1, Ordering::SeqCst);
+        // Duration / readout belong to the video being left: the new playurl
+        // publishes its own length when it lands.
+        self.api_duration_ms.store(0, Ordering::SeqCst);
+        self.decoder_duration_ms.store(0, Ordering::SeqCst);
+        self.position_ms.store(0, Ordering::SeqCst);
+        self.presented_ms.store(0, Ordering::SeqCst);
+        self.set_auto_paused(false);
+        // The readout (and the playhead) start at 0 while the old picture stays.
+        self.hold_position(0);
+        // Hold the frame on screen until the new stream's first frame, exactly
+        // like a release (see `seek_freeze`): the mailbox refuses both the old
+        // session's trailing frames and the new session's frames until the
+        // decode loop opens the gate.
+        if self.presented_frames() > 0 && !self.audio_only() {
+            let release_ms = monotonic_ms().max(1);
+            self.seek_freeze_at.store(release_ms, Ordering::SeqCst);
+        }
+        self.switch_at_ms.store(monotonic_ms().max(1), Ordering::SeqCst);
+        // Retire the running session (its decoder exits at the top of its next
+        // poll and the `run` loop arms the new source).
+        self.bump_seek();
+        true
+    }
+
+    /// One `series switch first_frame_ms=…` receipt per switch: called by the
+    /// decode loop when the new source's first frame reaches the UI.
+    pub fn note_switch_first_frame(&self) {
+        let at = self.switch_at_ms.swap(0, Ordering::SeqCst);
+        if at != 0 {
+            crate::debug_log(&format!(
+                "series switch first_frame_ms={}",
+                monotonic_ms().saturating_sub(at)
+            ));
+        }
     }
 
     /// Switch quality; restarts both streams at the current position via the
@@ -4462,6 +4789,7 @@ impl PlaybackControl {
             .map(|mut guard| guard.take().is_some())
             .unwrap_or(false);
         if self.quality_qn.swap(qn as u64, Ordering::SeqCst) != qn as u64 || cleared {
+            self.note_quality_switch(qn);
             self.bump_seek();
         }
     }
@@ -4481,8 +4809,30 @@ impl PlaybackControl {
             .and_then(|mut guard| guard.replace((qn, codecid, bandwidth)));
         let changed = previous != Some((qn, codecid, bandwidth));
         if self.quality_qn.swap(qn as u64, Ordering::SeqCst) != qn as u64 || changed {
+            self.note_quality_switch(qn);
             self.bump_seek();
         }
+    }
+
+    /// Arm the one-shot receipt for a 画质 switch: the next session's first
+    /// presented frame logs how long the switch took (`session first present`).
+    fn note_quality_switch(&self, qn: i64) {
+        self.quality_switch_qn.store(qn.max(0) as u64, Ordering::SeqCst);
+        self.quality_switch_at_ms
+            .store(monotonic_ms().max(1), Ordering::SeqCst);
+    }
+
+    /// The switch request waiting for its first frame, as `(qn, elapsed_ms)`.
+    /// Cleared by the read, so one switch yields exactly one receipt.
+    fn take_quality_switch(&self) -> Option<(i64, u64)> {
+        let at = self.quality_switch_at_ms.swap(0, Ordering::SeqCst);
+        if at == 0 {
+            return None;
+        }
+        Some((
+            self.quality_switch_qn.load(Ordering::SeqCst) as i64,
+            monotonic_ms().saturating_sub(at),
+        ))
     }
 
     /// The exact stream selected by the 画质 menu, if any.
@@ -4592,6 +4942,25 @@ impl PlaybackControl {
         if self.hwaccel.swap(on, Ordering::SeqCst) != on {
             self.bump_seek();
         }
+    }
+
+    /// Whether this session decodes at the source's own size (原始分辨率).
+    pub fn native_frame_size(&self) -> bool {
+        self.native_frame_size.load(Ordering::SeqCst)
+    }
+
+    /// 设置 → 播放 → 原始分辨率. A change restarts the decoder at the current
+    /// position, because the frame size is a property of one decode session.
+    pub fn set_native_frame_size(&self, native: bool) {
+        if self.native_frame_size.swap(native, Ordering::SeqCst) != native {
+            self.bump_seek();
+        }
+    }
+
+    /// Store the frame-size mode for the very first session without a restart
+    /// (playback has not started yet).
+    pub fn set_native_frame_size_initial(&self, native: bool) {
+        self.native_frame_size.store(native, Ordering::SeqCst);
     }
 
     /// Store the hardware-decoding state without a restart (internal fallback).
@@ -5235,6 +5604,21 @@ impl PlaybackControl {
         self.prof
             .longest_stall_ms
             .fetch_max(duration_ms, Ordering::Relaxed);
+    }
+
+    /// The stream the decoder is actually running right now: `(qn, codecid,
+    /// bandwidth)` as recorded by the last session's `note_stream`.
+    ///
+    /// This is the readback the 画质 menu is marked from (`stream qn=` on the
+    /// log), not the value a pick stored: if a pick's exact stream vanished from
+    /// the playurl and the decoder fell back to the automatic rule, the menu
+    /// must follow the decoder, never the click.
+    pub fn current_stream(&self) -> Option<(i64, i64, u64)> {
+        let media = self.prof.media.lock().ok()?;
+        if media.qn <= 0 || !self.prof.active.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some((media.qn, i64::from(media.codecid), media.bps))
     }
 
     /// Record the stream parameters of the track a decoder was just spawned
@@ -6514,6 +6898,115 @@ fn start_prefetch(
     }
 }
 
+/// `BILI_PREFETCH_SWITCH=0`: the pre-fix behaviour on a 画质 switch — the new
+/// tier's session is not given an engine of its own, so it reads the CDN URL
+/// while the previous tier's proxy keeps downloading its own file. Kept as an
+/// A/B knob for the switch QA run (`BILI_QUALITY_SWITCH_TEST`).
+fn prefetch_switch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("BILI_PREFETCH_SWITCH")
+            .map(|value| value.trim() == "0")
+            .unwrap_or(false)
+    })
+}
+
+/// The session cache file name of one raw stream: `<bvid>-<cid>-<qn>-<codecid>`.
+///
+/// The name carries the tier **and** the codec because the bytes do: 1080P AVC
+/// and 1080P AV1 are different bitstreams at different offsets, so a file named
+/// after the video alone would serve one stream's bytes to the other. The
+/// playlist preload (`PrefetchHandle::preload_keys`) writes exactly this name,
+/// which is what lets a preloaded item open from disk.
+fn stream_cache_key(bvid: &str, cid: u64, qn: i64, codecid: i64) -> String {
+    format!("{bvid}-{cid}-{qn}-{codecid}")
+}
+
+/// Rebuild this player's picture proxy for `track` — the 画质 switch path.
+///
+/// A switch opens a **different bitstream**, so it needs a different backend:
+/// its own cache file (`.part` + `.map`), its own loopback port, its own server
+/// task and its own disk writer. Reusing the previous tier's session is what
+/// makes a switched player show "loading" forever: the old engine is bound to
+/// the old URL and keeps prefetching the old file (the UI shows that as
+/// download speed), while the new stream — if it reads through a proxy at all —
+/// would be served bytes of another bitstream at the old offsets.
+///
+/// The engine is installed **before** the session spawns, so the first byte of
+/// the new tier is requested before the first frame is due
+/// (`prefetch switch … cache=…` then `prefetch fetch … bytes>0`). Speculative
+/// seek-point warming is off for the new engine (`warm_points: 0`): the first
+/// frame needs the read-ahead, not ten other regions of the file.
+///
+/// A failure is logged and the session reads the CDN URL directly; the stream is
+/// remembered so one broken mirror cannot cost a spawn attempt per seek.
+fn switch_prefetch(
+    control: &Arc<PlaybackControl>,
+    track: &bilibili::VideoTrack,
+    connections: usize,
+) -> Option<String> {
+    if track.url.is_empty() {
+        crate::debug_log(&format!(
+            "prefetch switch disabled reason=empty-url qn={} codecid={}",
+            track.id, track.codecid
+        ));
+        return None;
+    }
+    let failed = control
+        .prefetch_failed_stream
+        .lock()
+        .ok()
+        .and_then(|guard| *guard);
+    if failed == Some((track.id, track.codecid)) {
+        return None;
+    }
+    let host = bilibili::url_host(&track.url).unwrap_or_default();
+    let hosts = if host.is_empty() {
+        Vec::new()
+    } else {
+        vec![host.clone()]
+    };
+    let source = control.source();
+    let cache_key = stream_cache_key(&source.bvid, source.cid, track.id, track.codecid);
+    let config = PrefetchConfig {
+        hosts,
+        warm_points: 0,
+        connections,
+        cache_key: Some(cache_key.clone()),
+        media_duration_ms: Some(control.duration_ms()).filter(|ms| *ms > 0),
+        ..Default::default()
+    };
+    match prefetch::spawn(&track.url, config) {
+        Ok(handle) => {
+            let local = handle.local_url.clone();
+            let cache = handle
+                .cache_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            crate::debug_log(&format!(
+                "prefetch switch qn={} codecid={} host={host} local={local} cache={cache} connections={connections}",
+                track.id, track.codecid
+            ));
+            // Replaces and (on its own thread) shuts down the previous tier's
+            // engine: port, tasks, writer and `.part` all belong to the stream
+            // that was left.
+            control.install_prefetch(handle, track.url.clone(), host);
+            warmup_watchdog(control.clone());
+            Some(local)
+        }
+        Err(err) => {
+            crate::debug_log(&format!(
+                "prefetch switch disabled reason={err} qn={} codecid={} host={host}",
+                track.id, track.codecid
+            ));
+            if let Ok(mut guard) = control.prefetch_failed_stream.lock() {
+                *guard = Some((track.id, track.codecid));
+            }
+            None
+        }
+    }
+}
+
 /// Put a small prefetch proxy in front of the DASH audio track `ffplay` will
 /// read, and return it for installation on the player.
 ///
@@ -6697,6 +7190,14 @@ struct HistoryReporter {
     /// Position of that request in ms, so a `play_type=0` beat only goes out
     /// while the playhead really advanced.
     last_sent_pos_ms: u64,
+    /// `PlaybackControl::source_seq()` this record belongs to. A 选集 switch
+    /// bumps it: this reporter thread stays (one per player) but closes the
+    /// old record with `play_type=4` and starts a new one for the new video.
+    source_seq: u64,
+    /// Position of the previous sample. A switch zeroes the readout before this
+    /// thread sees it, and the closing beat must report where the OLD video
+    /// actually stopped, not the new video's 0.
+    previous_pos_ms: u64,
 }
 
 impl HistoryReporter {
@@ -6705,6 +7206,7 @@ impl HistoryReporter {
         video: &bilibili::FeedVideo,
         duration_s: u64,
         start_ts: u64,
+        source_seq: u64,
     ) -> Self {
         Self {
             session,
@@ -6715,6 +7217,8 @@ impl HistoryReporter {
             start_ts,
             last_sent: None,
             last_sent_pos_ms: 0,
+            source_seq,
+            previous_pos_ms: 0,
         }
     }
 
@@ -6760,7 +7264,7 @@ impl HistoryReporter {
     /// Sample the control until the session ends or is closed, then send the
     /// final `play_type=4` (if the session ever became reportable) and return.
     fn run(mut self, runtime: &tokio::runtime::Runtime, control: &PlaybackControl) {
-        let frames_base = control.presented_frames();
+        let mut frames_base = control.presented_frames();
         let mut started = false;
         let mut user_paused = control.user_paused();
         let mut watched_ms = 0u64;
@@ -6778,6 +7282,47 @@ impl HistoryReporter {
             let pos_ms = control.playback_position_ms();
             let paused = control.user_paused();
             let buffering = control.buffering();
+            let previous_pos_ms = self.previous_pos_ms;
+            self.previous_pos_ms = pos_ms;
+
+            // 选集: this player now plays another video. Close the current
+            // record at its last position (the site stores `progress` from the
+            // final beat) and re-anchor every field on the new source, so the
+            // new episode gets its OWN history entry on its own aid/bvid/cid.
+            let source_seq = control.source_seq();
+            if source_seq != self.source_seq {
+                let played_s = previous_pos_ms / 1000;
+                let watched_s = watched_ms / 1000;
+                if started && played_s >= HISTORY_MIN_PLAYED_S {
+                    self.report(runtime, 4, played_s, watched_s);
+                }
+                crate::debug_log(&format!(
+                    "history stop bvid={} reason=switch played={played_s} watched={watched_s} sent={}",
+                    self.bvid,
+                    u8::from(started && played_s >= HISTORY_MIN_PLAYED_S)
+                ));
+                self.source_seq = source_seq;
+                let source = control.source();
+                self.aid = source.aid.max(0) as u64;
+                self.bvid = source.bvid;
+                self.cid = source.cid;
+                self.start_ts = unix_now_secs();
+                self.duration_s = 0;
+                self.last_sent = None;
+                self.last_sent_pos_ms = 0;
+                frames_base = control.presented_frames();
+                started = false;
+                watched_ms = 0;
+                user_paused = control.user_paused();
+                next_play_at = Instant::now();
+                last_tick = Instant::now();
+                continue;
+            }
+            // The new video's playurl lands after the switch: adopt its real
+            // duration once, so the beats below carry the right length.
+            if self.duration_s == 0 {
+                self.duration_s = control.duration_ms() / 1000;
+            }
 
             // The start proof: a frame this session actually handed to the UI.
             // Never at spawn — a video that fails before its first frame must
@@ -6876,6 +7421,44 @@ fn run(
     // began — before playurl, so it matches "opened at" rather than "decoded at".
     let history_start_ts = unix_now_secs();
 
+    // 选集: this thread owns the window's decode loop for its whole life; a pick
+    // only replaces the SOURCE. `fell_back`, `last_resync` and the frame path
+    // (blend pool + mailbox) are per-window state and deliberately survive a
+    // switch, exactly like they survive a seek — only the playurl result, the
+    // tracks, the prefetch proxy and the danmaku are re-armed for the new cid.
+    //
+    // The loop body below keeps the original indentation: it is the whole
+    // per-video path (playurl → tracks → prefetch → danmaku → decode), and
+    // re-indenting 300 lines would bury the three switch points in diff noise.
+    let mut source = PlaybackSource {
+        bvid: video.bvid.clone(),
+        cid: video.cid,
+        aid: video.aid as i64,
+        title: video.title.clone(),
+    };
+    control.set_source(&source.bvid, source.cid, source.aid, &source.title);
+    let mut fell_back = false;
+    let mut last_resync: Option<Instant> = None;
+    let blend_pool: Arc<BlendPool> = Arc::new(BlendPool::new());
+    let mailbox = Arc::new(FrameMailbox::new(
+        window.clone(),
+        mini.clone(),
+        blend_pool.clone(),
+        control.clone(),
+    ));
+    'source: loop {
+    let video = bilibili::FeedVideo {
+        bvid: source.bvid.clone(),
+        cid: source.cid,
+        aid: source.aid.max(0) as u64,
+        title: source.title.clone(),
+        pic: video.pic.clone(),
+        owner: video.owner.clone(),
+        owner_mid: video.owner_mid,
+        view: video.view,
+        duration: video.duration,
+        pub_ts: video.pub_ts,
+    };
     let mut info = match runtime.block_on(session.playurl(&video.bvid, video.cid)) {
         Ok(info) => info,
         Err(err) => {
@@ -6889,6 +7472,26 @@ fn run(
                 crate::TOAST_KIND_ERROR,
             );
             set_playing(&window, false);
+            // A failed 选集 switch must not kill this window's decode thread:
+            // hold the frozen picture and wait for another pick (or the close),
+            // so a single bad episode leaves the player usable.
+            if control.source_seq() > 0 && !control.is_closed() {
+                crate::debug_log(&format!(
+                    "series switch failed bvid={} cid={} err={err}",
+                    video.bvid, video.cid
+                ));
+                while !control.is_closed() && !control.switch_pending() {
+                    std::thread::sleep(Duration::from_millis(60));
+                }
+                if control.is_closed() {
+                    return;
+                }
+                if let Some(next) = control.take_switch_request() {
+                    source = next;
+                    control.set_source(&source.bvid, source.cid, source.aid, &source.title);
+                    continue 'source;
+                }
+            }
             return;
         }
     };
@@ -6908,8 +7511,13 @@ fn run(
             video.bvid, video.cid
         ));
     } else if control.claim_history_reporter() {
-        let reporter =
-            HistoryReporter::new(session.clone(), &video, info.duration, history_start_ts);
+        let reporter = HistoryReporter::new(
+            session.clone(),
+            &video,
+            info.duration,
+            history_start_ts,
+            control.source_seq(),
+        );
         let reporter_control = control.clone();
         let _ = std::thread::Builder::new()
             .name("history".into())
@@ -6938,13 +7546,11 @@ fn run(
         _ => {}
     }
     let preferred = prefs.player_quality;
-    let initial_qn =
-        if preferred != 0 && info.video_tracks.iter().any(|track| track.id == preferred) {
-            preferred
-        } else {
-            info.default_qn
-        };
+    let initial_qn = initial_quality(&info, preferred);
     control.set_quality_initial(initial_qn);
+    // 设置 → 播放 → 原始分辨率: the frame size is a session property, so the
+    // first session takes it now and a change applies from the next restart.
+    control.set_native_frame_size_initial(prefs.player_native_size);
     // The stream the first decode session will actually open, so the menu can
     // mark the current row before that session has logged its `stream` line.
     // Same rule as the decoder (highest bandwidth at the `qn`).
@@ -6983,20 +7589,15 @@ fn run(
             .collect();
     }
     // The proxy is opened for the track the first decode session will use. A
-    // later quality switch selects a different track, and `media_url_for` then
-    // falls back to that track's direct URL instead of serving wrong bytes
-    // through this proxy.
+    // later 画质 switch opens a different bitstream, and the decode loop then
+    // replaces this engine with one of its own before that session spawns (see
+    // `switch_prefetch`): a proxy only ever serves the stream it was bound to.
     //
     // The cache file is named after the *stream*, not the player: a preload of
     // this playlist item (`PrefetchHandle::preload_keys`) writes exactly this
     // name, and reopening the same video+quality reuses it.
-    let cache_key = format!(
-        "{}-{}-{}-{}",
-        video.bvid,
-        video.cid,
-        initial_stream.0,
-        initial_stream.1
-    );
+    let cache_key =
+        stream_cache_key(video.bvid.as_str(), video.cid, initial_stream.0, initial_stream.1);
     // The audio proxy's own file, named after the audio stream it serves (the
     // track id is what distinguishes 64K/132K/192K/无损 for the same video).
     let audio_id = info
@@ -7021,6 +7622,7 @@ fn run(
     {
         let track = track.clone();
         let window = window.clone();
+        let session = session.clone();
         let cid = video.cid;
         let duration = info.duration;
         std::thread::spawn(move || {
@@ -7056,11 +7658,6 @@ fn run(
     {
         control.force_software_decode();
     }
-    // The frame path lives for the whole player, not one session: the blend
-    // pool, the mailbox and its one-generation recycle slot survive seeks and
-    // quality switches, so a restart never re-allocates them.
-    let blend_pool: Arc<BlendPool> = Arc::new(BlendPool::new());
-    let mailbox = Arc::new(FrameMailbox::new(window.clone(), mini.clone(), blend_pool.clone()));
     // QA hook (`BILI_PLAY_AFTER_END=<ms>`): once the track latches as ended,
     // press play through the real `toggle_paused` path after `<ms>` and log what
     // the control did. This is the recovery proof for a (false or real) end
@@ -7154,8 +7751,6 @@ fn run(
             });
         }
     }
-    let mut fell_back = false;
-    let mut last_resync: Option<Instant> = None;
     loop {
         match decode_loop(
             &info,
@@ -7169,6 +7764,22 @@ fn run(
             Ok(()) => {
                 if control.is_closed() {
                     break;
+                }
+                // 选集 pick: the decode session retired for the new video (see
+                // `decode_loop`'s first check). Re-arm on it — same window, same
+                // control, same mailbox; only playurl/tracks/danmaku change.
+                if let Some(next) = control.take_switch_request() {
+                    crate::debug_log(&format!(
+                        "series switch worker from={} cid={} to={} cid={} aid={}",
+                        source.bvid, source.cid, next.bvid, next.cid, next.aid,
+                    ));
+                    // 弹幕 belong to the cid being left: drop them now so the old
+                    // episode's comments never scroll over the new picture while
+                    // the new cid's list is still in flight.
+                    track.set_items(Vec::new());
+                    source = next;
+                    control.set_source(&source.bvid, source.cid, source.aid, &source.title);
+                    continue 'source;
                 }
                 // A seek is waiting for a decoder session: start it at once
                 // (this is the end→seek and seek-during-finish path). `pending`
@@ -7198,6 +7809,7 @@ fn run(
                     while !control.is_closed()
                         && !control.has_pending_seek()
                         && !control.resume_requested()
+                        && !control.switch_pending()
                     {
                         std::thread::sleep(Duration::from_millis(40));
                     }
@@ -7221,7 +7833,10 @@ fn run(
                     control.playback_position_ms(),
                     control.duration_ms()
                 ));
-                while !control.is_closed() && !control.has_pending_seek() {
+                while !control.is_closed()
+                    && !control.has_pending_seek()
+                    && !control.switch_pending()
+                {
                     std::thread::sleep(Duration::from_millis(40));
                 }
                 if control.is_closed() {
@@ -7248,6 +7863,15 @@ fn run(
                 }
                 if control.hwaccel() && !fell_back {
                     fell_back = true;
+                    if frame_gpu_enabled() && !gpu_frames_failed() {
+                        // The GPU scaler is the part that failed (or the CUDA
+                        // decoder under it): keep the CPU path for the rest of
+                        // the session instead of retrying a broken driver.
+                        disable_gpu_frames();
+                        crate::debug_log(&format!(
+                            "frame gpu failed err={err}; GPU frames disabled, falling back to software decode"
+                        ));
+                    }
                     crate::debug_log(&format!(
                         "hwaccel failed err={err}; falling back to software decode"
                     ));
@@ -7278,6 +7902,7 @@ fn run(
                     while !control.is_closed()
                         && !control.has_pending_seek()
                         && !control.resume_requested()
+                        && !control.switch_pending()
                     {
                         std::thread::sleep(Duration::from_millis(40));
                     }
@@ -7290,6 +7915,10 @@ fn run(
                 break;
             }
         }
+    }
+    // The decode loop only ends when the player is closed (a switch never
+    // reaches here: it continues the source loop above).
+    break;
     }
     control.disable_prefetch("playback ended");
     set_playing(&window, false);
@@ -7872,7 +8501,7 @@ impl ProfilerTick {
     /// Everything is measured from counters the pacer already maintains; no new
     /// work is added to the frame path.
     fn drive_startup_gate(&mut self, control: &PlaybackControl, now: Instant) {
-        if !crate::prefetch::startup_gate_enabled() {
+        if !crate::media_hooks::startup_gate_enabled() {
             return;
         }
         let stalls = control.prof.stalls.load(Ordering::Relaxed);
@@ -8142,17 +8771,23 @@ fn log_seek_served(control: &PlaybackControl, wait: &SeekWait, pushes: u64) {
     ));
 }
 
-/// Arm the seek overlay once an unknown-bufferedness seek has waited too long.
+/// Arm the seek overlay once the release's silent window has expired.
+///
+/// f151: the picture is frozen from the release, so the overlay is no longer
+/// "something the old picture hides"; it is the only thing telling the user the
+/// wait is real. It is therefore published purely on time (300ms), for cached
+/// and uncached targets alike, and stays up until the new first frame closes it.
 fn arm_seek_overlay(control: &PlaybackControl, wait: &mut SeekWait) {
-    if wait.published || wait.buffered || Instant::now() < wait.deadline {
+    if wait.published || Instant::now() < wait.deadline {
         return;
     }
     wait.published = true;
     control.begin_seek_buffering(wait.target);
     crate::debug_log(&format!(
-        "seek buffer armed target_ms={} reason=grace_ms={}",
+        "seek buffer armed target_ms={} reason=freeze_ms={} cached={}",
         wait.target,
-        SEEK_BUFFER_GRACE.as_millis()
+        SEEK_FREEZE_OVERLAY_MS,
+        u8::from(wait.buffered)
     ));
 }
 
@@ -8905,6 +9540,26 @@ fn first_frame_handover(control: &PlaybackControl, video_ms: i64) {
     }
 }
 
+/// One `session first present` line for the 画质 switch that is waiting for it.
+///
+/// Called from both presentation paths (the interpolated slot loop and the
+/// plain one-frame path) at the session's first presented frame, because which
+/// path runs is a property of the moment (a window drag suspends interpolation).
+/// A switch is only done when the new tier's picture is on screen;
+/// `switch_after_ms` is measured from the menu pick, so it is the number the
+/// user's wait is judged on, and `matched` proves the presented stream is the
+/// one that was asked for.
+fn log_session_first_present(control: &PlaybackControl, stream: Option<(i64, i64, u64)>) {
+    let Some((want_qn, after_ms)) = control.take_quality_switch() else {
+        return;
+    };
+    let (qn, codecid, bandwidth) = stream.unwrap_or((0, 0, 0));
+    crate::debug_log(&format!(
+        "session first present qn={qn} codecid={codecid} bandwidth={bandwidth} switch_qn={want_qn} switch_after_ms={after_ms} matched={}",
+        u8::from(qn == want_qn)
+    ));
+}
+
 /// How the A/V guard silences the audio child.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AudioGateMode {    Running,
@@ -9309,6 +9964,9 @@ fn decode_loop(
     last_resync: &mut Option<Instant>,
 ) -> Result<()> {
     ensure_high_res_timer();
+    // 设置 → 预取 → 并发连接, read once per decode loop: a 画质 switch spawns
+    // its own engine mid-session and must use the same policy as the open.
+    let prefetch_connections = crate::settings::load().prefetch_connections as usize;
     // Arming policy across session restarts: the first session of this decode
     // loop is pre-rolled, and so is one restarted by the empty-ring watchdog.
     // Seek, pause, quality and speed restarts are deliberately not gated - a
@@ -9356,6 +10014,12 @@ fn decode_loop(
         if control.is_closed() {
             return Ok(());
         }
+        // 选集 switch: this decode session belongs to the video being left. The
+        // `run` loop re-arms on the new source (new playurl / tracks / danmaku),
+        // so this one exits here — before a paused hold could keep it alive.
+        if control.switch_pending() {
+            return Ok(());
+        }
         if control.is_paused() {
             std::thread::sleep(Duration::from_millis(40));
             continue;
@@ -9388,11 +10052,25 @@ fn decode_loop(
         // A new session starts from a clean buffer state: any auto pause belonged
         // to the position (or the seek that superseded it) we are leaving.
         control.set_auto_paused(false);
-        // A user seek consumed here restarted this session. Decide now whether
-        // the target can be decoded from the cache file: only a region the disk
-        // map really holds skips the overlay. Otherwise the picture stays and
-        // the grace in `arm_seek_overlay` decides.
-        let mut seek_wait = pending_seek.map(|target| {
+        // A user seek consumed here restarted this session. The release froze
+        // the old picture, so the only question left is **when** to show the
+        // buffering overlay: the shadow path arms it from the pacer at
+        // `SEEK_FREEZE_OVERLAY_MS`; a hard restart (no shadow, or a shadow that
+        // failed) arms it here, measured from the release, never from this
+        // session's start.
+        //
+        // A hard restart caused by a *fallback* consumes no `pending_seek` (the
+        // pacer took it), so the frozen target is recovered from the session's
+        // own start: while the freeze is on, `start_ms` is the position the
+        // release asked for.
+        let wait_target = pending_seek.or_else(|| {
+            if adopted.is_none() && control.seek_freeze() {
+                Some(start_ms)
+            } else {
+                None
+            }
+        });
+        let mut seek_wait = wait_target.map(|target| {
             // One consumed seek = one decoder restart. A newer seek replaces the
             // pending target instead of queueing another session.
             crate::debug_log(&format!("seek start target={target} restart=1"));
@@ -9401,27 +10079,32 @@ fn decode_loop(
                 .prefetch_raw_stats()
                 .map(|stats| stats.bytes_fetched)
                 .unwrap_or(0);
+            // The release may already be older than the silent window (a
+            // shadow that timed out, or a slow adopt), in which case the
+            // overlay belongs on screen at the first poll.
+            let requested_at_ms = control.seek_requested_at_ms();
+            let waited = monotonic_ms().saturating_sub(requested_at_ms);
+            let grace = SEEK_FREEZE_OVERLAY_MS.saturating_sub(waited);
             let mut wait = SeekWait {
                 target,
-                published: false,
+                // A freeze overlay may already be up (the pacer's 300 ms
+                // rule): it belongs to this seek, so the served line measures
+                // and closes it instead of claiming `overlay_ms=0`.
+                published: control.seek_buffering(),
                 buffered: false,
-                deadline: Instant::now() + SEEK_BUFFER_GRACE,
-                requested_at_ms: control.seek_requested_at_ms(),
+                deadline: Instant::now() + Duration::from_millis(grace),
+                requested_at_ms,
                 map_before,
                 bytes_before,
             };
-            // The one decision line: what the disk map says about this target.
-            // `src=disk` means the decoder opens the cache file (zero upstream);
-            // `src=net` means the map does not hold it and the grace decides
-            // whether the overlay appears.
+            // The decision line: what the disk map says about this target, and
+            // how much of the 300ms silent window is left.
             let cached = control.log_seek_cache(target);
             match control.seek_beyond_prefetch(target) {
                 Some(true) => {
-                    wait.published = true;
-                    control.begin_seek_buffering(target);
                     let stats = control.prefetch_raw_stats();
                     crate::debug_log(&format!(
-                        "seek buffer armed target_ms={target} reason=unfetched cached=0 fetched={} total={}",
+                        "seek buffer pending target_ms={target} reason=unfetched cached=0 fetched={} total={} wait_ms={grace}",
                         stats.as_ref().map(|s| s.bytes_fetched).unwrap_or(0),
                         stats
                             .as_ref()
@@ -9431,16 +10114,17 @@ fn decode_loop(
                     ));
                 }
                 Some(false) if cached => {
-                    // On disk: no overlay, no grace - the decoder opens the
-                    // cache file and the new position's first frame is local.
+                    // On disk: the decoder opens the cache file and the new
+                    // position's first frame is local. It still gets the same
+                    // 300ms silent window - a frozen picture may not wait
+                    // silently past it, even for a cached target.
                     wait.buffered = true;
                     crate::debug_log(&format!(
-                        "seek buffer skipped target_ms={target} reason=cached-on-disk overlay=0"
+                        "seek buffer pending target_ms={target} reason=cached-on-disk cached=1 wait_ms={grace}"
                     ));
                 }
                 _ => crate::debug_log(&format!(
-                    "seek buffer pending target_ms={target} reason=not-on-disk cached=0 grace_ms={}",
-                    SEEK_BUFFER_GRACE.as_millis()
+                    "seek buffer pending target_ms={target} reason=not-on-disk cached=0 wait_ms={grace}"
                 )),
             }
             wait
@@ -9453,8 +10137,24 @@ fn decode_loop(
         // Shared with the seek shadow, so both open the same representation.
         let (track, exact) = session_track(control, info);
         let pick = if exact { "exact" } else { "auto" };
+        // The stream this session really opens, for the per-session first-frame
+        // receipt (and to prove the 画质 menu's marked row against it).
+        let session_stream = track.map(|track| (track.id, track.codecid, track.bandwidth));
         let video_url = match track {
-            Some(track) => control.media_url_for(&track.url),
+            Some(track) => {
+                // The proxy is per **stream**, not per player. A 画质 switch
+                // changes the bitstream, so the tier being left must hand over
+                // to an engine of its own (new port, new cache file, old one
+                // shut down) *before* this session opens anything — otherwise
+                // the old tier's session keeps downloading its own file while
+                // this one reads the CDN directly, which is the "speed but no
+                // progress" a switched player shows.
+                let bound = control.prefetch_source();
+                if prefetch_switch_enabled() && bound.as_deref() != Some(track.url.as_str()) {
+                    switch_prefetch(control, track, prefetch_connections);
+                }
+                control.media_url_for(&track.url)
+            }
             None => return Err(anyhow!("未找到可用视频流")),
         };
         // A session whose bytes are already in the session cache file decodes
@@ -9530,10 +10230,10 @@ fn decode_loop(
             .filter(|kind| *kind == GateKind::Initial)
             .map(|_| control.begin_startup("preroll"));
 
-        // ---- decode at the source size, independent of the window ---------
-        // The target is `min(source, 1920x1080)`, aspect preserved. It does not
-        // depend on the window rect, so a resize or a fullscreen toggle never
-        // changes the decode size and therefore never restarts the decoder.
+        // ---- decode at the picture the window shows (默认) -----------------
+        // The source is capped at 1080p; on top of that the session asks for the
+        // window's video band unless 原始分辨率 is on. The size is decided once
+        // here, per session, so a resize never restarts the decoder.
         let source_size = track
             .map(|track| (track.width, track.height))
             .unwrap_or((0, 0));
@@ -9580,9 +10280,9 @@ fn decode_loop(
             ));
         }
         let decode = target_frame_size(source_size.0, source_size.1);
-        // What the ring and the UI carry: the decoded size, or the window's
-        // pixel area when that is all the picture can be drawn at.
-        let out = reader_output_size(decode, (display_w, display_h));
+        // What the ring and the UI carry: the window's picture band (默认) or
+        // the source size when 原始分辨率 is on.
+        let out = reader_output_size(decode, (display_w, display_h), control.native_frame_size());
         // An adopted shadow's ring was produced at the size it was started with:
         // the session must keep exactly that size, whatever the window says now.
         let (out, capacity) = match adopted.as_ref() {
@@ -9691,8 +10391,15 @@ fn decode_loop(
                 None
             } else {
                 Some(
-                    spawn_video(&video_url, start_ms, hwaccel, out, local_play)
-                        .map_err(|err| anyhow!("无法启动解码器：{err}"))?,
+                    spawn_video(
+                        &video_url,
+                        start_ms,
+                        hwaccel,
+                        out,
+                        local_play,
+                        gpu_frame_scale(hwaccel, local_play, out, decode),
+                    )
+                    .map_err(|err| anyhow!("无法启动解码器：{err}"))?,
                 )
             };
             // Sound never starts before a picture exists — but the process starts
@@ -9764,17 +10471,24 @@ fn decode_loop(
             audio_start_attempted = has_audio;
             if has_audio {
                 audio_gate.set_pid(control.audio_pid());
-                // The sound is slaved to the picture from its very first moment.
-                // `ffplay` starts with the decoder so its clock is warm, but it
-                // must not *play* while the pre-roll holds the picture: it would
-                // run ahead by the whole pre-roll (the measured 2–7 s leads began
-                // exactly here) and force a restart at the first frame. Suspended,
-                // its clock stands at the session's start position, which is the
-                // held frame.
-                if pre_roll.is_some() && audio_gate.pause(false) {
+                // The sound is suspended until this session's first frame —
+                // gated or not. `ffplay` reads the very stream this session
+                // decodes, so it starts (and its clock runs) while the decoder
+                // is still connecting and seeking: on a 画质 switch that lead was
+                // measured at 1.2 s. The pacer then holds the picture against a
+                // clock that is ahead of it and the display grid skips every
+                // slot, so the session presents **nothing** — and because no
+                // frame was presented, the A/V guard and the resync are both
+                // disabled (`picture_live = pushes > 0`), which is the "switched
+                // quality, loading forever, speed but no progress" report.
+                // Suspended, its clock stands at the session's start position,
+                // which is the held frame, and `first_frame_handover` releases
+                // it in the same instant as the push.
+                if audio_gate.pause(false) {
                     crate::debug_log(&format!(
-                        "av audio pid={} action=pause via=suspend reason=preroll",
-                        control.audio_pid()
+                        "av audio pid={} action=pause via=suspend reason={}",
+                        control.audio_pid(),
+                        if pre_roll.is_some() { "preroll" } else { "session" }
                     ));
                 }
             }
@@ -9956,9 +10670,13 @@ fn decode_loop(
                 // iteration, so the next one can report where the gap went.
                 let mut last_mark: Option<Instant> = None;
                 // A seek's pre-rolled session. At most one is in flight: a newer
-                // release replaces it, so the last target wins (`§1`). While it
-                // is here, this session keeps presenting its own picture.
+                // release replaces it, so the last target wins (`§1`). The
+                // release froze this session's picture, so nothing is presented
+                // while the shadow pre-rolls.
                 let mut shadow: Option<SeekShadow> = None;
+                // f151: the `seek freeze pic=paused` line is a transition, not
+                // a per-poll line.
+                let mut seek_freeze_logged = false;
                 loop {
                     tag_here("pacer:loop");
                     let loop_top = Instant::now();
@@ -9998,7 +10716,28 @@ fn decode_loop(
                     // continues the same session — which requirement 2 demands
                     // (only a seek, quality/speed change or a decoder death may
                     // restart it).
-                    if control.is_paused() {
+                    //
+                    // A hold can be released between two iterations of this
+                    // loop (the occlusion watchdog runs on the UI thread), so
+                    // the release bookkeeping cannot live only in the block's
+                    // tail - it would leave `pause_hold_logged` latched and the
+                    // next pause would miss its enter line.
+                    if pause_hold_logged && !control.is_paused() && !control.occluded() {
+                        pause_hold_logged = false;
+                        last = Instant::now();
+                        empty_since = None;
+                        if let Some(hold) = startup.as_mut() {
+                            hold.rebase();
+                        }
+                        auto_grace_until =
+                            Instant::now() + Duration::from_millis(AUTO_PAUSE_START_GRACE_MS);
+                        crate::debug_log(&format!(
+                            "pause hold resume frames={frames} pushes={pushes} ring={} audio_paused={}",
+                            control.ring_len(),
+                            u8::from(audio_gate.is_paused())
+                        ));
+                    }
+                    if control.is_paused() || control.occluded() {
                         // No frames are presented while paused; do not leave the
                         // panel showing the rate measured before the pause.
                         control.set_prof_rates(0.0, 0.0);
@@ -10015,16 +10754,17 @@ fn decode_loop(
                                 lead,
                                 &mut last_av_log_ms,
                                 &mut last_av_action,
-                                "pause",
+                                if control.occluded() { "occluded" } else { "pause" },
                             );
                             control.note_av_state(lead, AV_HOLD);
                         }
                         if !pause_hold_logged {
                             pause_hold_logged = true;
                             crate::debug_log(&format!(
-                                "pause hold enter frames={frames} pushes={pushes} ring={} audio_paused={}",
+                                "pause hold enter frames={frames} pushes={pushes} ring={} audio_paused={} occluded={}",
                                 control.ring_len(),
-                                u8::from(audio_gate.is_paused())
+                                u8::from(audio_gate.is_paused()),
+                                u8::from(control.occluded())
                             ));
                         }
                         std::thread::sleep(Duration::from_millis(20));
@@ -10052,7 +10792,7 @@ fn decode_loop(
                             seeking = true;
                             break;
                         }
-                        if control.is_paused() {
+                        if control.is_paused() || control.occluded() {
                             continue;
                         }
                         pause_hold_logged = false;
@@ -10136,6 +10876,13 @@ fn decode_loop(
                             break;
                         }
                     }
+                    // f151: the 300ms silent window is measured on every path,
+                    // not only while the ring is empty: a restart can be held
+                    // by the audio seed gate with a full ring, and a frozen
+                    // picture must not wait silently past it.
+                    if let Some(wait) = seek_wait.as_mut() {
+                        arm_seek_overlay(control, wait);
+                    }
                     if let Some(pre) = shadow.as_mut() {
                         match pre.poll(speed) {
                             SeekStep::Wait => {}
@@ -10171,6 +10918,71 @@ fn decode_loop(
                                 break;
                             }
                         }
+                    }
+                    // ---- f151: the release froze the picture ------------------
+                    // A seek no longer keeps the old session playing while the
+                    // shadow pre-rolls. The release stopped the mailbox from
+                    // accepting this session's frames, and here the pacer stops
+                    // producing them: no pop, no clock, no sound. The frame on
+                    // screen at the release is the last one until the swap, so
+                    // the picture cannot advance while the readout already
+                    // shows the target.
+                    //
+                    // A `Ready` above has already left for the swap and a
+                    // `Failed` for the hard restart; the only state left here is
+                    // `Wait`. Its sound is suspended once, and after
+                    // `SEEK_FREEZE_OVERLAY_MS` the wait becomes visible: the
+                    // buffering overlay is published and stays until the new
+                    // position's first frame closes it.
+                    if control.seek_freeze() && shadow.is_some() {
+                        if !seek_freeze_logged {
+                            seek_freeze_logged = true;
+                            let held_ms = played.as_millis() as i64;
+                            let lead = control
+                                .audio_clock()
+                                .map(|ms| ms as i64 - held_ms)
+                                .unwrap_or(0);
+                            if pushes > 0 {
+                                // The sound stops with the picture, in the same
+                                // instant: a frozen frame over running audio
+                                // would be a different lie.
+                                pause_audio(
+                                    control,
+                                    &mut audio_gate,
+                                    false,
+                                    lead,
+                                    &mut last_av_log_ms,
+                                    &mut last_av_action,
+                                    "seek",
+                                );
+                            }
+                            control.set_prof_rates(0.0, 0.0);
+                            crate::debug_log(&format!(
+                                "seek freeze pic=paused frames={frames} pushes={pushes} presented_ms={} audio_clock_ms={} overlay={}",
+                                control.presented_position_ms(),
+                                control
+                                    .audio_clock()
+                                    .map(|ms| ms.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                u8::from(control.seek_buffering()),
+                            ));
+                        }
+                        let target = shadow.as_ref().map(|s| s.target_ms).unwrap_or(0);
+                        let waited =
+                            monotonic_ms().saturating_sub(control.seek_freeze_at_ms());
+                        if !control.seek_buffering()
+                            && waited >= SEEK_FREEZE_OVERLAY_MS
+                            && !control.is_paused()
+                        {
+                            control.begin_seek_buffering(target);
+                            crate::debug_log(&format!(
+                                "seek freeze overlay=1 target_ms={target} waited_ms={waited} presented_ms={}",
+                                control.presented_position_ms()
+                            ));
+                        }
+                        profiler.tick(control, Instant::now());
+                        std::thread::sleep(Duration::from_millis(SEEK_FREEZE_POLL_MS));
+                        continue;
                     }
                     if control.audio_only() {
                         mode_changed = true;
@@ -10858,8 +11670,11 @@ fn decode_loop(
                         None => match source.next_frame(Duration::from_millis(
                             // A seek's pre-roll is polled at its own cadence: the
                             // swap must not wait for this ring's 100 ms stall poll.
-                            if shadow.is_some() {
-                                SEEK_SHADOW_POLL_MS
+                            // f151: the release's freeze also shortens it, so the
+                            // pacer stops presenting a few ms after the release
+                            // even when the shadow is still being opened.
+                            if shadow.is_some() || control.seek_freeze() {
+                                SEEK_FREEZE_POLL_MS
                             } else {
                                 STALL_POLL_MS
                             },
@@ -11293,16 +12108,19 @@ fn decode_loop(
                                 ));
                             }
                         } else {
-                            // A seek shadow is pre-rolling: this session is
-                            // about to be replaced, so an A/V hold must not keep
-                            // the swap from being polled for a whole sleep. Cap
-                            // the hold to the shadow's poll cadence so the
+                            // A seek shadow is pre-rolling (or a release just
+                            // froze the picture): this session is about to be
+                            // replaced, so an A/V hold must not keep the swap
+                            // from being polled for a whole sleep. Cap the hold
+                            // to the shadow's poll cadence so the
                             // release→visible latency is not charged to the old
                             // picture's sync (the new session's guard owns the
                             // relation after the swap).
+                            let seek_pending = control.has_pending_seek()
+                                || control.seek_freeze();
                             let wait = (delta as u64)
                                 .min(MAX_SYNC_SLEEP_MS)
-                                .min(if shadow.is_some() {
+                                .min(if shadow.is_some() || seek_pending {
                                     SEEK_SHADOW_SYNC_HOLD_MS
                                 } else {
                                     MAX_SYNC_SLEEP_MS
@@ -11430,6 +12248,19 @@ fn decode_loop(
                             if late > 0 {
                                 control.note_interp_dropped(late);
                                 trace.drop_ticks(late as u64);
+                            }
+                            // The clock is entirely past this source interval:
+                            // every slot of it would be skipped, so this frame
+                            // could not be presented at all. Nothing else would
+                            // rescue the session — with no frame presented
+                            // (`picture_live = pushes > 0`) the A/V guard, the
+                            // behind-drop and the resync are all disabled — so a
+                            // clock that leads the picture livelocks it. Re-anchor
+                            // the grid on the frame in hand: a late picture that
+                            // is shown is what lets the guard correct the
+                            // relation, and the next interval starts on the grid.
+                            if ticker.next_ms >= tick_end {
+                                *ticker = InterpTicker::new(out_hz.max(1), speed, video_ms_f);
                             }
                             let mut first_tick = true;
                             // One motion pair per source interval, in the display
@@ -11620,6 +12451,30 @@ fn decode_loop(
                                     // belongs to may be heard - in the same
                                     // instant, and the startup bar closes on it.
                                     first_frame_handover(control, video_ms);
+                                    // The sound this session was holding (see the
+                                    // spawn path) belongs to the picture on
+                                    // screen now: release it without restarting
+                                    // it, so it continues from the position it
+                                    // was frozen at.
+                                    if audio_gate.is_paused() && !audio_gate.paused_for_drift() {
+                                        let lead = video_ms
+                                            - control.audio_clock().unwrap_or(0) as i64;
+                                        resume_audio(
+                                            control,
+                                            &mut audio_gate,
+                                            lead,
+                                            &mut last_av_log_ms,
+                                            &mut last_av_action,
+                                            "present",
+                                        );
+                                    }
+                                    // The switch receipt: a 画质 change is only
+                                    // done when the new tier's first frame is
+                                    // on screen. `switch_after_ms` is measured
+                                    // from the menu pick, not from this
+                                    // session's spawn, so it is the number the
+                                    // user's wait is judged on.
+                                    log_session_first_present(control, session_stream);
                                     // The swap receipt: the shadow's first frame
                                     // *is* the frame the user asked for, and the
                                     // sound was unmuted with it.
@@ -11634,6 +12489,21 @@ fn decode_loop(
                                     push_at.saturating_duration_since(gate_now).as_millis() as u64,
                                 );
                                 trace.present(push_at);
+                                // f151: this is the new position's first
+                                // frame (or a frame of a session with no seek
+                                // in flight): the picture may follow the
+                                // decoder again. The gate must open *before*
+                                // the push, because that is what the mailbox
+                                // checks.
+                                if pushes == 1 {
+                                    control.end_picture_freeze();
+                                    // 选集 switch receipt: this frame is the new
+                                    // episode's first picture (no-op otherwise).
+                                    control.note_switch_first_frame();
+                                }
+                                control
+                                    .presented_ms
+                                    .store(video_ms.max(0) as u64, Ordering::SeqCst);
                                 mailbox.push(MailFrame {
                                     buffer,
                                     pooled: true,
@@ -11791,7 +12661,22 @@ fn decode_loop(
                             // may be heard - in the same instant, and the
                             // startup bar closes on it.
                             first_frame_handover(control, video_ms);
-                            // The swap receipt (see the display-rate path above).
+                            // Release the sound this session was holding (see
+                            // the display-rate path above): same instant as the
+                            // picture, no restart.
+                            if audio_gate.is_paused() && !audio_gate.paused_for_drift() {
+                                let lead = video_ms - control.audio_clock().unwrap_or(0) as i64;
+                                resume_audio(
+                                    control,
+                                    &mut audio_gate,
+                                    lead,
+                                    &mut last_av_log_ms,
+                                    &mut last_av_action,
+                                    "present",
+                                );
+                            }
+                            // The switch receipt (see the display-rate path).
+                            log_session_first_present(control, session_stream);
                             if let Some(swap) = swap_trace.take() {
                                 log_seek_swap(control, &swap, video_ms, pushes);
                             }
@@ -11805,6 +12690,18 @@ fn decode_loop(
                         // buffer is what the UI shows (no copy on either
                         // thread), and the mailbox coalesces it if the UI is
                         // still busy with an older picture.
+                        //
+                        // f151: a first frame of the new position also ends the
+                        // release's freeze, immediately before the push the
+                        // mailbox gates on.
+                        if pushes == 1 {
+                            control.end_picture_freeze();
+                            // 选集 switch receipt (see the display-rate path).
+                            control.note_switch_first_frame();
+                        }
+                        control
+                            .presented_ms
+                            .store(video_ms.max(0) as u64, Ordering::SeqCst);
                         mailbox.push(MailFrame {
                             buffer: frame,
                             pooled: false,
@@ -11933,10 +12830,12 @@ fn decode_loop(
                 if control.is_closed() {
                     break;
                 }
-                if control.is_paused() {
+                if control.is_paused() || control.occluded() {
                     // 仅音频: the sound *is* the picture, so a pause holds this
                     // session (and suspends the process) instead of ending it —
                     // a resume continues where it stopped, with no respawn.
+                    // f152: an occlusion hold stops the sound for the same
+                    // reason - an invisible window must not keep playing.
                     control.set_prof_rates(0.0, 0.0);
                     let held_ms = played.as_millis() as i64;
                     let lead = control
@@ -12080,10 +12979,21 @@ fn decode_loop(
 
         // A session that ended while still buffering (pause, seek, stall or
         // close) must not leave the UI showing a buffer state.
-        if control.end_seek_buffering().is_some() {
-            crate::debug_log("seek buffer cleared reason=session-end");
+        //
+        // f151 exception: when this session ends **because a release froze it**
+        // and its overlay is already on screen, the overlay belongs to the
+        // seek, not to this session. It must stay up over the frozen frame
+        // until the new position's first frame closes it (that frame is pushed
+        // by the adopted/restarted session). Closing it here would uncover the
+        // stale picture and hide the wait the user is in.
+        if control.seek_freeze() && control.seek_buffering() {
+            crate::debug_log("seek buffer kept reason=seek-freeze");
+        } else {
+            if control.end_seek_buffering().is_some() {
+                crate::debug_log("seek buffer cleared reason=session-end");
+            }
+            control.end_buffering("session-end");
         }
-        control.end_buffering("session-end");
         // An auto pause belongs to the session that is ending; the next session
         // always starts from a released state.
         control.set_auto_paused(false);
@@ -12580,33 +13490,88 @@ fn nv12_to_rgba(dst: &mut [u8], src: &[u8], w: usize, h: usize) {
     nv12_to_rgba_scalar(dst, src, w, h);
 }
 
+/// The picture size a session decodes at when 原始分辨率 is off: the window's
+/// video band (see [`reader_output_size`]).
+///
+/// `BILI_FRAME_GPU=1`: decode into a CUDA surface and let the GPU do the
+/// downscale, downloading only the display-size NV12. Measured 245-257 ms to
+/// the first frame vs 504-521 ms for the CPU `scale` filter. If the driver
+/// cannot do it the child fails exactly like a hardware decode failure and the
+/// player falls back to software decode (see the `hwaccel failed` branch in the
+/// decode loop); [`disable_gpu_frames`] then keeps the rest of the session on
+/// the CPU path.
+fn frame_gpu_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BILI_FRAME_GPU")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Set when a GPU-scaled decoder died: the rest of the session (and every
+/// later one) uses the CPU path instead of retrying a broken driver.
+static GPU_FRAMES_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn gpu_frames_failed() -> bool {
+    GPU_FRAMES_FAILED.load(Ordering::SeqCst)
+}
+
+fn disable_gpu_frames() {
+    GPU_FRAMES_FAILED.store(true, Ordering::SeqCst);
+}
+
+/// Whether this session should ask ffmpeg for a GPU-scaled picture.
+///
+/// Only when it actually saves pipe bytes ([`size`] is smaller than the decoded
+/// size), the session keeps hardware decode, the source is remote (a local
+/// cache file decodes in software - hardware setup is the whole latency
+/// budget there) and the pipe carries NV12 (`BILI_PIX_FMT=rgba` is a CPU A/B).
+fn gpu_frame_scale(hwaccel: bool, local: bool, size: FrameSize, decode: FrameSize) -> bool {
+    frame_gpu_enabled()
+        && !gpu_frames_failed()
+        && hwaccel
+        && !local
+        && pipe_is_nv12()
+        && size.bytes() < decode.bytes()
+}
+
 /// The size of the frames a session decodes, converts and hands to the UI.
 ///
-/// The decoded picture is `decode`-sized (a property of the source). When the
-/// window cannot show that much — it fits inside [`SMALL_PICTURE_MAX`] in both
-/// axes — the session's frames are the window's pixel area instead: ffmpeg's
-/// `scale` filter produces that size directly (SSE2, and the pipe carries a
-/// third of the bytes), the reader converts it, and Slint uploads it. Doing the
-/// same downscale in the reader instead cost 0.74 cores at 1080p→668p.
+/// **Default: follow the window.** The decoder is asked for the picture the
+/// window actually shows (the video band inside it, aspect preserved, never
+/// upscaled), so a 1080p source in a 1216×684 window decodes 1216×684 instead
+/// of 1920×1080: the pipe carries a third of the bytes, the reader converts a
+/// third of the pixels, Slint uploads a third of the image, and the screen shows
+/// the same picture. It is also what makes the 画质 row honest — the player no
+/// longer decodes a resolution the window cannot display.
 ///
-/// The size is chosen once per session, so a resize never restarts the decoder;
-/// `BILI_FRAME_SCALE=0` keeps the full decode size (the A/B knob).
-fn reader_output_size(decode: FrameSize, display: (u32, u32)) -> FrameSize {
-    // Decoding follows the stream, not the window: the picture is presented at
-    // the resolution the media actually carries, so resizing or maximising the
-    // window never changes what the decoder produces (and never softens it).
-    // The old window-sized path survives only as an explicit A/B switch.
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        !frame_path_legacy()
-            && std::env::var("BILI_FRAME_SCALE")
-                .map(|value| value.trim() == "1")
-                .unwrap_or(false)
-    });
-    if !enabled || display.0 == 0 || display.1 == 0 {
-        return decode;
-    }
-    if display.0 > SMALL_PICTURE_MAX.0 || display.1 > SMALL_PICTURE_MAX.1 {
+/// `native` (设置 → 播放 → 原始分辨率 = `settings.player_native_size`) keeps the
+/// source size instead, for anyone who wants the full frame in the ring.
+///
+/// The size is chosen once per session, so a resize never restarts the decoder
+/// (the next session — a seek, a 画质 switch — picks up the new window). The
+/// `BILI_FRAME_SCALE` A/B knob overrides the setting: `1` = window-sized,
+/// `0` = native.
+///
+/// The pipe is the reason this exists: a 1080p source writes 3.1 MB/frame
+/// (NV12) into the rawvideo pipe, a 1188×668 picture 1.19 MB. The scale itself
+/// belongs on the GPU when it is available — see [`frame_gpu_enabled`].
+fn reader_output_size(decode: FrameSize, display: (u32, u32), native: bool) -> FrameSize {
+    // `BILI_FRAME_GPU=1` needs the display-sized path: the GPU scaler is given
+    // exactly the size the ring carries, so the download is already the size
+    // the UI draws.
+    let enabled = match std::env::var("BILI_FRAME_SCALE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .as_deref()
+    {
+        Some("0") => false,
+        Some("1") => true,
+        _ => frame_gpu_enabled() || !native,
+    };
+    if !enabled || frame_path_legacy() || display.0 == 0 || display.1 == 0 {
         return decode;
     }
     // The picture band inside the window: the UI draws the frame into the video
@@ -12630,7 +13595,7 @@ fn reader_output_size(decode: FrameSize, display: (u32, u32)) -> FrameSize {
 
 /// Scalar reference implementation (also the non-x86 fallback). It uses the
 /// same 8.8 decomposition as the SSE2 path, so the two are bit-identical.
-#[allow(dead_code)]
+#[cfg(any(test, not(target_arch = "x86_64")))]
 fn nv12_to_rgba_scalar(dst: &mut [u8], src: &[u8], w: usize, h: usize) {
     let y_plane = src;
     let uv_plane = &src[w * h..];
@@ -12824,6 +13789,10 @@ struct FrameMailbox {
     window: slint::Weak<PlayerWindow>,
     mini: MiniSlot,
     pool: Arc<BlendPool>,
+    /// f151: the frame gate for a frozen seek. Read on both the pacer thread
+    /// (`push`) and the UI thread (`show`), so a frame that was produced before
+    /// the release but delivered after it can never replace the frozen picture.
+    control: Arc<PlaybackControl>,
     /// Frames accepted into the slot.
     pushed: AtomicU64,
     /// Frames replaced before the UI took them.
@@ -12858,6 +13827,7 @@ impl FrameMailbox {
         window: slint::Weak<PlayerWindow>,
         mini: MiniSlot,
         pool: Arc<BlendPool>,
+        control: Arc<PlaybackControl>,
     ) -> Self {
         Self {
             inner: Mutex::new(MailboxInner {
@@ -12868,6 +13838,7 @@ impl FrameMailbox {
             window,
             mini,
             pool,
+            control,
             pushed: AtomicU64::new(0),
             coalesced: AtomicU64::new(0),
             posted: AtomicU64::new(0),
@@ -12879,6 +13850,15 @@ impl FrameMailbox {
     /// Hand a frame to the UI. Called from the pacer thread; never blocks on
     /// the event loop.
     fn push(self: &Arc<Self>, frame: MailFrame) {
+        // f151: a release froze the picture. An old-session frame produced
+        // before the pacer saw the freeze must not enter the slot; the frame on
+        // screen at the release is the last one the user sees until the swap.
+        if self.control.seek_freeze() {
+            if frame.pooled {
+                self.pool.recycle(frame.buffer);
+            }
+            return;
+        }
         self.pushed.fetch_add(1, Ordering::Relaxed);
         if self.legacy {
             // QA baseline: one event and one full-frame copy per frame, exactly
@@ -12945,10 +13925,22 @@ impl FrameMailbox {
     fn show(&self, frame: MailFrame) {
         tag_here("ui:publish");
         let MailFrame { buffer, pooled } = frame;
+        // f151: the same freeze the pacer checks, re-read on the UI thread. A
+        // delivery that was queued before the release runs *after* the seek's
+        // own event (both are on this thread), so this second gate is what
+        // makes the frozen frame exact rather than one frame late.
+        if self.control.seek_freeze() {
+            if pooled {
+                self.pool.recycle(buffer);
+            }
+            return;
+        }
         self.shown.fetch_add(1, Ordering::Relaxed);
         let image = slint::Image::from_rgba8(buffer.clone());
-        if let Some(window) = self.window.upgrade() {
-            window.set_frame(image.clone());
+        {
+            let view = crate::player_view::SlintPlayerView(self.window.clone());
+            crate::player_view::Presentation::new(&view)
+                .frame(crate::player_view::Picture::Image(image.clone()));
         }
         let mini = self
             .mini
@@ -12979,6 +13971,12 @@ impl FrameMailbox {
         tag_here("ui:publish");
         start_ui_load_probe();
         let MailFrame { buffer, pooled } = frame;
+        if self.control.seek_freeze() {
+            if pooled {
+                self.pool.recycle(buffer);
+            }
+            return;
+        }
         let mut copy = FrameBuf::new(buffer.width(), buffer.height());
         copy.make_mut_bytes().copy_from_slice(buffer.as_bytes());
         let image = slint::Image::from_rgba8(copy);
@@ -13179,20 +14177,20 @@ fn set_status(window: &slint::Weak<PlayerWindow>, text: &str, kind: i32) {
     let text = text.to_string();
     let _ = slint::invoke_from_event_loop(move || {
         crate::debug_log(&format!("player status kind={kind} text={text}"));
-        if let Some(window) = window.upgrade() {
-            window.set_player_status(text.clone().into());
-            if !text.is_empty() {
-                crate::toast_active(text, kind);
-            }
-        }
+        let view = crate::player_view::SlintPlayerView(window);
+        crate::player_view::Presentation::new(&view).status(&text, kind);
     });
 }
 
 fn set_playing(window: &slint::Weak<PlayerWindow>, playing: bool) {
     let window = window.clone();
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(window) = window.upgrade() {
-            window.set_playing(playing);
+        let view = crate::player_view::SlintPlayerView(window);
+        let mut presentation = crate::player_view::Presentation::new(&view);
+        if playing {
+            presentation.resume();
+        } else {
+            presentation.pause();
         }
     });
 }
@@ -13469,6 +14467,7 @@ fn spawn_video(
     hwaccel: bool,
     size: FrameSize,
     local: bool,
+    gpu: bool,
 ) -> std::io::Result<Child> {
     let (probe_size, probe_duration) = probe_args(local);
     let nv12 = pipe_is_nv12();
@@ -13519,7 +14518,16 @@ fn spawn_video(
             .arg("-rw_timeout")
             .arg("15000000");
     }
-    if hwaccel && !local {
+    if gpu {
+        // CUDA surfaces, not d3d11: this ffmpeg has no D3D11 scaling filter,
+        // while `scale_cuda` is present (ffmpeg 7.1.1, checked on this
+        // machine). The frame is downloaded once, at the display size.
+        command
+            .arg("-hwaccel")
+            .arg("cuda")
+            .arg("-hwaccel_output_format")
+            .arg("cuda");
+    } else if hwaccel && !local {
         // Hardware decode costs ~500 ms of device setup per process (measured on
         // this machine: 876 ms to the first frame from a local file with
         // `-hwaccel d3d11va`, 94 ms without). For a **local cache-file session**
@@ -13540,14 +14548,22 @@ fn spawn_video(
     // yuv→rgb conversion is the single most expensive thing ffmpeg did for us,
     // and doing it in the reader thread with SSE2 costs a fraction of that (see
     // `nv12_to_rgba`). Measured on 1440x1080/30 fps: ffmpeg 0.57 → 0.21 cores.
-    let filter = format!("scale={}:{}", size.w, size.h);
+    let filter = if gpu {
+        format!(
+            "scale_cuda={}:{}:format=nv12,hwdownload,format=nv12",
+            size.w, size.h
+        )
+    } else {
+        format!("scale={}:{}", size.w, size.h)
+    };
 
     if start_ms > 0 {
         command.arg("-ss").arg(format_secs(start_ms));
     }
     crate::debug_log(&format!(
-        "spawn ffmpeg hwaccel={} start_ms={start_ms} local={local} vf={filter} out=rawvideo:{pix_fmt}:{}x{} bytes={} probesize={probe_size} analyzeduration={probe_duration}",
+        "spawn ffmpeg hwaccel={} gpu={} start_ms={start_ms} local={local} vf={filter} out=rawvideo:{pix_fmt}:{}x{} bytes={} probesize={probe_size} analyzeduration={probe_duration}",
         u8::from(hwaccel && !local),
+        u8::from(gpu),
         size.w,
         size.h,
         if nv12 { nv12_bytes(size) } else { size.bytes() },
@@ -13573,14 +14589,11 @@ fn spawn_video(
         .spawn()
         .map(|child| {
             crate::job::assign(&child);
-            // Background work: the picture may not win a core against the UI.
-            // A local cache-file read is the exception — it is a seek's latency
-            // budget, not a sustained stream, so it keeps the normal class.
-            if local {
-                normal_process_priority(child.id());
-            } else {
-                lower_process_priority(child.id());
-            }
+            // Every video child - streaming or local cache-file - is a deadline
+            // task and runs at the normal class (see `NORMAL_PRIORITY_CLASS`).
+            // The pipe reader/converter it feeds lowers *itself* instead, which
+            // is where the yieldable work actually is.
+            raise_process_priority(child.id());
             child
         })
 }
@@ -13640,6 +14653,10 @@ fn spawn_audio(url: &str, start_ms: u64, speed: f64, local: bool) -> std::io::Re
         .spawn()
         .map(|child| {
             crate::job::assign(&child);
+            // The audio clock is the player's master clock: it owes a sample
+            // every ~20 ms, so it is a deadline task as well (see
+            // `NORMAL_PRIORITY_CLASS`).
+            raise_process_priority(child.id());
             child
         })
 }
@@ -13997,12 +15014,19 @@ impl SeekShadow {
             display_h = DEFAULT_DISPLAY_H;
         }
         let decode = target_frame_size(track.width, track.height);
-        let size = reader_output_size(decode, (display_w, display_h));
+        let size = reader_output_size(decode, (display_w, display_h), control.native_frame_size());
         let capacity = ring_capacity_for(size.bytes());
         let frame_ms = frame_ms_for(Some(track));
         let spawned_ms = monotonic_ms();
-        let mut child = spawn_video(&url, target_ms, hwaccel, size, local_play)
-            .map_err(|err| anyhow!("无法启动解码器：{err}"))?;
+        let mut child = spawn_video(
+            &url,
+            target_ms,
+            hwaccel,
+            size,
+            local_play,
+            gpu_frame_scale(hwaccel, local_play, size, decode),
+        )
+        .map_err(|err| anyhow!("无法启动解码器：{err}"))?;
         let accept_duration = !local_play || target_ms == 0;
         let stderr = child.stderr.take().map(|pipe| {
             let control = control.clone();
@@ -14206,7 +15230,7 @@ impl SeekShadow {
         // A local seek is picture-bound. `ffplay`'s first stats sample can be
         // 500–800 ms out even from a cache file; waiting for it would make the
         // sound the latency budget the six-frame pre-roll just removed. Once
-        // the picture is ready, freeze the (muted) sound after a short grace
+        // the picture is ready, freeze the (muted) sound after a 40 ms grace
         // and seed the clock from the request — `-ss target` already placed it.
         // The sound must already be muted: suspending it before its WASAPI
         // session exists would prevent that session from ever being created,
@@ -14403,7 +15427,10 @@ impl SeekShadow {
             audio_prime_at: self.audio_prime_at,
             map_before: self.map_before.clone(),
             bytes_before: self.bytes_before,
-            overlay: false,
+            // f151: the overlay the release armed while this shadow pre-rolled.
+            // It is still on screen at adoption (the session-end path keeps it
+            // for a frozen seek) and the first new frame closes it.
+            overlay: self.control.seek_buffering(),
         }
     }
 
@@ -14508,7 +15535,10 @@ fn log_seek_swap(control: &PlaybackControl, swap: &SwapTrace, video_ms: i64, pus
         control,
         &SeekWait {
             target: swap.target_ms,
-            published: false,
+            // f151: a shadow whose wait passed the silent window published the
+            // overlay; closing it here measures the wait on the `seek served`
+            // line and takes it down with the swap.
+            published: swap.overlay,
             buffered: swap.local_play,
             deadline: Instant::now(),
             requested_at_ms: swap.release_at_ms,
@@ -14821,9 +15851,1211 @@ fn maybe_arm_stall_test(child: &Child) {
 }
 
 
+// ---------------------------------------------------------------------------
+// 直播 (live playback)
+//
+// A live room is NOT a DASH session: there is no manifest, no duration, no
+// seek, no prefetch and no `PlayInfo`. It therefore gets its own, separate
+// pipeline next to the VOD one and shares only what is media-agnostic:
+//
+//   ffmpeg -re -i <hls/flv>  -> raw NV12 frames -> same `FrameMailbox`
+//   ffplay  -nodisp <same url>               -> the sound
+//
+// The video pipe is paced by `-re` (native read rate) and by ffmpeg's own
+// backpressure on the rawvideo pipe, so a burst of HLS segments cannot
+// fast-forward the picture; the mailbox coalesces anything the UI cannot
+// present. `PlaybackControl` still owns pause / volume / mute (the live arm
+// only reads `paused` and `audio_seq`), and closing the window kills both
+// children through `control.is_closed()`.
+//
+// Nothing here is reachable from `run` / `decode_loop`: a VOD window never
+// creates a `LiveSource`, and a live window never fetches a `PlayInfo`.
+// ---------------------------------------------------------------------------
+
+/// What the live window needs to know about its room.
+#[derive(Clone, Debug, Default)]
+pub struct LiveSource {
+    pub room_id: i64,
+    pub title: String,
+    pub uname: String,
+    pub area: String,
+    /// B站 tells us in `get_info`; a vertical room gets a 720x1280 canvas.
+    pub is_portrait: bool,
+    /// The room's 头图 (the index card's cover, or `get_info`'s `keyframe`). It
+    /// is the poster the window shows while nothing has been decoded yet.
+    pub cover: String,
+}
+
+impl LiveSource {
+    fn frame_size(&self) -> FrameSize {
+        if self.is_portrait {
+            FrameSize { w: 720, h: 1280 }
+        } else {
+            FrameSize { w: 1280, h: 720 }
+        }
+    }
+}
+
+/// Live counters for the QA hooks (frames delivered, first-frame latency, the
+/// reconnect count and the last `live_status` the room API reported).
+#[derive(Default)]
+pub struct LiveStats {
+    pub frames: AtomicU64,
+    pub first_frame_ms: AtomicU64,
+    pub reconnects: AtomicU64,
+    pub live_status: AtomicI64,
+    /// One entry per attempt: `url_kind`, the API wait and whether the decoder
+    /// produced a frame. Read by `BILI_LIVE_TEST`.
+    pub attempts: std::sync::Mutex<Vec<String>>,
+}
+
+impl LiveStats {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn snapshot(&self) -> (u64, u64, u64, i64) {
+        (
+            self.frames.load(Ordering::SeqCst),
+            self.first_frame_ms.load(Ordering::SeqCst),
+            self.reconnects.load(Ordering::SeqCst),
+            self.live_status.load(Ordering::SeqCst),
+        )
+    }
+}
+
+const LIVE_REFERER: &str = "https://live.bilibili.com/";
+const LIVE_HEADERS: &str = "Referer: https://live.bilibili.com/\r\nUser-Agent: Mozilla/5.0 \
+                            (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like \
+                            Gecko) Chrome/125.0.0.0 Safari/537.36\r\n";
+
+/// The live window's two children, reachable from the watchdog that must kill
+/// them on close / pause even while the pump thread is blocked on the pipe.
+#[derive(Default)]
+struct LiveChildren {
+    video: Option<Child>,
+    audio: Option<Child>,
+    /// Bumped for every attempt. A first-frame deadline armed by attempt N must
+    /// never kill the child of attempt N+1 (the deadlines outlive their pump).
+    generation: u64,
+}
+
+/// Characters of decoder stderr kept in one log line (the task's 2 KB budget).
+const LIVE_STDERR_LIMIT: usize = 2048;
+
+/// Flatten a decoder's stderr into one log-safe line: whitespace collapsed, at
+/// most [`LIVE_STDERR_LIMIT`] characters kept from the END (the last lines carry
+/// the reason). `BILI_DEBUG_LOG` is written once per line, so a raw multi-line
+/// capture would interleave with the other threads.
+fn live_stderr_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let len = flat.chars().count();
+    if len > LIVE_STDERR_LIMIT {
+        let cut = flat
+            .char_indices()
+            .nth(len - LIVE_STDERR_LIMIT)
+            .map(|(at, _)| at)
+            .unwrap_or(0);
+        format!("…{}", &flat[cut..])
+    } else {
+        flat
+    }
+}
+
+/// The bounded window of one decoder's stderr, shared between the draining
+/// thread and the first-frame deadline.
+#[derive(Default)]
+struct LiveStderr {
+    bytes: usize,
+    buf: Vec<u8>,
+}
+
+impl LiveStderr {
+    /// Append a chunk, keeping at most four windows (a decoder that screams for
+    /// minutes must not grow this buffer without limit).
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes += chunk.len();
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > 4 * LIVE_STDERR_LIMIT {
+            let drop = self.buf.len() - 2 * LIVE_STDERR_LIMIT;
+            self.buf.drain(..drop);
+        }
+    }
+
+    fn tail(&self) -> String {
+        live_stderr_tail(&self.buf)
+    }
+}
+
+/// Drain the child's stderr on its own thread, keeping a bounded window. The
+/// bytes are shared instead of only logged at EOF: when an attempt is killed
+/// for producing no frame, the deadline log is the only place that can show
+/// what the decoder was saying while it stalled.
+fn live_drain_stderr(
+    mut stderr: std::process::ChildStderr,
+    kind: &'static str,
+    sink: Arc<Mutex<LiveStderr>>,
+) {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut sink) = sink.lock() {
+                        sink.push(&buf[..n]);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let (bytes, tail) = match sink.lock() {
+            Ok(sink) => (sink.bytes, sink.tail()),
+            Err(_) => (0, String::new()),
+        };
+        crate::debug_log(&format!("live ffmpeg stderr kind={kind} bytes={bytes} tail={tail}"));
+    });
+}
+
+fn spawn_live_video(
+    url: &str,
+    size: FrameSize,
+    kind: &'static str,
+    sink: &Arc<Mutex<LiveStderr>>,
+) -> std::io::Result<Child> {
+    let mut command = base_command("ffmpeg.exe");
+    // `fps=30` makes the pipe a fixed 30 Hz grid: the reader paces it against
+    // the wall clock, so a 60 fps source and a burst of HLS segments both play
+    // in real time instead of racing ahead (measured without it: 34.3 fps
+    // presented over 30 s, i.e. ~14 % fast).
+    let filter = format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30",
+        w = size.w,
+        h = size.h
+    );
+    command
+        .arg("-hide_banner")
+        // `warning`: the open/read/protocol diagnostics that explain "spawned
+        // but no frame" never appear at `error`. The tail is bounded in
+        // [`live_drain_stderr`], so the volume is controlled there.
+        .arg("-loglevel")
+        .arg("warning")
+        .arg("-nostats")
+        .arg("-nostdin")
+        .arg("-threads")
+        .arg("0")
+        .arg("-fflags")
+        .arg("+discardcorrupt")
+        // No `-re`: the reader paces the pipe at 30 fps (see `live_pump`), and
+        // ffmpeg's own write blocks once ~one frame is queued, which is the
+        // cushion that absorbs a segment arriving in a burst.
+        .arg("-reconnect")
+        .arg("1")
+        .arg("-reconnect_streamed")
+        .arg("1")
+        .arg("-reconnect_delay_max")
+        .arg("5")
+        // A dead rendition must fail fast: at 15 s a bad HLS URL held the
+        // window on 缓冲 for that whole timeout before FLV was tried
+        // (measured click→first frame 19.5 s; 7.3 s after this bound). 5 s now:
+        // a live read that makes no progress for that long is not coming back,
+        // and the first-frame budget below is the outer bound anyway.
+        .arg("-rw_timeout")
+        .arg("5000000")
+        .arg("-headers")
+        .arg(LIVE_HEADERS)
+        .arg("-i")
+        .arg(url)
+        .arg("-an")
+        .arg("-vf")
+        .arg(filter)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg(if pipe_is_nv12() { "nv12" } else { "rgba" })
+        .arg("-");
+    crate::debug_log(&format!("live spawn ffmpeg {w}x{h} kind={kind}", w = size.w, h = size.h));
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(stderr) = child.stderr.take() {
+        live_drain_stderr(stderr, kind, sink.clone());
+    }
+    crate::job::assign(&child);
+    raise_process_priority(child.id());
+    Ok(child)
+}
+
+/// Local relay for the audio child.
+///
+/// ffplay on this machine cannot read a remote live body directly: against
+/// `api.live.bilibili.com`'s CDN it opens the TCP/TLS connection, sends the GET
+/// and then never receives a body (measured: `nan` position, `aq=0` for 30 s,
+/// while ffmpeg/ffprobe read the same URL in ~2 s). Serving the same bytes from
+/// `127.0.0.1` plays immediately, which is exactly how the VOD audio child
+/// already works (it reads the local prefetch proxy). So the live sound gets a
+/// one-connection relay: reqwest pulls the stream, the socket hands it to
+/// ffplay. The video child keeps reading the CDN directly.
+struct LiveRelay {
+    port: u16,
+    stop: Arc<AtomicBool>,
+}
+
+impl LiveRelay {
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/live", self.port)
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+fn start_live_relay(session: Arc<bilibili::Session>, source: String) -> Option<LiveRelay> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        // ffplay connects within a few hundred ms; give it 10 s and then let
+        // the listener go so a failed spawn cannot leak a thread.
+        let _ = listener.set_nonblocking(true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let socket = loop {
+            if stop_thread.load(Ordering::SeqCst) {
+                return;
+            }
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        crate::debug_log("live relay accept timeout");
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(60));
+                }
+                Err(_) => return,
+            }
+        };
+        let _ = socket.set_nonblocking(false);
+        let _ = socket.set_nodelay(true);
+        let mut socket = socket;
+        let mut head = [0u8; 4096];
+        let _ = socket.read(&mut head);
+        if socket
+            .write_all(b"HTTP/1.1 200 OK
+Content-Type: video/x-flv
+Connection: close
+
+")
+            .is_err()
+        {
+            return;
+        }
+        let Some(runtime) = bilibili::shared_runtime() else {
+            return;
+        };
+        let result = runtime.block_on(async move {
+            let mut response = session.open_stream(&source, LIVE_REFERER).await?;
+            let mut bytes = 0u64;
+            while let Some(chunk) = response.chunk().await? {
+                if stop_thread.load(Ordering::SeqCst) {
+                    break;
+                }
+                socket.write_all(&chunk)?;
+                bytes += chunk.len() as u64;
+            }
+            crate::debug_log(&format!("live relay done bytes={bytes}"));
+            Ok::<(), anyhow::Error>(())
+        });
+        if let Err(err) = result {
+            crate::debug_log(&format!("live relay err={err:#}"));
+        }
+    });
+    Some(LiveRelay { port, stop })
+}
+
+fn spawn_live_audio(url: &str) -> std::io::Result<Child> {
+    let mut command = base_command("ffplay.exe");
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("quiet")
+        .arg("-stats")
+        .arg("-nodisp")
+        .arg("-vn")
+        .arg("-autoexit")
+        .arg("-rw_timeout")
+        .arg("15000000")
+        .arg("-volume")
+        .arg("100");
+    // A localhost relay URL needs no referer / reconnect options; a direct
+    // CDN URL (only used if the relay could not bind) keeps them.
+    if !url.starts_with("http://127.0.0.1") {
+        command
+            .arg("-reconnect")
+            .arg("1")
+            .arg("-reconnect_streamed")
+            .arg("1")
+            .arg("-reconnect_delay_max")
+            .arg("5")
+            .arg("-headers")
+            .arg(LIVE_HEADERS);
+    }
+    command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = command.spawn()?;
+    crate::job::assign(&child);
+    Ok(child)
+}
+
+/// Spawn the live playback thread for one window. `mini` mirrors the picture
+/// into the PiP, exactly like the VOD mailbox does.
+pub fn spawn_live(
+    session: Arc<bilibili::Session>,
+    source: LiveSource,
+    window: slint::Weak<PlayerWindow>,
+    mini: MiniSlot,
+    control: Arc<PlaybackControl>,
+    stats: Arc<LiveStats>,
+) {
+    install_panic_log();
+    std::thread::spawn(move || {
+        note_thread_role("live");
+        let pool = Arc::new(BlendPool::new());
+        let mailbox = Arc::new(FrameMailbox::new(
+            window.clone(),
+            mini.clone(),
+            pool.clone(),
+            control.clone(),
+        ));
+        let children: Arc<std::sync::Mutex<LiveChildren>> =
+            Arc::new(std::sync::Mutex::new(LiveChildren::default()));
+        live_watchdog(control.clone(), children.clone());
+        live_room_info_loop(session.clone(), source.clone(), window.clone(), control.clone(), stats.clone());
+        live_run(session, source, window, control, stats, mailbox, children);
+    });
+}
+
+/// Kill the children on close and on pause. Runs on its own thread so a blocked
+/// `read_exact` on the rawvideo pipe is interrupted by the child going away.
+fn live_watchdog(control: Arc<PlaybackControl>, children: Arc<std::sync::Mutex<LiveChildren>>) {
+    std::thread::spawn(move || loop {
+        let closed = control.is_closed();
+        let paused = control.paused();
+        if closed || paused {
+            if let Ok(mut guard) = children.lock() {
+                if let Some(mut child) = guard.video.take() {
+                    kill(&mut child);
+                }
+                if let Some(mut child) = guard.audio.take() {
+                    kill(&mut child);
+                }
+            }
+            if closed {
+                crate::debug_log("live watchdog children killed reason=closed");
+                return;
+            }
+        } else {
+            // The WASAPI gain/mute is owed to every new ffplay; the control
+            // retries it here at its own bounded rate.
+            control.sync_audio_session();
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    });
+}
+
+fn live_set_viewers(window: &slint::Weak<PlayerWindow>, online: u64, status: i64) {
+    let window = window.clone();
+    let text: slint::SharedString = format!("{} 人气", format_viewers(online)).into();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = window.upgrade() {
+            window.set_live_viewers(text);
+            window.set_live_online(online.min(i32::MAX as u64) as i32);
+            window.set_live_status(status as i32);
+        }
+    });
+}
+
+/// Every 30 s: refresh the viewer count and the live status. Text only — the
+/// stream is never restarted for this.
+fn live_room_info_loop(
+    session: Arc<bilibili::Session>,
+    source: LiveSource,
+    window: slint::Weak<PlayerWindow>,
+    control: Arc<PlaybackControl>,
+    stats: Arc<LiveStats>,
+) {
+    std::thread::spawn(move || {
+        let Some(runtime) = bilibili::shared_runtime() else {
+            return;
+        };
+        loop {
+            if control.is_closed() {
+                return;
+            }
+            match runtime.block_on(session.live_room_info(source.room_id)) {
+                Ok(info) => {
+                    stats.live_status.store(info.live_status, Ordering::SeqCst);
+                    live_set_viewers(&window, info.online, info.live_status);
+                    crate::debug_log(&format!(
+                        "live room info room={} status={} online={} title={} area={}",
+                        info.room_id, info.live_status, info.online, info.title, info.area_name
+                    ));
+                }
+                Err(err) => crate::debug_log(&format!(
+                    "live room info err room={} err={err:#}",
+                    source.room_id
+                )),
+            }
+            for _ in 0..150 {
+                if control.is_closed() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
+}
+
+/// One delivery to try for a room, in the order this client prefers them.
+///
+/// Measured against room 27579539 on this machine (see the `live session` /
+/// `live ffmpeg stderr` lines): FLV opens and delivers its first frame in
+/// 2.7-4.1 s; HLS-fmp4 connects but produced no frame inside 8 s
+/// (`Found duplicated MOOV Atom. Skipped it`); the HLS-ts rendition never opens
+/// at all (`tls ... Error in the pull function`, `Error number -138`). So FLV is
+/// first, fmp4 second, ts last - and each one only gets
+/// [`LIVE_FIRST_FRAME_MS`].
+fn live_candidates(play: &bilibili::LivePlay) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    for (kind, url) in [
+        ("flv", play.flv.as_ref()),
+        ("hls_fmp4", play.hls_fmp4.as_ref()),
+        ("hls_ts", play.hls_ts.as_ref()),
+    ] {
+        if let Some(url) = url {
+            if url.len() > 12 {
+                out.push((kind, url.clone()));
+            }
+        }
+    }
+    if out.is_empty() {
+        // A payload that only carries the merged field: keep the room playable
+        // rather than spinning on "no source".
+        if let Some(url) = play.hls.as_ref() {
+            if url.len() > 12 {
+                out.push(("hls", url.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// `BILI_LIVE_FORCE=flv|hls_fmp4|hls_ts|hls` makes that delivery the one the
+/// session starts on (the others stay behind it as fallbacks). The "bad source"
+/// QA run proves a dead rendition is abandoned inside one budget instead of
+/// freezing the window.
+fn live_forced_kind() -> Option<&'static str> {
+    static FORCED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        let value = std::env::var("BILI_LIVE_FORCE").ok()?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "flv" => Some("flv"),
+            "hls_fmp4" | "hls-fmp4" | "fmp4" => Some("hls_fmp4"),
+            "hls_ts" | "hls-ts" | "ts" => Some("hls_ts"),
+            "hls" => Some("hls"),
+            _ => None,
+        }
+    })
+}
+
+/// How long one delivery may take to produce its FIRST frame before the session
+/// rotates to the next one. A working FLV start is measured at 2.7-4.1 s, so 8 s
+/// still admits a slow but real start while cutting a frozen source off in one
+/// budget instead of the 20 s+ a blocked `read_exact` used to cost.
+const LIVE_FIRST_FRAME_MS: u64 = 8_000;
+/// Gap between two deliveries of the same room. A source rotation is not a
+/// network failure, so it does not consume the reconnect backoff.
+const LIVE_SWITCH_MS: u64 = 150;
+
+/// Kill the attempt's decoder when no frame arrived within the budget.
+///
+/// `live_pump` blocks in `read_exact` on the rawvideo pipe, so a source that
+/// connects but delivers nothing never returns on its own (that is exactly the
+/// reported "spawned ffmpeg, then 20 s of nothing, no attempt=3"). Killing the
+/// child closes the pipe, which returns the pump to the rotation - the same
+/// mechanism `live_watchdog` uses for close/pause. `generation` guarantees this
+/// deadline can only ever kill its own attempt's child.
+fn live_arm_frame_deadline(
+    children: Arc<std::sync::Mutex<LiveChildren>>,
+    control: Arc<PlaybackControl>,
+    first_frame: Arc<AtomicBool>,
+    sink: Arc<Mutex<LiveStderr>>,
+    generation: u64,
+    kind: &'static str,
+) {
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let budget = Duration::from_millis(LIVE_FIRST_FRAME_MS);
+        while started.elapsed() < budget {
+            if first_frame.load(Ordering::SeqCst) || control.is_closed() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        if first_frame.load(Ordering::SeqCst) || control.is_closed() {
+            return;
+        }
+        let (bytes, tail) = match sink.lock() {
+            Ok(sink) => (sink.bytes, sink.tail()),
+            Err(_) => (0, String::new()),
+        };
+        let mut killed = false;
+        if let Ok(mut guard) = children.lock() {
+            if guard.generation == generation {
+                if let Some(mut child) = guard.video.take() {
+                    kill(&mut child);
+                    killed = true;
+                }
+            }
+        }
+        crate::debug_log(&format!(
+            "live attempt stalled kind={kind} after_ms={} killed={} stderr_bytes={bytes} tail={tail}",
+            started.elapsed().as_millis(),
+            u8::from(killed)
+        ));
+    });
+}
+
+/// Load the room's 头图 and publish it as the player's buffering poster. Two
+/// candidates: the window-sized variant first, the URL exactly as the API gave
+/// it second (a 320px card cover still beats a blank wallpaper).
+pub fn live_load_poster(
+    session: Arc<bilibili::Session>,
+    window: slint::Weak<PlayerWindow>,
+    cover: String,
+) {
+    let base = cover.trim();
+    if base.len() < 12 {
+        return;
+    }
+    let base = if let Some(rest) = base.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else {
+        base.to_string()
+    };
+    let (stem, already_sized) = match base.split_once('@') {
+        Some((stem, rest)) => (stem.to_string(), !rest.is_empty()),
+        None => (base.clone(), false),
+    };
+    let mut urls: Vec<String> = vec![format!("{stem}@960w_540h_1c.webp")];
+    if already_sized {
+        urls.push(base.clone());
+    }
+    std::thread::spawn(move || {
+        let Some(runtime) = bilibili::shared_runtime() else {
+            return;
+        };
+        for url in urls {
+            match runtime.block_on(session.fetch_thumb(&url)) {
+                Ok((bytes, w, h)) => {
+                    if bytes.len() < (w as usize) * (h as usize) * 4 {
+                        continue;
+                    }
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = window.upgrade() {
+                            let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+                            buffer.make_mut_bytes().copy_from_slice(&bytes);
+                            window.set_live_poster(slint::Image::from_rgba8(buffer));
+                        }
+                    });
+                    crate::debug_log(&format!("live poster ok {w}x{h} url_len={}", url.len()));
+                    return;
+                }
+                Err(err) => crate::debug_log(&format!(
+                    "live poster err url_len={} err={err:#}",
+                    url.len()
+                )),
+            }
+        }
+    });
+}
+
+/// `1.2万` for the card and the LIVE badge. Mirrors the feed's own style.
+fn format_viewers(online: u64) -> String {
+    if online >= 10_000 {
+        let value = online as f64 / 10_000.0;
+        if value >= 10.0 {
+            format!("{value:.0}万")
+        } else {
+            format!("{value:.1}万")
+        }
+    } else {
+        online.to_string()
+    }
+}
+
+/// `BILI_LIVE_BREAK`: kill the current live decoder once, exactly like a
+/// dropped stream, so the reconnect/backoff path is measured on the real code.
+static LIVE_BREAK: AtomicBool = AtomicBool::new(false);
+
+/// Ask the live pump to end its current session on the next frame.
+pub fn live_test_break() {
+    LIVE_BREAK.store(true, Ordering::SeqCst);
+    crate::debug_log("live test break armed");
+}
+
+/// Why the pump of one attempt stopped. `Break` is the QA hook's kill (the
+/// stream was fine, it was taken away); `Eof` is the decoder ending on its own
+/// (the source failed or the upstream dropped it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LivePumpEnd {
+    Eof,
+    Break,
+    Closed,
+}
+
+fn live_pump(
+    stdout: &mut std::process::ChildStdout,
+    size: FrameSize,
+    mailbox: &Arc<FrameMailbox>,
+    control: &Arc<PlaybackControl>,
+    stats: &Arc<LiveStats>,
+    first_at: &mut Option<Instant>,
+    first_frame: &Arc<AtomicBool>,
+    started: Instant,
+) -> LivePumpEnd {
+    let nv12 = pipe_is_nv12();
+    let nv12_len = nv12_bytes(size);
+    let rgba_len = size.bytes();
+    let mut pipe = vec![0u8; if nv12 { nv12_len } else { rgba_len }];
+    let mut last_log = Instant::now();
+    // Realtime presentation grid: the decoder is asked for `fps=30`, so one
+    // frame every 33.3 ms is the stream's own rate. Presenting them as fast as
+    // they arrive is what made this run 14 % fast before the pacer.
+    let period = Duration::from_millis(33);
+    let mut next_at = Instant::now();
+    loop {
+        if control.is_closed() {
+            return LivePumpEnd::Closed;
+        }
+        if LIVE_BREAK.swap(false, Ordering::SeqCst) {
+            crate::debug_log("live test break fired");
+            return LivePumpEnd::Break;
+        }
+        match stdout.read_exact(&mut pipe) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return LivePumpEnd::Eof, // EOF / killed child: the session decides.
+        }
+        // Re-check after the blocking read: a frame that arrived while the
+        // break was armed must not be presented (it would look like a recovery
+        // that never happened).
+        if LIVE_BREAK.swap(false, Ordering::SeqCst) {
+            crate::debug_log("live test break fired after read");
+            return LivePumpEnd::Break;
+        }
+        // Pace against the wall clock. A frame that arrives very late (a
+        // network gap) resyncs the grid instead of being pushed immediately
+        // and then followed by a rush.
+        let now = Instant::now();
+        // Only a real stall (2 s) resets the grid: a burst of HLS frames is
+        // normal, and resetting on it threw away the time already paced
+        // (measured: 19.9 fps instead of 30).
+        if now > next_at + Duration::from_secs(2) {
+            next_at = now;
+        } else if now < next_at {
+            std::thread::sleep(next_at - now);
+        } else {
+            next_at = now;
+        }
+        next_at += period;
+        let mut frame = mailbox.pool.take(size);
+        if nv12 {
+            nv12_to_rgba(frame.make_mut_bytes(), &pipe, size.w as usize, size.h as usize);
+        } else {
+            frame.make_mut_bytes().copy_from_slice(&pipe);
+        }
+        mailbox.push(MailFrame {
+            buffer: frame,
+            pooled: true,
+        });
+        let frames = stats.frames.fetch_add(1, Ordering::SeqCst) + 1;
+        if first_at.is_none() {
+            *first_at = Some(Instant::now());
+            first_frame.store(true, Ordering::SeqCst);
+            let ms = started.elapsed().as_millis() as u64;
+            stats.first_frame_ms.store(ms, Ordering::SeqCst);
+            crate::debug_log(&format!("live first frame after_ms={ms} size={}x{}", size.w, size.h));
+            control.prof.first_seen.store(true, Ordering::Relaxed);
+            control.prof.presented.fetch_add(1, Ordering::Relaxed);
+            control.release_audio_hold_now();
+            let window = mailbox.window.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let view = crate::player_view::SlintPlayerView(window);
+                let mut presentation = crate::player_view::Presentation::new(&view);
+                presentation.buffering(false, 1.0);
+                presentation.resume();
+            });
+        } else {
+            control.prof.presented.fetch_add(1, Ordering::Relaxed);
+        }
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            last_log = Instant::now();
+            let (pushed, coalesced, posted, shown) = mailbox.counters();
+            crate::debug_log(&format!(
+                "live fps={:.1} frames={frames} pushed={pushed} shown={shown} coalesced={coalesced} posted={posted} audio_pid={}",
+                frames as f64 / started.elapsed().as_secs_f64().max(0.001),
+                control.audio_pid()
+            ));
+        }
+    }
+}
+
+fn live_wait(control: &Arc<PlaybackControl>, ms: u64) -> bool {
+    let steps = (ms / 100).max(1);
+    for _ in 0..steps {
+        if control.is_closed() {
+            return false;
+        }
+        if control.paused() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+/// The live session loop: resolve → spawn → pump → back off → repeat.
+fn live_run(
+    session: Arc<bilibili::Session>,
+    source: LiveSource,
+    window: slint::Weak<PlayerWindow>,
+    control: Arc<PlaybackControl>,
+    stats: Arc<LiveStats>,
+    mailbox: Arc<FrameMailbox>,
+    children: Arc<std::sync::Mutex<LiveChildren>>,
+) {
+    let Some(runtime) = bilibili::shared_runtime() else {
+        return;
+    };
+    // Orientation decides the pipe's canvas (a 1080x1920 portrait room must not
+    // be padded into a 16:9 frame). The index payload does not carry it, so the
+    // first thing this thread does is ask `get_info` once - the same call the
+    // 30 s viewer refresh uses, and the same answer B站 itself renders with.
+    let mut source = source;
+    crate::debug_log(&format!(
+        "live session begin room={} title={} uname={} area={}",
+        source.room_id, source.title, source.uname, source.area
+    ));
+    match runtime.block_on(session.live_room_info(source.room_id)) {
+        Ok(info) => {
+            source.is_portrait = info.is_portrait;
+            stats.live_status.store(info.live_status, Ordering::SeqCst);
+            live_set_viewers(&window, info.online, info.live_status);
+            crate::debug_log(&format!(
+                "live orientation room={} portrait={} title={} cover={}",
+                source.room_id,
+                u8::from(info.is_portrait),
+                info.title,
+                info.cover.len()
+            ));
+            // The room's own 头图 is a better poster than the index card's 320px
+            // cover; fall back to it only when the card had nothing.
+            if source.cover.is_empty() && !info.cover.is_empty() {
+                source.cover = info.cover;
+                live_load_poster(session.clone(), window.clone(), source.cover.clone());
+            }
+        }
+        Err(err) => crate::debug_log(&format!(
+            "live orientation fallback room={} err={err:#}",
+            source.room_id
+        )),
+    }
+    let size = source.frame_size();
+    let mut attempt = 0u32;
+    let mut first_at: Option<Instant> = None;
+    // Whether the CURRENT attempt produced a frame. `stats.first_frame_ms` is
+    // per window (it must survive a reconnect), so a fresh attempt needs its own
+    // flag to tell "this source never opened" from "it played and then dropped".
+    let first_frame = Arc::new(AtomicBool::new(false));
+    // Which delivery this session is on (`live_candidates` order). A delivery
+    // that produces no frame rotates to the next one; a delivery that played
+    // and then dropped keeps its place and only reconnects.
+    let mut rank = 0usize;
+    // Full passes through the candidate list without a single frame.
+    let mut empty_passes = 0u32;
+    let forced = live_forced_kind();
+    if let Some(kind) = forced {
+        crate::debug_log(&format!("live force kind={kind}"));
+    }
+    // Attempts since the last successful frame burst. `0` = healthy.
+    loop {
+        if control.is_closed() {
+            return;
+        }
+        if control.paused() {
+            attempt = 0;
+            while control.paused() && !control.is_closed() {
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            if control.is_closed() {
+                return;
+            }
+            // A resume starts a fresh live edge; nothing is "continued".
+            control.clear_resume_request();
+        }
+        let resolve_started = Instant::now();
+        let play = match runtime.block_on(session.live_play_url(source.room_id)) {
+            Ok(play) => play,
+            Err(err) => {
+                crate::debug_log(&format!(
+                    "live playurl err room={} err={err:#}",
+                    source.room_id
+                ));
+                stats.live_status.store(0, Ordering::SeqCst);
+                if !live_backoff(&control, &window, &stats, &mut attempt, &err.to_string()) {
+                    return;
+                }
+                continue;
+            }
+        };
+        stats.live_status.store(play.live_status, Ordering::SeqCst);
+        if play.live_status != 1 {
+            let window_toast = window.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = window_toast.upgrade() {
+                    crate::toast(&window, "主播不在直播中", crate::TOAST_KIND_INFO);
+                }
+            });
+            if !live_backoff(&control, &window, &stats, &mut attempt, "not_live") {
+                return;
+            }
+            continue;
+        }
+        if play.locked {
+            let window_toast = window.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = window_toast.upgrade() {
+                    crate::toast(&window, "该直播间已加密，暂不支持播放", crate::TOAST_KIND_ERROR);
+                }
+            });
+            return;
+        }
+        let mut candidates = live_candidates(&play);
+        if let Some(kind) = forced {
+            // Start on the forced delivery, keep the rest behind it: a QA run
+            // that forces a dead rendition must still reach the picture.
+            match candidates.iter().position(|(candidate, _)| *candidate == kind) {
+                Some(pos) => {
+                    candidates.rotate_left(pos);
+                    crate::debug_log(&format!(
+                        "live force kind={kind} start_rank={pos} n={}",
+                        candidates.len()
+                    ));
+                }
+                None => crate::debug_log(&format!(
+                    "live force kind={kind} missing n={}",
+                    candidates.len()
+                )),
+            }
+        }
+        if candidates.is_empty() {
+            crate::debug_log(&format!("live playurl empty room={}", source.room_id));
+            if !live_backoff(&control, &window, &stats, &mut attempt, "no-source") {
+                return;
+            }
+            continue;
+        }
+        if rank >= candidates.len() {
+            rank = 0;
+        }
+        let (kind, url) = candidates[rank].clone();
+        let url_for_audio = url.clone();
+        let api_ms = resolve_started.elapsed().as_millis();
+        // One stderr window per attempt: the deadline below logs it when the
+        // delivery stalls, the drain thread logs it again at EOF.
+        let sink = Arc::new(Mutex::new(LiveStderr::default()));
+        crate::debug_log(&format!(
+            "live session room={} attempt={} kind={kind} api_ms={api_ms} url_len={} rank={rank}/{}",
+            source.room_id,
+            attempt + 1,
+            url.len(),
+            candidates.len()
+        ));
+        if std::env::var_os("BILI_LIVE_DEBUG_URL").is_some() {
+            crate::debug_log(&format!("live url kind={kind} {url}"));
+        }
+        let Ok(video) = spawn_live_video(&url, size, kind, &sink) else {
+            crate::debug_log("live ffmpeg spawn failed");
+            if !live_backoff(&control, &window, &stats, &mut attempt, "spawn") {
+                return;
+            }
+            continue;
+        };
+        control.decoder_live.store(true, Ordering::SeqCst);
+        // The sound starts at the same live edge. A failure here is not fatal:
+        // the picture plays silently and the next reconnect retries both.
+        // The sound goes through the local relay (see [`start_live_relay`]);
+        // if the listener could not bind, fall back to the CDN URL directly.
+        // A relay must forward a BODY, not a playlist: the FLV rendition is the
+        // continuous stream (the HLS URL would only deliver the m3u8 text).
+        let relay_source = play
+            .flv
+            .clone()
+            .unwrap_or_else(|| url_for_audio.clone());
+        let relay = start_live_relay(session.clone(), relay_source);
+        let audio_url = relay
+            .as_ref()
+            .map(LiveRelay::url)
+            .unwrap_or_else(|| url_for_audio.clone());
+        let audio = spawn_live_audio(&audio_url).ok();
+        if let Some(audio) = audio.as_ref() {
+            control.prof.decoded.store(0, Ordering::Relaxed);
+            control.set_audio_pid(audio.id());
+            // The gain/mute the user set belongs to the new session; honour it
+            // as soon as the session exists, but hold it silent until the first
+            // frame (released by `release_audio_hold_now`).
+            control.audio_hold_silent.store(true, Ordering::SeqCst);
+            control.audio_session_pending.store(true, Ordering::SeqCst);
+        }
+        let generation = match children.lock() {
+            Ok(mut guard) => {
+                guard.generation = guard.generation.wrapping_add(1);
+                guard.video = Some(video);
+                guard.audio = audio;
+                guard.generation
+            }
+            Err(_) => return,
+        };
+        let started = Instant::now();
+        first_frame.store(false, Ordering::SeqCst);
+        live_arm_frame_deadline(
+            children.clone(),
+            control.clone(),
+            first_frame.clone(),
+            sink.clone(),
+            generation,
+            kind,
+        );
+        let mut stdout = {
+            let mut guard = match children.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            guard.video.as_mut().and_then(|child| child.stdout.take())
+        };
+        let ended = match stdout.as_mut() {
+            Some(stdout) => live_pump(
+                stdout,
+                size,
+                &mailbox,
+                &control,
+                &stats,
+                &mut first_at,
+                &first_frame,
+                started,
+            ),
+            None => LivePumpEnd::Eof,
+        };
+        control.decoder_live.store(false, Ordering::SeqCst);
+        if let Ok(mut guard) = children.lock() {
+            if let Some(mut child) = guard.video.take() {
+                // `try_wait` first: a decoder that exited on its own (the common
+                // failure) must report its real code, not the kill we add.
+                let code = child.try_wait().ok().flatten().and_then(|status| status.code());
+                kill(&mut child);
+                crate::debug_log(&format!(
+                    "live ffmpeg exit code={code:?} kind={kind} ran_ms={} first_frame={}",
+                    started.elapsed().as_millis(),
+                    u8::from(first_frame.load(Ordering::SeqCst))
+                ));
+            }
+            if let Some(mut child) = guard.audio.take() {
+                kill(&mut child);
+            }
+        }
+        control.set_audio_pid(0);
+        if let Some(relay) = relay.as_ref() {
+            relay.stop();
+        }
+        if ended == LivePumpEnd::Closed || control.is_closed() {
+            return;
+        }
+        // A decoder that ran for a while is a healthy session that dropped, not
+        // a failing one: its backoff starts from 1 s again.
+        if started.elapsed() >= Duration::from_secs(10) {
+            attempt = 0;
+        }
+        // `Break` is the QA hook taking the stream away: the delivery was fine,
+        // so it must read as a normal reconnect and never as "this source cannot
+        // open" (that would rotate the session off a working rendition).
+        if ended == LivePumpEnd::Eof && !first_frame.load(Ordering::SeqCst) {
+            // This delivery never produced a picture. Rotate to the next one with
+            // a short gap instead of the reconnect backoff: the room is live, it
+            // is the rendition that cannot open here.
+            let from = kind;
+            rank += 1;
+            if rank >= candidates.len() {
+                rank = 0;
+                empty_passes += 1;
+            }
+            let to = candidates
+                .get(rank)
+                .map(|(candidate, _)| *candidate)
+                .unwrap_or("none");
+            crate::debug_log(&format!(
+                "live switch {from}->{to} reason=no-first-frame ran_ms={} pass={empty_passes}",
+                started.elapsed().as_millis()
+            ));
+            if empty_passes >= 2 {
+                // Two full passes with no picture anywhere: not a source
+                // problem. Hand it to the backoff (and its toast) so the window
+                // stops burning connections.
+                empty_passes = 0;
+                stats.reconnects.fetch_add(1, Ordering::SeqCst);
+                if !live_backoff(&control, &window, &stats, &mut attempt, "no-source-frame") {
+                    return;
+                }
+            } else if !live_wait(&control, LIVE_SWITCH_MS) {
+                return;
+            }
+            continue;
+        }
+        empty_passes = 0;
+        stats.reconnects.fetch_add(1, Ordering::SeqCst);
+        if !live_backoff(&control, &window, &stats, &mut attempt, "stream-ended") {
+            return;
+        }
+    }
+}
+
+/// Wait `1, 2, 4, 8, 16` s between attempts; after five failures show one toast
+/// and idle until the user presses play (or the room API says "live" again).
+/// Returns `false` when the window closed.
+fn live_backoff(
+    control: &Arc<PlaybackControl>,
+    window: &slint::Weak<PlayerWindow>,
+    stats: &Arc<LiveStats>,
+    attempt: &mut u32,
+    reason: &str,
+) -> bool {
+    *attempt = attempt.saturating_add(1);
+    if let Ok(mut list) = stats.attempts.lock() {
+        list.push(format!("{reason}"));
+        if list.len() > 16 {
+            list.remove(0);
+        }
+    }
+    if *attempt <= 5 {
+        let delay = 1u64 << (*attempt - 1).min(4);
+        crate::debug_log(&format!(
+            "live reconnect attempt={} delay_s={delay} reason={reason}",
+            *attempt
+        ));
+        return live_wait(control, delay * 1000);
+    }
+    crate::debug_log(&format!(
+        "live reconnect exhausted attempts={} reason={reason}",
+        *attempt
+    ));
+    *attempt = 0;
+    set_playing(window, false);
+    let window_toast = window.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = window_toast.upgrade() {
+            crate::toast(&window, "直播已结束或网络中断", crate::TOAST_KIND_ERROR);
+        }
+    });
+    // Idle until the user asks for play (the ▶ button or the API reporting the
+    // room live again). `resume_requested` is what the VOD path uses for the
+    // same "no decoder is running" press.
+    loop {
+        for _ in 0..20 {
+            if control.is_closed() {
+                return false;
+            }
+            if control.resume_requested() {
+                control.clear_resume_request();
+                crate::debug_log("live retry after play press");
+                return true;
+            }
+            if stats.live_status.load(Ordering::SeqCst) == 1 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Keep waiting in 2 s steps; the room-info thread can flip live_status.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_sources_are_ordered_flv_then_fmp4_then_ts() {
+        let all = bilibili::LivePlay {
+            hls: Some("https://cdn/live/ts.m3u8?sig=1".into()),
+            hls_fmp4: Some("https://cdn/live/fmp4.m3u8?sig=2".into()),
+            hls_ts: Some("https://cdn/live/ts.m3u8?sig=1".into()),
+            flv: Some("https://cdn/live/stream.flv?sig=3".into()),
+            live_status: 1,
+            locked: false,
+        };
+        let kinds: Vec<&str> = live_candidates(&all).into_iter().map(|(kind, _)| kind).collect();
+        // FLV is the delivery that opens here (2.7 s); the ts rendition never
+        // opens, so it must be last, never first.
+        assert_eq!(kinds, vec!["flv", "hls_fmp4", "hls_ts"]);
+
+        // A room with no FLV still tries fmp4 before ts.
+        let no_flv = bilibili::LivePlay {
+            flv: None,
+            ..all.clone()
+        };
+        let kinds: Vec<&str> = live_candidates(&no_flv).into_iter().map(|(kind, _)| kind).collect();
+        assert_eq!(kinds, vec!["hls_fmp4", "hls_ts"]);
+
+        // Only the merged field: the room stays playable instead of rotating
+        // through an empty list.
+        let merged = bilibili::LivePlay {
+            hls: Some("https://cdn/live/only.m3u8".into()),
+            ..Default::default()
+        };
+        let kinds: Vec<&str> = live_candidates(&merged).into_iter().map(|(kind, _)| kind).collect();
+        assert_eq!(kinds, vec!["hls"]);
+
+        // A short/empty URL is not a candidate (the API can answer "").
+        let empty = bilibili::LivePlay {
+            flv: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(live_candidates(&empty).is_empty());
+    }
+
+    #[test]
+    fn live_stderr_tail_is_one_line_and_keeps_the_end() {
+        let long = "x".repeat(LIVE_STDERR_LIMIT * 2);
+        let tail = live_stderr_tail(format!("Error opening input\n\n   {long}").as_bytes());
+        assert!(!tail.contains('\n'), "one log line");
+        // The marker plus exactly the budget: the head is what gets dropped.
+        assert_eq!(tail.chars().count(), LIVE_STDERR_LIMIT + 1);
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with('x'));
+        // Short input is only whitespace-collapsed.
+        assert_eq!(live_stderr_tail(b"  boom \r\n\n next  "), "boom next");
+        assert_eq!(live_stderr_tail(b""), "");
+    }
 
     #[test]
     fn startup_gate_releases_only_after_a_healthy_start() {
@@ -14900,10 +17132,15 @@ mod tests {
             target_frame_size(1920, 1080),
             FrameSize { w: 1920, h: 1080 }
         );
-        // A 4K source is capped at 1080p (the budget/cost cap).
+        // f176: a 4K source decodes at 4K — the pipe follows the stream.
         assert_eq!(
             target_frame_size(3840, 2160),
-            FrameSize { w: 1920, h: 1080 }
+            FrameSize { w: 3840, h: 2160 }
+        );
+        // 8K is the only thing still scaled down (the 4K cap).
+        assert_eq!(
+            target_frame_size(7680, 4320),
+            FrameSize { w: 3840, h: 2160 }
         );
         // Never upscale a small source.
         assert_eq!(target_frame_size(1280, 720), FrameSize { w: 1280, h: 720 });
@@ -14912,8 +17149,9 @@ mod tests {
             target_frame_size(1440, 1080),
             FrameSize { w: 1440, h: 1080 }
         );
-        // An ultrawide source is capped at 1920 wide, aspect preserved.
-        assert_eq!(target_frame_size(2560, 1080), FrameSize { w: 1920, h: 810 });
+        // An ultrawide source keeps its width (under the 4K cap), aspect
+        // preserved by the height clamp.
+        assert_eq!(target_frame_size(2560, 1080), FrameSize { w: 2560, h: 1080 });
         // Odd source/clamp values are made even, and the width comes from the
         // source aspect, not from an independent rounding.
         let odd = target_frame_size(1921, 1081);
@@ -14999,6 +17237,114 @@ mod tests {
             audio_tracks: Vec::new(),
             duration: 60,
         }
+    }
+
+    #[test]
+    fn a_stream_s_own_cache_key_names_the_tier_and_the_codec() {
+        // One `.part` per raw stream: the same video at 1080P AVC, 1080P AV1 and
+        // 720P is three different bitstreams at three different byte offsets, so
+        // a switch must never hand one file to another.
+        let avc = stream_cache_key("BV1xx411c7mD", 42, 80, 7);
+        let av1 = stream_cache_key("BV1xx411c7mD", 42, 80, 13);
+        let hd = stream_cache_key("BV1xx411c7mD", 42, 64, 7);
+        assert_eq!(avc, "BV1xx411c7mD-42-80-7");
+        assert_ne!(avc, av1);
+        assert_ne!(avc, hd);
+        // Same tier and codec on another video is another file.
+        assert_ne!(avc, stream_cache_key("BV1yy411c7mD", 42, 80, 7));
+        // The audio file of the same video can never collide with a video one.
+        assert_ne!(avc, format!("BV1xx411c7mD-42-audio-30280"));
+    }
+
+    #[test]
+    fn automatic_open_picks_the_highest_playable_source() {
+        // f176: the owner asked for "the best source available" on open, so
+        // 自动 (0) takes the top playable tier — 4K when the account may open it.
+        let info = play_info(
+            vec![
+                video_track(120, 7, 20_000_000),
+                video_track(116, 7, 8_000_000),
+                video_track(80, 7, 2_900_000),
+                video_track(64, 7, 1_300_000),
+                video_track(32, 7, 700_000),
+                video_track(16, 7, 430_000),
+            ],
+            32,
+        );
+        assert_eq!(initial_quality(&info, 0), 120);
+        // An explicit stored tier still wins.
+        assert_eq!(initial_quality(&info, 80), 80);
+        // A stored tier the video does not have falls back to the automatic rule.
+        assert_eq!(initial_quality(&info, 74), 120);
+        // With 4K locked out of the list (大会员), the highest playable wins.
+        let locked = play_info(
+            vec![video_track(80, 7, 2_900_000), video_track(64, 7, 1_300_000)],
+            32,
+        );
+        assert_eq!(initial_quality(&locked, 0), 80);
+    }
+
+    #[test]
+    fn automatic_open_takes_the_highest_playable_below_the_cap() {
+        // A 720P upload: 720P, not the 480P `default_qn` fallback and not 360P.
+        let info = play_info(
+            vec![video_track(64, 7, 1_300_000), video_track(16, 7, 430_000)],
+            32,
+        );
+        assert_eq!(initial_quality(&info, 0), 64);
+        // A 1080P60-only source still plays: the lowest tier above the cap is
+        // better than nothing.
+        let p60 = play_info(vec![video_track(116, 7, 8_000_000)], 0);
+        assert_eq!(initial_quality(&p60, 0), 116);
+        // A durl-only response (qn 0) keeps the decoder's own fallback.
+        let durl = play_info(vec![video_track(0, 0, 0)], 0);
+        assert_eq!(initial_quality(&durl, 0), 0);
+    }
+
+    #[test]
+    fn a_fresh_install_opens_the_best_source_at_its_own_size() {
+        // f176: 自动 (0) = the highest playable source, decoded at the stream's
+        // own resolution.
+        assert_eq!(crate::settings::Settings::default().player_quality, 0);
+        assert!(crate::settings::Settings::default().player_native_size);
+        // Any concrete tier is preserved (the owner may pin 4K); nonsense falls
+        // back to 自动.
+        for qn in [0, 32, 64, 80, 116, 120] {
+            assert_eq!(crate::settings::normalise_player_quality(qn), qn);
+        }
+        assert_eq!(crate::settings::normalise_player_quality(-4), 0);
+    }
+
+    #[test]
+    fn frame_size_follows_the_window_unless_native_is_on() {
+        let decode = target_frame_size(1920, 1080);
+        // 默认: the window's picture band, aspect preserved.
+        assert_eq!(
+            reader_output_size(decode, (1216, 684), false),
+            FrameSize { w: 1216, h: 684 }
+        );
+        // A big window never upscales: the source size is the ceiling.
+        assert_eq!(reader_output_size(decode, (2560, 1440), false), decode);
+        // 原始分辨率 keeps the source size whatever the window says.
+        assert_eq!(reader_output_size(decode, (1216, 684), true), decode);
+        // A window taller than 16:9 is bounded by the width.
+        assert_eq!(
+            reader_output_size(decode, (1920, 1440), false),
+            FrameSize { w: 1920, h: 1080 }
+        );
+        // A 4:3 source in a wide window keeps its own aspect.
+        let four_three = target_frame_size(1440, 1080);
+        assert_eq!(
+            reader_output_size(four_three, (1200, 900), false),
+            FrameSize { w: 1200, h: 900 }
+        );
+        // Without a published window size (0x0) the source size is used.
+        assert_eq!(reader_output_size(decode, (0, 0), false), decode);
+        // Odd window sizes are made even, never zero.
+        let odd = reader_output_size(decode, (1217, 685), false);
+        assert_eq!(odd.w % 2, 0);
+        assert_eq!(odd.h % 2, 0);
+        assert!(odd.w > 0 && odd.h > 0);
     }
 
     #[test]

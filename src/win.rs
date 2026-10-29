@@ -50,6 +50,15 @@ const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_FRAMECHANGED: u32 = 0x0020;
 const GWL_EXSTYLE: i32 = -20;
 const WS_EX_TOPMOST: isize = 0x0000_0008;
+/// `WS_EX_TRANSPARENT`: the window lets every hit test through. QA-only windows
+/// (and any future click-through overlay) are "transparent by design" and must
+/// not count as occlusion.
+const WS_EX_TRANSPARENT: isize = 0x0000_0020;
+/// `WS_EX_TOOLWINDOW`: an owned floating helper (our tooltips). Only skipped
+/// when it belongs to this process - another app's tooltip really does cover.
+const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+/// `GW_HWNDNEXT` (winuser.h): the window below `hwnd` in the z-order.
+const GW_HWNDNEXT: u32 = 2;
 const SW_HIDE: i32 = 0;
 const SW_SHOW: i32 = 5;
 const SW_MINIMIZE: i32 = 6;
@@ -89,6 +98,15 @@ const WM_STYLECHANGED: u32 = 0x007D;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_NCCALCSIZE: u32 = 0x0083;
 const WM_NCHITTEST: u32 = 0x0084;
+// f174 surface trace. These four are the window events a GPU swapchain can be
+// invalidated by, and they are read-only observers (each still falls through to
+// `DefSubclassProc`): `WM_SIZE` carries the 0x0 a minimise sends, `WM_SHOWWINDOW`
+// the hide/show a `SW_HIDE`/`SW_SHOW` performs, and the other two a DPI or
+// desktop-resolution change.
+const WM_SIZE: u32 = 0x0005;
+const WM_SHOWWINDOW: u32 = 0x0018;
+const WM_DISPLAYCHANGE: u32 = 0x007E;
+const WM_DPICHANGED: u32 = 0x02E0;
 // Non-client paint/activation messages. `WM_NCPAINT` paints the (now
 // zero-sized) non-client area; `WM_NCACTIVATE` is delivered on every
 // activation and deactivation change and its default handler repaints the
@@ -127,6 +145,10 @@ const DWMWCP_ROUND: u32 = 2;
 const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
 /// `DWM_BB_ENABLE` (dwmapi.h): the `enable` field of `DWM_BLURBEHIND` is set.
 const DWM_BB_ENABLE: u32 = 0x0000_0001;
+/// `DWMWA_CLOAKED` (dwmapi.h): non-zero for a window DWM does not compose -
+/// another virtual desktop's windows, suspended UWP shells. They must never
+/// count as occlusion.
+const DWMWA_CLOAKED: u32 = 14;
 
 /// `DWM_BLURBEHIND` (dwmapi.h) for the legacy blur-behind call.
 ///
@@ -280,6 +302,17 @@ extern "system" {
 
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
 
+    // f152: the read-only z-order walk behind `is_fully_covered`. `GetTopWindow`
+    // starts at the topmost top-level window and `GetWindow(GW_HWNDNEXT)` walks
+    // down, which is exactly the order a sample point must be tested in.
+    fn GetTopWindow(hwnd: isize) -> isize;
+
+    fn GetWindow(hwnd: isize, cmd: u32) -> isize;
+
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+
+    fn ClientToScreen(hwnd: isize, point: *mut Point) -> i32;
+
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
 
     fn IsWindowVisible(hwnd: isize) -> i32;
@@ -317,6 +350,8 @@ extern "system" {
 extern "system" {
     fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const u8, size: u32) -> i32;
 
+    fn DwmGetWindowAttribute(hwnd: isize, attribute: u32, value: *mut u8, size: u32) -> i32;
+
     fn DwmEnableBlurBehindWindow(hwnd: isize, data: *const BlurBehind) -> i32;
 }
 
@@ -335,25 +370,46 @@ extern "system" {
 
 /// `THREAD_PRIORITY_HIGHEST` (winbase.h).
 const THREAD_PRIORITY_HIGHEST: i32 = 2;
-/// `BELOW_NORMAL_PRIORITY_CLASS` (winbase.h).
-const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+/// `NORMAL_PRIORITY_CLASS` (winbase.h).
+const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
 
-/// Hand the machine back to the rest of the desktop, and keep our own UI on top
-/// of our own workers.
+/// Keep our own UI on top of our own workers without starving playback.
 ///
-/// The app used to run at `NORMAL_PRIORITY_CLASS` with every thread at normal
-/// priority: 16 network workers, three decode threads, the fish worker and the
-/// Slint event loop all competed as equals, so a playing video could starve the
-/// window that draws it *and* every other application on the machine. Setting
-/// the **process** class below normal fixes the second half (any other app wins
-/// against us), and raising the **UI thread** inside that class fixes the first
-/// (the event loop always wins against our network/decode threads, which stay at
-/// the class default, i.e. below normal in absolute terms).
+/// History: the **process** used to be put in `BELOW_NORMAL_PRIORITY_CLASS`
+/// (any other desktop app then outranks us) with the **UI thread** at
+/// `THREAD_PRIORITY_HIGHEST` inside it, and every other thread - the pacer, the
+/// pipe reader, the network pool - left at the class default.
+///
+/// That class default is the problem. In the below-normal class a thread's base
+/// priority is 6, so it runs only when nothing at 8 or above is ready. On a
+/// machine that is genuinely busy with normal-priority work it is not "a bit
+/// slower": it is scheduled out completely. Measured on this host while 13
+/// normal-priority `UnityShaderCompiler` processes kept all 12 logical CPUs busy
+/// (Windows perf counters: `_Total=1174` of `1200`):
+///
+///   * a below-normal `ffmpeg` decoding one 1080p frame used **0.34 s of CPU in
+///     65 s** and never produced it; the same command at normal priority
+///     produced it in 4.0 s (`cpu=0.50 s`);
+///   * the *pacer* thread (class default, i.e. below normal) printed one 1 Hz
+///     heartbeat in 13 s and never ran the startup timeout that would have
+///     released the first frame, while the ring already held 16 frames.
+///
+/// The result the owner saw was a player window that opened and never showed a
+/// picture, with `pacer beat frames=0 pushes=0 ring=16` and no decoder error.
+///
+/// So the process now stays at the **normal** class - the class every other
+/// desktop application runs in, and the class ffmpeg/ffplay themselves expect -
+/// and the UI thread is raised to `HIGHEST` inside it (base 10 vs 8). That keeps
+/// the original goal ("the event loop always beats our own network / decode
+/// threads") and additionally makes us beat other apps' background work, while
+/// everything we spawn gets a fair share of the machine instead of none.
+/// Throughput-only workers still lower *themselves* (see
+/// `player::lower_current_thread_priority` and `netpool`).
 ///
 /// Call once, from the thread that runs the Slint event loop.
 pub fn tune_priorities() {
     unsafe {
-        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
 }
@@ -568,6 +624,61 @@ pub fn prepare_frameless(window: &slint::Window) -> bool {
 ///   through [`set_close_hook`]: the hook runs and the window stays alive
 ///   (returning 0 suppresses the default destroy). The player and mini windows
 ///   have no registered hook and keep their normal close behaviour.
+/// Whether the f174 surface trace is on (`BILI_SURFACE_TRACE=1`).
+///
+/// Read once per process: the hook runs on every window message, so the check
+/// must be an atomic load, not a `GetEnvironmentVariableW`.
+fn surface_trace_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BILI_SURFACE_TRACE")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    })
+}
+
+/// One `f174 surface ...` line: the event, the numbers it carries, and the
+/// window's state right after it (size, visibility, maximise/minimise).
+///
+/// Read-only. Called only from the messages a swapchain cares about, and only
+/// when [`surface_trace_on`] is true.
+fn surface_trace(msg: u32, hwnd: isize, wparam: usize, lparam: isize) {
+    let detail = match msg {
+        WM_SIZE => format!(
+            "event=size w={} h={} minimized={}",
+            lparam as u32 & 0xFFFF,
+            (lparam as u32 >> 16) & 0xFFFF,
+            u8::from(wparam == 1)
+        ),
+        WM_SHOWWINDOW => format!("event=showwindow shown={}", wparam & 0xFF),
+        WM_DPICHANGED => format!("event=dpichanged dpi={}", wparam & 0xFFFF),
+        WM_DISPLAYCHANGE => format!(
+            "event=displaychange w={} h={} bpp={}",
+            lparam as u32 & 0xFFFF,
+            (lparam as u32 >> 16) & 0xFFFF,
+            wparam
+        ),
+        other => format!("event=0x{other:04X}"),
+    };
+    let mut client = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut window = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    let client_ok = unsafe { GetClientRect(hwnd, &mut client) } != 0;
+    let window_ok = unsafe { GetWindowRect(hwnd, &mut window) } != 0;
+    crate::debug_log(&format!(
+        "f174 surface {detail} hwnd={hwnd} visible={} iconic={} zoomed={} client={}x{} rect={}x{}",
+        unsafe { IsWindowVisible(hwnd) },
+        unsafe { IsIconic(hwnd) },
+        unsafe { IsZoomed(hwnd) },
+        client.right - client.left,
+        client.bottom - client.top,
+        if window_ok { window.right - window.left } else { -1 },
+        if window_ok { window.bottom - window.top } else { -1 },
+    ));
+    if !client_ok {
+        crate::debug_log("f174 surface client rect unavailable");
+    }
+}
+
 unsafe extern "system" fn subclass_proc(
     hwnd: isize,
     msg: u32,
@@ -577,6 +688,15 @@ unsafe extern "system" fn subclass_proc(
     _data: usize,
 ) -> isize {
     match msg {
+        // f174: surface-event trace. `BILI_SURFACE_TRACE=1` records the four
+        // window events a GPU swapchain can be invalidated by, with the handle,
+        // the size it carries and the window's state right after it - so a
+        // surface failure can be tied to the event that caused it instead of
+        // being "somewhere in the last 55 seconds". Read-only: the match arm
+        // records and falls through to the same `DefSubclassProc` as before.
+        WM_SIZE | WM_SHOWWINDOW | WM_DPICHANGED | WM_DISPLAYCHANGE if surface_trace_on() => {
+            surface_trace(msg, hwnd, wparam, lparam);
+        }
         // Client area == whole window for both the "proposed parameters" and
         // the plain window-rect form. Falling through to DefWindowProc here
         // would compute the standard caption + border frame.
@@ -895,6 +1015,9 @@ pub fn set_visible(window: &slint::Window, visible: bool) -> bool {
     let Some(hwnd) = hwnd_of(window) else {
         return false;
     };
+    if surface_trace_on() {
+        crate::debug_log(&format!("f174 surface app=set_visible(false) hwnd={hwnd}"));
+    }
     unsafe { ShowWindow(hwnd, SW_HIDE) };
     true
 }
@@ -949,6 +1072,21 @@ pub fn set_move_hook(window: &slint::Window, hook: impl Fn() + Send + Sync + 'st
     }
 }
 
+/// Whether a `WM_MOVE` observer is already registered for this window.
+///
+/// The player/mini watchdog uses this to publish the wallpaper exactly ONCE when
+/// its move hook is first installed (the saved layout is applied before the hook
+/// exists), without polling the position on every tick.
+pub fn move_hook_registered(window: &slint::Window) -> bool {
+    let Some(hwnd) = hwnd_of(window) else {
+        return false;
+    };
+    MOVE_HOOKS
+        .lock()
+        .map(|hooks| hooks.iter().any(|(move_hwnd, _)| *move_hwnd == hwnd))
+        .unwrap_or(false)
+}
+
 /// Post `WM_CLOSE` to a window, as the ✕ / Alt+F4 / taskbar close would.///
 /// Diagnostic only (`BILI_PLAYER_CLOSE_TEST=native`): no synthetic input is
 /// involved, the message goes straight to the window procedure. Best-effort.
@@ -971,6 +1109,167 @@ pub fn window_rect(window: &slint::Window) -> Option<(i32, i32, i32, i32)> {
         rect.right.saturating_sub(rect.left),
         rect.bottom.saturating_sub(rect.top),
     ))
+}
+
+/// Sample points of an 8x8 grid over a client rect: the centre of each cell.
+///
+/// Sampling (instead of a full rectangle union) is deliberate: it answers "is
+/// ANY part visible" cheaply and correctly for the shapes real windows have.
+/// The cell centres mean a sliver narrower than 1/8 of the window at an edge is
+/// not seen, which is exactly the "completely occluded" case we care about.
+fn occlusion_samples(x: i32, y: i32, w: i32, h: i32) -> [(i32, i32); 64] {
+    let mut points = [(0, 0); 64];
+    for row in 0..8i32 {
+        for col in 0..8i32 {
+            // (2 * n + 1) / 16 = the centre of cell n of 8.
+            let px = x.saturating_add(w.saturating_mul(2 * col + 1) / 16);
+            let py = y.saturating_add(h.saturating_mul(2 * row + 1) / 16);
+            points[(row * 8 + col) as usize] = (px, py);
+        }
+    }
+    points
+}
+
+/// Whether a top-level window may cover our client area.
+///
+/// Visible, non-minimised, not cloaked by DWM, and not one of our own
+/// click-through/tooltip helper windows. Other top-level windows of THIS app
+/// (the other players) do count: two overlapping players is the case this
+/// exists for.
+fn window_covers(win: isize, own_pid: u32) -> bool {
+    // SAFETY: read-only queries; every value is only used for this decision.
+    unsafe {
+        if IsWindowVisible(win) == 0 || IsIconic(win) != 0 {
+            return false;
+        }
+        let mut cloaked: u32 = 0;
+        let cloaked_hr = DwmGetWindowAttribute(
+            win,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut u8,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if cloaked_hr >= 0 && cloaked != 0 {
+            return false;
+        }
+        let ex_style = GetWindowLongPtrW(win, GWL_EXSTYLE);
+        // A click-through window cannot occlude by design.
+        if ex_style & WS_EX_TRANSPARENT != 0 {
+            return false;
+        }
+        // Our own tooltips are owned floating helpers, never content. Another
+        // process' tooltip is still an opaque window above us and counts.
+        if ex_style & WS_EX_TOOLWINDOW != 0 {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(win, &mut pid);
+            if pid == own_pid {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether `hwnd` is completely covered by windows above it in the z-order.
+///
+/// This is the f152 contract behind the occlusion pause: Windows does not
+/// composite a window that no pixel of is visible, so its picture stops while
+/// its audio would keep playing. The test walks the z-order from the topmost
+/// window down to `hwnd` (top-level siblings only), takes the windows that can
+/// really paint (see [`window_covers`]), and checks an 8x8 grid of the CLIENT
+/// rect against their outer rects. Only when every one of the 64 sample points
+/// is inside some covering window is the window "fully covered"; one uncovered
+/// sample (a partial overlap, a gap, a taskbar sliver) is enough to keep it
+/// playing.
+///
+/// The window itself is never tested. An invisible or minimised window, a
+/// window with no client area, or a handle that is not in the top-level
+/// z-order chain reports `false` (nothing to pause).
+pub fn is_fully_covered(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: read-only Win32 queries on a live top-level handle.
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+            return false;
+        }
+        let mut client = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetClientRect(hwnd, &mut client) == 0 {
+            return false;
+        }
+        let width = client.right.saturating_sub(client.left);
+        let height = client.bottom.saturating_sub(client.top);
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        // GetClientRect is client-relative; the grid must be in screen px.
+        let mut origin = Point { x: 0, y: 0 };
+        if ClientToScreen(hwnd, &mut origin) == 0 {
+            return false;
+        }
+        let points = occlusion_samples(origin.x, origin.y, width, height);
+        let mut covered = [false; 64];
+        let mut covered_count = 0usize;
+        let own_pid = std::process::id();
+        let mut current = GetTopWindow(0);
+        while current != 0 && current != hwnd {
+            if window_covers(current, own_pid) {
+                let mut rect = Rect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if GetWindowRect(current, &mut rect) != 0 {
+                    for (index, point) in points.iter().enumerate() {
+                        if covered[index] {
+                            continue;
+                        }
+                        if point.0 >= rect.left
+                            && point.0 < rect.right
+                            && point.1 >= rect.top
+                            && point.1 < rect.bottom
+                        {
+                            covered[index] = true;
+                            covered_count += 1;
+                        }
+                    }
+                    if covered_count == points.len() {
+                        return true;
+                    }
+                }
+            }
+            current = GetWindow(current, GW_HWNDNEXT);
+        }
+    }
+    false
+}
+
+/// Raise a window to the top of the non-topmost z-order without activating it.
+///
+/// Used by the QA runs to establish a known stacking order (two overlapping
+/// players) without stealing focus. Returns `false` without a native handle.
+pub fn raise(window: &slint::Window) -> bool {
+    let Some(hwnd) = hwnd_of(window) else {
+        return false;
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0, // HWND_TOP
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        ) != 0
+    }
 }
 
 /// The live cursor in physical screen pixels.
@@ -1063,6 +1362,9 @@ pub fn minimize(window: &slint::Window) -> bool {
     let Some(hwnd) = hwnd_of(window) else {
         return false;
     };
+    if surface_trace_on() {
+        crate::debug_log(&format!("f174 surface app=minimize hwnd={hwnd}"));
+    }
     unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
     true
 }
@@ -1077,6 +1379,9 @@ pub fn restore(window: &slint::Window) -> bool {
     let Some(hwnd) = hwnd_of(window) else {
         return false;
     };
+    if surface_trace_on() {
+        crate::debug_log(&format!("f174 surface app=restore hwnd={hwnd}"));
+    }
     show_preserving_zoom(hwnd);
     true
 }
@@ -2148,13 +2453,17 @@ struct SessionEnumeratorVtbl {
     get_session: unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> i32,
 }
 
-/// `IAudioSessionControl2`, after its `IAudioSessionControl` base (nine
-/// unused methods): `GetSessionIdentifier`, `GetSessionInstanceIdentifier`,
-/// `GetProcessId`, `IsSystemSoundsSession`, `SetDuckingPreference`.
+/// `IAudioSessionControl2`, after its `IAudioSessionControl` base. The base's
+/// first method, `GetState`, is the one piece f152 reads (a suspended process
+/// stops rendering and its session turns `Inactive`); the other eight methods
+/// stay unused slots. Then `GetSessionIdentifier`,
+/// `GetSessionInstanceIdentifier`, `GetProcessId`, `IsSystemSoundsSession`,
+/// `SetDuckingPreference`.
 #[repr(C)]
 struct SessionControl2Vtbl {
     head: ComVtblHead,
-    base: [VtblSlot; 9],
+    get_state: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32,
+    base_rest: [VtblSlot; 8],
     get_session_identifier: VtblSlot,
     get_session_instance_identifier: VtblSlot,
     get_process_id: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
@@ -2297,6 +2606,19 @@ fn normalise_level(volume: f32) -> Option<f32> {
 /// Find `pid`'s `ISimpleAudioVolume` in the default render device's session
 /// list. Returns one owned reference.
 unsafe fn find_session_volume(pid: u32) -> Option<ComRef> {
+    find_session_pair(pid).and_then(|(_control, volume)| volume)
+}
+
+/// Walk the render sessions once and return both interfaces of `pid`'s session:
+/// `IAudioSessionControl2` (state, pid, ducking) and, when available,
+/// `ISimpleAudioVolume` (the fader).
+///
+/// The control interface MUST come from the session object itself: the cached
+/// fader is an `ISimpleAudioVolume`, whose vtable has `SetMasterVolume` where
+/// `IAudioSessionControl` has `GetState`. Reading state through the fader
+/// pointer therefore called SetMasterVolume with a garbage level (it also
+/// explains why every read looked `Inactive`).
+unsafe fn find_session_pair(pid: u32) -> Option<(ComRef, Option<ComRef>)> {
     let mut raw: *mut c_void = std::ptr::null_mut();
     let hr = CoCreateInstance(
         &CLSID_MM_DEVICE_ENUMERATOR,
@@ -2370,11 +2692,10 @@ unsafe fn find_session_volume(pid: u32) -> Option<ComRef> {
         if hr < 0 || session_pid != pid {
             continue;
         }
-        // QI from the base interface: both come from the same session object.
-        if let Some(raw) = com_query_interface(control.as_ptr(), &IID_ISIMPLE_AUDIO_VOLUME) {
-            return ComRef::from_raw(raw);
-        }
-        continue;
+        // Both interfaces belong to the same session object; QI from the base.
+        let volume = com_query_interface(control.as_ptr(), &IID_ISIMPLE_AUDIO_VOLUME)
+            .and_then(|raw| ComRef::from_raw(raw));
+        return Some((control2, volume));
     }
     None
 }
@@ -2502,6 +2823,29 @@ pub fn audio_session_get(pid: u32) -> Option<(f32, bool)> {
         return None;
     }
     Some((level, mute != 0))
+}
+
+/// Windows `AudioSessionState` for `pid`'s render session:
+/// `0` = `Inactive` (no stream is rendering), `1` = `Active`, `2` = `Expired`.
+///
+/// This is the audio evidence behind the occlusion pause: suspending the
+/// `ffplay` process stops its WASAPI stream, so the session reads `Inactive`
+/// while the picture is held and `Active` again after the resume. `None` when
+/// the process has no session (yet) or COM fails.
+pub fn audio_session_state(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    // Walk the sessions directly: the cached pointer is an ISimpleAudioVolume,
+    // whose first method is SetMasterVolume, not GetState.
+    let (control, _volume) = unsafe { find_session_pair(pid) }?;
+    let mut state = 0i32;
+    let hr =
+        unsafe { (vtbl::<SessionControl2Vtbl>(control.as_ptr()).get_state)(control.as_ptr(), &mut state) };
+    if hr < 0 {
+        return None;
+    }
+    Some(state.max(0) as u32)
 }
 
 /// `ffplay.exe` processes whose parent is this process (diagnostics).
@@ -2806,6 +3150,37 @@ fn maybe_start_audio_session_selftest() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occlusion_grid_has_64_points_inside_the_client_rect() {
+        let points = occlusion_samples(100, 200, 800, 600);
+        assert_eq!(points.len(), 64);
+        for (x, y) in points {
+            assert!((100..900).contains(&x), "x={x}");
+            assert!((200..800).contains(&y), "y={y}");
+        }
+        // The first/last samples are the centres of the corner cells, not the
+        // corners themselves.
+        assert_eq!(points[0], (150, 237));
+        assert_eq!(points[63], ((100 + 800 * 15 / 16), (200 + 600 * 15 / 16)));
+    }
+
+    #[test]
+    fn occlusion_grid_follows_the_rect_origin_and_size() {
+        let a = occlusion_samples(0, 0, 80, 80);
+        // Cell centre = 5px in an 80px window; index 9 is row 1, column 1.
+        assert_eq!(a[0], (5, 5));
+        assert_eq!(a[9], (15, 15));
+        let b = occlusion_samples(10, 20, 80, 80);
+        assert_eq!(b[0], (15, 25));
+    }
+
+    #[test]
+    fn occlusion_samples_do_not_overflow_on_extreme_coordinates() {
+        // Saturating arithmetic, never a panic on a screen-sized rect.
+        let points = occlusion_samples(i32::MAX - 10, i32::MIN + 10, 4000, 4000);
+        assert_eq!(points.len(), 64);
+    }
 
     #[test]
     fn drag_target_follows_cursor_delta() {

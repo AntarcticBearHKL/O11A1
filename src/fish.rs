@@ -1,22 +1,28 @@
 //! 养鱼：一条住在鱼缸里的鲸鱼（DeepSeek）替鱼主人先看视频。
 //!
-//! The engine walks the home feed, gathers cheap **text** signals per video
-//! (metadata → Bilibili's own AI summary/outline/transcript → top comments +
-//! danmaku peaks), asks DeepSeek for a verdict, and stores everything in an
-//! embedded SQLite database (`fish.db`, next to `settings.json`).
+//! The engine walks the home feed and runs an auditable **watch plan** per
+//! video (see `fishwatch`): metadata, official subtitle/outline, top comments
+//! and danmaku peaks, optional local Whisper transcription, optional sampled
+//! frames observed by DeepSeek vision. It then asks DeepSeek for a verdict and
+//! stores both the verdict and its evidence in an embedded SQLite database
+//! (`fish.db`, next to `settings.json`).
 //!
 //! Design rules that the rest of this module relies on:
 //!
-//! * **No ASR, no media download.** Only text ever leaves Bilibili: the feed
-//!   item, `conclusion/get` (which includes Bilibili's own transcript), and —
-//!   when there is no transcript — the top comments and per-minute danmaku
-//!   counts. A video without any of those is judged on metadata alone and the
-//!   prompt says so.
+//! * **Every channel is a step.** A step that cannot run is recorded as
+//!   `skipped(reason)` and the evidence line says so; it never silently
+//!   disappears. Tiers (T0–T4) are presets of steps; the owner may edit each
+//!   switch, which becomes 自定义.
+//! * **A conversation with the player.** ASR polls an atomic playback flag and
+//!   waits while any player is playing or buffering (`fish asr paused
+//!   reason=playback` → `fish asr resumed waited_ms=…`). Audio for the fish has
+//!   its own cache (`cache/fishaudio`, 2 GB LRU), separate from playback.
 //! * **Never invent numbers.** Token counts come from DeepSeek's `usage`
-//!   block; there is no cost estimate because there is no price table here.
-//! * **One worker thread, one request in flight.** The worker `block_on`s the
-//!   process-wide Tokio runtime, so Bilibili sees at most one conclusion call at
-//!   a time with at least [`CONCLUSION_MIN_GAP_MS`] between starts.
+//!   block (vision batches included); coverage is *timed seconds covered*, not
+//!   characters.
+//! * **One worker thread, one video at a time.** The worker `block_on`s the
+//!   process-wide Tokio runtime; `conclusion/get` is spaced by
+//!   [`crate::fishwatch::transcript::ConclusionGate`].
 //!
 //! The UI layer consumes [`FishEngine::snapshot`], [`FishEngine::stats`] and
 //! [`FishEngine::verdicts`]; it never touches SQLite itself.
@@ -25,19 +31,24 @@
 // pass (`main.rs` and `ui/app.slint` belong to another change). Until then the
 // whole module would be one long dead-code warning; remove this once
 // `snapshot`/`stats`/`verdicts` are called from the app.
-#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::bilibili::{Conclusion, FishMeta, Session};
+use crate::bilibili::Session;
+use crate::fishwatch::evidence::Evidence;
+use crate::fishwatch::transcript::ConclusionGate;
+use crate::fishwatch::{
+    AsrOptions, DeepseekOptions, Gathered, Meta, StepSelection, VisionOptions, WatchConfig,
+    WatchCtx, WatchRun,
+};
 use crate::settings::{self, Settings};
 
 /// One feed card, as handed over by `bilibili::homepage_feed_from`.
@@ -138,7 +149,7 @@ pub fn active_preset(instruction: &str) -> Option<&'static FishPreset> {
 /// OpenAI-compatible chat completions endpoint.
 const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
 /// Bump when [`SCHEMA`] changes; stored in `kv('schema_version')`.
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 /// Front of a transcript that is always kept, in characters.
 const PROMPT_HEAD_CHARS: usize = 12_000;
 /// Tail of a long transcript that is kept so the ending is never lost.
@@ -151,18 +162,9 @@ const PROMPT_COMMENT_CHARS: usize = 240;
 const PROMPT_COMMENTS_BUDGET: usize = 2_000;
 /// A video judged less than this long ago is not queued again.
 const DEDUPE_WINDOW_S: i64 = 7 * 24 * 3600;
-/// Hard ceiling on gathering one video's material (all Bilibili calls included).
-const JOB_TIMEOUT_S: u64 = 75;
-/// Minimum pause between two `conclusion/get` calls (Bilibili risk control).
-const CONCLUSION_MIN_GAP_MS: u64 = 1_500;
-/// Extra attempts after a `-352` / `-412` answer.
-const CONCLUSION_MAX_RETRIES: u32 = 3;
-/// Top-level comments kept as the "what is in it" fallback.
-const COMMENT_LIMIT: usize = 20;
 /// Busiest danmaku minutes kept in the fallback signal.
+#[cfg(test)]
 const DANMAKU_TOP_MINUTES: usize = 5;
-/// Danmaku is only scanned for the first hour (10 segments), to bound traffic.
-const DANMAKU_MAX_SECONDS: u64 = 3_600;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS kv (
@@ -210,7 +212,14 @@ CREATE TABLE IF NOT EXISTS verdicts (
     tokens_in    INTEGER NOT NULL DEFAULT 0,
     tokens_out   INTEGER NOT NULL DEFAULT 0,
     elapsed_ms   INTEGER NOT NULL DEFAULT 0,
-    error        TEXT
+    error        TEXT,
+    channels      TEXT NOT NULL DEFAULT '',
+    coverage      REAL NOT NULL DEFAULT 0,
+    coverage_note TEXT NOT NULL DEFAULT '',
+    cost_ms       INTEGER NOT NULL DEFAULT 0,
+    cost_bytes    INTEGER NOT NULL DEFAULT 0,
+    cost_tokens   INTEGER NOT NULL DEFAULT 0,
+    steps_json    TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS queue (
     bvid       TEXT PRIMARY KEY,
@@ -222,7 +231,7 @@ CREATE TABLE IF NOT EXISTS queue (
 );
 CREATE INDEX IF NOT EXISTS idx_verdicts_at ON verdicts(at DESC);
 CREATE INDEX IF NOT EXISTS idx_queue_state ON queue(state, priority DESC);
-INSERT INTO kv (k, v) VALUES ('schema_version', '1') ON CONFLICT(k) DO NOTHING;
+INSERT INTO kv (k, v) VALUES ('schema_version', '2') ON CONFLICT(k) DO UPDATE SET v = excluded.v;
 "#;
 
 /// 养鱼出巡的流水线。
@@ -289,15 +298,16 @@ pub struct VerdictView {
     pub at: i64,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// 看片证据：channels / coverage / cost / per-step detail.
+    pub evidence: Evidence,
 }
 
 /// Aggregate view of the last `days` days (`0` = everything).
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub struct FishStats {
     pub watched: u32,
     pub recommend: u32,
-    pub skip: u32,
-    pub maybe: u32,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub top_tags: Vec<(String, u32)>,
@@ -305,13 +315,73 @@ pub struct FishStats {
     pub score_histogram: [u32; 11],
 }
 
+/// The four numbers one window shows: how many videos were judged, how they
+/// split, and what they cost. `Default` is the all-zero window, which is what
+/// a fresh install renders.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FishCounts {
+    pub watched: u32,
+    pub recommend: u32,
+    pub skip: u32,
+    pub maybe: u32,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+impl FishCounts {
+    /// Total tokens spent (in + out), the number the header prints as `1.2k tok`.
+    pub fn tokens(&self) -> u64 {
+        self.tokens_in.saturating_add(self.tokens_out)
+    }
+}
+
+/// Everything the 鱼缸 header shows: **today** (local midnight → now) is the
+/// number the owner acts on; 7 and 30 days are the small print beside it.
+///
+/// Windows are local *calendar* days, not rolling 24h blocks: "今日 3 条" has to
+/// mean the same thing as the 今天 section of the history, otherwise the two
+/// disagree for a few hours around midnight.
+#[derive(Clone, Debug, Default)]
+pub struct FishDashboard {
+    pub today: FishCounts,
+    pub week: FishCounts,
+    pub month: FishCounts,
+    pub top_tags: Vec<(String, u32)>,
+    pub score_histogram: [u32; 11],
+}
+
+/// One day's worth of history, newest verdict first.
+#[derive(Clone, Debug, Default)]
+pub struct FishDayGroup {
+    /// Local day number (days since the Unix epoch in local time).
+    pub day: i64,
+    /// `今天 · 3 条` / `昨天 · 5 条` / `10-24 周六 · 2 条`.
+    pub label: String,
+    pub rows: Vec<VerdictView>,
+}
+
+impl FishDayGroup {
+    pub fn count(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// What a 清空 left behind, printed by the UI and logged as
+/// `fish clear queue=… verdicts_kept=…`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClearReport {
+    /// Queue rows deleted (pending / running / error).
+    pub cleared: usize,
+    /// Verdict rows still in the database: history is never touched.
+    pub verdicts_kept: usize,
+}
+
+#[cfg(test)]
 impl Default for FishStats {
     fn default() -> Self {
         FishStats {
             watched: 0,
             recommend: 0,
-            skip: 0,
-            maybe: 0,
             tokens_in: 0,
             tokens_out: 0,
             top_tags: Vec::new(),
@@ -346,19 +416,103 @@ struct EngineConfig {
     budget_videos: u32,
     interval_ms: u64,
     endpoint: String,
+    /// 看片力度 + ASR/视觉参数，passed to `fishwatch` unchanged.
+    watch: WatchConfig,
 }
 
 impl EngineConfig {
     fn from_settings(settings: &Settings) -> Self {
+        let model = settings::normalise_fish_model(&settings.fish_model);
+        let key = settings.deepseek_key.trim().to_string();
+        let endpoint = DEEPSEEK_URL.to_string();
         EngineConfig {
-            key: settings.deepseek_key.trim().to_string(),
-            model: settings::normalise_fish_model(&settings.fish_model),
+            key: key.clone(),
+            model: model.clone(),
             instruction: settings::normalise_fish_instruction(&settings.fish_instruction),
             budget_videos: settings::normalise_fish_budget(settings.fish_budget_videos),
             interval_ms: settings::normalise_fish_interval(settings.fish_interval_ms),
-            endpoint: DEEPSEEK_URL.to_string(),
+            endpoint: endpoint.clone(),
+            watch: watch_config_from_settings(settings, &key, &model, &endpoint),
         }
     }
+
+    /// The per-run config with the current online state. The step selection was
+    /// snapshotted in [`EngineConfig::from_settings`], so a mid-run settings
+    /// edit only applies to the next video.
+    fn watch_config(&self, online: bool) -> WatchConfig {
+        let mut watch = self.watch.clone();
+        watch.online = online;
+        watch.deepseek = DeepseekOptions {
+            key: self.key.clone(),
+            model: self.model.clone(),
+            endpoint: self.endpoint.clone(),
+        };
+        watch
+    }
+}
+
+/// Expand the owner's tier/switches into a watch config. `fish_tier < 5` is a
+/// preset: its six stored switches are ignored, so a hand-edited file can never
+/// hold a tier that disagrees with its switches. The 自定义 tier uses them, and
+/// an all-off selection is repaired to T1 (a run with no steps has no evidence).
+fn watch_config_from_settings(
+    settings: &Settings,
+    key: &str,
+    model: &str,
+    endpoint: &str,
+) -> WatchConfig {
+    let tier = settings::normalise_fish_tier(settings.fish_tier);
+    let mut selection = if tier < settings::FISH_TIER_CUSTOM {
+        StepSelection::for_tier(tier)
+    } else {
+        StepSelection {
+            meta: settings.fish_step_meta,
+            subtitle: settings.fish_step_subtitle,
+            outline: settings.fish_step_outline,
+            comments: settings.fish_step_comments,
+            asr: settings.fish_step_asr,
+            frames: settings.fish_step_frames,
+        }
+    };
+    if selection.is_empty() {
+        selection = StepSelection::for_tier(1);
+    }
+    let model_dir = if settings.fish_asr_model_dir.trim().is_empty() {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper")
+    } else {
+        PathBuf::from(settings.fish_asr_model_dir.trim())
+    };
+    WatchConfig {
+        selection,
+        online: false,
+        asr: AsrOptions {
+            enabled: settings.fish_asr_enabled,
+            engine: settings::normalise_fish_asr_engine(&settings.fish_asr_engine),
+            device: settings::normalise_fish_asr_device(&settings.fish_asr_device),
+            model: settings::normalise_fish_asr_model(&settings.fish_asr_model),
+            threads: settings::normalise_fish_asr_threads(settings.fish_asr_threads),
+        },
+        vision: VisionOptions {
+            detail: settings::normalise_fish_vision_detail(&settings.fish_vision_detail),
+            ..VisionOptions::default()
+        },
+        deepseek: DeepseekOptions {
+            key: key.to_string(),
+            model: model.to_string(),
+            endpoint: endpoint.to_string(),
+        },
+        model_dir,
+        audio_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache/fishaudio"),
+        work_dir: std::env::temp_dir().join("o11a1-fishwatch"),
+        ffmpeg: "ffmpeg".to_string(),
+    }
+}
+
+/// The watch config for the UI thread (settings panel / model status), without
+/// opening a session. Kept beside the engine's own expansion so both agree.
+pub(crate) fn watch_config(prefs: &Settings) -> WatchConfig {
+    let model = settings::normalise_fish_model(&prefs.fish_model);
+    watch_config_from_settings(prefs, prefs.deepseek_key.trim(), &model, DEEPSEEK_URL)
 }
 
 /// One queue row the worker picked up.
@@ -393,6 +547,11 @@ struct Materials {
     comments: Vec<StoredComment>,
     danmaku: Vec<Peak>,
     conclusion_code: i32,
+    /// Sampled-frame observations from DeepSeek vision (phase 3). Empty when
+    /// the frames step did not run.
+    frame_observations: String,
+    /// Blind-spot sentence from `fishwatch::coverage`.
+    coverage_note: String,
 }
 
 /// One top comment kept as material.
@@ -437,7 +596,7 @@ pub struct FishEngine {
     current: Mutex<Option<(String, String)>>,
     signals: Mutex<Option<Signals>>,
     hook: Mutex<Option<SnapshotHook>>,
-    last_conclusion: Mutex<Option<Instant>>,
+    conclusion_gate: Arc<ConclusionGate>,
     paused: AtomicBool,
     /// True while a worker thread exists (guards `start` against a second one).
     worker: AtomicBool,
@@ -454,8 +613,15 @@ pub struct FishEngine {
 
 impl FishEngine {
     /// Open (or create) `fish.db` beside `settings.json`.
+    ///
+    /// `BILI_FISH_DB` overrides the path; the QA capture hooks point it at a
+    /// scratch database so an injected fixture never lands in the owner's
+    /// `fish.db`.
     pub fn open() -> Result<Arc<Self>> {
-        Self::open_at(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DB_FILE))
+        let path = std::env::var_os("BILI_FISH_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DB_FILE));
+        Self::open_at(&path)
     }
 
     /// Open a database at an explicit path (tests, and a future custom location).
@@ -497,7 +663,7 @@ impl FishEngine {
             current: Mutex::new(None),
             signals: Mutex::new(None),
             hook: Mutex::new(None),
-            last_conclusion: Mutex::new(None),
+            conclusion_gate: Arc::new(ConclusionGate::default()),
             paused: AtomicBool::new(false),
             worker: AtomicBool::new(false),
             persist: AtomicBool::new(true),
@@ -550,7 +716,8 @@ impl FishEngine {
         snapshot.queued = count(&db, "SELECT COUNT(*) FROM queue WHERE state IN ('pending','running')")
             .unwrap_or(0) as usize;
         snapshot.done =
-            count(&db, "SELECT COUNT(*) FROM verdicts WHERE error IS NULL").unwrap_or(0) as u32;
+            count(&db, "SELECT COUNT(DISTINCT bvid) FROM verdicts WHERE error IS NULL").unwrap_or(0)
+                as u32;
         snapshot.errors =
             count(&db, "SELECT COUNT(*) FROM queue WHERE state = 'error'").unwrap_or(0) as u32;
         if let Ok((tokens_in, tokens_out)) = db.query_row(
@@ -574,44 +741,100 @@ impl FishEngine {
     }
 
     /// Aggregates for the last `days` days; `0` means "since the beginning".
+    #[cfg(test)]
     pub fn stats(&self, days: u32) -> Result<FishStats> {
         let since = if days == 0 {
             0
         } else {
             now() - days as i64 * 86_400
         };
+        let tally = {
+            let db = self.lock_db()?;
+            aggregate_since(&db, since)?
+        };
+        Ok(FishStats {
+            watched: tally.counts.watched,
+            recommend: tally.counts.recommend,
+            tokens_in: tally.counts.tokens_in,
+            tokens_out: tally.counts.tokens_out,
+            top_tags: tally.top_tags,
+            score_histogram: tally.score_histogram,
+        })
+    }
+
+    /// The header's numbers: today / 7 days / 30 days, on **local calendar**
+    /// day boundaries so they agree with the history's day sections.
+    pub fn dashboard(&self) -> Result<FishDashboard> {
+        let offset = local_offset();
+        let today = day_key(now(), offset);
+        // `day_start` is the Unix second of local midnight.
+        let today_start = today * 86_400 - offset;
         let db = self.lock_db()?;
-        let mut statement = db.prepare(
-            "SELECT score, verdict, tags_json, tokens_in, tokens_out FROM verdicts \
-             WHERE error IS NULL AND at >= ?1",
-        )?;
-        let mut rows = statement.query(params![since])?;
-        let mut stats = FishStats::default();
-        let mut tags: HashMap<String, u32> = HashMap::new();
-        while let Some(row) = rows.next()? {
-            let score: f64 = row.get(0)?;
-            let verdict: String = row.get(1)?;
-            let tags_json: String = row.get(2)?;
-            let tokens_in: i64 = row.get(3)?;
-            let tokens_out: i64 = row.get(4)?;
-            stats.watched += 1;
-            match verdict.trim() {
-                "看" => stats.recommend += 1,
-                "不看" => stats.skip += 1,
-                _ => stats.maybe += 1,
-            }
-            stats.tokens_in += tokens_in.max(0) as u64;
-            stats.tokens_out += tokens_out.max(0) as u64;
-            stats.score_histogram[score_bucket(score)] += 1;
-            for tag in parse_string_list(&tags_json) {
-                *tags.entry(tag).or_insert(0) += 1;
-            }
-        }
-        let mut top: Vec<(String, u32)> = tags.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        top.truncate(8);
-        stats.top_tags = top;
-        Ok(stats)
+        let today_tally = aggregate_since(&db, today_start)?;
+        let week_tally = aggregate_since(&db, today_start - 6 * 86_400)?;
+        let month_tally = aggregate_since(&db, today_start - 29 * 86_400)?;
+        Ok(FishDashboard {
+            today: today_tally.counts,
+            week: week_tally.counts,
+            month: month_tally.counts,
+            top_tags: month_tally.top_tags,
+            score_histogram: month_tally.score_histogram,
+        })
+    }
+
+    /// When the owner last cleared the 推荐流, or `0` for "never".
+    ///
+    /// The marker lives in `kv` (not in the verdicts table): 清空 drops the
+    /// queue and hides the cards judged before the click, while every verdict
+    /// row stays readable in 历史.
+    pub fn cleared_at(&self) -> i64 {
+        let Ok(db) = self.lock_db() else {
+            return 0;
+        };
+        db.query_row(
+            "SELECT v FROM kv WHERE k = 'cleared_at'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+    }
+
+    /// 清空推荐流: drop every queue row and pin the cleared marker to *now*.
+    ///
+    /// Verdicts are history and are never deleted — the report says how many
+    /// were kept, and the UI keeps rendering them under 历史.
+    pub fn clear_queue(&self) -> Result<ClearReport> {
+        let at = now();
+        let (cleared, kept) = {
+            let mut db = self.lock_db()?;
+            let tx = db.transaction()?;
+            let cleared = tx.execute(
+                "DELETE FROM queue WHERE state IN ('pending','running','error')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO kv (k, v) VALUES ('cleared_at', ?1) \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![at.to_string()],
+            )?;
+            let kept: i64 = tx.query_row("SELECT COUNT(*) FROM verdicts", [], |row| row.get(0))?;
+            tx.commit()?;
+            (cleared, kept.max(0) as usize)
+        };
+        crate::debug_log(&format!(
+            "fish clear queue={cleared} verdicts_kept={kept}"
+        ));
+        // After the transaction released the connection: `publish` takes the
+        // same lock for its snapshot.
+        self.publish();
+        Ok(ClearReport {
+            cleared,
+            verdicts_kept: kept,
+        })
     }
 
     // -- writing -----------------------------------------------------------
@@ -623,16 +846,33 @@ impl FishEngine {
     /// is already `pending`/`running` keeps its state (only its priority may
     /// rise), so a second `enqueue` never duplicates work in flight.
     pub fn enqueue(&self, items: &[FeedItem]) {
+        self.enqueue_with(items, false);
+    }
+
+    /// Re-watch now: the same queue path without the seven-day dedupe. Used by
+    /// an explicit "再看一次" / QA run; the store keeps the previous verdict as
+    /// history and the feed shows the newest row.
+    pub fn enqueue_now(&self, items: &[FeedItem]) {
+        self.enqueue_with(items, true);
+    }
+
+    /// Test/QA only alias kept so older tests read naturally.
+    #[cfg(test)]
+    pub fn enqueue_forced(&self, items: &[FeedItem]) {
+        self.enqueue_with(items, true);
+    }
+
+    fn enqueue_with(&self, items: &[FeedItem], force: bool) {
         if items.is_empty() {
             return;
         }
-        if let Err(err) = self.enqueue_inner(items) {
+        if let Err(err) = self.enqueue_inner(items, force) {
             crate::debug_log(&format!("fish enqueue failed: {err:#}"));
         }
         self.publish();
     }
 
-    fn enqueue_inner(&self, items: &[FeedItem]) -> Result<()> {
+    fn enqueue_inner(&self, items: &[FeedItem], force: bool) -> Result<()> {
         let at = now();
         let mut db = self.lock_db()?;
         let tx = db.transaction()?;
@@ -642,14 +882,17 @@ impl FishEngine {
             if bvid.is_empty() {
                 continue;
             }
-            let recent: Option<i64> = tx
-                .query_row(
+            let recent: Option<i64> = if force {
+                None
+            } else {
+                tx.query_row(
                     "SELECT at FROM verdicts WHERE bvid = ?1 AND error IS NULL \
                      ORDER BY at DESC LIMIT 1",
                     params![bvid],
                     |row| row.get(0),
                 )
-                .optional()?;
+                .optional()?
+            };
             if let Some(at) = recent {
                 if at >= now() - DEDUPE_WINDOW_S {
                     continue;
@@ -885,26 +1128,51 @@ impl FishEngine {
         None
     }
 
-    /// Gather signals → ask DeepSeek → parse → store.
+    /// Gather signals (through the watch plan) → ask DeepSeek → parse → store.
     fn process(&self, job: &Job, config: &EngineConfig, started: Instant) -> Result<VerdictView> {
-        // A single Bilibili call can be retried, and `danmaku_all` walks up to
-        // ten segments; without a ceiling one slow video would hold the whole
-        // queue (it did: a throttled run sat on one video for the full 45 s).
-        let materials = runtime().block_on(async {
-            match tokio::time::timeout(
-                Duration::from_secs(JOB_TIMEOUT_S),
-                self.gather(job),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(anyhow!("取材料超时（{JOB_TIMEOUT_S}s）")),
+        let base = self.materials_from_db(&job.bvid)?;
+        let signals = self.signals.lock().ok().and_then(|slot| slot.clone());
+        let (materials, mut evidence) = match signals {
+            Some(Signals::Live(session)) => {
+                let watch = config.watch_config(true);
+                let mut ctx = WatchCtx::new(watch, meta_of(&base))
+                    .with_session(session)
+                    .with_gate(self.conclusion_gate.clone());
+                if let Some(gate) = playback_gate() {
+                    ctx = ctx.with_playback_gate(gate);
+                }
+                let run = WatchRun::new(ctx);
+                let timeout = run.timeout();
+                let outcome = runtime()
+                    .block_on(async { tokio::time::timeout(timeout, run.execute()).await })
+                    .map_err(|_| anyhow!("看片超时（{}s）", timeout.as_secs()))?;
+                let materials = materials_from_gathered(&base, &outcome.gathered, &outcome.evidence);
+                (materials, outcome.evidence)
             }
-        })?;
+            #[cfg(test)]
+            Some(Signals::Stub) => {
+                let mut materials = base.clone();
+                stub_materials(&mut materials);
+                (materials, stub_evidence())
+            }
+            None => return Err(anyhow!("养鱼引擎没有可用的 Bilibili 会话")),
+        };
+
         let (system, user) = build_prompt(&materials, &config.instruction);
         let model = config.model.trim();
         let asked = runtime().block_on(self.ask(config, model, &system, &user))?;
         let parsed = parse_verdict(&asked.content);
+        if parsed.verdict == "也许" && parsed.reasons.is_empty() {
+            crate::debug_log(&format!(
+                "fish verdict parse fallback raw={}",
+                clip(&collapse_ws(&asked.content), 400)
+            ));
+        }
+        let total_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        // `cost_ms` already contains every watch step; only the verdict call's
+        // own milliseconds are added, so the evidence line is not double-counted.
+        let verdict_ms = total_ms.saturating_sub(evidence.cost_ms);
+        evidence.append_verdict(verdict_ms, asked.tokens_in, asked.tokens_out);
         let view = VerdictView {
             bvid: materials.bvid.clone(),
             title: materials.title.clone(),
@@ -919,150 +1187,26 @@ impl FishEngine {
             at: now(),
             tokens_in: asked.tokens_in,
             tokens_out: asked.tokens_out,
+            evidence: evidence.clone(),
         };
         let hash = prompt_hash(model, &system, &user);
-        self.store_success(job, &materials, &view, model, &hash, started.elapsed())?;
+        self.store_success(
+            job,
+            &materials,
+            &view,
+            model,
+            &hash,
+            &evidence,
+            started.elapsed(),
+        )?;
         Ok(view)
     }
 
     // -- signals -----------------------------------------------------------
 
-    async fn gather(&self, job: &Job) -> Result<Materials> {
-        let mut materials = self.materials_from_db(&job.bvid)?;
-        let signals = self.signals.lock().ok().and_then(|slot| slot.clone());
-        match signals {
-            Some(Signals::Live(session)) => self.gather_live(&session, job, &mut materials).await?,
-            #[cfg(test)]
-            Some(Signals::Stub) => stub_materials(&mut materials),
-            None => return Err(anyhow!("养鱼引擎没有可用的 Bilibili 会话")),
-        }
-        Ok(materials)
-    }
-
-    /// Signal order: (1) feed metadata, (2) `conclusion/get`, (3) top comments
-    /// and danmaku peaks — **always**, because the comment thread is the one
-    /// signal that is about the video rather than inside it, and the owner
-    /// wants it in the prompt even when an official transcript exists. The
-    /// instruction (4) is added by [`build_prompt`].
-    async fn gather_live(
-        &self,
-        session: &Session,
-        job: &Job,
-        materials: &mut Materials,
-    ) -> Result<()> {
-        match session.fish_meta(&job.bvid).await {
-            Ok(meta) => {
-                materials.absorb_meta(&meta);
-                crate::debug_log(&format!(
-                    "fish step bvid={} signal=metadata cid={} duration_s={} tname={}",
-                    job.bvid, materials.cid, materials.duration_s, materials.tname
-                ));
-            }
-            Err(err) => crate::debug_log(&format!(
-                "fish metadata bvid={} failed: {err:#}",
-                job.bvid
-            )),
-        }
-        if materials.cid == 0 {
-            return Ok(());
-        }
-        match self
-            .conclusion_throttled(session, &job.bvid, materials.cid, materials.up_mid)
-            .await
-        {
-            Ok(conclusion) => {
-                materials.absorb_conclusion(conclusion);
-                if materials.transcript.is_empty() {
-                    crate::debug_log(&format!(
-                        "fish step bvid={} signal=official transcript=empty",
-                        job.bvid
-                    ));
-                } else {
-                    crate::debug_log(&format!(
-                        "fish step bvid={} signal=official transcript_chars={}",
-                        job.bvid,
-                        materials.transcript.chars().count()
-                    ));
-                }
-            }
-            Err(err) => {
-                if crate::bilibili::is_risk_control(&err) {
-                    return Err(err);
-                }
-                crate::debug_log(&format!(
-                    "fish conclusion bvid={} failed: {err:#}",
-                    job.bvid
-                ));
-            }
-        }
-        if materials.aid != 0 {
-            match session.comments(materials.aid, true, "").await {
-                Ok(page) => materials.absorb_comments(page),
-                Err(err) => crate::debug_log(&format!(
-                    "fish comments bvid={} failed: {err:#}",
-                    job.bvid
-                )),
-            }
-        }
-        if materials.duration_s > 0 {
-            let danmaku = session
-                .danmaku_all(materials.cid, materials.duration_s.min(DANMAKU_MAX_SECONDS))
-                .await;
-            materials.absorb_danmaku(&danmaku);
-        }
-        crate::debug_log(&format!(
-            "fish step bvid={} signal=comments comments={} danmaku_peaks={}",
-            job.bvid,
-            materials.comments.len(),
-            materials.danmaku.len()
-        ));
-        Ok(())
-    }
-
-    /// `conclusion/get` with the required spacing and exponential backoff.
-    async fn conclusion_throttled(
-        &self,
-        session: &Session,
-        bvid: &str,
-        cid: u64,
-        up_mid: u64,
-    ) -> Result<Conclusion> {
-        let mut attempt = 0u32;
-        loop {
-            let wait = self
-                .last_conclusion
-                .lock()
-                .ok()
-                .and_then(|guard| *guard)
-                .map(|at| Duration::from_millis(CONCLUSION_MIN_GAP_MS).saturating_sub(at.elapsed()));
-            if let Some(wait) = wait {
-                if !wait.is_zero() {
-                    tokio::time::sleep(wait).await;
-                }
-            }
-            if let Ok(mut guard) = self.last_conclusion.lock() {
-                *guard = Some(Instant::now());
-            }
-            match session.conclusion(bvid, cid, up_mid).await {
-                Ok(conclusion) => return Ok(conclusion),
-                Err(err) => {
-                    if !crate::bilibili::is_risk_control(&err)
-                        || attempt >= CONCLUSION_MAX_RETRIES
-                    {
-                        return Err(err);
-                    }
-                    attempt += 1;
-                    let backoff = Duration::from_millis(CONCLUSION_MIN_GAP_MS * 2u64.pow(attempt));
-                    crate::debug_log(&format!(
-                        "fish backoff bvid={bvid} attempt={attempt} wait_ms={}",
-                        backoff.as_millis()
-                    ));
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-
+    /// The feed metadata row as the watch plan's starting point. The live
+    /// session still asks `x/web-interface/view` in the meta step; this is what
+    /// keeps T0 (and a failed meta call) usable offline.
     fn materials_from_db(&self, bvid: &str) -> Result<Materials> {
         let db = self.lock_db()?;
         let row = db
@@ -1107,7 +1251,8 @@ impl FishEngine {
             ],
             "response_format": { "type": "json_object" },
             "temperature": 0.3,
-            "max_tokens": 600,
+            "max_tokens": 800,
+            "thinking": { "type": "disabled" },
             "stream": false,
         });
         let response = self
@@ -1149,6 +1294,7 @@ impl FishEngine {
 
     // -- persistence -------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn store_success(
         &self,
         job: &Job,
@@ -1156,6 +1302,7 @@ impl FishEngine {
         view: &VerdictView,
         model: &str,
         prompt_hash: &str,
+        evidence: &Evidence,
         elapsed: Duration,
     ) -> Result<()> {
         let at = view.at;
@@ -1166,14 +1313,14 @@ impl FishEngine {
         let tags_json = json_or_empty(&view.tags);
         let chars = materials.transcript.chars().count() as i64;
         let source = if materials.transcript.is_empty() {
-            if materials.transcript_source.is_empty() {
-                "none"
-            } else {
-                materials.transcript_source.as_str()
-            }
-        } else {
+            "none"
+        } else if materials.transcript_source.trim().is_empty() {
             "official"
+        } else {
+            materials.transcript_source.as_str()
         };
+        let channels = evidence.channels_text();
+        let steps_json = evidence.steps_json();
         let mut db = self.lock_db()?;
         let tx = db.transaction()?;
         upsert_video(&tx, materials, at)?;
@@ -1202,8 +1349,10 @@ impl FishEngine {
         )?;
         tx.execute(
             "INSERT INTO verdicts (bvid, at, model, prompt_hash, score, verdict, one_line, \
-             reasons_json, tags_json, quote, tokens_in, tokens_out, elapsed_ms, error) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
+             reasons_json, tags_json, quote, tokens_in, tokens_out, elapsed_ms, error, \
+             channels, coverage, coverage_note, cost_ms, cost_bytes, cost_tokens, steps_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, \
+             ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 materials.bvid,
                 at,
@@ -1217,7 +1366,14 @@ impl FishEngine {
                 view.quote,
                 view.tokens_in as i64,
                 view.tokens_out as i64,
-                elapsed.as_millis().min(i64::MAX as u128) as i64
+                elapsed.as_millis().min(i64::MAX as u128) as i64,
+                channels,
+                evidence.coverage,
+                evidence.coverage_note,
+                evidence.cost_ms as i64,
+                evidence.cost_bytes as i64,
+                evidence.cost_tokens as i64,
+                steps_json
             ],
         )?;
         tx.execute(
@@ -1264,7 +1420,7 @@ impl FishEngine {
             .map_err(|_| anyhow!("养鱼配置锁被污染"))
     }
 
-    fn lock_db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+    pub(crate) fn lock_db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.db
             .lock()
             .map_err(|_| anyhow!("fish.db 锁被污染"))
@@ -1308,9 +1464,12 @@ impl FishEngine {
 
 const VERDICT_SELECT: &str = "SELECT v.bvid, COALESCE(w.title, ''), COALESCE(w.up_name, ''), \
      COALESCE(w.cover, ''), v.score, v.verdict, v.one_line, v.reasons_json, v.tags_json, \
-     v.quote, v.at, v.tokens_in, v.tokens_out \
+     v.quote, v.at, v.tokens_in, v.tokens_out, v.channels, v.coverage, v.coverage_note, \
+     v.cost_ms, v.cost_bytes, v.cost_tokens, v.steps_json \
      FROM verdicts v LEFT JOIN videos w ON w.bvid = v.bvid \
-     WHERE v.error IS NULL ORDER BY v.at DESC, v.id DESC LIMIT ?1";
+     WHERE v.error IS NULL AND v.id = (SELECT v2.id FROM verdicts v2 \
+       WHERE v2.bvid = v.bvid AND v2.error IS NULL ORDER BY v2.at DESC, v2.id DESC LIMIT 1) \
+     ORDER BY v.at DESC, v.id DESC LIMIT ?1";
 
 fn open_db(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)
@@ -1327,14 +1486,49 @@ fn open_db(path: &Path) -> Result<Connection> {
     db.busy_timeout(Duration::from_millis(3_000))?;
     db.execute_batch(SCHEMA)
         .context("创建养鱼数据库表失败")?;
+    migrate_verdict_columns(&db).context("迁移 verdicts 证据列失败")?;
     let version: String = db
         .query_row("SELECT v FROM kv WHERE k = 'schema_version'", [], |row| row.get(0))
         .unwrap_or_else(|_| SCHEMA_VERSION.to_string());
     if version != SCHEMA_VERSION {
-        // Future migrations hook in here; today only version 1 exists.
+        // Future migrations hook in here; today only version 1 → 2 exists, and
+        // the ALTER TABLE pass above is idempotent, so it already ran.
         crate::debug_log(&format!("fish.db schema_version={version}"));
     }
     Ok(db)
+}
+
+/// Add the phase-1 evidence columns to a database created before they existed.
+/// `ALTER TABLE ... ADD COLUMN` is the migration: it is idempotent when guarded
+/// by `PRAGMA table_info`, and every column has a default so historical rows
+/// stay valid without a rewrite.
+fn migrate_verdict_columns(db: &Connection) -> Result<()> {
+    const COLUMNS: [(&str, &str); 7] = [
+        ("channels", "TEXT NOT NULL DEFAULT ''"),
+        ("coverage", "REAL NOT NULL DEFAULT 0"),
+        ("coverage_note", "TEXT NOT NULL DEFAULT ''"),
+        ("cost_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("cost_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("cost_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("steps_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ];
+    let mut statement = db.prepare("PRAGMA table_info(verdicts)")?;
+    let existing: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (name, definition) in COLUMNS {
+        if existing.iter().any(|column| column == name) {
+            continue;
+        }
+        db.execute(
+            &format!("ALTER TABLE verdicts ADD COLUMN {name} {definition}"),
+            [],
+        )
+        .with_context(|| format!("ADD COLUMN {name}"))?;
+        crate::debug_log(&format!("fish.db migrate verdicts add column={name}"));
+    }
+    Ok(())
 }
 
 fn upsert_video(tx: &rusqlite::Transaction<'_>, materials: &Materials, at: i64) -> Result<()> {
@@ -1368,6 +1562,56 @@ fn count(db: &Connection, sql: &str) -> rusqlite::Result<i64> {
     db.query_row(sql, [], |row| row.get(0))
 }
 
+/// One window's numbers, plus the two side tables the panels read.
+struct Tally {
+    counts: FishCounts,
+    score_histogram: [u32; 11],
+    top_tags: Vec<(String, u32)>,
+}
+
+/// Count every video whose **newest** successful verdict is at or after
+/// `since`. Re-judging a video replaces its row in the feed, exactly like
+/// [`FishEngine::verdicts`], so a re-watch never counts twice in one day.
+fn aggregate_since(db: &Connection, since: i64) -> Result<Tally> {
+    let mut statement = db.prepare(
+        "SELECT score, verdict, tags_json, tokens_in, tokens_out FROM verdicts v \
+         WHERE v.error IS NULL AND v.at >= ?1 AND v.id = (SELECT v2.id FROM verdicts v2 \
+           WHERE v2.bvid = v.bvid AND v2.error IS NULL \
+           ORDER BY v2.at DESC, v2.id DESC LIMIT 1)",
+    )?;
+    let mut rows = statement.query(params![since])?;
+    let mut tally = Tally {
+        counts: FishCounts::default(),
+        score_histogram: [0; 11],
+        top_tags: Vec::new(),
+    };
+    let mut tags: HashMap<String, u32> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let score: f64 = row.get(0)?;
+        let verdict: String = row.get(1)?;
+        let tags_json: String = row.get(2)?;
+        let tokens_in: i64 = row.get(3)?;
+        let tokens_out: i64 = row.get(4)?;
+        tally.counts.watched += 1;
+        match verdict.trim() {
+            "看" => tally.counts.recommend += 1,
+            "不看" => tally.counts.skip += 1,
+            _ => tally.counts.maybe += 1,
+        }
+        tally.counts.tokens_in += tokens_in.max(0) as u64;
+        tally.counts.tokens_out += tokens_out.max(0) as u64;
+        tally.score_histogram[score_bucket(score)] += 1;
+        for tag in parse_string_list(&tags_json) {
+            *tags.entry(tag).or_insert(0) += 1;
+        }
+    }
+    let mut top: Vec<(String, u32)> = tags.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top.truncate(8);
+    tally.top_tags = top;
+    Ok(tally)
+}
+
 fn last_verdict(db: &Connection) -> Result<Option<VerdictView>> {
     let mut statement = db.prepare(VERDICT_SELECT)?;
     let mut rows = statement.query(params![1i64])?;
@@ -1380,6 +1624,13 @@ fn last_verdict(db: &Connection) -> Result<Option<VerdictView>> {
 fn verdict_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VerdictView> {
     let reasons: String = row.get(7)?;
     let tags: String = row.get(8)?;
+    let channels: String = row.get(13)?;
+    let coverage: f64 = row.get(14)?;
+    let coverage_note: String = row.get(15)?;
+    let cost_ms: i64 = row.get(16)?;
+    let cost_bytes: i64 = row.get(17)?;
+    let cost_tokens: i64 = row.get(18)?;
+    let steps_json: String = row.get(19)?;
     Ok(VerdictView {
         bvid: row.get(0)?,
         title: row.get(1)?,
@@ -1394,6 +1645,15 @@ fn verdict_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VerdictView> {
         at: row.get(10)?,
         tokens_in: row.get::<_, i64>(11)?.max(0) as u64,
         tokens_out: row.get::<_, i64>(12)?.max(0) as u64,
+        evidence: Evidence::from_columns(
+            &channels,
+            coverage,
+            &coverage_note,
+            cost_ms.max(0) as u64,
+            cost_bytes.max(0) as u64,
+            cost_tokens.max(0) as u64,
+            &steps_json,
+        ),
     })
 }
 
@@ -1409,95 +1669,145 @@ fn json_or_empty<T: Serialize>(value: &T) -> String {
 // Materials
 // ---------------------------------------------------------------------------
 
-impl Materials {
-    fn absorb_meta(&mut self, meta: &FishMeta) {
-        if !meta.title.trim().is_empty() {
-            self.title = meta.title.clone();
-        }
-        if meta.cid > 0 {
-            self.cid = meta.cid;
-        }
-        if meta.aid != 0 {
-            self.aid = meta.aid;
-        }
-        if meta.up_mid > 0 {
-            self.up_mid = meta.up_mid;
-        }
-        if !meta.up_name.trim().is_empty() {
-            self.up_name = meta.up_name.clone();
-        }
-        if meta.duration_s > 0 {
-            self.duration_s = meta.duration_s;
-        }
-        if meta.view > 0 {
-            self.view = meta.view;
-        }
-        if meta.pub_ts > 0 {
-            self.pub_ts = meta.pub_ts;
-        }
-        if !meta.cover.is_empty() {
-            self.cover = meta.cover.clone();
-        }
-        if !meta.tname.trim().is_empty() {
-            self.tname = meta.tname.clone();
-        }
-        if !meta.desc.trim().is_empty() {
-            self.desc = meta.desc.clone();
-        }
-    }
-
-    fn absorb_conclusion(&mut self, conclusion: Conclusion) {
-        self.conclusion_code = conclusion.data_code;
-        if !conclusion.summary.trim().is_empty() {
-            self.summary = conclusion.summary;
-        }
-        if !conclusion.outline.is_empty() {
-            self.outline = conclusion.outline;
-        }
-        if !conclusion.cues.is_empty() {
-            let mut text = String::new();
-            for cue in conclusion.cues {
-                let piece = cue.text.trim();
-                if piece.is_empty() {
-                    continue;
-                }
-                text.push_str(piece);
-                text.push('\n');
-            }
-            if !text.trim().is_empty() {
-                self.transcript = text.trim_end().to_string();
-                self.transcript_source = "official".to_string();
-            }
-        }
-    }
-
-    fn absorb_comments(&mut self, page: crate::bilibili::CommentPage) {
-        let mut all = page.comments;
-        if let Some(top) = page.top {
-            all.push(top);
-        }
-        all.sort_by(|a, b| b.like.cmp(&a.like));
-        self.comments = all
-            .into_iter()
-            .take(COMMENT_LIMIT)
-            .filter_map(|comment| {
-                let text = clip(comment.message.trim(), 300);
-                (!text.is_empty()).then_some(StoredComment {
-                    like: comment.like,
-                    text,
-                })
-            })
-            .collect();
-    }
-
-    fn absorb_danmaku(&mut self, items: &[crate::danmaku::Danmaku]) {
-        self.danmaku = danmaku_peaks(items);
+/// The feed row as the watch plan's starting metadata.
+fn meta_of(materials: &Materials) -> Meta {
+    Meta {
+        bvid: materials.bvid.clone(),
+        cid: materials.cid,
+        aid: materials.aid,
+        title: materials.title.clone(),
+        up_mid: materials.up_mid,
+        up_name: materials.up_name.clone(),
+        duration_s: materials.duration_s,
+        view: materials.view,
+        pub_ts: materials.pub_ts,
+        cover: materials.cover.clone(),
+        tname: materials.tname.clone(),
+        desc: materials.desc.clone(),
     }
 }
 
+/// Fold the watch result back into the row shape `build_prompt` and the
+/// `signals` table already use. The `videos` columns keep the feed's values;
+/// only what the steps learned replaces them.
+fn materials_from_gathered(base: &Materials, gathered: &Gathered, evidence: &Evidence) -> Materials {
+    let mut materials = base.clone();
+    materials.bvid = gathered.meta.bvid.clone();
+    materials.cid = gathered.meta.cid;
+    materials.aid = gathered.meta.aid;
+    materials.title = gathered.meta.title.clone();
+    materials.up_mid = gathered.meta.up_mid;
+    materials.up_name = gathered.meta.up_name.clone();
+    materials.duration_s = gathered.meta.duration_s;
+    materials.view = gathered.meta.view;
+    materials.pub_ts = gathered.meta.pub_ts;
+    materials.cover = gathered.meta.cover.clone();
+    materials.tname = gathered.meta.tname.clone();
+    materials.desc = gathered.meta.desc.clone();
+    materials.summary = gathered.summary.clone();
+    materials.outline = gathered.outline.clone();
+    materials.transcript = gathered.transcript.clone();
+    materials.transcript_source = if gathered.transcript.trim().is_empty() {
+        "none".to_string()
+    } else if gathered.transcript_source.trim().is_empty() {
+        "official".to_string()
+    } else {
+        gathered.transcript_source.clone()
+    };
+    materials.comments = gathered
+        .comments
+        .iter()
+        .map(|comment| StoredComment {
+            like: comment.like,
+            text: comment.text.clone(),
+        })
+        .collect();
+    materials.danmaku = gathered
+        .danmaku
+        .iter()
+        .map(|peak| Peak {
+            minute: peak.minute,
+            count: peak.count,
+            sample: peak.sample.clone(),
+        })
+        .collect();
+    materials.frame_observations = gathered
+        .frames
+        .as_ref()
+        .map(|frames| frames.observations.clone())
+        .unwrap_or_default();
+    materials.coverage_note = evidence.coverage_note.clone();
+    materials
+}
+
+#[cfg(test)]
+fn stub_evidence() -> Evidence {
+    use crate::fishwatch::evidence::StepRecord;
+    let mut evidence = Evidence {
+        channels: "subtitle,comments".to_string(),
+        coverage: 0.5,
+        coverage_note: "离线样例：字幕覆盖 50% 的时长".to_string(),
+        cost_ms: 1,
+        cost_bytes: 0,
+        cost_tokens: 0,
+        steps: vec![
+            StepRecord {
+                id: "meta".to_string(),
+                label: "元数据".to_string(),
+                state: "ok".to_string(),
+                reason: String::new(),
+                ms: 0,
+                bytes: 0,
+                tokens: 0,
+                detail: "feed 元数据".to_string(),
+            },
+            StepRecord {
+                id: "subtitle".to_string(),
+                label: "官方字幕".to_string(),
+                state: "ok".to_string(),
+                reason: String::new(),
+                ms: 1,
+                bytes: 0,
+                tokens: 0,
+                detail: "离线样例".to_string(),
+            },
+            StepRecord {
+                id: "comments".to_string(),
+                label: "热门评论".to_string(),
+                state: "ok".to_string(),
+                reason: String::new(),
+                ms: 0,
+                bytes: 0,
+                tokens: 0,
+                detail: "0 条 · 弹幕峰值 0".to_string(),
+            },
+        ],
+    };
+    evidence.cost_ms = 1;
+    evidence
+}
+
+/// True while any player window is playing or buffering. Updated on the UI
+/// thread by a small timer in `main.rs` (the player state is `Rc<RefCell<…>>`,
+/// not shareable), and polled by the ASR step, which waits instead of competing
+/// for the GPU with playback.
+static PLAYBACK_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Publish the current playback state to the fish engine. Called from the UI
+/// thread only.
+pub fn note_playback_busy(busy: bool) {
+    PLAYBACK_BUSY.store(busy, Ordering::Relaxed);
+}
+
+fn playback_gate() -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+    Some(Arc::new(|| PLAYBACK_BUSY.load(Ordering::Relaxed)))
+}
+
 /// Bucket danmaku by minute and keep the busiest ones (with a sample line).
+#[cfg(test)]
 fn danmaku_peaks(items: &[crate::danmaku::Danmaku]) -> Vec<Peak> {
-    let mut buckets: BTreeMap<u32, (u32, String)> = BTreeMap::new();
+    let mut buckets: std::collections::BTreeMap<u32, (u32, String)> =
+        std::collections::BTreeMap::new();
     for item in items {
         let text = item.text.trim();
         if text.is_empty() {
@@ -1608,7 +1918,11 @@ fn build_prompt(materials: &Materials, instruction: &str) -> (String, String) {
     }
 
     if !materials.transcript.trim().is_empty() {
-        out.push_str("\n## AI 字幕\n");
+        if materials.transcript_source == "asr" {
+            out.push_str("\n## 语音转写（ASR，可能有专名错误）\n");
+        } else {
+            out.push_str("\n## AI 字幕\n");
+        }
         out.push_str(&clip_transcript(&materials.transcript));
         out.push('\n');
     }
@@ -1655,6 +1969,19 @@ fn build_prompt(materials: &Materials, instruction: &str) -> (String, String) {
         }
     }
 
+    if !materials.frame_observations.trim().is_empty() {
+        out.push_str("\n## 画面观察（抽样画面，不代表完整观看）\n");
+        out.push_str("下面只来自每隔一段时间抽一张的画面，不是逐帧观看；没画到的段落不要当作没有内容。\n");
+        out.push_str(materials.frame_observations.trim());
+        out.push('\n');
+    }
+
+    if !materials.coverage_note.trim().is_empty() {
+        out.push_str("\n## 取证范围\n");
+        out.push_str(&materials.coverage_note);
+        out.push('\n');
+    }
+
     if materials.transcript.trim().is_empty() {
         out.push_str("\n（这个视频没有 AI 字幕，上面的评论和弹幕峰值就是能拿到的全部内容材料。）\n");
     }
@@ -1680,7 +2007,9 @@ fn build_prompt(materials: &Materials, instruction: &str) -> (String, String) {
          2. 标题党、封面党、前 30 秒纯引流 —— 直接判“不看”，并在 reasons 里指出证据。\n\
          3. 同一件事反复讲的，按实际有效信息量给分，不按时长给分。\n\
          4. reasons 写“为什么值/不值”，不要复述剧情；最多 4 条，每条不超过 60 字。\n\
-         5. quote 必须是材料里真实出现过的一句原话，不要改写。\n",
+         5. quote 必须是材料里真实出现过的一句原话，不要改写。\n\
+         6. 区分证据来源：口播/字幕里说到的、抽样画面里看到的、你自己推断的，不能混为一谈；\
+         画面只在有“画面观察”段时才能当作依据，并且必须注明来自抽样画面。\n",
     );
     (SYSTEM_PROMPT.to_string(), out)
 }
@@ -1862,13 +2191,163 @@ fn mmss(seconds: u64) -> String {
     }
 }
 
-/// Unix seconds → `YYYY-MM-DD` (UTC; `未知` for a missing stamp).
+/// Unix seconds → `YYYY-MM-DD` (UTC; `未知` for a missing stamp). Used for the
+/// video's publish date, which is a date, not a clock.
 fn ymd(ts: i64) -> String {
     if ts <= 0 {
         return "未知".to_string();
     }
-    // Howard Hinnant's civil_from_days.
-    let days = ts.div_euclid(86_400);
+    let (year, month, day) = civil_from_day(ts.div_euclid(86_400));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+// ---------------------------------------------------------------------------
+// Local calendar — the 鱼缸 timeline
+// ---------------------------------------------------------------------------
+// The tank reads like a diary: every card carries the local wall clock of its
+// verdict and the history is split into local calendar days, so "今日" in the
+// header and "今天" in the history always mean the same cards. No timezone
+// crate is pulled in: the offset between local wall time and the Unix epoch is
+// measured from the two clocks the process already reads (`GetLocalTime` and
+// `SystemTime`) and rounded to a whole minute, which only removes the
+// sub-second jitter between the two reads (every real offset is a multiple of
+// 15 minutes).
+
+#[cfg(windows)]
+#[repr(C)]
+struct WinLocalTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLocalTime(time: *mut WinLocalTime);
+}
+
+/// `周日` … `周六`, indexed by `(day + 4) % 7` (1970-01-01 was a Thursday).
+const WEEKDAYS: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/// Seconds to add to a Unix timestamp to get local wall time (UTC+8 → 28800).
+pub fn local_offset() -> i64 {
+    #[cfg(windows)]
+    {
+        let mut time = WinLocalTime {
+            year: 1970,
+            month: 1,
+            day_of_week: 0,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            milliseconds: 0,
+        };
+        unsafe { GetLocalTime(&mut time) };
+        let local = days_from_civil(time.year as i64, time.month as i64, time.day as i64) * 86_400
+            + time.hour as i64 * 3_600
+            + time.minute as i64 * 60
+            + time.second as i64;
+        let diff = local - now();
+        (diff + 30).div_euclid(60) * 60
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// `(now, local offset)`: one clock read for a whole repaint.
+pub fn local_now() -> (i64, i64) {
+    let now = now();
+    (now, local_offset())
+}
+
+/// The local day a timestamp belongs to, as days since the Unix epoch. Two
+/// stamps with the same key are the same calendar day in the owner's timezone.
+pub fn day_key(at: i64, offset: i64) -> i64 {
+    (at + offset).div_euclid(86_400)
+}
+
+/// The wall clock of `at`, as `(hour, minute)` in local time.
+pub fn local_hm(at: i64, offset: i64) -> (i64, i64) {
+    let seconds = (at + offset).rem_euclid(86_400);
+    (seconds / 3_600, (seconds % 3_600) / 60)
+}
+
+/// A verdict's time on a card: `今天 14:32`, `昨天`, `10-26 09:11`, and
+/// `2024-10-26 09:11` once the year differs. Coarse on purpose — today needs a
+/// clock, yesterday only a word (its day section already spells the date out),
+/// and anything older needs a date to be findable in the history.
+pub fn verdict_time_text(at: i64, now: i64, offset: i64) -> String {
+    if at <= 0 {
+        return "未知".to_string();
+    }
+    let day = day_key(at, offset);
+    let today = day_key(now, offset);
+    let (hour, minute) = local_hm(at, offset);
+    if day == today {
+        return format!("今天 {hour:02}:{minute:02}");
+    }
+    if day == today - 1 {
+        return "昨天".to_string();
+    }
+    let (year, month, date) = civil_from_day(day);
+    if year == civil_from_day(today).0 {
+        format!("{month:02}-{date:02} {hour:02}:{minute:02}")
+    } else {
+        format!("{year:04}-{month:02}-{date:02} {hour:02}:{minute:02}")
+    }
+}
+
+/// A history section header: `今天 · 3 条`, `昨天 · 5 条`, `10-24 周六 · 2 条`.
+pub fn day_label(day: i64, now: i64, offset: i64, count: usize) -> String {
+    let today = day_key(now, offset);
+    let name = if day == today {
+        "今天".to_string()
+    } else if day == today - 1 {
+        "昨天".to_string()
+    } else {
+        let (year, month, date) = civil_from_day(day);
+        let weekday = WEEKDAYS[(day + 4).rem_euclid(7) as usize];
+        if year == civil_from_day(today).0 {
+            format!("{month:02}-{date:02} {weekday}")
+        } else {
+            format!("{year:04}-{month:02}-{date:02} {weekday}")
+        }
+    };
+    format!("{name} · {count} 条")
+}
+
+/// Group newest-first verdicts into local calendar days, preserving the order
+/// inside each day. Days come out newest first because the input does.
+pub fn group_by_day(rows: Vec<VerdictView>, now: i64, offset: i64) -> Vec<FishDayGroup> {
+    let mut groups: Vec<FishDayGroup> = Vec::new();
+    for row in rows {
+        let day = day_key(row.at, offset);
+        match groups.last_mut() {
+            Some(group) if group.day == day => group.rows.push(row),
+            _ => groups.push(FishDayGroup {
+                day,
+                label: String::new(),
+                rows: vec![row],
+            }),
+        }
+    }
+    for group in &mut groups {
+        group.label = day_label(group.day, now, offset, group.count());
+    }
+    groups
+}
+
+/// Days since 1970-01-01 → `(year, month, day)` (Howard Hinnant's algorithm).
+fn civil_from_day(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -1879,7 +2358,17 @@ fn ymd(ts: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}")
+    (year, month, day)
+}
+
+/// `(year, month, day)` → days since 1970-01-01 (Hinnant's inverse).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// The process-wide runtime the worker `block_on`s. Two worker threads are
@@ -2054,6 +2543,79 @@ mod tests {
                 .expect("version count");
             assert_eq!(versions, 1, "re-open must not duplicate the version row");
         }
+        drop(engine);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn migration_adds_evidence_columns_to_an_old_database() {
+        let path = temp_db("migrate");
+        {
+            // The schema this app shipped before phase 1: no evidence columns.
+            let db = Connection::open(&path).expect("old db");
+            db.execute_batch(
+                "CREATE TABLE videos (bvid TEXT PRIMARY KEY, cid INTEGER NOT NULL DEFAULT 0, \
+                 title TEXT NOT NULL DEFAULT '', up_mid INTEGER NOT NULL DEFAULT 0, \
+                 up_name TEXT NOT NULL DEFAULT '', duration_s INTEGER NOT NULL DEFAULT 0, \
+                 view_count INTEGER NOT NULL DEFAULT 0, pub_ts INTEGER NOT NULL DEFAULT 0, \
+                 cover TEXT NOT NULL DEFAULT '', tname TEXT NOT NULL DEFAULT '', \
+                 first_seen INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL DEFAULT 0); \
+                 CREATE TABLE verdicts (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 bvid TEXT NOT NULL, at INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', \
+                 prompt_hash TEXT NOT NULL DEFAULT '', score REAL NOT NULL DEFAULT 0, \
+                 verdict TEXT NOT NULL DEFAULT '也许', one_line TEXT NOT NULL DEFAULT '', \
+                 reasons_json TEXT NOT NULL DEFAULT '[]', tags_json TEXT NOT NULL DEFAULT '[]', \
+                 quote TEXT NOT NULL DEFAULT '', tokens_in INTEGER NOT NULL DEFAULT 0, \
+                 tokens_out INTEGER NOT NULL DEFAULT 0, elapsed_ms INTEGER NOT NULL DEFAULT 0, \
+                 error TEXT); \
+                 CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL); \
+                 INSERT INTO kv (k, v) VALUES ('schema_version', '1'); \
+                 INSERT INTO videos (bvid, title) VALUES ('BVOLD', '旧行'); \
+                 INSERT INTO verdicts (bvid, at, score, verdict, one_line) \
+                 VALUES ('BVOLD', 1700000000, 7, '看', '改动前的结论');",
+            )
+            .expect("old schema");
+        }
+        let engine = FishEngine::open_at(&path).expect("migrated open");
+        {
+            let db = engine.lock_db().expect("db");
+            let mut statement = db.prepare("PRAGMA table_info(verdicts)").expect("pragma");
+            let columns: Vec<String> = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("columns")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("rows");
+            for added in [
+                "channels",
+                "coverage",
+                "coverage_note",
+                "cost_ms",
+                "cost_bytes",
+                "cost_tokens",
+                "steps_json",
+            ] {
+                assert!(columns.iter().any(|column| column == added), "missing {added}");
+            }
+            let (channels, coverage, steps): (String, f64, String) = db
+                .query_row(
+                    "SELECT channels, coverage, steps_json FROM verdicts WHERE bvid = 'BVOLD'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("old row keeps defaults");
+            assert_eq!(channels, "");
+            assert_eq!(coverage, 0.0);
+            assert_eq!(steps, "[]");
+            let version: String = db
+                .query_row("SELECT v FROM kv WHERE k = 'schema_version'", [], |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+        let verdicts = engine.verdicts(5).expect("verdicts");
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].one_line, "改动前的结论");
+        assert!(verdicts[0].evidence.steps.is_empty());
+        assert_eq!(verdicts[0].evidence.line(), "");
         drop(engine);
         cleanup(&path);
     }
@@ -2262,7 +2824,7 @@ mod tests {
     fn insert_verdict(engine: &FishEngine, bvid: &str, at: i64) {
         let db = engine.lock_db().expect("db");
         db.execute(
-            "INSERT INTO videos (bvid, title, first_seen, last_seen) VALUES (?1, ?1, ?2, ?2)",
+            "INSERT OR IGNORE INTO videos (bvid, title, first_seen, last_seen) VALUES (?1, ?1, ?2, ?2)",
             params![bvid, at],
         )
         .expect("video row");
@@ -2354,6 +2916,44 @@ mod tests {
     }
 
     #[test]
+    fn newest_verdict_replaces_the_feed_row_and_history_is_kept() {
+        let path = temp_db("supersede");
+        let engine = FishEngine::open_at(&path).expect("open");
+        let at = now();
+        insert_verdict(&engine, "BV1SAME", at - 600);
+        {
+            // An upgraded run for the same video writes a second row.
+            let db = engine.lock_db().expect("db");
+            db.execute(
+                "INSERT INTO verdicts (bvid, at, model, prompt_hash, score, verdict, one_line, \
+                 channels, coverage, steps_json) \
+                 VALUES ('BV1SAME', ?1, 'deepseek-flash', 'h2', 9, '看', '升级后的结论', \
+                 'meta,subtitle,asr', 0.9, '[]')",
+                params![at],
+            )
+            .expect("second verdict");
+        }
+        let feed = engine.verdicts(10).expect("verdicts");
+        assert_eq!(feed.len(), 1, "the feed shows one row per video");
+        assert_eq!(feed[0].one_line, "升级后的结论", "the newest row wins");
+        assert_eq!(feed[0].evidence.coverage, 0.9);
+        let stats = engine.stats(0).expect("stats");
+        assert_eq!(stats.watched, 1, "stats count the video once, not the history");
+        let rows: i64 = {
+            let db = engine.lock_db().expect("db");
+            db.query_row(
+                "SELECT COUNT(*) FROM verdicts WHERE bvid = 'BV1SAME'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("rows")
+        };
+        assert_eq!(rows, 2, "the old verdict is kept as history");
+        drop(engine);
+        cleanup(&path);
+    }
+
+    #[test]
     fn danmaku_peaks_keep_the_busiest_minutes() {
         let mut items: Vec<crate::danmaku::Danmaku> = Vec::new();
         let mut push = |progress_ms: u32, text: &str| {
@@ -2432,6 +3032,175 @@ mod tests {
         assert_eq!(score_bucket(8.6), 9);
         assert_eq!(score_bucket(99.0), 10);
         assert_eq!(score_bucket(f64::NAN), 0);
+    }
+
+    /// A verdict at `at`, for the calendar tests (the fields they read).
+    fn view_at(bvid: &str, at: i64) -> VerdictView {
+        VerdictView {
+            bvid: bvid.to_string(),
+            title: format!("{bvid} 的标题"),
+            at,
+            verdict: "看".to_string(),
+            one_line: "值得看".to_string(),
+            ..VerdictView::default()
+        }
+    }
+
+    /// Insert one successful verdict with explicit numbers, so a window's
+    /// counts can be asserted exactly.
+    fn insert_row(
+        engine: &FishEngine,
+        bvid: &str,
+        at: i64,
+        verdict: &str,
+        score: f64,
+        tokens_in: i64,
+        tokens_out: i64,
+    ) {
+        let db = engine.lock_db().expect("db");
+        db.execute(
+            "INSERT OR IGNORE INTO videos (bvid, title, first_seen, last_seen) VALUES (?1, ?1, ?2, ?2)",
+            params![bvid, at],
+        )
+        .expect("video row");
+        db.execute(
+            "INSERT INTO verdicts (bvid, at, model, prompt_hash, score, verdict, one_line, \
+             tokens_in, tokens_out) VALUES (?1, ?2, 'deepseek-flash', 'hash', ?3, ?4, '一句话', ?5, ?6)",
+            params![bvid, at, score, verdict, tokens_in, tokens_out],
+        )
+        .expect("verdict row");
+    }
+
+    /// The calendar the 鱼缸 renders: 今天 / 昨天 / a dated day, grouped in that
+    /// order, with the per-card time ladder — all from a fixed clock, so the
+    /// test does not depend on the machine's date.
+    #[test]
+    fn calendar_groups_days_and_labels_cards_in_local_time() {
+        // 2023-11-15 06:13:20 at UTC+8 (now is 2023-11-14 22:13:20 UTC).
+        let now = 1_700_000_000;
+        let offset = 8 * 3_600;
+        assert_eq!(day_key(now, offset), days_from_civil(2023, 11, 15));
+        assert_eq!(local_hm(now, offset), (6, 13));
+
+        let today_at = now - 3_600; // 05:13:20 local, same day
+        let yesterday_at = now - 86_400; // 2023-11-14 06:13:20 local
+        let old_at = now - 8 * 86_400; // 2023-11-07 06:13:20 local
+        assert_eq!(verdict_time_text(today_at, now, offset), "今天 05:13");
+        assert_eq!(verdict_time_text(yesterday_at, now, offset), "昨天");
+        assert_eq!(verdict_time_text(old_at, now, offset), "11-07 06:13");
+        let last_year = now - 400 * 86_400;
+        assert!(
+            verdict_time_text(last_year, now, offset).starts_with("2022-10-11 "),
+            "a different year keeps the year: {}",
+            verdict_time_text(last_year, now, offset)
+        );
+
+        // Newest first, as `verdicts()` returns them: 2 today, 1 yesterday,
+        // 1 eight days ago.
+        let rows = vec![
+            view_at("BV1TODAYA", today_at),
+            view_at("BV1TODAYB", today_at - 600),
+            view_at("BV1YESTER", yesterday_at),
+            view_at("BV1WEEKOLD", old_at),
+        ];
+        let groups = group_by_day(rows, now, offset);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].label, "今天 · 2 条");
+        assert_eq!(groups[0].count(), 2);
+        assert_eq!(groups[1].label, "昨天 · 1 条");
+        assert_eq!(groups[2].label, "11-07 周二 · 1 条");
+        assert_eq!(groups[2].rows[0].bvid, "BV1WEEKOLD");
+        // `今天 · 2 条` really is both today rows, in feed order.
+        assert_eq!(groups[0].rows[0].bvid, "BV1TODAYA");
+        assert_eq!(groups[0].rows[1].bvid, "BV1TODAYB");
+    }
+
+    /// Crossing local midnight must change what the page says without touching
+    /// the data: the same verdict is 今天 at 23:59 and 昨天 after 00:00, which is
+    /// why `apply_fish` keys its rebuild on the local day.
+    #[test]
+    fn the_same_verdict_becomes_yesterday_after_local_midnight() {
+        let offset = 8 * 3_600;
+        // 2023-11-15 06:13 local.
+        let at = 1_700_000_000;
+        let rows = vec![view_at("BV1LATE", at)];
+        let before = group_by_day(rows.clone(), at + 17 * 3_600, offset);
+        assert_eq!(before[0].label, "今天 · 1 条");
+        assert_eq!(verdict_time_text(at, at + 17 * 3_600, offset), "今天 06:13");
+        // 18 hours later it is 00:13 on the 16th: a new local day.
+        let after = group_by_day(rows, at + 18 * 3_600, offset);
+        assert_eq!(after[0].label, "昨天 · 1 条");
+        assert_eq!(verdict_time_text(at, at + 18 * 3_600, offset), "昨天");
+    }
+
+    /// 今日 is a local calendar day, and 7 / 30 days are day windows that
+    /// contain it — the header and the history can never disagree.
+    #[test]
+    fn dashboard_counts_today_separately_from_7_and_30_days() {
+        let path = temp_db("dashboard");
+        let engine = FishEngine::open_at(&path).expect("open");
+        let (now, offset) = local_now();
+        let today_start = day_key(now, offset) * 86_400 - offset;
+        insert_row(&engine, "BV1A", today_start + 60, "看", 9.0, 1_000, 200);
+        insert_row(&engine, "BV1B", today_start + 120, "不看", 3.0, 500, 100);
+        insert_row(&engine, "BV1C", today_start + 180, "也许", 6.0, 250, 50);
+        insert_row(&engine, "BV1D", today_start - 3_600, "看", 8.0, 0, 0);
+        insert_row(&engine, "BV1E", today_start - 3_700, "不看", 2.0, 0, 0);
+        // Eight days ago: outside the 7-day window, inside the 30-day one.
+        insert_row(&engine, "BV1F", today_start - 8 * 86_400, "看", 7.0, 0, 0);
+
+        let board = engine.dashboard().expect("dashboard");
+        assert_eq!(board.today.watched, 3);
+        assert_eq!(board.today.recommend, 1);
+        assert_eq!(board.today.skip, 1);
+        assert_eq!(board.today.maybe, 1);
+        assert_eq!(board.today.tokens_in, 1_750);
+        assert_eq!(board.today.tokens_out, 350);
+        assert_eq!(board.today.tokens(), 2_100);
+
+        assert_eq!(board.week.watched, 5, "today + yesterday, not the 8-day-old row");
+        assert_eq!(board.month.watched, 6);
+        assert_eq!(board.month.recommend, 3);
+        // The histogram/tags follow the 30-day window.
+        assert_eq!(board.score_histogram[9], 1);
+        drop(engine);
+        cleanup(&path);
+    }
+
+    /// 清空推荐流: the queue goes to zero, every verdict row survives, and the
+    /// marker is what the 推荐流 filters on.
+    #[test]
+    fn clear_queue_empties_the_queue_and_keeps_every_verdict() {
+        let path = temp_db("clear");
+        let engine = FishEngine::open_at(&path).expect("open");
+        insert_verdict(&engine, "BV1KEEP1", now());
+        insert_verdict(&engine, "BV1KEEP2", now() - 86_400);
+        engine.enqueue(&[
+            feed("BV1QUEUE1", "排队一"),
+            feed("BV1QUEUE2", "排队二"),
+            feed("BV1QUEUE3", "排队三"),
+        ]);
+        assert_eq!(engine.snapshot().queued, 3);
+        assert_eq!(engine.cleared_at(), 0, "nothing cleared yet");
+
+        let report = engine.clear_queue().expect("clear");
+        assert_eq!(report.cleared, 3);
+        assert_eq!(report.verdicts_kept, 2);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.queued, 0, "queue=0 after 清空");
+        assert!(engine.cleared_at() > 0, "the marker is written");
+        assert_eq!(
+            engine.verdicts(10).expect("verdicts").len(),
+            2,
+            "history is untouched"
+        );
+
+        // A second clear is a no-op, not an error.
+        let again = engine.clear_queue().expect("clear twice");
+        assert_eq!(again.cleared, 0);
+        assert_eq!(again.verdicts_kept, 2);
+        drop(engine);
+        cleanup(&path);
     }
 
     // -- end to end --------------------------------------------------------
@@ -2552,6 +3321,7 @@ mod tests {
                 budget_videos: 10,
                 interval_ms: 20,
                 endpoint: server.endpoint(),
+                watch: WatchConfig::default(),
             },
         );
         let deadline = started + Duration::from_secs(20);
@@ -2595,7 +3365,8 @@ mod tests {
         let body = server.request_body();
         assert!(body.contains(TEST_INSTRUCTION), "instruction missing: {body}");
         assert!(body.contains("\"response_format\":{\"type\":\"json_object\"}"));
-        assert!(body.contains("\"max_tokens\":600"));
+        assert!(body.contains("\"max_tokens\":800"));
+        assert!(body.contains("\"thinking\":{\"type\":\"disabled\"}"));
         assert!(body.contains("\"temperature\":0.3"));
         assert!(body.contains("deepseek-chat"));
         assert!(body.contains("AI 字幕"));
@@ -2645,6 +3416,7 @@ mod tests {
                 budget_videos: 5,
                 interval_ms: 10,
                 endpoint: server.endpoint(),
+                watch: WatchConfig::default(),
             },
         );
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -2753,6 +3525,7 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 10,
                 endpoint: format!("http://127.0.0.1:{port}/chat/completions"),
+                watch: WatchConfig::default(),
             },
         );
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -2785,10 +3558,152 @@ mod tests {
     /// Real APIs, off by default: set `DEEPSEEK_API_KEY` and `BILI_FISH_LIVE=1`
     /// (optionally `BILI_FISH_BVID`) and run
     /// `cargo test --release -- --ignored live_smoke --nocapture`.
+    // -- live smoke --------------------------------------------------------
+
+    /// One real tier run through the whole engine (watch plan → DeepSeek →
+    /// `fish.db`), with the evidence row read back.
+    ///
+    /// `BILI_FISH_BVID`, `BILI_FISH_TIER` (0–4), `BILI_FISH_ASR=1`,
+    /// `BILI_FISH_FRAMES=1`; the key comes from `DEEPSEEK_API_KEY` or
+    /// `settings.json` (read only, never written).
+    #[test]
+    #[ignore = "hits Bilibili + DeepSeek; needs a login token and a key"]
+    fn live_watch_tier() {
+        let Ok(bvid) = std::env::var("BILI_FISH_BVID") else {
+            eprintln!("BILI_FISH_BVID absent: skipped");
+            return;
+        };
+        let key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_else(|| settings::load().deepseek_key);
+        assert!(!key.trim().is_empty(), "no DeepSeek key");
+        let tier = std::env::var("BILI_FISH_TIER")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(1);
+        let prefs = settings::load();
+        let mut watch = watch_config_from_settings(&prefs, &key, "deepseek-flash", DEEPSEEK_URL);
+        watch.online = true;
+        watch.selection = StepSelection::for_tier(tier);
+        watch.asr.enabled = std::env::var("BILI_FISH_ASR").as_deref() == Ok("1");
+        if std::env::var("BILI_FISH_FRAMES").as_deref() == Ok("1") {
+            watch.selection.frames = true;
+        }
+        watch.model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper");
+        watch.audio_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache/fishaudio");
+        let selected = watch
+            .selection
+            .ids()
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "tier={tier} selected={selected:?} asr_enabled={} frames={} bvid={bvid}",
+            watch.asr.enabled, watch.selection.frames
+        );
+
+        let path = if std::env::var("BILI_FISH_DB").as_deref() == Ok("real") {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DB_FILE)
+        } else {
+            temp_db("live-tier")
+        };
+        let real_db = std::env::var("BILI_FISH_DB").as_deref() == Ok("real");
+        let engine = if real_db {
+            FishEngine::open().expect("open real fish.db")
+        } else {
+            FishEngine::open_at(&path).expect("open")
+        };
+        engine.persist.store(false, Ordering::SeqCst);
+        let session = runtime()
+            .block_on(async {
+                match crate::bilibili::load_token() {
+                    Some(token) => crate::bilibili::Session::from_token(&token).await,
+                    None => crate::bilibili::Session::new().await,
+                }
+            })
+            .expect("bilibili session");
+        if std::env::var("BILI_FISH_FORCE").as_deref() == Ok("1") {
+            // QA seeding against the real `fish.db`: park other pending rows so
+            // this one video is the job, not whatever the feed queued earlier.
+            if let Ok(db) = engine.lock_db() {
+                let _ = db.execute("DELETE FROM queue WHERE state = 'pending'", []);
+            }
+            engine.enqueue_forced(&[feed(&bvid, "live tier")]);
+        } else {
+            engine.enqueue(&[feed(&bvid, "live tier")]);
+        }
+        engine.start_for_test(
+            Signals::Live(Arc::new(session)),
+            EngineConfig {
+                key: key.clone(),
+                model: "deepseek-flash".to_string(),
+                instruction: settings::default_fish_instruction(),
+                budget_videos: 1,
+                interval_ms: 500,
+                endpoint: DEEPSEEK_URL.to_string(),
+                watch,
+            },
+        );
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2_400);
+        while engine.snapshot().queued > 0 {
+            assert!(Instant::now() < deadline, "live tier run timed out");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let verdicts = engine.verdicts(5).expect("verdicts");
+        eprintln!("elapsed_ms={}", started.elapsed().as_millis());
+        assert!(!verdicts.is_empty(), "live run produced no verdict");
+        let verdict = &verdicts[0];
+        eprintln!(
+            "verdict={} score={:.1} one_line={} tokens={}+{} evidence={}",
+            verdict.verdict, verdict.score, verdict.one_line, verdict.tokens_in,
+            verdict.tokens_out, verdict.evidence.line()
+        );
+        eprintln!("evidence detail:\n{}", verdict.evidence.detail());
+        let (channels, coverage, cost_ms, cost_bytes, cost_tokens, steps_json): (
+            String,
+            f64,
+            i64,
+            i64,
+            i64,
+            String,
+        ) = {
+            let db = engine.lock_db().expect("db");
+            db.query_row(
+                "SELECT channels, coverage, cost_ms, cost_bytes, cost_tokens, steps_json \
+                 FROM verdicts WHERE bvid = ?1 AND error IS NULL ORDER BY at DESC LIMIT 1",
+                params![bvid],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("evidence columns")
+        };
+        eprintln!(
+            "db channels={channels} coverage={coverage:.2} cost_ms={cost_ms} cost_bytes={cost_bytes} cost_tokens={cost_tokens} steps_len={}",
+            steps_json.len()
+        );
+        assert!(!channels.is_empty());
+        assert!(cost_ms >= 0);
+        assert!(!steps_json.is_empty());
+        drop(engine);
+        if !real_db {
+            cleanup(&path);
+        }
+    }
+
     #[test]
     #[ignore = "hits DeepSeek and Bilibili; needs DEEPSEEK_API_KEY and BILI_FISH_LIVE=1"]
-    fn live_smoke() {
-        let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
+    fn live_smoke() {        let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
             eprintln!("DEEPSEEK_API_KEY absent: skipped");
             return;
         };
@@ -2818,6 +3733,7 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 1_500,
                 endpoint: DEEPSEEK_URL.to_string(),
+                watch: WatchConfig::default(),
             },
         );
         let deadline = Instant::now() + Duration::from_secs(180);
