@@ -16,6 +16,20 @@
 // measured numbers in Cargo.toml ([profile.release.package.o11a1]) and
 // tools/build.ps1.
 fn main() {
+    // f178: the executable's own icon. `winres` writes the ICON resource into
+    // the .exe, so Explorer, the taskbar, Alt-Tab and the tray (which loads the
+    // same resource by id) all show the same artwork. Rerun only when the .ico
+    // changes; a missing icon is a hard error on purpose - a release without
+    // its icon is worse than a failed build.
+    println!("cargo:rerun-if-changed=assets/icons/o11a1.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut res = winres::WindowsResource::new();
+        res.set_icon("assets/icons/o11a1.ico");
+        if let Err(err) = res.compile() {
+            eprintln!("icon resource failed: {err}");
+            std::process::exit(1);
+        }
+    }
     if let Err(err) = slint_build::compile("ui/app.slint") {
         eprintln!("slint build failed: {err}");
         std::process::exit(1);

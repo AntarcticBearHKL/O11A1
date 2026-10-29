@@ -250,7 +250,7 @@ pub(crate) fn publish_settings(ui: &AppWindow, snapshot: &settings::Settings) {
     ui.set_set_autostart(snapshot.autostart);
     // 优化: 下载连接数, the prefetch proxy's parallel fetcher count.
     ui.set_set_prefetch_connections(snapshot.prefetch_connections as i32);
-    // 关闭主窗口的行为 (0 = 最小化到任务栏, 1 = 隐藏到系统托盘, 2 = 直接退出),
+    // 关闭主窗口的行为 (1 = 隐藏到系统托盘, 2 = 直接退出程序; 旧的 0 已迁移成 1),
     // so the panel opens on the stored value.
     ui.set_set_close_action(snapshot.close_action as i32);
     // 防干扰: the panel's two switches and the live state the toolbar / search

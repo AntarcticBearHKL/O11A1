@@ -1,6 +1,6 @@
 [package]
 name = "o11a1"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 edition = "2021"
 build = "build.rs"
 description = "O11A1 — a Rust + Slint Bilibili desktop client"
@@ -55,6 +55,9 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 slint-build = "1"
+# f178: embeds assets/icons/o11a1.ico as the executable's icon (Explorer,
+# taskbar, Alt-Tab, and the tray via LoadImage on the same resource).
+winres = "0.1"
 
 # ---------------------------------------------------------------------------
 # f174: the shipped default is femtovg on wgpu (D3D12/Vulkan), not on OpenGL.

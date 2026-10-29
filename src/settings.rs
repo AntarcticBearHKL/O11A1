@@ -137,8 +137,9 @@ pub struct Settings {
     /// `list_page_size` property and the paging helpers from this value.
     #[serde(default = "default_page_size")]
     pub page_size: i64,
-    /// 关闭主窗口（✕ / Alt+F4 / 任务栏关闭）后的行为：0 = 最小化到任务栏,
-    /// 1 = 隐藏到系统托盘, 2 = 直接退出程序.
+    /// 关闭主窗口（✕ / Alt+F4 / 任务栏关闭）后的行为：1 = 隐藏到系统托盘,
+    /// 2 = 直接退出程序. 旧的 0（最小化到任务栏）已下线，读到就迁移成 1
+    /// （[`normalise_close_action`]）。
     #[serde(default = "default_close_action")]
     pub close_action: u32,
     /// 播放器窗口上次的位置与大小，逻辑像素 `[x, y, w, h]`，描述的是**基础**
@@ -361,9 +362,18 @@ pub fn normalise_pgc_sorts(stored: BTreeMap<String, String>) -> BTreeMap<String,
         })
         .collect()
 }
-/// 关闭主窗口后的行为（见 [`Settings::close_action`]）：0 = 最小化到任务栏,
-/// 1 = 隐藏到系统托盘, 2 = 直接退出程序.
-pub const CLOSE_ACTIONS: [u32; 3] = [0, 1, 2];
+/// 关闭主窗口后的行为（见 [`Settings::close_action`]）：1 = 隐藏到系统托盘,
+/// 2 = 直接退出程序.
+///
+/// `0`（旧的「最小化到任务栏」）已经下线：最小化之后窗口仍然占着任务栏按钮，
+/// 在主窗口的 ✕ 上看起来和「没关掉」一模一样，正是用户报的那个问题。
+/// 老 `settings.json` 里的 `0` 由 [`normalise_close_action`] 迁移成
+/// [`CLOSE_ACTION_TRAY`]。
+pub const CLOSE_ACTIONS: [u32; 2] = [CLOSE_ACTION_TRAY, CLOSE_ACTION_QUIT];
+/// 隐藏到系统托盘：任务栏按钮与 Alt-Tab 项都消失，进程继续驻留。
+pub const CLOSE_ACTION_TRAY: u32 = 1;
+/// 直接退出程序：走 `request_quit` 那条收尾路径。
+pub const CLOSE_ACTION_QUIT: u32 = 2;
 /// Upper bound for [`Settings::feed_prefetch_batches`].
 pub const FEED_PREFETCH_MAX: u32 = 4;
 /// Smallest accepted count of warmed seek positions. **0 is not allowed**:
@@ -508,9 +518,14 @@ pub fn default_page_size() -> i64 {
     24
 }
 
-/// 默认关闭行为：最小化到任务栏（保留任务栏按钮，永远不会让窗口无法找回）。
+/// 默认关闭行为：隐藏到系统托盘。
+///
+/// 默认最小化（0）在任务栏上看起来和"没关掉"一模一样，用户报告的正是这个；
+/// 隐藏到托盘会真正让窗口从任务栏与 Alt-Tab 消失，托盘图标和「退出」是明确的
+/// 归处。已经写进 `settings.json` 的旧值不受影响（[`normalise_close_action`]
+/// 只做合法性校正）。
 pub fn default_close_action() -> u32 {
-    0
+    1
 }
 
 /// 默认预加载两个推荐批次：刷新时总能立刻拿到一个，同时再补一个。
@@ -939,11 +954,16 @@ pub fn normalise_feed_prefetch_batches(value: u32) -> u32 {
 /// The value arrives both from JSON (a corrupt or hand-edited file can hold
 /// anything) and from the 设置 menu: only the offered actions ([`CLOSE_ACTIONS`])
 /// are kept, anything else falls back to [`default_close_action`].
+///
+/// `0` is the retired 「最小化到任务栏」: it is migrated to
+/// [`CLOSE_ACTION_TRAY`] rather than rejected, because an old `settings.json`
+/// holding it still expressed "don't quit", and minimising was exactly what made
+/// the window look unclosed on the taskbar.
 pub fn normalise_close_action(value: u32) -> u32 {
-    if CLOSE_ACTIONS.contains(&value) {
-        value
-    } else {
-        default_close_action()
+    match value {
+        0 => CLOSE_ACTION_TRAY,
+        offered if CLOSE_ACTIONS.contains(&offered) => offered,
+        _ => default_close_action(),
     }
 }
 
@@ -1488,6 +1508,15 @@ mod tests {
         for value in [3u32, 4, 99, u32::MAX] {
             assert_eq!(normalise_close_action(value), default_close_action());
         }
+    }
+
+    #[test]
+    fn close_action_migrates_the_retired_minimize_value() {
+        // 0 = 「最小化到任务栏」 from an old settings.json: never offered again,
+        // and migrated to the tray instead of being treated as corrupt.
+        assert_eq!(normalise_close_action(0), CLOSE_ACTION_TRAY);
+        assert!(!CLOSE_ACTIONS.contains(&0));
+        assert_eq!(default_close_action(), CLOSE_ACTION_TRAY);
     }
 
     #[test]

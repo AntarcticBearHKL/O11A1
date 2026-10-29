@@ -541,7 +541,11 @@ pub(crate) fn start_tray(weak: &Weak<AppWindow>) {
                 let weak = weak.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = weak.upgrade() {
-                        win::restore(ui.window());
+                        // Same path as the tray double-click: clears the
+                        // `WS_EX_TOOLWINDOW` bit and gives the taskbar its tab
+                        // back, so "显示主窗口" really restores the window.
+                        let state = win::show_from_tray(ui.window());
+                        crate::debug_log(&format!("tray: show {}", state.show_summary()));
                     }
                 });
             })
@@ -552,7 +556,8 @@ pub(crate) fn start_tray(weak: &Weak<AppWindow>) {
                 let weak = weak.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = weak.upgrade() {
-                        win::set_visible(ui.window(), false);
+                        let state = win::hide_to_tray(ui.window());
+                        crate::debug_log(&format!("tray: hide {}", state.hide_summary()));
                     }
                 });
             })
@@ -576,22 +581,22 @@ pub(crate) fn toggle_main_window(ui: &AppWindow, hide_muted: &Arc<AtomicBool>) {
     let visible = win::is_visible(window).unwrap_or(false);
     let minimized = win::is_minimized(window).unwrap_or(false);
     if visible && !minimized {
-        win::set_visible(window, false);
+        let state = win::hide_to_tray(window);
         if let Some(control) = player::active_control() {
             if !control.muted() {
                 control.set_muted(true);
                 hide_muted.store(true, Ordering::SeqCst);
             }
         }
-        crate::debug_log("boss key: main window hidden");
+        crate::debug_log(&format!("boss key: main window hidden {}", state.hide_summary()));
     } else {
-        win::restore(window);
+        let state = win::show_from_tray(window);
         if hide_muted.swap(false, Ordering::SeqCst) {
             if let Some(control) = player::active_control() {
                 control.set_muted(false);
             }
         }
-        crate::debug_log("boss key: main window shown");
+        crate::debug_log(&format!("boss key: main window shown {}", state.show_summary()));
     }
 }
 
@@ -604,24 +609,28 @@ pub(crate) fn toggle_main_window(ui: &AppWindow, hide_muted: &Arc<AtomicBool>) {
 pub(crate) fn apply_close_action(ui: &AppWindow, settings_store: &Arc<Mutex<settings::Settings>>) {
     let window = ui.window();
     match close_action(settings_store) {
-        0 => {
-            // `SW_MINIMIZE` keeps the taskbar button, so the window can always be
-            // brought back the normal way.
-            let ok = win::minimize(window);
+        settings::CLOSE_ACTION_QUIT => {
             crate::debug_log(&format!(
-                "close: action=0 minimize ok={ok} {}",
+                "close: action={} quit requested {}",
+                settings::CLOSE_ACTION_QUIT,
                 close_state(window)
             ));
+            request_quit("close action=2");
         }
-        1 => {
-            let ok = win::set_visible(window, false);
+        _ => {
+            // Hide to the tray *properly*: `SW_HIDE` alone leaves the taskbar
+            // button (and the Alt-Tab entry) behind, which reads as "the window
+            // cannot be closed". `hide_to_tray` drops the tab through
+            // `ITaskbarList` and marks the window `WS_EX_TOOLWINDOW`.
+            let state = win::hide_to_tray(window);
             tray::notify_hidden_once();
             crate::debug_log(&format!(
-                "close: action=1 hide-to-tray ok={ok} {}",
+                "close: action={} hide-to-tray {} {}",
+                settings::CLOSE_ACTION_TRAY,
+                state.hide_summary(),
                 close_state(window)
             ));
         }
-        _ => request_quit("close action=2"),
     }
 }
 
@@ -639,7 +648,7 @@ pub(crate) fn close_action(settings_store: &Arc<Mutex<settings::Settings>>) -> u
 /// the teardown at the end of `main` (player children reaped, tray icon removed)
 /// still runs. Safe from the close hook: it fires on the UI thread.
 pub(crate) fn request_quit(reason: &str) {
-    crate::debug_log(&format!("close: quit requested ({reason})"));
+    crate::debug_log(&format!("quit reason={reason}"));
     let _ = slint::quit_event_loop();
 }
 

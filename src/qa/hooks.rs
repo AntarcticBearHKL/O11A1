@@ -426,8 +426,8 @@ pub(crate) fn run_close_test(
                 let Some(ui) = retry.upgrade() else {
                     return;
                 };
-                let ok = win::restore(ui.window());
-                crate::debug_log(&format!("close restore ok={ok} {}", close_state(&ui.window())));
+                let ok = win::show_from_tray(ui.window());
+                crate::debug_log(&format!("close restore ok={} {}", ok.taskbar_ok, close_state(&ui.window())));
             });
         }
     });

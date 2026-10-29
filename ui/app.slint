@@ -15565,9 +15565,12 @@ export component AppWindow inherits Window {
     in property <[int]> set_key_map: [3, 4, 5, 6, 7, 0, 8, 12, 9, 10, 11];
     in-out property <int> set_key_edit: -1;
     in-out property <bool> set_autostart: false;
-    // Close-button behaviour for the main window: 0 = 最小化到任务栏,
-    // 1 = 隐藏到系统托盘  2 = 直接退出程序 
-    in-out property <int> set_close_action: 0;
+    // Close-button behaviour for the main window: 1 = 隐藏到系统托盘,
+    // 2 = 直接退出程序 (`settings::CLOSE_ACTIONS`; the retired 0 = 最小化到任务栏
+    // arrives as 1 through `normalise_close_action`). Mirrors
+    // `settings::default_close_action()`; the stored value is published over
+    // this before the first frame.
+    in-out property <int> set_close_action: 1;
 
     // ---- 优化 (ninth settings category) ----
     // 预加载批次数 0-4, the two prefetch switches and the download connection
@@ -19286,21 +19289,23 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
-                                    // ---- 关闭主窗口时的动启 ----
-                                    // Three stacked radio rows. The callback is
-                                    // declared but (for now) unregistered on the
-                                    // Rust side, so it is a safe no-op until the
-                                    // backend wiring lands; the property alone
-                                    // drives the selected state.
+                                    // ---- 关闭主窗口时的行为 ----
+                                    // Two stacked radio rows for the two offered
+                                    // actions (`settings::CLOSE_ACTIONS = [1, 2]`).
+                                    // The row index is 0-based, so the value sent
+                                    // through `settings_close_action` is `index + 1`.
+                                    // The callback is registered in `main.rs`,
+                                    // persists through `update_settings` and takes
+                                    // effect on the very next ✕ / Alt+F4 (no restart).
                                     Text { text: "关闭主窗口时"; color: AppTheme.text-soft; font-size: 13px; }
 
                                     VerticalLayout {
                                         spacing: 6px;
 
-                                        for opt[index] in ["最小化到任务栏", "隐藏到系统托作", "直接退出程盘"] : Rectangle {
+                                        for opt[index] in ["隐藏到系统托盘", "直接退出程序"] : Rectangle {
                                             height: 36px;
                                             border-radius: 8px;
-                                            background: root.set_close_action == index
+                                            background: root.set_close_action == index + 1
                                                 ? AppTheme.pill-hover
                                                 : (opt_hit.has-hover ? AppTheme.pill-hover : AppTheme.pill-bg);
 
@@ -19322,11 +19327,11 @@ export component AppWindow inherits Window {
                                                 height: 14px;
                                                 border-radius: 7px;
                                                 border-width: 1.5px;
-                                                border-color: root.set_close_action == index ? AppTheme.accent : AppTheme.border;
+                                                border-color: root.set_close_action == index + 1 ? AppTheme.accent : AppTheme.border;
                                                 background: #00000000;
 
                                                 Rectangle {
-                                                    visible: root.set_close_action == index;
+                                                    visible: root.set_close_action == index + 1;
                                                     x: (parent.width - 8px) / 2;
                                                     y: (parent.height - 8px) / 2;
                                                     width: 8px;
@@ -19338,17 +19343,16 @@ export component AppWindow inherits Window {
 
                                             opt_hit := TouchArea {
                                                 clicked => {
-                                                    root.set_close_action = index;
-                                                    root.settings_close_action(index);
+                                                    root.set_close_action = index + 1;
+                                                    root.settings_close_action(index + 1);
                                                 }
                                             }
                                         }
                                     }
 
                                     Text {
-                                        text: root.set_close_action == 0 ? "窗口最小化，点任务栏图标即可恢程"
-                                            : root.set_close_action == 1 ? "窗口完全隐藏，播放继续，双击托盘图标恢复"
-                                            : "结束进程，播放器与下载一并关复";
+                                        text: root.set_close_action == 1 ? "窗口从任务栏与 Alt-Tab 消失，播放继续，双击托盘图标恢复"
+                                            : "结束进程，播放器与下载一并关闭";
                                         color: AppTheme.text-soft;
                                         font-size: 12px;
                                         wrap: word-wrap;

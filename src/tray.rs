@@ -21,7 +21,9 @@ use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
     NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
 };
+use windows_sys::Win32::System::LibraryLoader as kernel32;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
+    LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, HICON,
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
@@ -339,7 +341,28 @@ fn add_tray_icon(hwnd: HWND, tooltip: &str) {
     let mut data = base_icon(hwnd);
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_TRAY;
-    data.hIcon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
+    // f178: our own icon, embedded in the .exe by `build.rs` (winres) with
+    // resource id 1. Loading it by id keeps the tray identical to the taskbar /
+    // Explorer icon without shipping a second file; the generic application
+    // icon stays as a fallback so a stripped build still gets a tray entry.
+    data.hIcon = {
+        let module = unsafe { kernel32::GetModuleHandleW(std::ptr::null()) };
+        let loaded = unsafe {
+            LoadImageW(
+                module,
+                1 as *const u16,
+                IMAGE_ICON,
+                0,
+                0,
+                LR_DEFAULTSIZE | LR_SHARED,
+            )
+        };
+        if loaded.is_null() {
+            unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) }
+        } else {
+            loaded as HICON
+        }
+    };
     fill_wide(&mut data.szTip, tooltip);
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
 

@@ -6990,13 +6990,22 @@ pub(crate) fn main() -> Result<()> {
     win::unhook_create_hook();
 
     tray::shutdown();
+    crate::debug_log("tray: shutdown requested (icon removed)");
 
     // Signal every player worker to stop so their ffmpeg/ffplay children are
     // reaped before the process exits (they would otherwise outlive us).
-    for session in player_sessions(&player_state) {
+    let sessions = player_sessions(&player_state);
+    let players = sessions.len();
+    for session in sessions {
         session.control.close();
     }
     std::thread::sleep(Duration::from_millis(200));
+    // Last line before `main` returns: the process is gone once this is
+    // written, which is the proof "退出" actually ends it.
+    crate::debug_log(&format!(
+        "process exited pid={} players_closed={players}",
+        std::process::id()
+    ));
     Ok(())
 }
 

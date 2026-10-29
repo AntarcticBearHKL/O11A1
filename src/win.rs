@@ -34,7 +34,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Media::Audio::{eConsole, eRender};
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-    COINIT_DISABLE_OLE1DDE,
+    COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -61,7 +61,6 @@ const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
 const GW_HWNDNEXT: u32 = 2;
 const SW_HIDE: i32 = 0;
 const SW_SHOW: i32 = 5;
-const SW_MINIMIZE: i32 = 6;
 const SW_RESTORE: i32 = 9;
 
 // Window style bits (winuser.h).
@@ -1022,13 +1021,228 @@ pub fn set_visible(window: &slint::Window, visible: bool) -> bool {
     true
 }
 
+/// `CLSID_TaskbarList` (shobjidl.h): the shell object that owns taskbar tabs.
+const CLSID_TASKBAR_LIST: GUID = GUID {
+    data1: 0x56FD_F344,
+    data2: 0xFD6D,
+    data3: 0x11D0,
+    data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+};
+
+/// `IID_ITaskbarList` (shobjidl.h).
+const IID_ITASKBAR_LIST: GUID = GUID {
+    data1: 0x56FD_F342,
+    data2: 0xFD6D,
+    data3: 0x11D0,
+    data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+};
+
+/// `ITaskbarList` vtable: the `IUnknown` prefix, then `HrInit`, `AddTab`,
+/// `DeleteTab`, `ActivateTab`, `SetActiveAlt` — declaration order in
+/// shobjidl.h, which is the calling order the ABI depends on.
+#[repr(C)]
+struct TaskbarListVtbl {
+    head: ComVtblHead,
+    hr_init: unsafe extern "system" fn(*mut c_void) -> i32,
+    add_tab: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+    delete_tab: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+    activate_tab: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+    set_active_alt: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+}
+
+/// What a hide/show actually achieved, so one log line can prove all three
+/// independent facts (taskbar tab, Alt-Tab style bit, native visibility).
+#[derive(Clone, Copy)]
+pub struct TrayState {
+    pub taskbar_ok: bool,
+    pub toolwindow: bool,
+    pub visible: bool,
+}
+
+impl TrayState {
+    /// `ok=… tab_removed=… toolwindow=… visible=…` for the hide log line.
+    ///
+    /// `ok` is the whole contract: the tab is gone, the Alt-Tab bit is set and
+    /// the window is natively hidden. Each part is still printed, so a degraded
+    /// shell call is visible instead of hidden behind a single `false`.
+    pub fn hide_summary(&self) -> String {
+        let ok = self.taskbar_ok && self.toolwindow && !self.visible;
+        format!(
+            "ok={ok} tab_removed={} toolwindow={} visible={}",
+            self.taskbar_ok, self.toolwindow, self.visible
+        )
+    }
+
+    /// `ok=… tab_added=… toolwindow=… visible=…` for the restore log line.
+    pub fn show_summary(&self) -> String {
+        let ok = self.taskbar_ok && !self.toolwindow && self.visible;
+        format!(
+            "ok={ok} tab_added={} toolwindow={} visible={}",
+            self.taskbar_ok, self.toolwindow, self.visible
+        )
+    }
+}
+
+/// `AddTab`/`DeleteTab` for `hwnd`, on a short-lived MTA thread.
+///
+/// The shell object is a cross-process proxy: calling it from the UI thread's
+/// STA would pump messages inside a nested call while the ✕ handler runs, and a
+/// busy Explorer could then block the window. A worker in the MTA makes the
+/// call a plain RPC, and the 1.5 s receive timeout bounds it either way — a
+/// failure here must never keep the window visible (the caller still hides it).
+fn taskbar_tab(hwnd: isize, add: bool) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("bili-taskbar".into())
+        .spawn(move || {
+            let _ = sender.send(taskbar_tab_here(hwnd, add));
+        })
+        .map_err(|err| format!("任务栏线程启动失败：{err}"))?;
+    match receiver.recv_timeout(Duration::from_millis(1500)) {
+        Ok(result) => result,
+        Err(_) => Err("任务栏调用超时 1500ms".to_string()),
+    }
+}
+
+/// The worker half of [`taskbar_tab`]: own apartment, own `ITaskbarList`.
+fn taskbar_tab_here(hwnd: isize, add: bool) -> Result<(), String> {
+    let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32) };
+    // Already in an apartment (S_FALSE / RPC_E_CHANGED_MODE): usable as-is, and
+    // this thread must not uninitialise an apartment it does not own.
+    let owned = hr >= 0;
+    let result = (|| {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe {
+            CoCreateInstance(
+                &CLSID_TASKBAR_LIST,
+                std::ptr::null_mut(),
+                CLSCTX_ALL,
+                &IID_ITASKBAR_LIST,
+                &mut raw,
+            )
+        };
+        if hr < 0 {
+            return Err(format!("CoCreateInstance(ITaskbarList) hr=0x{:08X}", hr as u32));
+        }
+        let list = unsafe { ComRef::from_raw(raw) }.ok_or("ITaskbarList 为空")?;
+        let vtbl = unsafe { vtbl::<TaskbarListVtbl>(list.as_ptr()) };
+        let init = unsafe { (vtbl.hr_init)(list.as_ptr()) };
+        if init < 0 {
+            return Err(format!("ITaskbarList::HrInit hr=0x{:08X}", init as u32));
+        }
+        let hr = if add {
+            unsafe { (vtbl.add_tab)(list.as_ptr(), hwnd) }
+        } else {
+            unsafe { (vtbl.delete_tab)(list.as_ptr(), hwnd) }
+        };
+        if hr < 0 {
+            let name = if add { "AddTab" } else { "DeleteTab" };
+            return Err(format!("ITaskbarList::{name} hr=0x{:08X}", hr as u32));
+        }
+        Ok(())
+    })();
+    if owned {
+        unsafe { CoUninitialize() };
+    }
+    result
+}
+
+/// Set or clear `WS_EX_TOOLWINDOW`, which is what keeps a hidden window out of
+/// Alt-Tab (the taskbar button is `ITaskbarList`'s job).
+fn set_toolwindow(hwnd: isize, on: bool) {
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let want = if on {
+        style | WS_EX_TOOLWINDOW
+    } else {
+        style & !WS_EX_TOOLWINDOW
+    };
+    if want != style {
+        unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want) };
+        // The frame must be recomputed before the new ex-style takes effect.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// Whether the window is currently marked as a tool window (Alt-Tab skip).
+pub fn is_toolwindow(window: &slint::Window) -> Option<bool> {
+    let hwnd = hwnd_of(window)?;
+    Some((unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_TOOLWINDOW) != 0)
+}
+
+/// Hide the window to the tray: no taskbar button, no Alt-Tab entry, not visible.
+///
+/// The three steps are independent and each is best-effort: losing the COM
+/// `DeleteTab` (Explorer restarting, a hung shell) still yields a hidden window
+/// with the `WS_EX_TOOLWINDOW` bit, which by itself keeps the window out of
+/// Alt-Tab — the caller logs which parts worked.
+pub fn hide_to_tray(window: &slint::Window) -> TrayState {
+    let Some(hwnd) = hwnd_of(window) else {
+        return TrayState {
+            taskbar_ok: false,
+            toolwindow: false,
+            visible: false,
+        };
+    };
+    if surface_trace_on() {
+        crate::debug_log(&format!("f174 surface app=hide_to_tray hwnd={hwnd}"));
+    }
+    let taskbar = taskbar_tab(hwnd, false);
+    if let Err(err) = &taskbar {
+        crate::debug_log(&format!("tray: DeleteTab degraded hwnd={hwnd} err={err}"));
+    }
+    set_toolwindow(hwnd, true);
+    let _ = set_visible(window, false);
+    TrayState {
+        taskbar_ok: taskbar.is_ok(),
+        toolwindow: is_toolwindow(window).unwrap_or(false),
+        visible: unsafe { IsWindowVisible(hwnd) } != 0,
+    }
+}
+
+/// The inverse of [`hide_to_tray`]: clear the Alt-Tab bit, show, then hand the
+/// taskbar its button back. `AddTab` runs last so the shell registers a window
+/// that is already on screen.
+pub fn show_from_tray(window: &slint::Window) -> TrayState {
+    let Some(hwnd) = hwnd_of(window) else {
+        return TrayState {
+            taskbar_ok: false,
+            toolwindow: false,
+            visible: false,
+        };
+    };
+    if surface_trace_on() {
+        crate::debug_log(&format!("f174 surface app=show_from_tray hwnd={hwnd}"));
+    }
+    set_toolwindow(hwnd, false);
+    let _ = restore(window);
+    let taskbar = taskbar_tab(hwnd, true);
+    if let Err(err) = &taskbar {
+        crate::debug_log(&format!("tray: AddTab degraded hwnd={hwnd} err={err}"));
+    }
+    TrayState {
+        taskbar_ok: taskbar.is_ok(),
+        toolwindow: is_toolwindow(window).unwrap_or(false),
+        visible: unsafe { IsWindowVisible(hwnd) } != 0,
+    }
+}
+
 /// Register the close hook for one window's native handle.
 ///
 /// Records `hwnd` plus the hook in [`CLOSE_HOOK`]; from then on that window's
 /// `WM_CLOSE` (✕, Alt+F4, the taskbar's 关闭) invokes the hook instead of
 /// destroying the window. The hook runs on the UI thread and must therefore be
 /// cheap and must not block — it typically reads the stored close preference
-/// and calls [`minimize`] / [`set_visible`] / asks Slint to quit.
+/// and calls [`hide_to_tray`] / [`show_from_tray`] / asks Slint to quit.
 ///
 /// The subclass is installed (idempotently) so the hook actually fires. Returns
 /// `false` when the native handle is not available yet, in which case the
@@ -1351,22 +1565,6 @@ pub fn work_area_for_rect(x: i32, y: i32, w: i32, h: i32) -> Option<(i32, i32, i
 pub fn is_minimized(window: &slint::Window) -> Option<bool> {
     let hwnd = hwnd_of(window)?;
     Some(unsafe { IsIconic(hwnd) } != 0)
-}
-
-/// Minimise the window to the taskbar (`SW_MINIMIZE`).
-///
-/// Unlike [`set_visible`]`(false)` this keeps the taskbar button, so the window
-/// can always be brought back the normal way. Returns `false` without a native
-/// handle.
-pub fn minimize(window: &slint::Window) -> bool {
-    let Some(hwnd) = hwnd_of(window) else {
-        return false;
-    };
-    if surface_trace_on() {
-        crate::debug_log(&format!("f174 surface app=minimize hwnd={hwnd}"));
-    }
-    unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
-    true
 }
 
 /// Bring the window back and to the foreground, PRESERVING its maximise state.
