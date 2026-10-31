@@ -133,6 +133,9 @@ $windowsDlls = @(
     "api-ms-win-crt-locale-l1-1-0.dll","api-ms-win-crt-convert-l1-1-0.dll",
     "api-ms-win-crt-environment-l1-1-0.dll","api-ms-win-crt-filesystem-l1-1-0.dll",
     "api-ms-win-eventing-provider-l1-1-0.dll","api-ms-win-appmodel-runtime-l1-1-1.dll",
+    # Media Foundation ships with Windows. An app-local mfreadwrite.dll would be
+    # pinned next to the system mfplat.dll and break decoding on another machine.
+    "mfreadwrite.dll","mfplat.dll","mf.dll","mfcore.dll","mfuuid.dll","dxva2.dll",
     # supplied by the GPU driver, never by us: copying these into the folder
     # would pin an old driver API next to a newer driver
     "nvcuda.dll","nvml.dll","nvapi64.dll","nvapi.dll","dxcore.dll","opengl32.dll"

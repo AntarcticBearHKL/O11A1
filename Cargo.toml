@@ -1,6 +1,6 @@
 [package]
 name = "o11a1"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 edition = "2021"
 build = "build.rs"
 description = "O11A1 — a Rust + Slint Bilibili desktop client"
