@@ -54,8 +54,9 @@ const WS_EX_TOPMOST: isize = 0x0000_0008;
 /// (and any future click-through overlay) are "transparent by design" and must
 /// not count as occlusion.
 const WS_EX_TRANSPARENT: isize = 0x0000_0020;
-/// `WS_EX_TOOLWINDOW`: an owned floating helper (our tooltips). Only skipped
-/// when it belongs to this process - another app's tooltip really does cover.
+/// `WS_EX_TOOLWINDOW`: an owned floating helper (the tray's hidden window, our
+/// tooltips). Used by the tray hide/show path; it no longer plays any part in
+/// the occlusion decision, because f183 only ever lets a PLAYER window cover.
 const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
 /// `GW_HWNDNEXT` (winuser.h): the window below `hwnd` in the z-order.
 const GW_HWNDNEXT: u32 = 2;
@@ -243,6 +244,18 @@ type HookProc = unsafe extern "system" fn(i32, usize, isize) -> isize;
 /// and we never double-install the hook.
 static SUBCLASSED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
+/// The app's own PLAYER windows, booked in by each player's watchdog loop.
+///
+/// f183: this list is the allow-list of the occlusion test. Only a window that
+/// is one of our players may count as a cover; every other top-level window -
+/// another app, a game, a browser in fullscreen, our own main/tray/mini window -
+/// is transparent to the decision, so the player keeps playing (and keeps its
+/// sound) when something outside this program covers it. Registration is
+/// idempotent and the list is pruned of destroyed handles on every read, so a
+/// closed player can never keep the back one paused.
+static PLAYER_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+
 /// Windows whose DWM attributes (rounded corner, dark chrome, no border) have
 /// already been applied. A window can be subclassed by the `WH_CBT` hook before
 /// `CreateWindowExW` returns, i.e. before DWM will accept those attributes, so
@@ -308,13 +321,13 @@ extern "system" {
 
     fn GetWindow(hwnd: isize, cmd: u32) -> isize;
 
-    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
-
     fn ClientToScreen(hwnd: isize, point: *mut Point) -> i32;
 
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
 
     fn IsWindowVisible(hwnd: isize) -> i32;
+
+    fn IsWindow(hwnd: isize) -> i32;
 
     fn IsZoomed(hwnd: isize) -> i32;
 
@@ -1344,13 +1357,75 @@ fn occlusion_samples(x: i32, y: i32, w: i32, h: i32) -> [(i32, i32); 64] {
     points
 }
 
-/// Whether a top-level window may cover our client area.
+/// Book a player window into the f183 occluder allow-list.
 ///
-/// Visible, non-minimised, not cloaked by DWM, and not one of our own
-/// click-through/tooltip helper windows. Other top-level windows of THIS app
-/// (the other players) do count: two overlapping players is the case this
-/// exists for.
-fn window_covers(win: isize, own_pid: u32) -> bool {
+/// Idempotent (a watchdog that re-books its own handle every 100 ms must not
+/// grow the list) and safe to call from the UI thread only, like every other
+/// window function here. The first registration logs the new list so a QA run
+/// can see exactly which handles are allowed to pause a player.
+pub fn register_player_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let mut list_after = None;
+    if let Ok(mut list) = PLAYER_WINDOWS.lock() {
+        if !list.contains(&hwnd) {
+            list.push(hwnd);
+            list_after = Some(list.clone());
+        }
+    }
+    if let Some(list) = list_after {
+        crate::debug_log(&format!(
+            "player window registered hwnd={hwnd} players={list:?}"
+        ));
+    }
+}
+
+/// Remove a player window from the occluder allow-list (its close path).
+///
+/// Returns whether the handle was in the list. A handle that was already gone
+/// (a second call, or a window destroyed before its close path ran) is a no-op;
+/// [`player_windows`] additionally prunes destroyed handles on every read.
+pub fn unregister_player_window(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let mut removed = false;
+    let mut remaining = 0usize;
+    if let Ok(mut list) = PLAYER_WINDOWS.lock() {
+        let before = list.len();
+        list.retain(|entry| *entry != hwnd);
+        removed = list.len() != before;
+        remaining = list.len();
+    }
+    if removed {
+        crate::debug_log(&format!(
+            "player window unregistered hwnd={hwnd} players_remaining={remaining}"
+        ));
+    }
+    removed
+}
+
+/// Snapshot of the app's live player windows, in registration order.
+///
+/// Destroyed handles are pruned here, not only in [`unregister_player_window`],
+/// so a window torn down by a path that never reached its close callback cannot
+/// leave a stale handle that the OS might later hand to an unrelated window.
+pub fn player_windows() -> Vec<isize> {
+    let Ok(mut list) = PLAYER_WINDOWS.lock() else {
+        return Vec::new();
+    };
+    list.retain(|hwnd| unsafe { IsWindow(*hwnd) } != 0);
+    list.clone()
+}
+
+/// Whether a top-level window can really paint over us at all.
+///
+/// Visible, non-minimised, not cloaked by DWM, and not click-through. The
+/// f183 decision additionally requires the handle to be one of OUR player
+/// windows ([`player_windows`]); this function only answers "is this window
+/// opaque at all", so the caller can apply the allow-list before asking.
+fn window_may_occlude(win: isize) -> bool {
     // SAFETY: read-only queries; every value is only used for this decision.
     unsafe {
         if IsWindowVisible(win) == 0 || IsIconic(win) != 0 {
@@ -1371,42 +1446,47 @@ fn window_covers(win: isize, own_pid: u32) -> bool {
         if ex_style & WS_EX_TRANSPARENT != 0 {
             return false;
         }
-        // Our own tooltips are owned floating helpers, never content. Another
-        // process' tooltip is still an opaque window above us and counts.
-        if ex_style & WS_EX_TOOLWINDOW != 0 {
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(win, &mut pid);
-            if pid == own_pid {
-                return false;
-            }
-        }
     }
     true
 }
 
-/// Whether `hwnd` is completely covered by windows above it in the z-order.
+/// Whether a client-space sample point lies inside a window's outer rect.
 ///
-/// This is the f152 contract behind the occlusion pause: Windows does not
-/// composite a window that no pixel of is visible, so its picture stops while
-/// its audio would keep playing. The test walks the z-order from the topmost
-/// window down to `hwnd` (top-level siblings only), takes the windows that can
-/// really paint (see [`window_covers`]), and checks an 8x8 grid of the CLIENT
-/// rect against their outer rects. Only when every one of the 64 sample points
-/// is inside some covering window is the window "fully covered"; one uncovered
-/// sample (a partial overlap, a gap, a taskbar sliver) is enough to keep it
-/// playing.
+/// Half-open on the far edges, exactly like `GetWindowRect` + the point-in-rect
+/// test it replaces: a point on `right`/`bottom` belongs to the next window.
+fn rect_contains(rect: Rect, x: i32, y: i32) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+/// The windows that COMPLETELY cover `hwnd`, or `None` when it is not covered.
 ///
-/// The window itself is never tested. An invisible or minimised window, a
-/// window with no client area, or a handle that is not in the top-level
-/// z-order chain reports `false` (nothing to pause).
-pub fn is_fully_covered(hwnd: isize) -> bool {
+/// This is the f183 contract behind the occlusion pause: only the app's own
+/// PLAYER windows may pause another player. `allow` is the handle list from
+/// [`player_windows`]; the z-order walk still starts at the topmost top-level
+/// window, but a window is skipped unless it is in `allow`. Every other window -
+/// another application, a fullscreen game, this app's main / tray / mini window -
+/// cannot cause a pause, which is the point: a player covered by a game must
+/// keep playing its sound (its picture is simply not visible).
+///
+/// For the allowed windows the test is unchanged: an 8x8 grid of the CLIENT
+/// rect is checked against their outer rects, and only when every one of the 64
+/// sample points is inside some covering player window is the window "fully
+/// covered". One uncovered sample (a partial overlap, a gap, a taskbar sliver)
+/// keeps it playing. The returned handles are the players that covered at least
+/// one previously-uncovered sample, in z-order (topmost first) - the list the
+/// pause log prints.
+///
+/// The window itself is never tested (the walk stops at it). An invisible or
+/// minimised window, a window with no client area, or a handle that is not in
+/// the top-level z-order chain reports `None` (nothing to pause).
+pub fn covering_player_windows(hwnd: isize, allow: &[isize]) -> Option<Vec<isize>> {
     if hwnd == 0 {
-        return false;
+        return None;
     }
     // SAFETY: read-only Win32 queries on a live top-level handle.
     unsafe {
         if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
-            return false;
+            return None;
         }
         let mut client = Rect {
             left: 0,
@@ -1415,25 +1495,28 @@ pub fn is_fully_covered(hwnd: isize) -> bool {
             bottom: 0,
         };
         if GetClientRect(hwnd, &mut client) == 0 {
-            return false;
+            return None;
         }
         let width = client.right.saturating_sub(client.left);
         let height = client.bottom.saturating_sub(client.top);
         if width <= 0 || height <= 0 {
-            return false;
+            return None;
         }
         // GetClientRect is client-relative; the grid must be in screen px.
         let mut origin = Point { x: 0, y: 0 };
         if ClientToScreen(hwnd, &mut origin) == 0 {
-            return false;
+            return None;
         }
         let points = occlusion_samples(origin.x, origin.y, width, height);
         let mut covered = [false; 64];
         let mut covered_count = 0usize;
-        let own_pid = std::process::id();
+        let mut occluders: Vec<isize> = Vec::new();
         let mut current = GetTopWindow(0);
         while current != 0 && current != hwnd {
-            if window_covers(current, own_pid) {
+            // f183: a window outside the player list is not a cover, no matter
+            // what it paints. This is the whole "external fullscreen must not
+            // pause" rule, in one condition.
+            if allow.contains(&current) && window_may_occlude(current) {
                 let mut rect = Rect {
                     left: 0,
                     top: 0,
@@ -1441,28 +1524,38 @@ pub fn is_fully_covered(hwnd: isize) -> bool {
                     bottom: 0,
                 };
                 if GetWindowRect(current, &mut rect) != 0 {
+                    let mut covers_new = false;
                     for (index, point) in points.iter().enumerate() {
                         if covered[index] {
                             continue;
                         }
-                        if point.0 >= rect.left
-                            && point.0 < rect.right
-                            && point.1 >= rect.top
-                            && point.1 < rect.bottom
-                        {
+                        if rect_contains(rect, point.0, point.1) {
                             covered[index] = true;
                             covered_count += 1;
+                            covers_new = true;
                         }
                     }
+                    if covers_new {
+                        occluders.push(current);
+                    }
                     if covered_count == points.len() {
-                        return true;
+                        return Some(occluders);
                     }
                 }
             }
             current = GetWindow(current, GW_HWNDNEXT);
         }
     }
-    false
+    None
+}
+
+/// Whether `hwnd` is completely covered by the given player windows.
+///
+/// Thin wrapper over [`covering_player_windows`] for callers that only need the
+/// decision; the watchdog uses the fuller form so its pause log can name the
+/// covering players.
+pub fn is_fully_covered(hwnd: isize, allow: &[isize]) -> bool {
+    covering_player_windows(hwnd, allow).is_some()
 }
 
 /// Raise a window to the top of the non-topmost z-order without activating it.
@@ -3378,6 +3471,44 @@ mod tests {
         // Saturating arithmetic, never a panic on a screen-sized rect.
         let points = occlusion_samples(i32::MAX - 10, i32::MIN + 10, 4000, 4000);
         assert_eq!(points.len(), 64);
+    }
+
+    #[test]
+    fn occlusion_rect_contains_is_half_open() {
+        let rect = Rect {
+            left: 10,
+            top: 20,
+            right: 110,
+            bottom: 220,
+        };
+        assert!(rect_contains(rect, 10, 20));
+        assert!(rect_contains(rect, 109, 219));
+        // The far edges belong to the next window, exactly like the point test
+        // this replaced; a point there must not count as covered.
+        assert!(!rect_contains(rect, 110, 219));
+        assert!(!rect_contains(rect, 109, 220));
+        assert!(!rect_contains(rect, 9, 20));
+        assert!(!rect_contains(rect, 10, 19));
+    }
+
+    #[test]
+    fn player_window_registry_dedupes_and_unregisters() {
+        // Handles are opaque here: the registry itself never validates them
+        // (only `player_windows` prunes destroyed ones), so a fake value pins
+        // the bookkeeping without a real window.
+        register_player_window(4242);
+        register_player_window(4242);
+        let count = PLAYER_WINDOWS
+            .lock()
+            .map(|list| list.iter().filter(|hwnd| **hwnd == 4242).count())
+            .unwrap_or(0);
+        assert_eq!(count, 1);
+        assert!(unregister_player_window(4242));
+        assert!(!unregister_player_window(4242));
+        assert!(!PLAYER_WINDOWS
+            .lock()
+            .map(|list| list.contains(&4242))
+            .unwrap_or(false));
     }
 
     #[test]

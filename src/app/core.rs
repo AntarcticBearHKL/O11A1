@@ -22,6 +22,15 @@ pub(crate) const THUMB_CONCURRENCY: usize = 6;
 /// Bumped in `open_player_inner` and decremented on every player close path.
 pub(crate) static PLAYER_OPEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// The live value of the search sequence counter, mirrored into a plain atomic
+/// so a QA hook (and the cover logs) can name the generation a page belongs to
+/// without reaching into `main`'s wiring. Product code never reads it.
+pub(crate) static SEARCH_SEQ_MIRROR: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn search_seq_now() -> u64 {
+    SEARCH_SEQ_MIRROR.load(Ordering::SeqCst)
+}
+
 /// The one live session, shared with the player worker threads.
 pub(crate) type SessionSlot = Arc<Mutex<Option<Arc<bilibili::Session>>>>;
 
@@ -3413,6 +3422,11 @@ pub(crate) fn run_search(
     // loaded page fills exactly one screen.
     let ps = current_page_size(&weak);
     let seq = search_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    SEARCH_SEQ_MIRROR.store(seq, Ordering::SeqCst);
+    crate::debug_log(&format!(
+        "search run seq={seq} keyword={keyword:?} tab={tab} page={page} players={}",
+        PLAYER_OPEN_COUNT.load(Ordering::SeqCst)
+    ));
     if let Some(ui) = weak.upgrade() {
         publish_refresh(&ui, true, 0.0);
         update_page_bar(&ui);

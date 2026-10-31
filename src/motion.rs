@@ -236,13 +236,45 @@ impl MotionInterp {
         phase: f32,
         budget_ms: f32,
     ) -> bool {
+        if !Self::supports(w, h) {
+            return false;
+        }
+        self.interpolate_impl(out, a, b, w, h, phase, budget_ms)
+    }
+
+    /// QA measurement entry point: [`Self::interpolate_impl`] without the size
+    /// gate, so a spike can price a 1080p pair instead of only observing that
+    /// the product path refuses one. Test-only: the gate above is the product
+    /// behaviour.
+    #[cfg(test)]
+    pub fn interpolate_beyond_cap(
+        &mut self,
+        out: &mut [u8],
+        a: &[u8],
+        b: &[u8],
+        w: u32,
+        h: u32,
+        phase: f32,
+        budget_ms: f32,
+    ) -> bool {
+        self.interpolate_impl(out, a, b, w, h, phase, budget_ms)
+    }
+
+    /// The four passes for one pair, plus the cost record. The caller has
+    /// already decided that this frame size may run at all.
+    fn interpolate_impl(
+        &mut self,
+        out: &mut [u8],
+        a: &[u8],
+        b: &[u8],
+        w: u32,
+        h: u32,
+        phase: f32,
+        budget_ms: f32,
+    ) -> bool {
         let (wu, hu) = (w as usize, h as usize);
         let bytes = wu.saturating_mul(hu).saturating_mul(4);
-        if !Self::supports(w, h)
-            || out.len() < bytes
-            || a.len() < bytes
-            || b.len() < bytes
-        {
+        if out.len() < bytes || a.len() < bytes || b.len() < bytes || wu < BLOCK || hu < BLOCK {
             return false;
         }
         let started = Instant::now();

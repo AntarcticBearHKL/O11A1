@@ -2,6 +2,474 @@
 
 use crate::*;
 
+/// The danmaku lane's rate for a player whose pacer may run at `out_hz`.
+///
+/// Without interpolation (`out_hz == 0`) the lane keeps the display's own rate:
+/// a 30 fps picture needs its own high-rate overlay to look smooth, and that is
+/// the shipped behaviour. With interpolation on, the window already repaints
+/// `out_hz` times a second, and every danmaku row write is one more full-window
+/// repaint, so the lane caps at 60 Hz: the comments keep their px/ms speed and
+/// the repaint count stops doubling. Measured at 60 fps output on a 120 Hz
+/// display, that is the difference between ~35 and ~55 pictures a second on a
+/// busy host — the danmaku lane was asking for twice the repaints the picture
+/// did.
+pub(crate) fn danmaku_target_hz(out_hz: u32, display_hz: u32) -> u32 {
+    if out_hz >= 60 {
+        // An interpolated grid already repaints this window `out_hz` times a
+        // second; a 120 Hz comment lane on top of it doubles that count for
+        // half a pixel of movement per tick. 60 keeps the px/ms speed exactly
+        // and lets the comment repaints share the picture's.
+        display_hz.clamp(30, 60)
+    } else {
+        display_hz.clamp(30, 120)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 性能面板: the per-second instrument.
+//
+// The panel this replaced read `Stats::fps_presented` and printed it as
+// 呈现 - but that counter is the **pacer's pushes**, not the frames that
+// reached the screen. Measured on a 60 fps grid with 弹幕 on: 60 pushes,
+// 29 presents, the rest merged by the mailbox. The panel said 120 because it
+// was reporting the pacer's target, not the display.
+//
+// So every row below is a counter incremented by the thread that owns the
+// event, read once a second, and nothing is derived from a target:
+//
+//   生成     `PlaybackControl::presented_frames` - the pacer's hand-offs.
+//   上屏     the present-interval histogram's sample count - one sample per
+//            frame that *actually* reached the screen (both present paths
+//            record it: the DComp video sink and the Slint hand-over).
+//   合并     生成 - 上屏 over the same window: a pushed frame is either shown
+//            or replaced before it was, so this difference IS the coalesced
+//            count, not an estimate.
+//   帧间隔   p50/p95 of the same histogram, in ms.
+//   解码     `Stats::fps_decoded` - frames ffmpeg's reader actually read.
+//   卡顿     `Stats::stalls` - the watchdog's cumulative empty-ring stalls.
+//   弹幕帧率  the fast lane's own tick counter (one tick = one repaint
+//            request), counted in the callback that runs it.
+//   绘制     the layer's `DanmakuStats::render_ms` p50/p95. Only the DComp
+//            comment layer has one: on the winit path the comments are drawn
+//            inside the UI tree, so the row says "—" instead of inventing a
+//            cost the process cannot measure.
+//   UI 间隔  the 4 ms probe in the 性能 body: real gaps on this event loop.
+//   UI 绘制  `dcomp::ui_counters` - the last UI paint's cost.
+//   速率     the proxy's counted bytes/s (no ≈), plus this session's peak.
+//   连接     busy workers / configured ones, from the same snapshot.
+//   缓冲     decoded seconds ahead, and the ring's occupancy at the track's
+//            own rate.
+//   失败区间 `PrefetchStats::failed_ranges`.
+//   插帧     模式 / 档位 / 一帧的成本 / 视频层达到的上屏率.
+//
+// Values are formatted here, once a second: an empty one is "—" and never a
+// zero pretending to be a measurement. The write only happens while the player
+// window is on screen and playing - a paused player publishes nothing, so the
+// panel keeps the last second of playback it measured instead of decaying to
+// zero.
+// ---------------------------------------------------------------------------
+
+/// Samples one rolling cost window keeps. The UI probe runs at 4 ms, so 256
+/// samples is the last second; the 弹幕 windows fill slower and therefore span
+/// more than a second, which is what their p50/p95 wants.
+const PERF_HIST_SAMPLES: usize = 256;
+
+/// The 性能 panel publishes once a second. Anything faster would turn the
+/// panel into a per-frame property writer (the old 4 Hz `网络分析` publish is
+/// still there for the strip; this one is the instrument).
+const PERF_PUBLISH_MS: i64 = 1000;
+
+/// Rolling sample window for one measured cost, in 1/100 ms.
+#[derive(Default)]
+struct CostHist {
+    samples: VecDeque<u16>,
+}
+
+impl CostHist {
+    /// Add one sample. Non-finite/negative values are dropped: a cost that
+    /// cannot be represented is not a measurement.
+    fn push(&mut self, ms: f32) {
+        if !ms.is_finite() || ms < 0.0 {
+            return;
+        }
+        if self.samples.len() >= PERF_HIST_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((ms * 100.0).min(f32::from(u16::MAX)) as u16);
+    }
+
+    /// `(p50, p95)` in ms, or `None` while there is nothing to describe (one
+    /// sample is not a distribution, so the row reads "—" until there are two).
+    fn percentiles(&self) -> Option<(f64, f64)> {
+        if self.samples.len() < 2 {
+            return None;
+        }
+        let mut values: Vec<u16> = self.samples.iter().copied().collect();
+        values.sort_unstable();
+        let pick = |percent: f64| -> f64 {
+            let index = ((values.len() as f64 * percent).ceil() as usize)
+                .saturating_sub(1)
+                .min(values.len() - 1);
+            f64::from(values[index]) / 100.0
+        };
+        Some((pick(0.50), pick(0.95)))
+    }
+}
+
+/// One publish's playback state, read by the tick that publishes (`None` rows
+/// need to know why a counter has no sample).
+#[derive(Clone, Copy)]
+pub(crate) struct PerfCtx {
+    pub(crate) danmaku_on: bool,
+    pub(crate) paused: bool,
+    pub(crate) frames_on: bool,
+    /// Rows the danmaku model currently holds.
+    pub(crate) dm_rows: usize,
+}
+
+/// The 性能 panel's measurements. One per player window, UI thread only.
+pub(crate) struct PerfPanel {
+    /// Player-clock ms of the previous publish (`0` = none yet, so the first
+    /// window is measured from the player's own start).
+    last_at: Cell<i64>,
+    /// Cumulative counters at the previous publish.
+    last_pushed: Cell<u64>,
+    last_shown: Cell<u64>,
+    last_dm_ticks: Cell<u64>,
+    /// Highest metered throughput of this session, bytes/s.
+    peak_bps: Cell<u64>,
+    /// 弹幕 fast-lane ticks, shared with the lane's own callback.
+    dm_ticks: Rc<Cell<u64>>,
+    /// Cost windows: 弹幕 layer render, UI probe gap.
+    dm_render_ms: RefCell<CostHist>,
+    ui_gap_ms: RefCell<CostHist>,
+    /// Monotonic instant of the previous 4 ms probe callback.
+    ui_last: Cell<Option<Instant>>,
+    /// Gate for the 20 Hz 弹幕 render sample: reading that counter takes the
+    /// layer registry lock, so it is not read per frame.
+    dm_sample_at: Cell<i64>,
+}
+
+impl PerfPanel {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_at: Cell::new(0),
+            last_pushed: Cell::new(0),
+            last_shown: Cell::new(0),
+            last_dm_ticks: Cell::new(0),
+            peak_bps: Cell::new(0),
+            dm_ticks: Rc::new(Cell::new(0)),
+            dm_render_ms: RefCell::new(CostHist::default()),
+            ui_gap_ms: RefCell::new(CostHist::default()),
+            ui_last: Cell::new(None),
+            dm_sample_at: Cell::new(-50),
+        }
+    }
+
+    /// One 弹幕 fast-lane tick: one repaint request by the lane. The lane's
+    /// own gate drops the wakes that arrive early, so this is the rate the
+    /// tick scheduler really ran at - the number the row reports.
+    pub(crate) fn note_dm_tick(&self) {
+        self.dm_ticks.set(self.dm_ticks.get().wrapping_add(1));
+    }
+
+    /// One sample of the 弹幕 layer's per-frame render cost (DComp path).
+    pub(crate) fn note_dm_render(&self, ms: f32) {
+        self.dm_render_ms.borrow_mut().push(ms);
+    }
+
+    /// One 4 ms probe callback: the gap since the previous one is the event
+    /// loop's real cadence while the panel is on screen.
+    pub(crate) fn note_ui_tick(&self) {
+        let now = Instant::now();
+        if let Some(previous) = self.ui_last.replace(Some(now)) {
+            self.ui_gap_ms
+                .borrow_mut()
+                .push(now.duration_since(previous).as_secs_f32() * 1000.0);
+        }
+    }
+
+    /// Publish one second of measurements. `now_ms` is the player tick's clock.
+    pub(crate) fn publish(
+        &self,
+        window: &PlayerWindow,
+        stats: Option<&player::Stats>,
+        metered: Option<&prefetch::PrefetchStats>,
+        control: &player::PlaybackControl,
+        ctx: PerfCtx,
+        now_ms: i64,
+    ) {
+        // 暂停时不发布: a frozen picture's numbers freeze with it, so the panel
+        // keeps the last second of playback it measured instead of decaying
+        // into 0.0 /s a second after the pause. The one exception is a player
+        // that is already paused before it ever published (opened paused): it
+        // gets one snapshot, or every row would read "—" forever.
+        if ctx.paused && self.last_at.get() != 0 {
+            return;
+        }
+        // A hidden window is never published to.
+        if control.occluded() {
+            return;
+        }
+
+        // Video: the two counters are cumulative for this player window, so the
+        // rate is the delta over the window this publish covers.
+        let pushed = control.presented_frames();
+        let shown = control.present_percentiles().2;
+        let ticks = self.dm_ticks.get();
+        let previous_at = self.last_at.replace(now_ms);
+        let dt_ms = now_ms - previous_at;
+        if previous_at != 0 && dt_ms > 2500 {
+            // A gap (a pause, a hidden window, a long seek): the deltas over it
+            // do not describe one second, so the window restarts here and the
+            // next publish is a clean one.
+            self.last_pushed.set(pushed);
+            self.last_shown.set(shown);
+            self.last_dm_ticks.set(ticks);
+            return;
+        }
+        let dt_ms = dt_ms.max(1);
+        let pushed_delta = pushed.saturating_sub(self.last_pushed.replace(pushed));
+        let shown_delta = shown.saturating_sub(self.last_shown.replace(shown));
+        let gen_s = rate_text(pushed_delta, dt_ms);
+        let shown_s = rate_text(shown_delta, dt_ms);
+        // A pushed frame is either shown or replaced before the UI took it, so
+        // this difference is exactly the coalesced count of the same window.
+        let coal_s = rate_text(pushed_delta.saturating_sub(shown_delta), dt_ms);
+        let (gap_p50, gap_p95, gap_n) = control.present_percentiles();
+        window.set_perf_gen(gen_s.clone().into());
+        window.set_perf_shown(shown_s.clone().into());
+        window.set_perf_coal(coal_s.clone().into());
+        window.set_perf_gap(
+            if gap_n < 2 {
+                "—".to_string()
+            } else {
+                format!("{} / {} ms", gap_value(gap_p50), gap_value(gap_p95))
+            }
+            .into(),
+        );
+
+        match stats {
+            Some(stats) => {
+                window.set_perf_decode(format!("{:.1} /s", stats.fps_decoded).into());
+                window.set_perf_stalls(format!("{} 次", stats.stalls).into());
+                window.set_perf_codec(
+                    if stats.width == 0 || stats.height == 0 {
+                        crate::codec_name(stats.codecid).to_string()
+                    } else {
+                        format!(
+                            "{} · {}×{} · {:.0} fps",
+                            crate::codec_name(stats.codecid),
+                            stats.width,
+                            stats.height,
+                            stats.declared_fps
+                        )
+                    }
+                    .into(),
+                );
+                // 缓冲: decoded seconds ahead + the ring in frames at the
+                // track's own rate. `declared_fps` is the stream's, not a
+                // measurement, so it is only the denominator.
+                let ring = control.ring_occupancy();
+                window.set_perf_net_buffer(
+                    format!(
+                        "{:.2} s · ring {ring} 帧 / {:.1} fps",
+                        stats.buffer_s, stats.declared_fps
+                    )
+                    .into(),
+                );
+            }
+            None => {
+                // No track yet: every video row reads "—" rather than zero.
+                window.set_perf_decode("—".into());
+                window.set_perf_stalls("—".into());
+                window.set_perf_codec("—".into());
+                window.set_perf_net_buffer("—".into());
+            }
+        }
+
+        // 弹幕: the fast lane's tick count. Off means no ticks happen at all,
+        // and "—" says so instead of a 0 that would read as a measurement.
+        let dm_delta = ticks.saturating_sub(self.last_dm_ticks.replace(ticks));
+        window.set_perf_dm_rate(
+            if ctx.danmaku_on && ctx.frames_on {
+                rate_text(dm_delta, dt_ms)
+            } else {
+                "—".to_string()
+            }
+            .into(),
+        );
+        window.set_perf_dm_paint(
+            match self.dm_render_ms.borrow().percentiles() {
+                Some((p50, p95)) => format!("{p50:.2} / {p95:.2} ms"),
+                None => "—".to_string(),
+            }
+            .into(),
+        );
+        window.set_perf_dm_rows(
+            if ctx.danmaku_on && ctx.dm_rows > 0 {
+                format!("{} 条", ctx.dm_rows)
+            } else {
+                "—".to_string()
+            }
+            .into(),
+        );
+
+        // UI: the 4 ms probe's own gaps, one paint's cost, and the renderer
+        // that actually won at boot (DComp when the player window is the
+        // composite one - that is the layer that presents the picture).
+        let hwnd = crate::win::hwnd_of(window.window()).unwrap_or(0);
+        window.set_perf_ui_gap(
+            match self.ui_gap_ms.borrow().percentiles() {
+                Some((p50, p95)) => format!("{p50:.2} / {p95:.2} ms"),
+                None => "—".to_string(),
+            }
+            .into(),
+        );
+        window.set_perf_ui_paint(
+            match crate::dcomp::ui_counters(hwnd) {
+                Some((_, ms)) if ms > 0.0 => format!("{ms:.2} ms"),
+                _ => "—".to_string(),
+            }
+            .into(),
+        );
+        let renderer = crate::qa::perf::active_renderer();
+        window.set_perf_renderer(
+            if crate::dcomp::is_player_window(hwnd) {
+                format!("DComp · {renderer}")
+            } else {
+                renderer.to_string()
+            }
+            .into(),
+        );
+
+        // 网络: counted bytes only. Without the metered proxy there is no
+        // rate to report, so the rows read "—" (the old panel's ≈ estimate is
+        // gone with the counter that produced it).
+        match metered {
+            Some(metered) => {
+                if metered.bytes_per_sec > self.peak_bps.get() {
+                    self.peak_bps.set(metered.bytes_per_sec);
+                }
+                window.set_perf_net_rate(mbps_text(metered.bytes_per_sec).into());
+                window.set_perf_net_peak(mbps_text(self.peak_bps.get()).into());
+                window.set_perf_net_conn(
+                    format!(
+                        "{} / {}",
+                        metered.active_workers.min(metered.workers.len() as u32),
+                        metered.workers.len()
+                    )
+                    .into(),
+                );
+                window.set_perf_net_failed(format!("{} 次", metered.failed_ranges).into());
+            }
+            None => {
+                window.set_perf_net_rate("—".into());
+                window.set_perf_net_peak(if self.peak_bps.get() > 0 {
+                    mbps_text(self.peak_bps.get()).into()
+                } else {
+                    "—".into()
+                });
+                window.set_perf_net_conn("—".into());
+                window.set_perf_net_failed("—".into());
+            }
+        }
+
+        // 插帧: the mode the pacer runs, the tier it resolved, what one
+        // generated frame cost, and the rate those frames reached the screen
+        // at (the same 上屏 counter as the video group).
+        //
+        // 档位 is the grid the pacer RESOLVED, never the stored 120 switch: a
+        // session whose output ceiling is 60 Hz runs 60 even with the 120
+        // setting on, and the row must say what ran (the f201 capture caught it
+        // printing 120 next to an `out_hz=60` log line).
+        let mode = control.interp_mode();
+        let out_hz = control.interp_out_hz();
+        window.set_perf_interp_on(mode != 0);
+        if mode != 0 {
+            window.set_perf_interp_hz(
+                if out_hz == 0 {
+                    "—".to_string()
+                } else {
+                    out_hz.to_string()
+                }
+                .into(),
+            );
+            // Mode 2 measures its pairs (block matching), mode 3 its optical
+            // flow submits. Mode 1 has no pair histogram, so it reports the
+            // measured per-frame average (`interp_us / generated`) instead of a
+            // percentile it cannot compute.
+            let cost = match mode {
+                2 => {
+                    let (p50, p95) = control.interp_bm_percentiles();
+                    (p50 > 0.0 || p95 > 0.0).then(|| format!("{p50:.2} / {p95:.2} ms"))
+                }
+                3 => {
+                    let (p50, p95) = control.interp_ofa_percentiles();
+                    (p50 > 0.0 || p95 > 0.0).then(|| format!("{p50:.2} / {p95:.2} ms"))
+                }
+                _ => {
+                    let (generated, _, avg_ms) = control.interp_stats();
+                    (generated > 0 && avg_ms > 0.0).then(|| format!("{avg_ms:.2} ms 均"))
+                }
+            };
+            window.set_perf_interp_cost(cost.unwrap_or_else(|| "—".to_string()).into());
+            window.set_perf_interp_reach(shown_s.clone().into());
+        }
+
+        // The log counterpart of the screen: one line per publish, so a QA run
+        // can line the digits up with the player's own `fps_presented` /
+        // `shown_s` lines for the same second.
+        crate::debug_log(&format!(
+            "perf panel t_ms={now_ms} window_ms={dt_ms} pushed={pushed} shown={shown} \
+             gen_s={} shown_s={} coal_s={} gap_p50_ms={gap_p50:.2} gap_p95_ms={gap_p95:.2} \
+             gap_n={gap_n} dm_ticks={ticks} dm_rows={} dm_paint={} ui_gap={} ui_paint={} \
+             renderer={}",
+            clean(&gen_s),
+            clean(&shown_s),
+            clean(&coal_s),
+            ctx.dm_rows,
+            clean(&window.get_perf_dm_paint().to_string()),
+            clean(&window.get_perf_ui_gap().to_string()),
+            clean(&window.get_perf_ui_paint().to_string()),
+            clean(&window.get_perf_renderer().to_string()),
+        ));
+    }
+}
+
+/// `118.2 /s` for `count` events over `dt_ms`. The window is the publish's own
+/// interval, so a short one cannot inflate the rate.
+fn rate_text(count: u64, dt_ms: i64) -> String {
+    format!("{:.1} /s", count as f64 * 1000.0 / dt_ms.max(1) as f64)
+}
+
+/// `42.3 MB/s`, decimal units: the same base as the strip's byte counts, so a
+/// rate and a claimed range read off one screen agree.
+fn mbps_text(bps: u64) -> String {
+    format!("{:.1} MB/s", bps as f64 / 1_000_000.0)
+}
+
+/// The pacer's present-interval histogram tops out at 32 ms (128 buckets of
+/// 0.25 ms), so a percentile that lands exactly on the cap means "this long or
+/// longer". Printing it as an exact `32.00` would be the kind of precision this
+/// panel exists to remove, so the cap is spelled out.
+const PRESENT_HIST_CAP_MS: f64 = 32.0;
+
+/// One present-interval value, marked with `≥` when it sits on the histogram's
+/// last bucket.
+fn gap_value(ms: f64) -> String {
+    if ms >= PRESENT_HIST_CAP_MS {
+        format!("≥{ms:.2}")
+    } else {
+        format!("{ms:.2}")
+    }
+}
+
+/// A log field with no spaces in it (the line is parsed by column).
+fn clean(text: &str) -> String {
+    text.replace(' ', "_")
+}
+
 /// The open player's comment state: which video's comments are loaded, the
 /// paging cursor, the rows the UI renders, the sort mode and a cache of each
 /// comment's dialog (keyed by root `rpid`).
@@ -670,6 +1138,101 @@ pub(crate) fn schedule_overlay_exit(
 /// closes the focused one first (card_open mode 0 / queue / detail 播放), while
 /// [`OpenMode::NewWindow`] leaves them untouched and adds a cascaded window
 /// (card_open mode 1).
+/// One folder row of the player's 收藏 picker (f179). `confirmed` is false when
+/// the folder list did not report this video's membership: the UI then says
+/// 未确认 instead of drawing a check mark nobody verified.
+#[derive(Clone)]
+pub(crate) struct FavPick {
+    pub(crate) fid: i64,
+    pub(crate) title: String,
+    pub(crate) count: u32,
+    pub(crate) checked: bool,
+    pub(crate) confirmed: bool,
+}
+
+impl FavPick {
+    /// `收藏夹/资源` rows for the Slint model.
+    fn rows(rows: &[FavPick]) -> Vec<PlayerFavRow> {
+        rows.iter()
+            .map(|row| PlayerFavRow {
+                fid: row.fid.to_string().into(),
+                title: row.title.clone().into(),
+                count: row.count.min(i32::MAX as u32) as i32,
+                checked: row.checked,
+                confirmed: row.confirmed,
+            })
+            .collect()
+    }
+}
+
+/// Publish the picker: the rows, the 收藏 chip's state (solid when ANY folder
+/// holds the video) and one optional line of feedback. Also mirrors the rows
+/// into the shared slot so the next toggle starts from what the user sees.
+fn publish_fav_picker(
+    window: &PlayerWindow,
+    slot: &Arc<Mutex<Vec<FavPick>>>,
+    rows: Vec<FavPick>,
+    hint: Option<(&str, bool)>,
+) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = rows.clone();
+    }
+    let any = rows.iter().any(|row| row.checked);
+    window.set_fav_items(ModelRc::from(std::rc::Rc::new(VecModel::from(FavPick::rows(
+        &rows,
+    )))));
+    window.set_fav_loading(false);
+    window.set_favorited(any);
+    window.set_fav_text(if any { "已收藏" } else { "收藏" }.into());
+    if let Some((text, error)) = hint {
+        window.set_fav_hint(text.into());
+        window.set_fav_hint_error(error);
+    }
+}
+
+/// f202: publish 画质增强 — the tier in effect, which tiers this machine can
+/// run, and the one line that explains the greyed ones.
+///
+/// The tiers only exist in the DComp picture path (`src/dcomp/video.rs`); on the
+/// winit path there is no video layer to draw into, so 1–3 are greyed with that
+/// reason rather than silently doing nothing.
+///
+/// f204: the same publish also fills the 画面直出 row: `player_dcomp` is the
+/// stored preference the row edits, `dcomp_active` is the path this process
+/// actually runs on (`platform::enabled()` was resolved at start-up). The two
+/// differ exactly when the user flipped the switch and has not restarted yet,
+/// which is what the row's "重启后生效" wording is derived from.
+fn publish_enhance(window: &PlayerWindow, player_dcomp: bool) {
+    let dcomp = crate::dcomp::platform::enabled();
+    let availability = crate::dcomp::enhance::availability();
+    let shader_ok = dcomp && availability.shaders;
+    let mut parts: Vec<String> = Vec::new();
+    if !dcomp {
+        parts.push("未开启画面直出：锐化 / Anime4K / FSR（1–3 档）不可用".to_string());
+    } else if !availability.shaders {
+        parts.push(format!("锐化 / Anime4K / FSR：{}", availability.shader_reason));
+    }
+    window.set_enhance_shader_ok(shader_ok);
+    window.set_enhance_hint(parts.join("；").into());
+    window.set_player_dcomp(player_dcomp);
+    window.set_dcomp_active(dcomp);
+    // A stored tier this machine cannot run must not look selected. Falling
+    // back here (once, before the first frame) is what keeps a settings.json
+    // copied from another machine from reporting a filter that is not running.
+    let wanted = crate::dcomp::enhance::desired();
+    let allowed = wanted == crate::dcomp::enhance::OFF || shader_ok;
+    if !allowed {
+        crate::dcomp::enhance::set_desired(crate::dcomp::enhance::OFF);
+        window.set_enhance_mode(crate::dcomp::enhance::OFF as i32);
+    }
+    crate::debug_log(&format!(
+        "enhance publish mode={} dcomp={dcomp} player_dcomp={player_dcomp} shaders={} hint={}",
+        crate::dcomp::enhance::desired(),
+        availability.shaders,
+        parts.join("；")
+    ));
+}
+
 pub(crate) fn open_player_inner(
     session: Arc<bilibili::Session>,
     video: bilibili::FeedVideo,
@@ -706,6 +1269,7 @@ pub(crate) fn open_player_inner(
         None
     };
     if let Some(old) = replacing.as_ref() {
+        let close_started = std::time::Instant::now();
         crate::debug_log(&format!(
             "card open replace closed_win={} bvid={bvid}",
             old.id
@@ -717,18 +1281,32 @@ pub(crate) fn open_player_inner(
             settings_store,
             "replace",
         );
+        crate::debug_log(&format!(
+            "card open replace close_ms={}",
+            close_started.elapsed().as_millis()
+        ));
     }
     let open_count = state.players.borrow().len();
     crate::debug_log(&format!(
         "player open mode={mode:?} bvid={bvid} existing={open_count}"
     ));
 
-    let player = match PlayerWindow::new() {
+    let player = match crate::dcomp::with_player_scope(PlayerWindow::new) {
         Ok(player) => player,
         Err(_) => return,
     };
     let title_for_mini = video.title.clone();
     player.global::<AppTheme>().set_dark(state.theme_dark.get());
+    // f194: the player window built by the DComp adapter renders its Slint UI
+    // with the software renderer. Tell the theme so the danmaku layer can drop
+    // the second Text per item (see `soft-ui` in `ui/app.slint`): that is the
+    // difference between ~50 and ~70 UI-layer updates per second while the
+    // danmaku move.
+    if let Some(hwnd) = win::hwnd_of(player.window()) {
+        player
+            .global::<AppTheme>()
+            .set_soft_ui(crate::dcomp::is_player_window(hwnd));
+    }
     player.set_video_title(video.title.clone().into());
     // Left sidebar's video-info header: everything the feed row already knows
     // (the card/detail path fills what it has and leaves the rest empty).
@@ -877,6 +1455,10 @@ pub(crate) fn open_player_inner(
     player.set_speed_milli(prefs.player_speed as f32);
     player.set_speed_text(format_speed(prefs.player_speed as f64 / 1000.0).into());
     player.set_key_map(key_map_model(&prefs.player_keys));
+    // f202: restore 画质增强 before the first frame is presented, so a stored
+    // Anime4K/FSR tier is already the one the video thread reads.
+    crate::dcomp::enhance::set_desired(prefs.player_enhance);
+    player.set_enhance_mode(prefs.player_enhance as i32);
 
     // Frameless at the moment of presentation: strip the caption and install
     // the non-client subclass synchronously, before/around `show()`, so the
@@ -1083,7 +1665,7 @@ pub(crate) fn open_player_inner(
     // `start_player_loops`, which reads the native rect at 60Hz: it therefore
     // fires once the gestured rect settles, exactly as with a native resize.
     let player_resize = Rc::new(win::WindowResize::new());
-    player_resize.set_min(480, 270);
+    player_resize.set_min(524, 270);
     let player_resize_timer = Rc::new(slint::Timer::default());
     {
         let weak = weak.clone();
@@ -1173,6 +1755,11 @@ pub(crate) fn open_player_inner(
         });
     }
     let control = player::PlaybackControl::new();
+    // f212: publish the window handle before any decode thread can ask for the
+    // video layer. The DComp side already knows this window (its composition
+    // tree is attached by now), so the zero-copy decision no longer needs the
+    // event loop — see `player::start_mf_session`.
+    control.set_window_hwnd(win::hwnd_of(player.window()).unwrap_or(0));
     // The video this window starts on: a 选集 pick replaces it in place (see
     // `PlaybackControl::switch_to`), so the control has to know it from the
     // first click, not only once the decode thread has armed.
@@ -1198,11 +1785,17 @@ pub(crate) fn open_player_inner(
     // `set_interp_mode` normalises it (0 = 关闭, 1 = 混合, 2 = 块匹配, 3 = OFA,
     // anything else = off) and is what the badge and the pacer read.
     control.set_interp_mode(prefs.interp_mode);
+    // 插帧帧率: persisted 60/120. The pacer reads it when it resolves the next
+    // session's grid; 120 additionally needs the picture surface (see
+    // `player::video_surface`) and the self-check below.
+    control.set_interp_120(prefs.interp_120);
     start_gpu_sampler();
     // The three interpolation labels are republished by the tick on change; seed
     // them now so the row never shows a stale/blank mode for the first frames.
     player.set_interp_mode_text(control.interp_mode_text().into());
     player.set_interp_mode(i32::from(control.interp_mode()));
+    player.set_interp_120(control.interp_120());
+    player.set_interp_120_ok(true);
     player.set_interp_stats_text(control.interp_stats_text().into());
     player.set_interp_gpu_text(gpu_utilization_text().into());
     // `interp_cycle()` (the row and the shortcut menu item) advances
@@ -1241,6 +1834,144 @@ pub(crate) fn open_player_inner(
             ));
         });
     }
+    // f190 平滑 menu: a row picks an ABSOLUTE mode, so 混合 / 块匹配 / OFA is one
+    // press away instead of one-to-three cycle steps. Same tail as the cycle
+    // above (normalise, apply to this player, persist to settings, republish
+    // all three labels in the same turn) - only the target differs.
+    //
+    // The OFA row is refused where the runtime is missing, exactly like the
+    // cycle's skip: `set_interp_mode(3)` would report a mode the pacer can
+    // never run, and the user would see "OFA" over a blended picture.
+    {
+        let control = control.clone();
+        let window = weak.clone();
+        let store = settings_store.clone();
+        player.on_interp_set(move |mode| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let wanted = mode.clamp(0, 3) as u8;
+            if wanted == player::INTERP_MODE_OFA && !player::ofa_present() {
+                crate::debug_log("interp menu skip mode=3 reason=dll_missing");
+                return;
+            }
+            control.set_interp_mode(wanted);
+            update_settings(&store, |prefs| prefs.interp_mode = wanted);
+            window.set_interp_mode_text(control.interp_mode_text().into());
+            window.set_interp_mode(i32::from(control.interp_mode()));
+            window.set_interp_stats_text(control.interp_stats_text().into());
+            crate::debug_log(&format!(
+                "interp menu set mode={} text={} source=menu",
+                control.interp_mode(),
+                control.interp_mode_text()
+            ));
+        });
+    }
+    // 帧率 row of the 平滑 menu: 60 / 120 for the *output grid*.
+    //
+    // 120 is not a promise the UI can make on its own, so it is measured: the
+    // switch requests a restart (a seek to the current position, the same path
+    // a 画质 pick uses), waits for the new session to settle, then reads the
+    // present intervals it produced for three seconds. A grid that cannot hold
+    // an 8.3 ms slot (p95 over one 120 Hz frame) is refused: 120 is turned back
+    // off, the row stays unavailable for this window, and both the log and the
+    // toast carry the measured p95 as the reason.
+    {
+        let control = control.clone();
+        let window = weak.clone();
+        let store = settings_store.clone();
+        let ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        player.on_interp_fps(move |on| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            if control.interp_mode() == 0 && on {
+                crate::debug_log("interp fps ignored hz=120 reason=mode_off");
+                return;
+            }
+            if busy.load(Ordering::SeqCst) {
+                return;
+            }
+            if !on {
+                control.set_interp_120(false);
+                ok.store(true, Ordering::SeqCst);
+                update_settings(&store, |prefs| prefs.interp_120 = false);
+                window.set_interp_120(false);
+                window.set_interp_120_ok(true);
+                window.set_interp_120_note(SharedString::default());
+                // The grid applies to the next session: restart this one.
+                control.seek(control.playback_position_ms());
+                crate::debug_log("interp fps set hz=60 source=menu");
+                return;
+            }
+            if !ok.load(Ordering::SeqCst) {
+                crate::debug_log("interp fps refused hz=120 reason=self_check_failed");
+                return;
+            }
+            busy.store(true, Ordering::SeqCst);
+            control.set_interp_120(true);
+            update_settings(&store, |prefs| prefs.interp_120 = true);
+            window.set_interp_120(true);
+            crate::debug_log("interp fps set hz=120 source=menu check=armed");
+            // The restart is what makes the pacer resolve a 120 Hz grid.
+            control.seek(control.playback_position_ms());
+            let control_probe = control.clone();
+            let window_probe = window.as_weak();
+            let ok_probe = ok.clone();
+            let busy_probe = busy.clone();
+            let store_probe = store.clone();
+            std::thread::spawn(move || {
+                // 1.2 s for the restart to reach its first picture, then a 3 s
+                // window of present intervals.
+                std::thread::sleep(Duration::from_millis(1_200));
+                std::thread::sleep(Duration::from_millis(3_000));
+                let (p50, p95, samples) = control_probe.present_percentiles();
+                let out_hz = control_probe.interp_out_hz();
+                let (shown_surface, blit_us) = control_probe.surface_receipt();
+                // The threshold is one 120 Hz slot plus 2 %: an interval p95
+                // above it means the grid misses frames, and the mode would be
+                // advertised with a rate it cannot hold.
+                let threshold = 8.5;
+                let passed = out_hz >= 120 && samples >= 60 && p95 <= threshold;
+                // `shown_s` is derived from the measured interval: that is the
+                // rate pictures actually reached the screen at during the
+                // check, which is the number the mode is judged on (and the one
+                // the log keeps for every entry into 120).
+                let shown_s = if p50 > 0.0 { 1000.0 / p50 } else { 0.0 };
+                crate::debug_log(&format!(
+                    "interp fps check hz=120 out_hz={out_hz} passed={} shown_s={shown_s:.1} p50_ms={p50:.2} p95_ms={p95:.2} n={samples} threshold_ms={threshold:.2} surface_shown={shown_surface} blit_us={blit_us}",
+                    u8::from(passed)
+                ));
+                let _ = slint::invoke_from_event_loop(move || {
+                    busy_probe.store(false, Ordering::SeqCst);
+                    let Some(window) = window_probe.upgrade() else {
+                        return;
+                    };
+                    if passed {
+                        ok_probe.store(true, Ordering::SeqCst);
+                        window.set_interp_120_ok(true);
+                        window.set_interp_120_note(SharedString::default());
+                        toast(
+                            &window,
+                            format!("插帧 120：{shown_surface} 帧/秒（实测）"),
+                            TOAST_KIND_SUCCESS,
+                        );
+                        return;
+                    }
+                    // Refused: put the setting back and say exactly why.
+                    ok_probe.store(false, Ordering::SeqCst);
+                    control_probe.set_interp_120(false);
+                    update_settings(&store_probe, |prefs| prefs.interp_120 = false);
+                    window.set_interp_120(false);
+                    window.set_interp_120_ok(false);
+                    let note = format!("120 档上屏不达标：p95 {p95:.1} ms（需 ≤ 8.3）");
+                    window.set_interp_120_note(note.clone().into());
+                    toast(&window, format!("已保持 60 fps · {note}"), TOAST_KIND_INFO);
+                });
+            });
+        });
+    }
     // Everything that belongs to exactly this window. The session is registered
     // before the callbacks below, which resolve it by HWND.
     let session_rec = Rc::new(PlayerSession {
@@ -1274,8 +2005,22 @@ pub(crate) fn open_player_inner(
     let clock = Instant::now();
     // The danmaku model is created once here and mutated in place by the tick, so
     // a frame diffs rows instead of re-creating every danmaku node each tick.
-    let danmaku_model = Rc::new(VecModel::<DanmakuItem>::from(Vec::<DanmakuItem>::new()));
-    player.set_danmaku_items(ModelRc::from(danmaku_model.clone()));
+    //
+    // f196: on the composite path the comments belong to the DComp danmaku layer
+    // (`src/dcomp/danmaku.rs`), and the motion lane must publish into THAT
+    // model - the player component's own `danmaku_items` stays empty, which is
+    // what keeps a moving comment from dirtying the UI layer at all.
+    let external_danmaku = win::hwnd_of(player.window())
+        .and_then(crate::dcomp::danmaku_model);
+    let danmaku_model = match &external_danmaku {
+        Some(model) => model.clone(),
+        None => Rc::new(VecModel::<DanmakuItem>::from(Vec::<DanmakuItem>::new())),
+    };
+    if external_danmaku.is_some() {
+        player.set_external_danmaku(true);
+    } else {
+        player.set_danmaku_items(ModelRc::from(danmaku_model.clone()));
+    }
     // 弹幕 motion lane: the fast tick (see the "弹幕 motion lane" section) owns the
     // x of the comments already on screen; the 33 ms tick below owns everything
     // else and publishes the visible set plus the media-clock anchor. The rate
@@ -1289,7 +2034,19 @@ pub(crate) fn open_player_inner(
         danmaku_hz,
     ));
     player.set_danmaku_frame_interval(danmaku_wake_ms(danmaku_hz));
+    // f196 QA: `BILI_F196_CAPTURE` snapshots this window's Slint tree (see
+    // src/qa/f196.rs); inert without the variable.
+    crate::qa::f196_spawn_capture(&player.as_weak());
+    // f200 QA: `BILI_F200_LAYERS=<seconds>` prints the three layers' per-second
+    // rates (see src/qa/f200.rs); inert without the variable.
+    crate::qa::f200_spawn_layers();
+    // f201 QA: `BILI_F201_TEST=<seconds>[,pause|idle]` opens the rewritten 性能
+    // panel and reads its rows back once a second (see src/qa/f201.rs); inert
+    // without the variable.
+    crate::qa::f201_spawn_panel(player.as_weak());
     player.set_danmaku_frame_running(false);
+    // The panel's refresh rate, captured for the 插帧-120 cap in the slow tick.
+    let danmaku_display_hz = display_hz;
     crate::debug_log(&format!(
         "danmaku frame open hz={danmaku_hz} display_hz={display_hz} source={danmaku_hz_source} \
          interval_ms={:.2} wake_ms={}",
@@ -1310,6 +2067,12 @@ pub(crate) fn open_player_inner(
     let refresh = Rc::new(Cell::new(true));
     let last_position = Rc::new(Cell::new(u64::MAX));
     let last_danmaku_on = Rc::new(Cell::new(true));
+    // f207: the wake the danmaku timer currently holds, so the strips path can
+    // raise it once without re-arming the timer on every tick.
+    let last_danmaku_wake = Rc::new(Cell::new(danmaku_wake_ms(danmaku_hz)));
+    // f196: one-shot log of the player's HWND (see the danmaku-visibility block
+    // in the tick).
+    let hwnd_logged = Rc::new(Cell::new(false));
     // Last duration written to the window: constant for a track, so the total
     // label is formatted once per track instead of on every 33ms tick.
     let last_duration = Rc::new(Cell::new(u64::MAX));
@@ -1323,6 +2086,12 @@ pub(crate) fn open_player_inner(
     let net_panel = Rc::new(NetPanel::new());
     net_panel.attach(&player);
     let net_last_publish = Rc::new(Cell::new(-NET_PUBLISH_MS));
+    // 性能面板: the per-second instrument (see the `PerfPanel` section above).
+    // It owns the present/push deltas, the 弹幕 fast-lane tick count and the
+    // rolling cost windows, and writes the `perf_*` properties once a second -
+    // never per frame, so a busy panel cannot cost frames.
+    let perf_panel = Rc::new(PerfPanel::new());
+    let perf_last_publish = Rc::new(Cell::new(-PERF_PUBLISH_MS));
     // Gate for the once-a-second `prefetch stats` line (per-host split).
     let net_last_split = Rc::new(Cell::new(-NET_SPLIT_LOG_MS));
     // `BILI_BUFFER_TRACE=1`: log the first 500 ms of `buffering` / position at
@@ -1391,6 +2160,8 @@ pub(crate) fn open_player_inner(
         let panel_geom = panel_geom.clone();
         let net_panel = net_panel.clone();
         let net_last_publish = net_last_publish.clone();
+        let perf_panel = perf_panel.clone();
+        let perf_last_publish = perf_last_publish.clone();
         let net_last_split = net_last_split.clone();
         let buffer_trace = buffer_trace.clone();
         let buffer_trace_at = buffer_trace_at.clone();
@@ -1485,6 +2256,26 @@ pub(crate) fn open_player_inner(
             if window.get_interp_gpu_text().as_str() != interp_gpu_text {
                 window.set_interp_gpu_text(interp_gpu_text.into());
             }
+            // f202: 画质增强. The tier is a process-wide atomic (the video
+            // thread reads it once per frame), so this tick is what makes a
+            // fallback visible: when a tier fails it clears the atomic, and the
+            // row snaps back to 关闭 with the failure as its hint instead of
+            // showing a tier that is no longer running.
+            let enhance_mode = crate::dcomp::enhance::desired() as i32;
+            if window.get_enhance_mode() != enhance_mode {
+                window.set_enhance_mode(enhance_mode);
+                // A paused picture produces no frames, so the tier change has to
+                // be presented explicitly or the menu would look dead until
+                // playback resumes.
+                if let Some(hwnd) = crate::win::hwnd_of(window.window()) {
+                    crate::dcomp::repaint(hwnd);
+                }
+            }
+            if let Some(reason) = crate::dcomp::enhance::last_failure() {
+                if window.get_enhance_hint().as_str() != reason {
+                    window.set_enhance_hint(reason.into());
+                }
+            }
             // 播放列表: this window is the queue's active player, so report the
             // play/pause state and watch for the end of the track (self-gated
             // to 250ms, like the toast tick).
@@ -1503,6 +2294,42 @@ pub(crate) fn open_player_inner(
                 window.get_bottom_panel(),
                 false,
             );
+            // f194: the DComp video layer is placed from the same properties the
+            // UI lays the band out with. Publishing it here (not only with a
+            // frame) keeps the picture in the right slot while paused, when a
+            // panel that changes the band opens without a frame arriving.
+            if let Some(hwnd) = win::hwnd_of(window.window()) {
+                let (fw, fh) = (control.frame_width(), control.frame_height());
+                // The transparent hole the DComp picture shows through must
+                // have the decoded frame's aspect, not a fixed 16:9 (4:3 and
+                // 21:9 sources otherwise leak the desktop through the bars).
+                let aspect = if fw > 0 && fh > 0 {
+                    fw as f32 / fh as f32
+                } else {
+                    16.0 / 9.0
+                };
+                if (window.get_video_aspect() - aspect).abs() > 0.001 {
+                    window.set_video_aspect(aspect);
+                }
+                crate::dcomp::sync_layout(
+                    hwnd,
+                    crate::dcomp::VideoLayout {
+                        band: (
+                            window.get_surface_x(),
+                            window.get_surface_y(),
+                            window.get_surface_w(),
+                            window.get_surface_h(),
+                        ),
+                        scale: window.window().scale_factor(),
+                        fit: window.get_fit_mode().clamp(0, 2) as u8,
+                        frame: if fw > 0 && fh > 0 {
+                            (fw, fh)
+                        } else {
+                            (960, 540)
+                        },
+                    },
+                );
+            }
             // 网络分析: the profiler is sampled every tick but only formatted
             // at 4 Hz; one sparkline sample per second. Both snapshots are taken
             // inside the 4 Hz block below: `prefetch_stats` locks the proxy and
@@ -1517,7 +2344,12 @@ pub(crate) fn open_player_inner(
             // A queued window has no decoder yet: it shows the explicit queue
             // state, never the buffering plate over a black frame.
             let queued = window.get_playback_queued();
-            let has_picture = control.audio_only() || window.get_frame().size().width > 0;
+            // 插帧 120: the picture is on its own surface, so `frame` stays
+            // 0x0 — the plate must not read that as "no picture at all" and
+            // stay up over a video that is playing.
+            let has_picture = control.audio_only()
+                || window.get_external_video()
+                || window.get_frame().size().width > 0;
             let gate = control.buffering();
             let buffering = !queued && (gate || !has_picture || window.get_qa_force_buffering());
             window.set_buffering(buffering);
@@ -1651,6 +2483,116 @@ pub(crate) fn open_player_inner(
             if window.get_danmaku_frame_running() != frames_on {
                 window.set_danmaku_frame_running(frames_on);
             }
+            // 性能面板: one publish per second, from counters only. Placed after
+            // `frames_on` (the 弹幕 rows need to know whether the lane could
+            // run at all) and before the paused-frame skip guard below, so a
+            // pause still publishes the second it happened.
+            if net_now - perf_last_publish.get() >= PERF_PUBLISH_MS {
+                perf_last_publish.set(net_now);
+                // The proxy snapshot takes a lock and merges range
+                // bookkeeping; at 1 Hz it is the same work the 网络分析 publish
+                // already does 4x a second, so one more sample per second is
+                // cheap and keeps the two panels on one source.
+                let perf_stats = control.play_stats();
+                let perf_prefetch = control.prefetch_stats();
+                perf_panel.publish(
+                    &window,
+                    perf_stats.as_ref(),
+                    perf_prefetch.as_ref(),
+                    &control,
+                    PerfCtx {
+                        danmaku_on,
+                        paused,
+                        frames_on,
+                        dm_rows: danmaku_layer.model.row_count(),
+                    },
+                    net_now,
+                );
+            }
+            // f196: the composite path draws the comments in their own layer,
+            // so the switch has to reach that layer too (the in-band copy hides
+            // itself through `danmaku_on`).
+            // f196: the composite path draws the comments in their own layer,
+            // so the switch has to reach that layer too (the in-band copy hides
+            // itself through `danmaku_on`). The resolved HWND is logged once so
+            // a QA capture can address the player window on both platforms
+            // (winit does not report one at session creation).
+            if let Some(hwnd) = win::hwnd_of(window.window()) {
+                if !hwnd_logged.get() {
+                    hwnd_logged.set(true);
+                    crate::debug_log(&format!(
+                        "player hwnd={hwnd} class={}",
+                        if crate::dcomp::is_player_window(hwnd) {
+                            "dcomp"
+                        } else {
+                            "winit"
+                        }
+                    ));
+                }
+                crate::dcomp::set_danmaku_visible(hwnd, danmaku_on);
+            }
+            // 弹幕 绘制: the layer's own per-frame render cost, sampled at 20 Hz
+            // while the lane runs. Reading it takes the layer registry lock, so
+            // it is deliberately not a per-frame read; the panel's p50/p95 is
+            // taken over the last 256 samples of that stream. The winit path has
+            // no layer stats at all (`None`), and its 绘制 row comes from the
+            // fast lane's own measured tick instead.
+            if frames_on && net_now - perf_panel.dm_sample_at.get() >= 50 {
+                perf_panel.dm_sample_at.set(net_now);
+                if let Some(hwnd) = win::hwnd_of(window.window()) {
+                    if let Some(dm) = crate::dcomp::danmaku_stats(hwnd) {
+                        perf_panel.note_dm_render(dm.render_ms);
+                    }
+                }
+            }
+            // 插帧 120 (or the 4x grid): the picture already changes 120 times a
+            // second, and every danmaku row write is a full-window repaint on
+            // this window. Half the ticks carry the same picture, so the lane is
+            // capped at 60 Hz whenever the pacer's output grid is at or above
+            // that. The motion stays smooth (a scroll comment moves ~1.3 px per
+            // 60 Hz tick) and the repaint count stops doubling for comments.
+            //
+            // f207: with the comment layer blitting cached masks
+            // (`dcomp::strips`) a tick is no longer a window repaint, so this
+            // cap was re-measured as a candidate to lift: at 120 Hz the lane did
+            // reach ~110 presents/s, and the NVIDIA driver faulted inside
+            // `nvwgf2umx.dll` (0xc0000005, faulting offset identical across
+            // runs) within 10-20 s of the switch - twice, with and without the
+            // frame-latency wait in front of the present. The cap stays at 60
+            // because 120 presents/s of a third composition layer is not
+            // something this driver survives, not because of the repaint cost.
+            {
+                let display_hz = danmaku_target_hz(control.interp_out_hz(), danmaku_display_hz);
+                let strips_on = win::hwnd_of(window.window())
+                    .and_then(crate::dcomp::danmaku_stats)
+                    .is_some_and(|stats| stats.strips_on);
+                if display_hz != danmaku_layer.hz() {
+                    danmaku_layer.apply_hz(display_hz);
+                    crate::debug_log(&format!(
+                        "danmaku frame cap hz={display_hz} out_hz={} display_hz={danmaku_display_hz} \
+                         strips={}",
+                        control.interp_out_hz(),
+                        u8::from(strips_on)
+                    ));
+                }
+                // f207: the timer wakes every `1000 / hz` ms (whole ms, 16 ms for
+                // 60 Hz) while the gate needs `1000 / hz` = 16.67 ms, so the
+                // first wake is dropped and the lane lands at 42-56 ticks/s.
+                // Giving the wake one extra millisecond lets every wake through
+                // (~59/s) - measured on the strips path, where a tick costs
+                // ~0.1 ms. The fallback keeps the old wake: there a tick is a
+                // full software render.
+                if strips_on {
+                    let wake = danmaku_frame_interval_ms(display_hz).floor() as i64 + 1;
+                    if last_danmaku_wake.get() != wake {
+                        last_danmaku_wake.set(wake);
+                        window.set_danmaku_frame_interval(wake);
+                        crate::debug_log(&format!(
+                            "danmaku frame wake ms={wake} hz={display_hz} strips=1"
+                        ));
+                    }
+                }
+            }
             if !frames_on {
                 danmaku_layer.freeze();
             }
@@ -1761,8 +2703,71 @@ pub(crate) fn open_player_inner(
     {
         // The fast half: 8 ms (120 Hz), and it touches nothing but the x of the
         // rows already on screen. See the "弹幕 motion lane" section.
+        //
+        // 弹幕帧率: one tick here is one repaint request, so counting the ticks
+        // is the honest frame rate of the comment lane (the 性能 panel reads the
+        // delta once a second). The lane's 绘制 cost is not measured here: on
+        // the winit path the comments are drawn inside the UI tree, so the only
+        // real per-frame number is the layer's own (DComp) stats, and the panel
+        // reports "—" where those do not exist.
         let layer = danmaku_layer.clone();
-        player.on_danmaku_frame_tick(move || layer.frame_tick());
+        let perf_tick = perf_panel.clone();
+        player.on_danmaku_frame_tick(move || {
+            player::probe_danmaku_tick(|| layer.frame_tick());
+            perf_tick.note_dm_tick();
+        });
+    }
+
+    {
+        // 性能面板 4 ms probe: the 性能 body's timer calls this while it is on
+        // screen (see `perf_ui_tick` in ui/app.slint), and each call records the
+        // gap to the previous one. One Instant and one bucket per wakeup; the
+        // panel reads the result in its 1 Hz publish.
+        let perf_probe = perf_panel.clone();
+        player.on_perf_ui_tick(move || perf_probe.note_ui_tick());
+    }
+
+    {
+        // f198: the 60 Hz presentation lane (the `progress_tick` timer in
+        // ui/app.slint, armed only while the chrome is on screen). It owns
+        // nothing: the playhead is a function of the same clock the pacer uses,
+        // so one read per tick is the whole input. The 33 ms tick keeps owning
+        // the comment set, the panels and the toasts; this lane only moves what
+        // the pill displays, which is what lets the fill and the two time
+        // labels follow a 120 Hz picture instead of stepping at 30 Hz.
+        let control = control.clone();
+        let window = weak.clone();
+        let last_at = Rc::new(Cell::new(u64::MAX));
+        player.on_progress_tick(move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            // A frozen picture (pause, a seek in flight, buffering) keeps the
+            // readout where it is. `seek_freeze` is checked because the 33 ms
+            // tick writes the held target itself, and a lane that overtook it
+            // would show the old position again.
+            if control.paused() || control.buffering() || control.seek_freeze() {
+                last_at.set(u64::MAX);
+                return;
+            }
+            let position = control.playback_position_ms();
+            if position == last_at.get() {
+                return;
+            }
+            last_at.set(position);
+            let duration = control.duration_ms();
+            // The readout goes through the presentation rules like the content
+            // tick does (see `player_view::Presentation::seek`): a seek jumps,
+            // playback moves.
+            crate::player_view::Presentation::new(&crate::player_view::SlintPlayerView(
+                window.as_weak(),
+            ))
+            .seek(position as u64);
+            window.set_time_current(format_mmss(position).into());
+            window.set_time_remaining(
+                format!("-{}", format_mmss(duration.saturating_sub(position))).into(),
+            );
+        });
     }
 
     {
@@ -1826,6 +2831,56 @@ pub(crate) fn open_player_inner(
                     TOAST_KIND_INFO,
                 );
             }
+        });
+    }
+    // QA (`BILI_AUDIO_ONLY_TEST=<delay_ms>`): flips 仅音频 through this same
+    // callback, measures the sound and captures the two states (f184).
+    crate::qa::maybe_start_audio_only_test(player.as_weak(), control.clone());
+    // QA (`BILI_SR_QA=1`): drives 画质增强 through the same process-wide tier the
+    // menu writes and logs each tier's GPU cost, presents/s and drops.
+    crate::qa::maybe_start_sr_test(player.as_weak(), control.clone());
+    // f204: open the 画质增强 menu (and optionally one tier) for a capture of
+    // the 画面直出 row; no-op without `BILI_F204_MENU`.
+    crate::qa::maybe_open_enhance_menu(player.as_weak());
+    // f202: 画质增强. The pick goes to a process-wide atomic the video thread
+    // reads on its next frame, is mirrored into the row (`enhance_mode`) and is
+    // persisted, so a restart keeps the tier. The availability/hint publish at
+    // open because nothing about it can change inside one session.
+    //
+    // f204: the 画面直出 row lives in the same section. It writes
+    // `player_dcomp` and nothing else: `platform::enabled()` already resolved
+    // this process's window class, so the row only shows "重启后生效" until the
+    // next start. Never restart the app from here — that is the user's call.
+    {
+        let window = weak.clone();
+        let store = settings_store.clone();
+        let stored_dcomp = settings_store
+            .lock()
+            .map(|prefs| prefs.player_dcomp)
+            .unwrap_or(false);
+        if let Some(window) = window.upgrade() {
+            publish_enhance(&window, stored_dcomp);
+        }
+        player.on_set_enhance(move |mode| {
+            let mode = mode.clamp(0, 4) as u32;
+            crate::dcomp::enhance::set_desired(mode);
+            update_settings(&store, |prefs| prefs.player_enhance = mode);
+            // The row mirrors the pick on its own; the tick sees the change and
+            // repaints a paused picture (see the 画质增强 block there).
+            if let Some(window) = window.upgrade() {
+                if let Some(hwnd) = crate::win::hwnd_of(window.window()) {
+                    crate::dcomp::repaint(hwnd);
+                }
+            }
+        });
+        let store = settings_store.clone();
+        player.on_set_player_dcomp(move |on| {
+            update_settings(&store, |prefs| prefs.player_dcomp = on);
+            crate::debug_log(&format!(
+                "f204 dcomp setting={} active={} (restart required)",
+                if on { "on" } else { "off" },
+                crate::dcomp::platform::enabled()
+            ));
         });
     }
     {
@@ -2178,7 +3233,10 @@ pub(crate) fn open_player_inner(
             let Some(window) = window.upgrade() else {
                 return;
             };
-            let items = window.get_danmaku_items();
+            // f196: the hit test reads the model the comments are actually drawn
+            // from - the layer's own model on the composite path, the player
+            // component's on winit.
+            let items = ModelRc::from(danmaku_model.clone());
             let mut hash = String::new();
             for index in 0..items.row_count() {
                 let Some(item) = items.row_data(index) else {
@@ -2233,6 +3291,9 @@ pub(crate) fn open_player_inner(
             }
         }));
     }
+    // f179: no UI entry calls this any more (the 互动 下载 chip is gone). The
+    // handler stays wired so `download::spawn` and the shared download slot keep
+    // their only caller: `src/download.rs` is kept, not deleted.
     {
         let session = session.clone();
         let bvid = bvid.clone();
@@ -2332,7 +3393,10 @@ pub(crate) fn open_player_inner(
         let control = control.clone();
         let state = state.clone();
         let window = weak.clone();
-        let mini_slot = session_rec.mini_slot.clone();
+        // The event loop is the presentation thread: keep it above the prefetch
+    // workers for the whole process (idempotent, UI thread only).
+    player::raise_ui_thread_priority();
+    let mini_slot = session_rec.mini_slot.clone();
         player.on_toggle_mini(move || {
             // The title strip is the truth: a 选集 switch may have moved this
             // window to another episode since it opened.
@@ -2425,9 +3489,11 @@ pub(crate) fn open_player_inner(
         });
     }
 
-    // Coin state on open, then the 投币/收藏/稍后再看 handlers.
+    // Coin state on open, then the 投币 / 收藏 picker handlers.
     let coin_state = Arc::new(AtomicU64::new(0));
-    let player_fav_ids: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+    // f179: the picker's rows are the shared truth between the network workers
+    // and the UI handlers (fid, count, check state, whether it was confirmed).
+    let fav_rows: Arc<Mutex<Vec<FavPick>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let session = session.clone();
         let bvid = bvid.clone();
@@ -2497,36 +3563,95 @@ pub(crate) fn open_player_inner(
     {
         let session = session.clone();
         let window = weak.clone();
-        let player_fav_ids = player_fav_ids.clone();
+        let fav_rows = fav_rows.clone();
         player.on_open_fav_menu(move || {
+            if let Some(window) = window.upgrade() {
+                window.set_fav_loading(true);
+                window.set_fav_hint("".into());
+                window.set_fav_hint_error(false);
+            }
             let session = session.clone();
             let window = window.clone();
-            let player_fav_ids = player_fav_ids.clone();
+            let fav_rows = fav_rows.clone();
             crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
-                runtime.block_on(async move {
-                    let folders = session.fav_folders().await.unwrap_or_default();
-                    let (favoured, _) = session.fav_state(aid).await.unwrap_or((false, 0));
-                    let ids: Vec<i64> = folders.iter().map(|folder| folder.id).collect();
-                    let rows: Vec<PlayerFavRow> = folders
-                        .iter()
-                        .map(|folder| PlayerFavRow {
-                            fid: folder.id.to_string().into(),
-                            title: format!("{}（{}）", folder.name, folder.count).into(),
-                        })
-                        .collect();
-                    if let Ok(mut guard) = player_fav_ids.lock() {
-                        *guard = ids;
-                    }
+                if aid <= 0 {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = window.upgrade() {
-                            window.set_fav_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
-                                rows,
-                            ))));
-                            window.set_favorited(favoured);
-                            window.set_fav_text(if favoured { "已收藏" } else { "收藏" }.into());
+                            window.set_fav_loading(false);
+                            window.set_fav_hint("该视频缺少 aid，无法读取收藏夹".into());
+                            window.set_fav_hint_error(true);
+                        }
+                    });
+                    return;
+                }
+                runtime.block_on(async move {
+                    let folders = match session.fav_folders_all(aid).await {
+                        Ok(folders) => folders,
+                        Err(err) => {
+                            crate::debug_log(&format!("fav picker folders err={err:#}"));
+                            let text = format!("读取收藏夹失败：{err}");
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(window) = window.upgrade() {
+                                    window.set_fav_loading(false);
+                                    window.set_fav_hint(text.into());
+                                    window.set_fav_hint_error(true);
+                                }
+                            });
+                            return;
+                        }
+                    };
+                    // The folder list reports this video's membership per folder
+                    // (`fav_state`). The one-video endpoint is still asked: it
+                    // is the authoritative "is it favourited at all / in how
+                    // many folders" answer, and it is what makes an unresolved
+                    // list honest instead of silently all-unchecked.
+                    let (favoured, fav_count) =
+                        session.fav_state(aid).await.unwrap_or((true, 0));
+                    let mut picks: Vec<FavPick> = folders
+                        .iter()
+                        .map(|folder| {
+                            let (checked, confirmed) = match folder.member {
+                                Some(checked) => (checked, true),
+                                None if !favoured => (false, true),
+                                None => (false, false),
+                            };
+                            FavPick {
+                                fid: folder.id,
+                                title: folder.name.clone(),
+                                count: folder.count,
+                                checked,
+                                confirmed,
+                            }
+                        })
+                        .collect();
+                    // The API says the video is in >= 1 folder, yet no row came
+                    // back checked: the per-folder flags are not usable, so every
+                    // row is marked 未确认 rather than drawn as "not in it".
+                    if favoured && fav_count > 0 && !picks.iter().any(|row| row.checked) {
+                        for row in picks.iter_mut() {
+                            row.confirmed = false;
+                        }
+                        crate::debug_log(
+                            "fav picker membership unresolved: favoured but no folder reported it",
+                        );
+                    }
+                    crate::debug_log(&format!(
+                        "fav picker rows={} checked={} unknown={} favoured={favoured}",
+                        picks.len(),
+                        picks.iter().filter(|row| row.checked).count(),
+                        picks.iter().filter(|row| !row.confirmed).count()
+                    ));
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = window.upgrade() {
+                            let hint = if picks.is_empty() {
+                                Some(("还没有收藏夹，可先新建一个", false))
+                            } else {
+                                None
+                            };
+                            publish_fav_picker(&window, &fav_rows, picks, hint);
                         }
                     });
                 });
@@ -2536,7 +3661,8 @@ pub(crate) fn open_player_inner(
     {
         let session = session.clone();
         let window = weak.clone();
-        player.on_toggle_fav(move |fid| {
+        let fav_rows = fav_rows.clone();
+        player.on_fav_toggle(move |fid, add| {
             let Ok(folder_id) = fid.parse::<i64>() else {
                 return;
             };
@@ -2546,29 +3672,99 @@ pub(crate) fn open_player_inner(
                 }
                 return;
             }
+            let before = fav_rows.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let title = before
+                .iter()
+                .find(|row| row.fid == folder_id)
+                .map(|row| row.title.clone())
+                .unwrap_or_default();
+            // Optimistic: the check mark follows the click immediately; a
+            // rejected request rolls it back to `before`.
+            let mut optimistic = before.clone();
+            for row in optimistic.iter_mut() {
+                if row.fid == folder_id {
+                    row.checked = add;
+                    row.confirmed = true;
+                }
+            }
+            if let Some(window) = window.upgrade() {
+                publish_fav_picker(&window, &fav_rows, optimistic, None);
+                window.set_fav_hint(
+                    format!(
+                        "{}「{title}」…",
+                        if add { "正在加入" } else { "正在移出" }
+                    )
+                    .into(),
+                );
+                window.set_fav_hint_error(false);
+            }
+            crate::debug_log(&format!(
+                "fav picker toggle rid={aid} folder={folder_id} add={add} title={title:?}"
+            ));
             let session = session.clone();
             let window = window.clone();
+            let fav_rows = fav_rows.clone();
+            let before = before.clone();
             crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
-                let result = runtime.block_on(session.fav_deal(aid, &[folder_id], &[]));
+                let (add_ids, del_ids): (Vec<i64>, Vec<i64>) = if add {
+                    (vec![folder_id], Vec::new())
+                } else {
+                    (Vec::new(), vec![folder_id])
+                };
+                let result = runtime.block_on(session.fav_deal(aid, &add_ids, &del_ids));
                 let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = window.upgrade() {
-                        match result {
-                            Ok(()) => {
-                                window.set_favorited(true);
-                                window.set_fav_text("已收藏".into());
-                                toast(&window, "已收藏", TOAST_KIND_SUCCESS);
+                    let Some(window) = window.upgrade() else {
+                        return;
+                    };
+                    match result {
+                        Ok(()) => {
+                            crate::debug_log(&format!(
+                                "fav deal {} ok rid={aid} folder={folder_id} title={title:?}",
+                                if add { "add" } else { "del" }
+                            ));
+                            let mut rows = before.clone();
+                            for row in rows.iter_mut() {
+                                if row.fid == folder_id {
+                                    row.checked = add;
+                                    row.confirmed = true;
+                                }
                             }
-                            Err(err) => {
-                                crate::debug_log(&format!("fav_deal add err={err:#}"));
-                                toast(
-                                    &window,
-                                    format!("收藏失败：{err}"),
-                                    TOAST_KIND_ERROR,
-                                );
-                            }
+                            publish_fav_picker(
+                                &window,
+                                &fav_rows,
+                                rows,
+                                Some((
+                                    &format!(
+                                        "{}「{title}」",
+                                        if add { "已加入" } else { "已移出" }
+                                    ),
+                                    false,
+                                )),
+                            );
+                            toast(
+                                &window,
+                                if add {
+                                    format!("已收藏到「{title}」")
+                                } else {
+                                    format!("已从「{title}」移出")
+                                },
+                                TOAST_KIND_SUCCESS,
+                            );
+                        }
+                        Err(err) => {
+                            crate::debug_log(&format!(
+                                "fav picker deal err rid={aid} folder={folder_id} add={add} err={err:#}"
+                            ));
+                            publish_fav_picker(
+                                &window,
+                                &fav_rows,
+                                before.clone(),
+                                Some((&format!("收藏失败：{err}"), true)),
+                            );
+                            toast(&window, format!("收藏失败：{err}"), TOAST_KIND_ERROR);
                         }
                     }
                 });
@@ -2578,7 +3774,73 @@ pub(crate) fn open_player_inner(
     {
         let session = session.clone();
         let window = weak.clone();
-        let player_fav_ids = player_fav_ids.clone();
+        let fav_rows = fav_rows.clone();
+        player.on_fav_create(move |name| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                if let Some(window) = window.upgrade() {
+                    window.set_fav_hint("收藏夹名称不能为空".into());
+                    window.set_fav_hint_error(true);
+                }
+                return;
+            }
+            let session = session.clone();
+            let window = window.clone();
+            let fav_rows = fav_rows.clone();
+            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
+                let Some(runtime) = crate::bilibili::shared_runtime() else {
+                    return;
+                };
+                let result = runtime.block_on(session.fav_create(&name, 0));
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(window) = window.upgrade() else {
+                        return;
+                    };
+                    match result {
+                        Ok(id) => {
+                            let mut rows = fav_rows.lock().map(|guard| guard.clone()).unwrap_or_default();
+                            rows.retain(|row| row.fid != id);
+                            rows.push(FavPick {
+                                fid: id,
+                                title: name.clone(),
+                                count: 0,
+                                // A brand-new folder is empty, so "not in it"
+                                // is a known fact, not a guess.
+                                checked: false,
+                                confirmed: true,
+                            });
+                            window.set_fav_new_name("".into());
+                            publish_fav_picker(
+                                &window,
+                                &fav_rows,
+                                rows,
+                                Some((&format!("已新建收藏夹「{name}」"), false)),
+                            );
+                            toast(
+                                &window,
+                                format!("已新建收藏夹「{name}」"),
+                                TOAST_KIND_SUCCESS,
+                            );
+                        }
+                        Err(err) => {
+                            crate::debug_log(&format!("fav picker create err name={name:?} err={err:#}"));
+                            window.set_fav_hint(format!("新建收藏夹失败：{err}").into());
+                            window.set_fav_hint_error(true);
+                            toast(
+                                &window,
+                                format!("新建收藏夹失败：{err}"),
+                                TOAST_KIND_ERROR,
+                            );
+                        }
+                    }
+                });
+            }));
+        });
+    }
+    {
+        let session = session.clone();
+        let window = weak.clone();
+        let fav_rows = fav_rows.clone();
         player.on_unfav_all(move || {
             if aid <= 0 {
                 if let Some(window) = window.upgrade() {
@@ -2586,73 +3848,62 @@ pub(crate) fn open_player_inner(
                 }
                 return;
             }
-            let ids = player_fav_ids
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
+            let before = fav_rows.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let mut ids: Vec<i64> = before
+                .iter()
+                .filter(|row| row.checked)
+                .map(|row| row.fid)
+                .collect();
+            if ids.is_empty() {
+                ids = before.iter().map(|row| row.fid).collect();
+            }
+            crate::debug_log(&format!("fav picker unfav_all rid={aid} folders={ids:?}"));
             let session = session.clone();
             let window = window.clone();
+            let fav_rows = fav_rows.clone();
             crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
                 let result = runtime.block_on(session.fav_deal(aid, &[], &ids));
                 let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = window.upgrade() {
-                        match result {
-                            Ok(()) => {
-                                window.set_favorited(false);
-                                window.set_fav_text("收藏".into());
-                                toast(&window, "已取消收藏", TOAST_KIND_SUCCESS);
+                    let Some(window) = window.upgrade() else {
+                        return;
+                    };
+                    match result {
+                        Ok(()) => {
+                            let mut rows = before.clone();
+                            for row in rows.iter_mut() {
+                                row.checked = false;
+                                row.confirmed = true;
                             }
-                            Err(err) => {
-                                crate::debug_log(&format!("fav_deal del err={err:#}"));
-                                toast(
-                                    &window,
-                                    format!("取消收藏失败：{err}"),
-                                    TOAST_KIND_ERROR,
-                                );
-                            }
+                            publish_fav_picker(
+                                &window,
+                                &fav_rows,
+                                rows,
+                                Some(("已取消收藏（全部收藏夹）", false)),
+                            );
+                            toast(&window, "已取消收藏", TOAST_KIND_SUCCESS);
+                        }
+                        Err(err) => {
+                            crate::debug_log(&format!("fav picker unfav_all err={err:#}"));
+                            publish_fav_picker(
+                                &window,
+                                &fav_rows,
+                                before.clone(),
+                                Some((&format!("取消收藏失败：{err}"), true)),
+                            );
+                            toast(
+                                &window,
+                                format!("取消收藏失败：{err}"),
+                                TOAST_KIND_ERROR,
+                            );
                         }
                     }
                 });
             }));
         });
     }
-    {
-        let session = session.clone();
-        let bvid = bvid.clone();
-        let window = weak.clone();
-        player.on_add_toview(move || {
-            let session = session.clone();
-            let bvid = bvid.clone();
-            let window = window.clone();
-            crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
-                let Some(runtime) = crate::bilibili::shared_runtime() else {
-                    return;
-                };
-                let result = runtime.block_on(session.toview_add(&bvid));
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = window.upgrade() {
-                        match result {
-                            Ok(()) => {
-                                toast(&window, "已加入稍后再看", TOAST_KIND_SUCCESS);
-                            }
-                            Err(err) => {
-                                crate::debug_log(&format!("toview_add err={err:#}"));
-                                toast(
-                                    &window,
-                                    format!("加入稍后再看失败：{err}"),
-                                    TOAST_KIND_ERROR,
-                                );
-                            }
-                        }
-                    }
-                });
-            }));
-        });
-    }
-
     // 历史弹幕: fetch the available dates, then load one day's danmaku.
     {
         let session = session.clone();
@@ -3203,6 +4454,294 @@ pub(crate) fn open_player_inner(
                 );
             });
         });
+    }
+    // QA hooks (`BILI_F187_FAV_SHOT` / `BILI_F187_PREVIEW_SHOT`): the two
+    // player-window captures this round needs (f179 picker, f185 hover
+    // preview). Both drive the SAME state the UI writes - no synthetic pointer
+    // event, no test-only rendering path - and hand the chrome back afterwards.
+    //
+    //   BILI_F187_FAV_SHOT=<tag>[,<delay_ms>[,<toggle>]]
+    //     收藏 picker: open the right panel on 信息 (its home), run the chip's
+    //     own `open_fav_menu` callback, force the expanded state with the QA
+    //     seam, wait for the folder rows, capture, release. `toggle=1` also
+    //     proves a real add: the row with the fewest videos is clicked through
+    //     `fav_toggle`, the capture is taken with the check mark and the
+    //     「已加入…」 hint up, and the SAME row is clicked again right after, so
+    //     the account is left exactly as it was found.
+    //   BILI_F187_PREVIEW_SHOT=<tag>[,<delay_ms>[,<frac>[,<level>]]]
+    //     悬停预览: wait for `sb_ready` (the storyboard atlas), park the fake
+    //     cursor at `frac` of the seek band (level 0, the normal bar) or of the
+    //     zoom strip (level 1, the right-click scrubber), capture, release.
+    if let Ok(spec) = std::env::var("BILI_F187_FAV_SHOT") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "f187_fav_picker".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(9_000)
+            .clamp(1_000, 120_000);
+        let toggle = parts
+            .next()
+            .map(|part| part.trim() == "1")
+            .unwrap_or(false);
+        let weak = weak.clone();
+        let timer = Rc::new(slint::Timer::default());
+        let stop_timer = timer.clone();
+        keep_qa_timer(timer.clone());
+        let step = Rc::new(Cell::new(0u8));
+        let tries = Rc::new(Cell::new(0u32));
+        let waited = Rc::new(Cell::new(0u64));
+        // The folder this run adds to (and then removes from again).
+        let target = Rc::new(Cell::new(0i64));
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(500),
+            move || {
+                let Some(player) = weak.upgrade() else {
+                    return;
+                };
+                let n = tries.get() + 1;
+                tries.set(n);
+                let waited_ms = waited.get() + 500;
+                waited.set(waited_ms);
+                match step.get() {
+                    0 => {
+                        // `delay` first (let the decoder settle), then the
+                        // first frame: the panel and the toolbar only exist
+                        // once the player has a picture.
+                        if waited_ms < delay || (player.get_duration_ms() <= 0.0 && n < 120) {
+                            return;
+                        }
+                        player.set_pointer_inside(true);
+                        player.set_right_panel(1);
+                        player.set_right_tab(0);
+                        player.set_qa_fav_open(true);
+                        player.invoke_open_fav_menu();
+                        crate::debug_log(&format!(
+                            "f187 fav shot panel=1 tab=0 delay={delay} rows={} toggle={}",
+                            player.get_fav_items().row_count(),
+                            u8::from(toggle)
+                        ));
+                        step.set(1);
+                    }
+                    1 => {
+                        // The list arrives on the netpool; give it a moment.
+                        let rows = player.get_fav_items().row_count();
+                        if (rows == 0 && player.get_fav_loading()) && n < 120 {
+                            return;
+                        }
+                        crate::debug_log(&format!(
+                            "f187 fav shot rows={rows} loading={} hint={:?}",
+                            player.get_fav_loading(),
+                            player.get_fav_hint()
+                        ));
+                        step.set(2);
+                    }
+                    2 => {
+                        if !toggle {
+                            step.set(4);
+                            return;
+                        }
+                        // The lightest unchecked folder: one video added and
+                        // immediately removed leaves the account as it was
+                        // found (no folder keeps a stray entry).
+                        let model = player.get_fav_items();
+                        let mut pick: Option<(i32, i64, i32)> = None;
+                        for i in 0..model.row_count() {
+                            let Some(row) = model.row_data(i as usize) else {
+                                continue;
+                            };
+                            if row.checked {
+                                continue;
+                            }
+                            let fid = row.fid.to_string().parse::<i64>().unwrap_or(0);
+                            if fid == 0 {
+                                continue;
+                            }
+                            let better = match pick {
+                                None => true,
+                                Some((_, _, count)) => row.count < count,
+                            };
+                            if better {
+                                pick = Some((i as i32, fid, row.count));
+                            }
+                        }                        match pick {
+                            Some((_, fid, count)) => {
+                                target.set(fid);
+                                crate::debug_log(&format!(
+                                    "f187 fav shot toggle add fid={fid} count={count}"
+                                ));
+                                player.invoke_fav_toggle(fid.to_string().into(), true);
+                                step.set(3);
+                            }
+                            None => {
+                                crate::debug_log(
+                                    "f187 fav shot toggle skipped reason=no-unchecked-folder",
+                                );
+                                step.set(4);
+                            }
+                        }
+                    }
+                    3 => {
+                        // Wait for the add to land: the hint is its receipt.
+                        if player.get_fav_hint() == "" && n < 120 {
+                            return;
+                        }
+                        let model = player.get_fav_items();
+                        let checked = (0..model.row_count())
+                            .filter(|i| {
+                                model
+                                    .row_data(*i as usize)
+                                    .is_some_and(|row| row.checked)
+                            })
+                            .count();
+                        crate::debug_log(&format!(
+                            "f187 fav shot add hint={:?} checked={checked}",
+                            player.get_fav_hint()
+                        ));
+                        step.set(4);
+                    }
+                    4 => {
+                        let path = qa_capture_path(&tag);
+                        match capture_window_png(&player.window(), &path) {
+                            Some((w, h)) => crate::debug_log(&format!(
+                                "f187 fav shot png={} {w}x{h}",
+                                path.display()
+                            )),
+                            None => crate::debug_log("f187 fav shot png=FAILED"),
+                        }
+                        let fid = target.get();
+                        if toggle && fid != 0 {
+                            // Put the account back exactly as it was found.
+                            player.invoke_fav_toggle(fid.to_string().into(), false);
+                            crate::debug_log(&format!("f187 fav shot toggle del fid={fid}"));
+                            step.set(5);
+                        } else {
+                            step.set(6);
+                        }
+                    }
+                    5 => {
+                        if player.get_fav_hint() == "" && n < 240 {
+                            return;
+                        }
+                        crate::debug_log(&format!(
+                            "f187 fav shot restored hint={:?}",
+                            player.get_fav_hint()
+                        ));
+                        step.set(6);
+                    }
+                    _ => {
+                        player.set_qa_fav_open(false);
+                        player.set_pointer_inside(player_pointer_inside(&player));
+                        crate::debug_log("f187 fav shot chrome=release");
+                        stop_timer.stop();
+                    }
+                }
+            },
+        );
+    }
+    if let Ok(spec) = std::env::var("BILI_F187_PREVIEW_SHOT") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "f187_hover_preview".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(9_000)
+            .clamp(1_000, 120_000);
+        let frac = parts
+            .next()
+            .and_then(|part| part.trim().parse::<f32>().ok())
+            .unwrap_or(0.62)
+            .clamp(0.05, 0.95);
+        let level = parts
+            .next()
+            .and_then(|part| part.trim().parse::<i32>().ok())
+            .unwrap_or(0)
+            .clamp(0, 1);
+        let weak = weak.clone();
+        let timer = Rc::new(slint::Timer::default());
+        let stop_timer = timer.clone();
+        keep_qa_timer(timer.clone());
+        let step = Rc::new(Cell::new(0u8));
+        let tries = Rc::new(Cell::new(0u32));
+        let waited = Rc::new(Cell::new(0u64));
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(500),
+            move || {
+                let Some(player) = weak.upgrade() else {
+                    return;
+                };
+                let n = tries.get() + 1;
+                tries.set(n);
+                let waited_ms = waited.get() + 500;
+                waited.set(waited_ms);
+                match step.get() {
+                    0 => {
+                        if waited_ms < delay || (player.get_duration_ms() <= 0.0 && n < 120) {
+                            return;
+                        }
+                        if !player.get_sb_ready() && n < 240 {
+                            // Up to ~4 min for the atlas; log the outcome once.
+                            if n % 20 == 0 {
+                                crate::debug_log(&format!(
+                                    "f187 preview wait sb_ready=0 tries={n}"
+                                ));
+                            }
+                            return;
+                        }
+                        player.set_pointer_inside(true);
+                        if level > 0 {
+                            player.set_scrub_level(1);
+                            player.invoke_scrub_level_changed(1);
+                        }
+                        let band = if level > 0 {
+                            player.get_qa_pill_w() as f32
+                        } else {
+                            player.get_qa_seek_w() as f32
+                        };
+                        player.set_qa_preview_x(band * frac);
+                        player.set_qa_preview_hover(true);
+                        crate::debug_log(&format!(
+                            "f187 preview sb_ready={} cells={} cols={} level={level} frac={frac} band={band:.0}",
+                            player.get_sb_ready(),
+                            player.get_sb_cells().row_count(),
+                            player.get_sb_cols()
+                        ));
+                        step.set(1);
+                    }
+                    1 => {
+                        let path = qa_capture_path(&tag);
+                        match capture_window_png(&player.window(), &path) {
+                            Some((w, h)) => crate::debug_log(&format!(
+                                "f187 preview png={} {w}x{h} level={level}",
+                                path.display()
+                            )),
+                            None => crate::debug_log("f187 preview png=FAILED"),
+                        }
+                        step.set(2);
+                    }
+                    _ => {
+                        player.set_qa_preview_hover(false);
+                        if level > 0 {
+                            player.set_scrub_level(0);
+                            player.invoke_scrub_level_changed(0);
+                        }
+                        player.set_pointer_inside(player_pointer_inside(&player));
+                        crate::debug_log("f187 preview chrome=release");
+                        stop_timer.stop();
+                    }
+                }
+            },
+        );
     }
     // QA hook (`BILI_QUALITY_PICK=<index>[,<delay_ms>]`): invoke the real 画质
     // menu callback after `delay_ms` (default 12000), so an exact-stream switch
@@ -4105,6 +5644,9 @@ pub(crate) fn open_player_inner(
         }));
     }
 
+    // The event loop is the presentation thread: keep it above the prefetch
+    // workers for the whole process (idempotent, UI thread only).
+    player::raise_ui_thread_priority();
     let mini_slot = session_rec.mini_slot.clone();
     // f150: decoding/presentation belong to THIS window, never to focus. The
     // only shared limit is the number of running decoders; the fourth window
@@ -4143,20 +5685,370 @@ pub(crate) fn open_player_inner(
         } else {
             set_active_player(&player);
         }
-        player::spawn(session, video, weak, mini_slot, control, track);
+        player::spawn(session.clone(), video, weak, mini_slot, control.clone(), track);
         crate::debug_log(&format!(
             "player running win={} running={running} cap={MAX_CONCURRENT_PLAYERS}",
             session_rec.id
         ));
+        // 进度条悬停预览: 首帧之后在后台拉一次 storyboard（见该函数的注释）。
+        // 排队中的窗口不拉: 它还没有解码线程，首帧要等到拿到槽位之后。
+        spawn_storyboard_prefetch(player.as_weak(), session.clone(), control.clone());
     }
     // QA (`BILI_F139_TEST`): measure the fast lane against the real decoder and
     // capture `f139_danmaku_<hz>.png` with comments on screen.
     maybe_start_danmaku_frame_qa(&player, danmaku_layer.clone());
+    // QA (`BILI_INTERP_FPS_TEST=120`): press the 帧率 row after `_MS` (default
+    // 6 s) through the window's own callback, so the 120 fps self-check runs
+    // exactly as a click makes it run (restart, 3 s measurement, keep/refuse).
+    if let Some(value) = crate::qa::env::var("BILI_INTERP_FPS_TEST") {
+        if let Ok(hz) = value.trim().parse::<i32>() {
+            let delay = crate::qa::env::var("BILI_INTERP_FPS_MS")
+                .and_then(|ms| ms.trim().parse::<u64>().ok())
+                .unwrap_or(6_000)
+                .clamp(1_000, 60_000);
+            let player_weak = player.as_weak();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(delay));
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(player) = player_weak.upgrade() {
+                        crate::debug_log(&format!("interp fps test press hz={hz}"));
+                        player.invoke_interp_fps(hz >= 120);
+                    }
+                });
+            });
+        }
+    }
     // The new window takes focus: card_open(0) replaces IT, and a later click on
     // an older window moves focus there (`poll_player_focus`).
     focus_player(state, &session_rec, false);
+    // f179 QA (`BILI_F179_TEST=1`): one line with the toolbar grid AS LAID OUT
+    // after the first layout pass - the cells, the two gap tokens, the pill's
+    // width and the 信息 cell's own rect, so the report proves the new cell sits
+    // inside the pill at its neighbours' size instead of trusting the source.
+    if crate::qa::env::flag("BILI_F179_TEST") {
+        let weak = player.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(2500), move || {
+            let Some(p) = weak.upgrade() else {
+                return;
+            };
+            let x = |value: f32| value;
+            let info_x = x(p.get_qa_info_btn_x());
+            let info_w = x(p.get_qa_info_btn_w());
+            let dm_x = x(p.get_qa_dm_btn_x2());
+            let dm_w = x(p.get_qa_dm_btn_w2());
+            let cm_x = x(p.get_qa_cm_btn_x());
+            crate::debug_log(&format!(
+                "f179 toolbar cell={:.0} gap={:.0} group_gap={:.0} content_w={:.0} bar_w={:.0} \
+                 pill_x={:.1} pill_w={:.1} play={:.1}+{:.1} time_w={:.1} dm={:.1}+{:.1} \
+                 info={:.1}+{:.1}@y{:.1} radius={:.0} visible={} cm={:.1}+{:.1} \
+                 series={:.1}+{:.1} gap_before_info={:.1} gap_after_info={:.1} \
+                 info_right={:.1} pill_right={:.1}",
+                x(p.get_qa_bar_cell()),
+                x(p.get_qa_bar_gap()),
+                x(p.get_qa_bar_group_gap()),
+                x(p.get_qa_bar_content_w()),
+                x(p.get_qa_bar_w()),
+                x(p.get_qa_pill_x()),
+                x(p.get_qa_pill_w()),
+                x(p.get_qa_play_x()),
+                x(p.get_qa_play_w()),
+                x(p.get_qa_time_w()),
+                dm_x,
+                dm_w,
+                info_x,
+                info_w,
+                x(p.get_qa_info_btn_y()),
+                x(p.get_qa_info_btn_radius()),
+                p.get_qa_info_btn_visible(),
+                cm_x,
+                x(p.get_qa_cm_btn_w()),
+                x(p.get_qa_series_btn_x()),
+                x(p.get_qa_series_btn_w()),
+                info_x - (dm_x + dm_w),
+                cm_x - (info_x + info_w),
+                info_x + info_w,
+                x(p.get_qa_pill_x()) + x(p.get_qa_pill_w()),
+            ));
+        });
+    }
     maybe_start_window_probe(state);
 }
+
+// ===================== 进度条悬停预览 (storyboard) =====================
+//
+// B站 web 播放器 hover 进度条时显示的那张帧预览，来自 `x/player/videoshot`
+// 返回的雪碧图 (storyboard)：`cols x rows` 格（实测 10x10），每格 480x270，
+// 一组 1..N 张 jpg，`index` 给出每格的时间戳（秒）。这里把它做成一张**单一
+// atlas**：每格缩到 160x90（预览卡的实际尺寸），第 s 张图的第 r 行落在
+// atlas 的第 `s * rows + r` 行，所以第 k 格永远是
+//     x = (k % cols) * 160,  y = (k / cols) * 90
+// 与“第几张图”无关——格子是连续编号的，这个式子跨图也成立。
+//
+// 时间 -> 格子：`times[k]` 是第 k 格对应的时间，取**最后一个 `times[k] <= t`**
+// （一个格子代表从它自己的时间开始的那一段）。三支实测视频核对过：
+//   29 s   times 0,5,10,15,20,25                    (5 s 步长)
+//   356 s  times 0,5,…,355                          (5 s 步长)
+//   3203 s times 0,10,17,24,…,3195                  (开头 10 s，之后 7 s)
+// UI 不做二分：Rust 把 1 s 一档的“时间桶 -> 格子”表 (`sb_cells`) 一次发布，
+// Slint 只做 `min(floor(ms / 1000), len - 1)` 的下标（O(1)，没有回调、没有每帧
+// 分配），所以指针移动时 UI 线程只改 source-clip 的四个数。
+//
+// 拉取时机：首帧到达且正在播放之后，在 netpool (Low) 里拉一次；换集时
+// `source_seq` 变化再拉一次。暂停/遮挡不额外拉取，hover 只读已经解码好的图。
+
+/// 预览格子在图集里的尺寸。必须与 `ui/app.slint` 的预览卡图窗一致。
+pub(crate) const STORYBOARD_CELL_W: u32 = 160;
+pub(crate) const STORYBOARD_CELL_H: u32 = 90;
+/// 时间桶宽度 (ms)：一格代表 1 s，远小于最短的 5 s 格距。
+pub(crate) const STORYBOARD_BUCKET_MS: u64 = 1000;
+/// 图集上限（格数）：160x90 RGBA 每格 57.6 KB，900 格约 51 MB，够 1.7 h
+/// (7 s/格) 的视频；更长的视频保留前段，尾部沿用最后一格。
+pub(crate) const STORYBOARD_MAX_TILES: usize = 900;
+/// 最多下载的雪碧图张数（10x10 一张 100 格）。
+pub(crate) const STORYBOARD_MAX_SHEETS: usize = 9;
+
+/// 1 s 一档的“毫秒 -> 格子”表: `cells[i]` 是第 i 秒开始的格子。
+///
+/// 即“第 t 秒对应最后一个 `times[k] <= t` 的格子”，在 Rust 里一次算完；
+/// UI 只做一次数组下标，指针移动时没有回调、没有分配。
+pub(crate) fn storyboard_buckets(times: &[f32], duration_ms: u64) -> Vec<i32> {
+    if times.is_empty() {
+        return Vec::new();
+    }
+    let seconds = duration_ms / STORYBOARD_BUCKET_MS + 1;
+    let end = (times.last().copied().unwrap_or(0.0).ceil() as u64) + 1;
+    let buckets = seconds.max(end) as usize;
+    let mut out = Vec::with_capacity(buckets);
+    let mut k = 0usize;
+    for bucket in 0..buckets {
+        let at = (bucket as f32) * (STORYBOARD_BUCKET_MS as f32) / 1000.0;
+        while k + 1 < times.len() && times[k + 1] <= at {
+            k += 1;
+        }
+        out.push(k as i32);
+    }
+    out
+}
+
+/// 把一张雪碧图整幅（`sw x sh`）盒式缩到 `aw x dh_full`，写进 atlas 的
+/// `oy` 行起。超出 atlas 底部的行丢弃（最后一张图通常只用得到一部分）。
+fn blit_sheet(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dst: &mut [u8],
+    aw: usize,
+    ah: usize,
+    oy: usize,
+    dh_full: usize,
+) {
+    if sw == 0 || sh == 0 || aw == 0 || dh_full == 0 {
+        return;
+    }
+    let rows = dh_full.min(ah.saturating_sub(oy));
+    for dy in 0..rows {
+        let y0 = dy * sh / dh_full;
+        let y1 = (((dy + 1) * sh / dh_full).max(y0 + 1)).min(sh);
+        for dx in 0..aw {
+            let x0 = dx * sw / aw;
+            let x1 = (((dx + 1) * sw / aw).max(x0 + 1)).min(sw);
+            let mut sum = [0u32; 3];
+            let mut count = 0u32;
+            for y in y0..y1 {
+                let row = y * sw;
+                for x in x0..x1 {
+                    let at = (row + x) * 4;
+                    if at + 3 >= src.len() {
+                        continue;
+                    }
+                    sum[0] += u32::from(src[at]);
+                    sum[1] += u32::from(src[at + 1]);
+                    sum[2] += u32::from(src[at + 2]);
+                    count += 1;
+                }
+            }
+            let at = ((oy + dy) * aw + dx) * 4;
+            if at + 3 >= dst.len() || count == 0 {
+                continue;
+            }
+            dst[at] = (sum[0] / count) as u8;
+            dst[at + 1] = (sum[1] / count) as u8;
+            dst[at + 2] = (sum[2] / count) as u8;
+            dst[at + 3] = 255;
+        }
+    }
+}
+
+/// 首帧之后在后台拉一次本视频的 storyboard；换集时按 `source_seq` 重拉。
+pub(crate) fn spawn_storyboard_prefetch(
+    weak: Weak<PlayerWindow>,
+    session: Arc<bilibili::Session>,
+    control: Arc<player::PlaybackControl>,
+) {
+    std::thread::spawn(move || {
+        // 等首帧：预取只在画面真的出来之后开始（暂停时也不拉）。
+        let started = Instant::now();
+        loop {
+            if control.is_closed() {
+                return;
+            }
+            if control.presented_frames() > 0 && !control.paused() {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(45) {
+                crate::debug_log("storyboard skip reason=no-first-frame");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        let mut seq = control.source_seq();
+        loop {
+            let source = control.source();
+            if source.cid != 0 && !source.bvid.trim().is_empty() {
+                fetch_storyboard(
+                    weak.clone(),
+                    session.clone(),
+                    control.clone(),
+                    seq,
+                    source.bvid.clone(),
+                    source.cid,
+                );
+            }
+            // 换集 / 换视频：等 source_seq 变化，清掉旧图再拉新的。
+            loop {
+                std::thread::sleep(Duration::from_millis(400));
+                if control.is_closed() {
+                    return;
+                }
+                let next = control.source_seq();
+                if next != seq {
+                    seq = next;
+                    break;
+                }
+            }
+            let clear_target = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = clear_target.upgrade() {
+                    clear_storyboard(&window);
+                }
+            });
+        }
+    });
+}
+
+/// Clear the preview properties (a switch: the old video's atlas must never be
+/// shown against the new timeline).
+fn clear_storyboard(window: &PlayerWindow) {
+    window.set_sb_ready(false);
+    window.set_sb_image(Image::default());
+    window.set_sb_cells(ModelRc::from(Rc::new(VecModel::<i32>::from(Vec::<i32>::new()))));
+}
+
+/// Download + decode + stitch one video's storyboard, on the netpool.
+fn fetch_storyboard(
+    weak: Weak<PlayerWindow>,
+    session: Arc<bilibili::Session>,
+    control: Arc<player::PlaybackControl>,
+    seq: u64,
+    bvid: String,
+    cid: u64,
+) {
+    crate::netpool::submit(
+        crate::netpool::Prio::Low,
+        Box::new(move || {
+            let Some(runtime) = crate::bilibili::shared_runtime() else {
+                return;
+            };
+            let started = Instant::now();
+            let shot = match runtime.block_on(session.videoshot(&bvid, cid)) {
+                Ok(shot) => shot,
+                Err(err) => {
+                    // No storyboard for this video (or no login): the UI simply
+                    // keeps showing the time alone. Never a user-facing error.
+                    crate::debug_log(&format!(
+                        "storyboard none bvid={bvid} cid={cid} err={err:#}"
+                    ));
+                    return;
+                }
+            };
+            let cols = shot.cols as usize;
+            let rows = shot.rows as usize;
+            let per_sheet = cols * rows;
+            let sheets_needed = shot
+                .sheets
+                .len()
+                .min(STORYBOARD_MAX_SHEETS)
+                .min(per_sheet.max(1));
+            let tiles = shot
+                .times
+                .len()
+                .min(per_sheet * sheets_needed)
+                .min(STORYBOARD_MAX_TILES);
+            if cols == 0 || rows == 0 || tiles == 0 || sheets_needed == 0 {
+                crate::debug_log(&format!("storyboard empty bvid={bvid} cid={cid}"));
+                return;
+            }
+            let aw = cols * STORYBOARD_CELL_W as usize;
+            let ah_rows = (tiles + cols - 1) / cols;
+            let ah = ah_rows * STORYBOARD_CELL_H as usize;
+            let mut atlas = vec![0u8; aw * ah * 4];
+            for (index, url) in shot.sheets.iter().take(sheets_needed).enumerate() {
+                if control.is_closed() || control.source_seq() != seq {
+                    return;
+                }
+                let decoded = match runtime.block_on(session.fetch_image(url)) {
+                    Ok(decoded) => decoded,
+                    Err(err) => {
+                        crate::debug_log(&format!(
+                            "storyboard sheet {index} err={err:#} bvid={bvid}"
+                        ));
+                        return;
+                    }
+                };
+                let (bytes, width, height) = decoded;
+                let oy = index * rows * STORYBOARD_CELL_H as usize;
+                if oy >= ah {
+                    break;
+                }
+                blit_sheet(
+                    &bytes,
+                    width as usize,
+                    height as usize,
+                    &mut atlas,
+                    aw,
+                    ah,
+                    oy,
+                    rows * STORYBOARD_CELL_H as usize,
+                );
+            }
+            let duration = control.duration_ms();
+            let times = &shot.times[..tiles];
+            let cells = storyboard_buckets(times, duration);
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let target = weak.clone();
+            let control_after = control.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if control_after.is_closed() || control_after.source_seq() != seq {
+                    return;
+                }
+                let Some(window) = target.upgrade() else {
+                    return;
+                };
+                let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(aw as u32, ah as u32);
+                buffer.make_mut_bytes().copy_from_slice(&atlas);
+                window.set_sb_cells(ModelRc::from(Rc::new(VecModel::from(cells))));
+                window.set_sb_cols(cols as i32);
+                window.set_sb_image(Image::from_rgba8(buffer));
+                window.set_sb_ready(true);
+                crate::debug_log(&format!(
+                    "storyboard ready bvid={bvid} cid={cid} sheets={sheets_needed} tiles={tiles} \
+                     atlas={aw}x{ah} fetch_ms={elapsed:.0}"
+                ));
+            });
+        }),
+    );
+}
+
 
 /// Load the first page of `aid`'s comments, replacing any current state.
 ///

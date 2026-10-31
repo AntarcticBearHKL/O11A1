@@ -1924,10 +1924,111 @@ pub(crate) fn f152_open_cached(
     true
 }
 
+pub(crate) fn f183_log(line: impl AsRef<str>) {
+    crate::debug_log(&format!("f183 {}", line.as_ref()));
+}
+
+/// One player's OWN rendered scene as RGBA pixels, also saved to `tag.png`.
+///
+/// Same mechanism as [`f152_capture_player`] (`take_snapshot`, so z-order and
+/// DWM composition do not matter) but the pixels come back too, so the caller
+/// can prove motion with a real per-pixel diff instead of trusting a counter.
+pub(crate) fn f183_player_frame(
+    weak: &Weak<AppWindow>,
+    id: u64,
+    tag: &str,
+) -> Option<(PathBuf, u32, u32, Vec<u8>)> {
+    let tag = tag.to_string();
+    f145_on_ui(weak, move |_ui| {
+        let state = WALLPAPER_STATE.with(|slot| slot.borrow().clone())?;
+        let session = player_sessions(&state)
+            .into_iter()
+            .find(|session| session.id == id)?;
+        let buffer = session.window.window().take_snapshot().ok()?;
+        let path = qa_capture_path(&tag);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let bytes: Vec<u8> = buffer
+            .as_slice()
+            .iter()
+            .flat_map(|pixel| [pixel.r, pixel.g, pixel.b, pixel.a])
+            .collect();
+        let png = image::RgbaImage::from_raw(buffer.width(), buffer.height(), bytes.clone())?;
+        png.save(&path).ok()?;
+        Some((path, buffer.width(), buffer.height(), bytes))
+    })
+    .flatten()
+}
+
+/// Save a top-down RGBA buffer (`f150_grab_screen`'s output) as `tag.png`.
+pub(crate) fn f183_save_rgba(tag: &str, w: u32, h: u32, rgba: Vec<u8>) -> Option<PathBuf> {
+    let path = qa_capture_path(tag);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let png = image::RgbaImage::from_raw(w, h, rgba)?;
+    png.save(&path).ok()?;
+    Some(path)
+}
+
+/// Max per-channel difference, mean difference and changed-pixel count between
+/// two RGBA frames. `None` when the sizes differ (a resized window).
+pub(crate) fn f183_frame_diff(
+    a: &(u32, u32, Vec<u8>),
+    b: &(u32, u32, Vec<u8>),
+) -> Option<(u32, f64, usize)> {
+    if a.0 != b.0 || a.1 != b.1 || a.2.len() != b.2.len() {
+        return None;
+    }
+    let mut max_diff = 0u32;
+    let mut sum = 0u64;
+    let mut changed = 0usize;
+    let pixels = a.2.len() / 4;
+    for (left, right) in a.2.chunks_exact(4).zip(b.2.chunks_exact(4)) {
+        let diff = (left[0] as i32 - right[0] as i32)
+            .abs()
+            .max((left[1] as i32 - right[1] as i32).abs())
+            .max((left[2] as i32 - right[2] as i32).abs()) as u32;
+        max_diff = max_diff.max(diff);
+        sum += u64::from(diff);
+        if diff > 2 {
+            changed += 1;
+        }
+    }
+    Some((max_diff, sum as f64 / pixels.max(1) as f64, changed))
+}
+
+/// Lines from `BILI_DEBUG_LOG` that contain any of `needles`, read from the
+/// tail of the file (a QA run's log can be hundreds of MB; the pause receipt is
+/// always near the end).
+pub(crate) fn f183_log_tail(needles: &[&str]) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(path) = std::env::var("BILI_DEBUG_LOG") else {
+        return Vec::new();
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Vec::new();
+    };
+    let start = meta.len().saturating_sub(1024 * 1024);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .filter(|line| needles.iter().any(|needle| line.contains(needle)))
+        .map(str::to_string)
+        .collect()
+}
+
 pub(crate) fn f154_log(line: impl AsRef<str>) {
     crate::debug_log(&format!("f154 {}", line.as_ref()));
 }
-
 /// `BILI_QA_*` flags: 1/true/yes/on enable, anything else (and "unset") is off.
 pub(crate) fn f154_env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -2122,6 +2223,26 @@ pub(crate) fn f154_log_renderer_boot() {
             "winit-femtovg-wgpu,winit-femtovg,winit-software"
         },
     ));
+}
+
+/// The renderer that actually paints this process, as the 性能 panel names it.
+///
+/// Same resolution [`f154_log_renderer_boot`] logs (`env` if the request names a
+/// renderer this binary compiled, otherwise the winit default), cached because
+/// `SLINT_BACKEND` cannot change while the process runs. The panel appends
+/// `DComp` when the player window is the composite one - that layer is what
+/// presents the picture there, so it is part of the answer, not a detail.
+pub(crate) fn active_renderer() -> &'static str {
+    static RESOLVED: OnceLock<&'static str> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let request = env::var("SLINT_BACKEND")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        match request.as_deref().and_then(f154_requested_renderer) {
+            Some(name) if f154_renderer_compiled(&name) => f154_canonical_renderer(&name),
+            _ => f154_default_renderer(),
+        }
+    })
 }
 
 

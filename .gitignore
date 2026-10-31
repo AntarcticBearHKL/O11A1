@@ -49,3 +49,9 @@ Thumbs.db
 
 # Whisper models (460 MB - 1.5 GB): downloaded on demand, never in git
 /models/
+
+# Build artefacts: the exe is a release asset, the packaged folder is generated
+# by scripts/package.ps1. GitHub rejects files over 100 MB, and the binary now
+# carries the UI font, so neither belongs in history.
+/O11A1.exe
+/dist/

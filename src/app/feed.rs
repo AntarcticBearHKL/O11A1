@@ -679,6 +679,36 @@ pub(crate) fn cover_fetches_first_screen() -> u64 {
 
 pub(crate) static COVER_CACHE: OnceLock<Mutex<CoverCache>> = OnceLock::new();
 
+/// Cache lookups that were answered from memory / had to go to the network.
+/// Together they are the `cache=hit/miss` column of the cover QA lines.
+pub(crate) static COVER_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) static COVER_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Decoded covers dropped because the player gate was closed; logged so a
+/// leaked `PLAYER_OPEN_COUNT` cannot hide behind "no covers".
+pub(crate) static COVER_SKIP_PLAYER: AtomicU64 = AtomicU64::new(0);
+
+/// Cover fetches that returned an error (HTTP status, timeout, bad image).
+pub(crate) static COVER_FAIL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn cover_failures() -> u64 {
+    COVER_FAIL.load(Ordering::Relaxed)
+}
+
+pub(crate) fn cover_cache_hits() -> u64 {
+    COVER_CACHE_HITS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn cover_cache_misses() -> u64 {
+    COVER_CACHE_MISSES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn cover_skip_player() -> u64 {
+    COVER_SKIP_PLAYER.load(Ordering::Relaxed)
+}
+
+
 pub(crate) fn cover_cache() -> &'static Mutex<CoverCache> {
     COVER_CACHE.get_or_init(|| Mutex::new(CoverCache::new()))
 }
@@ -702,13 +732,24 @@ pub(crate) async fn cover_fetch(
     path: CoverPath,
 ) -> Option<Arc<CoverPixels>> {
     if url.is_empty() || player_active() {
+        if !url.is_empty() {
+            let skips = COVER_SKIP_PLAYER.fetch_add(1, Ordering::Relaxed) + 1;
+            if skips <= 3 || skips % 100 == 0 {
+                crate::debug_log(&format!(
+                    "covers skip reason=player count={} skips={skips}",
+                    PLAYER_OPEN_COUNT.load(Ordering::SeqCst)
+                ));
+            }
+        }
         return None;
     }
     if let Ok(mut cache) = cover_cache().lock() {
         if let Some(hit) = cache.get(url) {
+            COVER_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return Some(hit);
         }
     }
+    COVER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     match path {
         CoverPath::Display => &COVER_FETCHES_DISPLAY,
         CoverPath::Warm => &COVER_FETCHES_WARM,
@@ -718,7 +759,18 @@ pub(crate) async fn cover_fetch(
     // also releases the count when the future is cancelled mid-fetch.
     crate::player::tag_here("cover:decode");
     let _decoding = CoverDecodeGuard::new();
-    let pixels = Arc::new(session.fetch_thumb(url).await.ok()?);
+    let pixels = match session.fetch_thumb(url).await {
+        Ok(pixels) => Arc::new(pixels),
+        Err(err) => {
+            let failures = COVER_FAIL.fetch_add(1, Ordering::Relaxed) + 1;
+            if failures <= 5 || failures % 50 == 0 {
+                crate::debug_log(&format!(
+                    "covers fail n={failures} url={url} err={err:#}"
+                ));
+            }
+            return None;
+        }
+    };
     if let Ok(mut cache) = cover_cache().lock() {
         cache.put(url, pixels.clone());
     }
@@ -767,6 +819,10 @@ pub(crate) async fn stream_thumbs<F, I>(
     let mut stream = futures::stream::iter(fetches).buffer_unordered(THUMB_CONCURRENCY);
     while let Some((index, pixels)) = stream.next().await {
         if player_active() {
+            crate::debug_log(&format!(
+                "covers drop reason=player index={index} count={}",
+                PLAYER_OPEN_COUNT.load(Ordering::SeqCst)
+            ));
             continue;
         }
         on_one(index, pixels);
@@ -1438,6 +1494,9 @@ pub(crate) async fn show_home_after_login(
     session: Arc<bilibili::Session>,
     capacity: usize,
 ) {
+    // Cover QA (`BILI_SEARCH_LOOP` / `BILI_COVER_PAGE_TEST`): armed here because
+    // this is the first point after the main window's callbacks are wired.
+    crate::qa::maybe_start_cover_hooks(weak);
     let waited = Instant::now();
     if capacity == 0 {
         // Preloading is off: nothing can arrive, so do not make the user wait.
@@ -1773,11 +1832,51 @@ pub(crate) fn load_region(
     }));
 }
 
+/// f199: apply the 显示条数 cap to the model that is already loaded.
+///
+/// The picker can shrink or grow the limit at any moment; a shrink must be
+/// immediate (no reload, no network) and must keep the four parallel vectors -
+/// the row model, `history_kids`, `history_bvids`, `history_page.mids` - on the
+/// same indices, because a card's click and its UP name resolve by index.
+/// Growing the limit does nothing here: the next cursor page simply appends
+/// (the backend stays one page per request).
+pub(crate) fn trim_history(
+    ui: &AppWindow,
+    history_page: &Arc<Mutex<HistoryPageState>>,
+    kids: &Arc<Mutex<Vec<String>>>,
+    bvids: &Arc<Mutex<Vec<String>>>,
+) -> usize {
+    let limit = ui.get_history_limit().max(0) as usize;
+    let model = ui.get_history_items();
+    let len = model.row_count();
+    if limit == 0 || len <= limit {
+        return len;
+    }
+    let rows: Vec<HistoryRow> = (0..limit).filter_map(|index| model.row_data(index)).collect();
+    ui.set_history_items(ModelRc::from(Rc::new(VecModel::from(rows))));
+    if let Ok(mut guard) = kids.lock() {
+        guard.truncate(limit);
+    }
+    if let Ok(mut guard) = bvids.lock() {
+        guard.truncate(limit);
+    }
+    if let Ok(mut state) = history_page.lock() {
+        state.mids.truncate(limit);
+    }
+    crate::debug_log(&format!(
+        "history limit trimmed from={len} to={limit} kept={limit}"
+    ));
+    limit
+}
+
 /// Load one page of the watch history and (append to) the card list.
 ///
 /// `append` loads the next cursor page on top of the loaded rows; `target_page`
 /// is the client page the list lands on afterwards (`None` keeps the current
 /// one, and a non-append load restarts at 0 because the data is replaced).
+/// `notice` is the status line the load leaves behind (`None` clears it): the
+/// 清空 path passes "已清空 N 条" so the result survives the reload.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_history(
     weak: Weak<AppWindow>,
     session_slot: SessionSlot,
@@ -1786,6 +1885,7 @@ pub(crate) fn load_history(
     history_bvids: Arc<Mutex<Vec<String>>>,
     append: bool,
     target_page: Option<i64>,
+    notice: Option<String>,
 ) {
     let Some(session) = active_session(&session_slot) else {
         return;
@@ -1811,6 +1911,7 @@ pub(crate) fn load_history(
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
                             publish_refresh(&ui, false, 1.0);
+                            ui.set_history_clearing(false);
                             ui.set_history_status(message.into());
                             update_page_bar(&ui);
                         }
@@ -1902,6 +2003,19 @@ pub(crate) fn load_history(
                         all_kids.push(kid);
                     }
                     all_mids.extend(mids);
+                    // f199: 显示条数. The fetch above is still ONE cursor page
+                    // (`ps=30`); this only caps what the model keeps. `0` is
+                    // 全部. `all_mids` is extended in the same row order as the
+                    // three vectors, so one truncate keeps them aligned.
+                    let limit = ui.get_history_limit().max(0) as usize;
+                    let at_cap = limit > 0 && all_rows.len() >= limit;
+                    if limit > 0 && all_rows.len() > limit {
+                        all_rows.truncate(limit);
+                        all_bvids.truncate(limit);
+                        all_kids.truncate(limit);
+                        all_mids.truncate(limit);
+                    }
+                    let shown = all_rows.len();
                     if let Ok(mut guard) = history_bvids_a.lock() {
                         *guard = all_bvids;
                     }
@@ -1916,6 +2030,9 @@ pub(crate) fn load_history(
                         } else {
                             state.max = 0;
                         }
+                        // `has_more` keeps the API's own answer: the VIEW's
+                        // `history_has_more` is the one that respects the cap,
+                        // so a later 显示条数 change can still ask for a page.
                         state.has_more = has_more;
                         state.mids = all_mids;
                     }
@@ -1929,12 +2046,15 @@ pub(crate) fn load_history(
                     }
                     ui.set_history_items(ModelRc::from(std::rc::Rc::new(VecModel::from(all_rows))));
                     publish_refresh(&ui, false, 1.0);
-                    ui.set_history_has_more(has_more);
-                    ui.set_history_status(String::new().into());
+                    ui.set_history_has_more(has_more && !at_cap);
+                    ui.set_history_status(notice.unwrap_or_default().into());
+                    ui.set_history_clearing(false);
                     publish_list_offset(&ui);
                     skeleton_arm(&ui, covers as u64);
                     update_page_bar(&ui);
-                    crate::debug_log(&format!("history load rendered items={loaded}"));
+                    crate::debug_log(&format!(
+                        "history load rendered items={loaded} shown={shown} limit={limit}"
+                    ));
                 }
             });
             let keys: Vec<String> = items

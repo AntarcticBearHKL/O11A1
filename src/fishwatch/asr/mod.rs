@@ -102,7 +102,7 @@ pub fn detect(config: &WatchConfig) -> Option<Availability> {
 
 fn detect_inner(config: &WatchConfig) -> Option<Availability> {
     let python = external_fw::find_python();
-    let cpp = whispercpp::find_binary(&PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let cpp = whispercpp::find_binary(&crate::paths::root());
     let requested = config.asr.engine.trim();
     let (engine, python, cpp_binary) = match requested {
         "faster-whisper" => ("faster-whisper", python, None),
@@ -1042,7 +1042,7 @@ mod tests {
         };
         let root = std::env::var_os("BILI_MODEL_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper"));
+            .unwrap_or_else(|| crate::paths::root().join("models/whisper"));
         assert!(
             models::model_ready(&root, &models::FW_SMALL_SPEC),
             "run live_download_small_model first"
@@ -1081,7 +1081,7 @@ mod tests {
         }
         let config = WatchConfig {
             model_dir: root.clone(),
-            audio_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache/fishaudio"),
+            audio_dir: crate::paths::root().join("cache/fishaudio"),
             work_dir: std::env::temp_dir().join("o11a1-asr-live"),
             ..WatchConfig::default()
         };
@@ -1152,11 +1152,11 @@ mod tests {
     fn live_long_audio_chunked() {
         let root = std::env::var_os("BILI_MODEL_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper"));
+            .unwrap_or_else(|| crate::paths::root().join("models/whisper"));
         let engine = std::env::var("BILI_ASR_ENGINE").unwrap_or_else(|_| "faster-whisper".to_string());
         let config = WatchConfig {
             model_dir: root.clone(),
-            audio_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache/fishaudio"),
+            audio_dir: crate::paths::root().join("cache/fishaudio"),
             work_dir: std::env::temp_dir().join("o11a1-asr-live"),
             asr: crate::fishwatch::AsrOptions {
                 enabled: true,

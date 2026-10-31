@@ -150,6 +150,20 @@ const FW_MEDIUM: &[ModelFile] = &[
     },
 ];
 
+const CPP_TINY: &[ModelFile] = &[ModelFile {
+    name: "ggml-tiny.bin",
+    size: 77_691_713,
+    sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+    repo: CPP_REPO,
+}];
+
+const CPP_BASE: &[ModelFile] = &[ModelFile {
+    name: "ggml-base.bin",
+    size: 147_951_465,
+    sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+    repo: CPP_REPO,
+}];
+
 const CPP_SMALL: &[ModelFile] = &[ModelFile {
     name: "ggml-small.bin",
     size: 487_601_967,
@@ -189,13 +203,24 @@ pub const FW_MEDIUM_SPEC: ModelSpec = ModelSpec {
     dir: "faster-whisper-medium",
     files: FW_MEDIUM,
 };
+pub const CPP_TINY_SPEC: ModelSpec = ModelSpec {
+    id: "tiny",
+    engine: "whisper.cpp",
+    dir: "whisper.cpp",
+    files: CPP_TINY,
+};
+pub const CPP_BASE_SPEC: ModelSpec = ModelSpec {
+    id: "base",
+    engine: "whisper.cpp",
+    dir: "whisper.cpp",
+    files: CPP_BASE,
+};
 pub const CPP_SMALL_SPEC: ModelSpec = ModelSpec {
     id: "small",
     engine: "whisper.cpp",
     dir: "whisper.cpp",
     files: CPP_SMALL,
-};
-pub const CPP_TURBO_SPEC: ModelSpec = ModelSpec {
+};pub const CPP_TURBO_SPEC: ModelSpec = ModelSpec {
     id: "turbo",
     engine: "whisper.cpp",
     dir: "whisper.cpp",
@@ -220,6 +245,9 @@ pub fn spec(model: &str, engine: &str) -> Option<&'static ModelSpec> {
         ("small", "whisper.cpp") => Some(&CPP_SMALL_SPEC),
         ("turbo", "whisper.cpp") => Some(&CPP_TURBO_SPEC),
         ("medium", "whisper.cpp") => Some(&CPP_MEDIUM_SPEC),
+        // f206: tiny/base 只在 whisper.cpp 里有（下载面板的四档就是它们）。
+        ("tiny", "whisper.cpp") => Some(&CPP_TINY_SPEC),
+        ("base", "whisper.cpp") => Some(&CPP_BASE_SPEC),
         _ => None,
     }
 }
@@ -514,6 +542,8 @@ mod tests {
     #[test]
     fn every_manifest_entry_has_a_real_hash_and_size() {
         for spec in [
+            &CPP_TINY_SPEC,
+            &CPP_BASE_SPEC,
             &FW_SMALL_SPEC,
             &FW_TURBO_SPEC,
             &FW_MEDIUM_SPEC,
@@ -524,12 +554,26 @@ mod tests {
             assert!(!spec.files.is_empty());
             assert_eq!(spec.files[0].name.contains("model.bin") || spec.files[0].name.contains("ggml"), true);
             let total = spec.total_bytes();
-            assert!(total > 400_000_000, "{} total {total}", spec.id);
+            // tiny is 74 MB; every other shipped tier is well past 100 MB.
+            assert!(total > 70_000_000, "{} total {total}", spec.id);
             for file in spec.files {
                 assert_eq!(file.sha256.len(), 64, "{}:{}", spec.id, file.name);
                 assert!(file.size > 0);
                 assert!(file.url().starts_with("https://huggingface.co/"));
             }
+        }
+    }
+
+    /// f206: 设置页的下载面板（`crate::models_dl`）与这里的清单必须是同一组
+    /// 数字，否则进度条的百分比、下载完的体积校验和「当前使用」会对不上。
+    #[test]
+    fn the_download_panel_and_the_engine_share_one_manifest() {
+        for model in crate::models_dl::MODELS {
+            let cpp = spec(model.name, "whisper.cpp")
+                .unwrap_or_else(|| panic!("whisper.cpp 没有 {} 档", model.name));
+            assert_eq!(cpp.primary().name, model.file, "{}", model.name);
+            assert_eq!(cpp.primary().size, model.bytes, "{}", model.name);
+            assert_eq!(cpp.path(&PathBuf::from("root")), PathBuf::from("root/whisper.cpp"));
         }
     }
 
@@ -574,7 +618,7 @@ mod tests {
     fn live_download_small_model() {
         let root = std::env::var_os("BILI_MODEL_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper"));
+            .unwrap_or_else(|| crate::paths::root().join("models/whisper"));
         eprintln!("model root={}", root.display());
         let mut last_ms = 0u128;
         let started = Instant::now();
@@ -616,7 +660,7 @@ mod tests {
     fn live_download_cpp_small_model() {
         let root = std::env::var_os("BILI_MODEL_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper"));
+            .unwrap_or_else(|| crate::paths::root().join("models/whisper"));
         eprintln!("model root={}", root.display());
         let target = CPP_SMALL_SPEC.path(&root).join(CPP_SMALL_SPEC.primary().name);
         if target.exists() {

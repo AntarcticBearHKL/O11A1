@@ -1076,9 +1076,7 @@ fn set_busy(window: &slint::Weak<AppWindow>, busy: bool) {
 }
 
 fn ffmpeg_dir() -> PathBuf {
-    std::env::var("BILI_FFMPEG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Programs\ffmpeg-unpack\bin"))
+    crate::paths::ffmpeg_dir()
 }
 
 fn base_command(exe: &str) -> Command {

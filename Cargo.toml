@@ -7,6 +7,21 @@ description = "O11A1 — a Rust + Slint Bilibili desktop client"
 
 [dependencies]
 slint = { version = "1", features = ["raw-window-handle-06"] }
+# f194: the hybrid platform. The player window is composited by DirectComposition
+# (`src/dcomp/`), every other window stays on winit. `set_platform` is
+# process-global and one-shot, so the process now installs a platform that holds
+# this backend and forwards everything to it; see `src/dcomp/platform.rs`.
+#
+# Both are private crates and must move with the `slint` version above: the
+# pinned `=1.18.1` is the version in Cargo.lock, so this adds no download and no
+# second copy of either. `default-features = false` keeps the feature set coming
+# from the `slint` dependency (feature unification), exactly as the default
+# selector would build it.
+i-slint-backend-winit = { version = "=1.18.1", default-features = false }
+# The `Platform` trait's `bind_context` / `process_events` signatures name
+# `SlintContextWeak` and `InternalToken`, which are not re-exported through
+# `slint::platform`; implementing the trait needs the crate itself.
+i-slint-core = { version = "=1.18.1", default-features = false }
 # f174: the `log` facade, so the layers below the app (wgpu, wgpu_hal, the Slint
 # renderers) can report INTO our debug log. Without a logger their records are
 # dropped silently, which is why a wgpu surface failure used to leave exactly
@@ -50,6 +65,85 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    # f206: `BROWSEINFOW` / `SHBrowseForFolderW` (the native 选择文件夹 dialog for
+    # the 语音识别模型 directory) live in `Win32_UI_Shell_Common`. Already in the
+    # lock file and already compiled for this crate; this only unlocks the
+    # bindings, it adds no crate and no download.
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# f194: DirectComposition / DXGI / D3D11 for the player window, plus the Win32
+# calls whose COM interfaces `windows-sys` cannot express (raw vtables). The
+# same feature set the f192 prototype (`examples/dcomp_proto.rs`) was verified
+# with, so the code path in `src/dcomp/` is the one that was measured.
+# f194: `Matrix3x2` for `IDCompositionVisual::SetTransform2`. Already in the
+# lock (the `windows` crate depends on it); naming it directly avoids enabling
+# the whole WinRT `Foundation` surface just for one struct.
+windows-numerics = "0.3"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    # f208: `ID3D10Multithread`. Media Foundation's DXGI device manager uses the
+    # device from its own decode threads, so `src/mediadec/` calls
+    # SetMultithreadProtected before the first transform touches it. Bindings
+    # only; no new crate and no download.
+    "Win32_Graphics_Direct3D10",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media",
+    # f208: Media Foundation itself - `MFStartup`, the source reader
+    # (`mfreadwrite.dll`), `MFCreateDXGIDeviceManager` and the IMF interfaces the
+    # hardware decoder hands its picture through. Windows ships these DLLs, so
+    # this is still nothing to bundle; `Win32_System_Com_StructuredStorage` is
+    # the PROPVARIANT the seek needs.
+    "Win32_Media_MediaFoundation",
+    "Win32_Storage_Xps",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# f208: `#[implement]` (the custom `IMFByteStream` in `src/mediadec/mf.rs`)
+# expands to `::windows_core::…` paths, so the crate itself must be in the
+# extern prelude. It is the exact version `windows` above already depends on
+# (check Cargo.lock), so this adds no download and no second copy.
+windows-core = "0.62"
+
+[dev-dependencies]
+# f192: `examples/dcomp_proto.rs` is the standalone DirectComposition spike
+# (window with WS_EX_NOREDIRECTIONBITMAP, a 120 fps video swapchain and an alpha
+# UI swapchain on one composition target). It drives DComp/DXGI/D3D11 directly,
+# which windows-sys cannot express without raw vtables; `windows` is already in
+# the lock file (wgpu-hal and Slint depend on it), so this adds no download.
+# Only the example uses these features: the shipped binary still builds against
+# the windows-sys feature set above.
+# f194: `Matrix3x2` for `IDCompositionVisual::SetTransform2`. Already in the
+# lock (the `windows` crate depends on it); naming it directly avoids enabling
+# the whole WinRT `Foundation` surface just for one struct.
+windows-numerics = "0.3"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media",
+    "Win32_Media_MediaFoundation",
+    "Win32_Storage_Xps",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

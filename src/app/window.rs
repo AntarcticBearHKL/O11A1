@@ -8,7 +8,8 @@ pub(crate) fn player_active() -> bool {
 
 /// One more player window owns playback.
 pub(crate) fn player_opened() {
-    PLAYER_OPEN_COUNT.fetch_add(1, Ordering::SeqCst);
+    let count = PLAYER_OPEN_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::debug_log(&format!("players opened n={count}"));
 }
 
 /// One player window is gone; the main window resumes only at zero.
@@ -16,6 +17,10 @@ pub(crate) fn player_closed() {
     let _ = PLAYER_OPEN_COUNT.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
         Some(count.saturating_sub(1))
     });
+    crate::debug_log(&format!(
+        "players closed n={}",
+        PLAYER_OPEN_COUNT.load(Ordering::SeqCst)
+    ));
 }
 
 pub(crate) fn region_labels() -> Vec<SharedString> {
@@ -623,7 +628,9 @@ pub(crate) fn apply_close_action(ui: &AppWindow, settings_store: &Arc<Mutex<sett
             // cannot be closed". `hide_to_tray` drops the tab through
             // `ITaskbarList` and marks the window `WS_EX_TOOLWINDOW`.
             let state = win::hide_to_tray(window);
-            tray::notify_hidden_once();
+            // f188: no balloon. The owner asked for the "hidden to tray" toast
+            // to stay off - the window disappearing is signal enough, and the
+            // tray icon is always there.
             crate::debug_log(&format!(
                 "close: action={} hide-to-tray {} {}",
                 settings::CLOSE_ACTION_TRAY,
@@ -1091,6 +1098,14 @@ pub(crate) fn start_player_loops(
         occluded_hold: Cell::new(false),
         occluded_at: Cell::new(None),
     });
+    // f183: book this player into the occlusion allow-list. Only the app's own
+    // player windows may pause another player; every other window (a game, a
+    // browser in fullscreen, the main window) is ignored by the z-order test.
+    // The handle can appear a few frames after `show()`, so the watchdog books
+    // it in again (idempotent) and `stop_player_loops` unregisters it.
+    if let Some(hwnd) = win::hwnd_of(player.window()) {
+        win::register_player_window(hwnd);
+    }
     {
         // Armed by the pointer watch whenever the rect changed, and re-armed by
         // every further change, so it fires once the window has been still for
@@ -1130,6 +1145,12 @@ pub(crate) fn start_player_loops(
                 // through `control.set_occluded` so clearing it can never
                 // release a pause the user asked for. Uncovering the window
                 // releases it immediately at the next sample.
+                //
+                // f183 narrows the trigger: a cover only counts when it is ONE
+                // OF THIS PROGRAM'S PLAYER WINDOWS (two overlapping players is
+                // the case f152 exists for). Any other window - a fullscreen
+                // game, a browser, another video player - is ignored, so the
+                // sound keeps playing while the picture is simply not visible.
                 let occlusion_due = loops
                     .occlusion_checked
                     .get()
@@ -1146,7 +1167,20 @@ pub(crate) fn start_player_loops(
                         // until that frame), and the window may still be in its
                         // pre-show placement. Only a real picture can be
                         // "paused by occlusion".
-                        if win::is_fully_covered(hwnd) && control.presented_frames() > 0 {
+                        //
+                        // f183: the only covers that count are the app's own
+                        // player windows. Another program - a fullscreen game,
+                        // a browser, a video player - covering this window is
+                        // explicitly NOT a reason to pause: the sound must keep
+                        // playing even though the picture is not visible.
+                        win::register_player_window(hwnd);
+                        let players = win::player_windows();
+                        let covered = win::is_fully_covered(hwnd, &players);
+                        if covered && control.presented_frames() > 0 {
+                            // The pause receipt names the covering players; only
+                            // a fully covered window needs this second walk.
+                            let occluders =
+                                win::covering_player_windows(hwnd, &players).unwrap_or_default();
                             let since = loops.occluded_since.get().unwrap_or(now);
                             loops.occluded_since.set(Some(since));
                             if !loops.occluded_hold.get()
@@ -1159,7 +1193,7 @@ pub(crate) fn start_player_loops(
                                 OCCLUDED_PAUSES.fetch_add(1, Ordering::Relaxed);
                                 let audio_pid = control.audio_pid();
                                 crate::debug_log(&format!(
-                                    "player occluded pause win={} covered_ms={} audio_pid={audio_pid} audio_state={}",
+                                    "player occluded pause win={} covered_ms={} occluders={occluders:?} audio_pid={audio_pid} audio_state={}",
                                     loops.id,
                                     now.saturating_duration_since(since).as_millis(),
                                     audio_state_name(win::audio_session_state(audio_pid)),
@@ -1282,6 +1316,11 @@ pub(crate) fn stop_player_loops(loops: &Rc<PlayerLoops>) {
     loops.layout_timer.stop();
     if let Some(player) = loops.window.upgrade() {
         player.set_pointer_inside(false);
+        // f183: a closed player must stop being a cover. A handle that is
+        // already gone is pruned by `player_windows` on the next read anyway.
+        if let Some(hwnd) = win::hwnd_of(player.window()) {
+            win::unregister_player_window(hwnd);
+        }
     }
     // A hidden/closed window must reopen with the chrome visible: forget the
     // stillness streak and the idle latch.

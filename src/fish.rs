@@ -478,7 +478,7 @@ fn watch_config_from_settings(
         selection = StepSelection::for_tier(1);
     }
     let model_dir = if settings.fish_asr_model_dir.trim().is_empty() {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper")
+        crate::paths::root().join("models/whisper")
     } else {
         PathBuf::from(settings.fish_asr_model_dir.trim())
     };
@@ -502,7 +502,7 @@ fn watch_config_from_settings(
             endpoint: endpoint.to_string(),
         },
         model_dir,
-        audio_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache/fishaudio"),
+        audio_dir: crate::paths::root().join("cache/fishaudio"),
         work_dir: std::env::temp_dir().join("o11a1-fishwatch"),
         ffmpeg: "ffmpeg".to_string(),
     }
@@ -620,7 +620,7 @@ impl FishEngine {
     pub fn open() -> Result<Arc<Self>> {
         let path = std::env::var_os("BILI_FISH_DB")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DB_FILE));
+            .unwrap_or_else(|| crate::paths::root().join(DB_FILE));
         Self::open_at(&path)
     }
 
@@ -3591,8 +3591,8 @@ mod tests {
             watch.selection.frames = true;
         }
         watch.model_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper");
-        watch.audio_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache/fishaudio");
+            crate::paths::root().join("models/whisper");
+        watch.audio_dir = crate::paths::root().join("cache/fishaudio");
         let selected = watch
             .selection
             .ids()
@@ -3605,7 +3605,7 @@ mod tests {
         );
 
         let path = if std::env::var("BILI_FISH_DB").as_deref() == Ok("real") {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DB_FILE)
+            crate::paths::root().join(DB_FILE)
         } else {
             temp_db("live-tier")
         };

@@ -14,11 +14,27 @@
 //! This is the **test face, not the product face**: if a behaviour is only
 //! reachable from here, a user cannot reach it.
 
+pub mod covers;
+pub mod f196;
+pub mod f199;
+pub mod f200;
+pub mod f201;
+pub mod f211;
+pub mod f212;
 pub mod env;
 pub mod hooks;
+pub mod mf;
 pub mod perf;
 pub mod pgc;
+pub mod sr;
 
+pub(crate) use covers::*;
+pub(crate) use f196::*;
+pub(crate) use f199::*;
+pub(crate) use f200::*;
+pub(crate) use f201::*;
+pub(crate) use f212::*;
 pub(crate) use hooks::*;
 pub(crate) use perf::*;
 pub(crate) use pgc::*;
+pub(crate) use sr::*;

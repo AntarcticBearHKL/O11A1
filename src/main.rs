@@ -32,12 +32,16 @@ mod autostart;
 mod backdrop;
 mod bilibili;
 mod danmaku;
+mod dcomp;
 mod download;
 mod fish;
 mod fishwatch;
 mod job;
 mod media_hooks;
+mod mediadec;
+mod models_dl;
 mod netpool;
+mod paths;
 mod player;
 mod player_view;
 mod prefetch; // the player wires it in
@@ -45,6 +49,7 @@ mod qa;
 mod settings;
 mod theme;
 mod tray;
+mod update;
 mod wbi;
 mod win;
 
@@ -769,6 +774,13 @@ fn f174_spawn_soak() {
         let mut fps_max = 0.0f64;
         let mut windows = 0usize;
         let mut seek_targets = vec![40u64, 80u64];
+        // f194: the DComp player's own counters, sampled with the same clock as
+        // the line above. `video_s` is present-calls that returned S_OK on the
+        // video swapchain; `ui_s` is Slint repaints that reached the UI
+        // swapchain - the two rates the composition has to sustain.
+        let mut last_video = (0u64, Instant::now());
+        let mut last_ui = (0u64, Instant::now());
+        let mut last_dm = (0u64, Instant::now());
         crate::debug_log(&format!("f174 soak start seconds={seconds}"));
         loop {
             std::thread::sleep(Duration::from_secs(5));
@@ -795,6 +807,28 @@ fn f174_spawn_soak() {
                     stats.position_ms,
                     stats.stalls
                 ));
+                if let Some(hwnd) = win::player_windows().first().copied() {
+                    if let Some(video) = dcomp::video_counters(hwnd) {
+                        let (ui_paints, ui_ms) = dcomp::ui_counters(hwnd).unwrap_or((0, 0.0));
+                        // f196: the danmaku layer's own rate, sampled on the same
+                        // clock - the three layers have to hold 115/55/55.
+                        let (dm_paints, dm_ms) = dcomp::danmaku_counters(hwnd).unwrap_or((0, 0.0));
+                        let window_s = last_video.1.elapsed().as_secs_f64().max(0.001);
+                        let video_s =
+                            video.presented.saturating_sub(last_video.0) as f64 / window_s;
+                        let ui_window = last_ui.1.elapsed().as_secs_f64().max(0.001);
+                        let ui_s = ui_paints.saturating_sub(last_ui.0) as f64 / ui_window;
+                        let dm_window = last_dm.1.elapsed().as_secs_f64().max(0.001);
+                        let dm_s = dm_paints.saturating_sub(last_dm.0) as f64 / dm_window;
+                        last_video = (video.presented, Instant::now());
+                        last_ui = (ui_paints, Instant::now());
+                        last_dm = (dm_paints, Instant::now());
+                        crate::debug_log(&format!(
+                            "f196 layers t={elapsed}s video_s={video_s:.1} dm_s={dm_s:.1} ui_s={ui_s:.1}                              dm_ms={dm_ms:.2} ui_ms={ui_ms:.2}                              video_presented={} pushed={} coal={} stage_us={},                              ui_paints={ui_paints} dm_paints={dm_paints}",
+                            video.presented, video.pushed, video.coalesced, video.stage_us
+                        ));
+                    }
+                }
             } else {
                 // No player yet (open is still resolving) or it just closed.
                 last_frames = 0;
@@ -875,6 +909,762 @@ fn f174_spawn_soak() {
 
 
 
+// -------------------------- f180 QA: 长按右键刷新 ---------------------------
+//
+// `BILI_F180_TEST=<delay_ms>` drives the REAL gesture with Slint pointer events
+// (no OS input) and captures the four required instants:
+//
+//   f180_hold_0.png     right press just landed, ring just started
+//   f180_hold_250.png   the ring's own `hold_ms` reached 250 (half way)
+//   f180_hold_done.png  `hold_fired` first observed (ring full, fade tick 1)
+//   f180_after.png      ~1.4s later, the refreshed page
+//
+// Then, on the same run: a 120ms press (must log only
+// `hold refresh cancel ... reason=release`), a press + 40px move (must log
+// `reason=move`), and a right press on the first card. Since f188 a right press
+// on a card belongs to THIS gesture (the card only opens on release and only if
+// the hold did not fire), so the card probe now logs `hold refresh press` +
+// `cancel ... reason=release` and then `card open ... mode=1 (new-window)` -
+// the short-press half of the same contract. `BILI_F188_TEST` covers the
+// long-press half (no `card open` at all). The run ends
+// with `std::process::exit(0)`, so the log closes on its own.
+//
+// The captures are keyed to the ring's own `hold_ms` / `hold_fired`, not to wall
+// time, so a slow `PrintWindow` can never desynchronise the picture from the
+// clock that actually drives the arc.
+fn start_f180_test(weak: Weak<AppWindow>, delay: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay));
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            use slint::platform::{PointerEventButton, WindowEvent};
+
+            fn pointer(win: &slint::Window, x: f32, y: f32, button: PointerEventButton) {
+                let position = slint::LogicalPosition::new(x, y);
+                win.dispatch_event(WindowEvent::PointerMoved { position });
+                win.dispatch_event(WindowEvent::PointerPressed { position, button });
+            }
+            fn moved(win: &slint::Window, x: f32, y: f32) {
+                win.dispatch_event(WindowEvent::PointerMoved {
+                    position: slint::LogicalPosition::new(x, y),
+                });
+            }
+            fn release(win: &slint::Window, x: f32, y: f32, button: PointerEventButton) {
+                win.dispatch_event(WindowEvent::PointerReleased {
+                    position: slint::LogicalPosition::new(x, y),
+                    button,
+                });
+            }
+            fn capture(win: &slint::Window, tag: &str, ring: String) -> String {
+                let path = qa_capture_path(tag);
+                match capture_window_png(win, &path) {
+                    Some((w, h)) => format!("{tag}.png {w}x{h} {ring}"),
+                    None => format!("{tag}.png FAILED {ring}"),
+                }
+            }
+
+            let scale = ui.window().scale_factor().max(0.2) as f32;
+            let width = ui.window().size().width as f32 / scale;
+            let height = ui.window().size().height as f32 / scale;
+            // The top strip's empty band: the one strip every page shares, with
+            // no card under it and enough room for the whole 62px ring (the
+            // feed's left gutter is only 28px wide, so a ring there would be
+            // half off-screen). `top_bar_drag` rejects a right press, so the
+            // event falls through to `hold_gesture`. x is the empty band
+            // between the name block and the window buttons.
+            let px = (width / 2.0).clamp(40.0, (width - 240.0).max(40.0));
+            let py = 34.0f32;
+            // The behavioural probes sit left and right of the same band, so
+            // their rings never overlap the long hold's own spot and no control
+            // (avatar / name / gear / window buttons) owns the press.
+            let px_short = (px - 300.0).clamp(40.0, width - 40.0);
+            let px_move = (px + 300.0).clamp(40.0, width - 240.0);
+            let py_short = py;
+            let py_move = py;
+
+            crate::debug_log(&format!(
+                "f180 start window={width:.0}x{height:.0} press=({px:.0},{py:.0}) delay={delay}"
+            ));
+
+            let phase = Rc::new(Cell::new(0i32)); // 0 warm, 1 hold, 2 after, ...
+            let t = Rc::new(Cell::new(0i32));
+            let bits = Rc::new(Cell::new(0u32));
+
+            let timer = Rc::new(slint::Timer::default());
+            keep_qa_timer(timer.clone());
+            let tick_timer = timer.clone();
+            let tick_ui = ui.as_weak();
+            tick_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
+                let Some(ui) = tick_ui.upgrade() else { return; };
+                let win = ui.window();
+                t.set(t.get() + 16);
+                let ring = || {
+                    format!(
+                        "active={} hold_ms={} fired={} view={}",
+                        u8::from(ui.get_hold_active()),
+                        ui.get_hold_ms(),
+                        u8::from(ui.get_hold_fired()),
+                        ui.get_view_mode()
+                    )
+                };
+                // Watchdog: a phase that never completes must not hang the app.
+                if phase.get() >= 1 && phase.get() <= 9 && t.get() > 8_000 {
+                    crate::debug_log(&format!("f180 timeout phase={} {}", phase.get(), ring()));
+                    std::process::exit(5);
+                }
+                match phase.get() {
+                    // Warm-up: the gesture is only meaningful once the page and
+                    // the feed have landed (a logged-out login card has no page
+                    // background to press).
+                    0 => {
+                        let ready = ui.get_logged_in() && ui.get_feed_items().row_count() > 0;
+                        if ready {
+                            phase.set(1);
+                            t.set(0);
+                            ui.set_qa_probe_card(0);
+                            pointer(&win, px, py, PointerEventButton::Right);
+                            crate::debug_log(&format!(
+                                "f180 hold press rows={} logged_in={}",
+                                ui.get_feed_items().row_count(),
+                                u8::from(ui.get_logged_in())
+                            ));
+                        } else if t.get() > 20_000 {
+                            crate::debug_log(&format!(
+                                "f180 warm timeout logged_in={} rows={}",
+                                u8::from(ui.get_logged_in()),
+                                ui.get_feed_items().row_count()
+                            ));
+                            std::process::exit(4);
+                        }
+                    }
+                    1 => {
+                        if bits.get() & 1 == 0 && t.get() >= 48 {
+                            bits.set(bits.get() | 1);
+                            crate::debug_log(&format!(
+                                "f180 {}",
+                                capture(&win, "f180_hold_0", ring())
+                            ));
+                        }
+                        if bits.get() & 2 == 0 && ui.get_hold_ms() >= 250 {
+                            bits.set(bits.get() | 2);
+                            crate::debug_log(&format!(
+                                "f180 {}",
+                                capture(&win, "f180_hold_250", ring())
+                            ));
+                        }
+                        if bits.get() & 4 == 0 && ui.get_hold_fired() {
+                            bits.set(bits.get() | 4);
+                            crate::debug_log(&format!(
+                                "f180 {}",
+                                capture(&win, "f180_hold_done", ring())
+                            ));
+                            release(&win, px, py, PointerEventButton::Right);
+                            crate::debug_log("f180 hold released after done");
+                            phase.set(2);
+                            t.set(0);
+                        }
+                    }
+                    2 => {
+                        if t.get() >= 1_400 {
+                            crate::debug_log(&format!(
+                                "f180 {}",
+                                capture(&win, "f180_after", ring())
+                            ));
+                            phase.set(3);
+                            t.set(0);
+                        }
+                    }
+                    // A <200ms press: the ring appears and goes away, and the log
+                    // must show ONLY a `cancel ... reason=release` line.
+                    3 => {
+                        pointer(&win, px_short, py_short, PointerEventButton::Right);
+                        crate::debug_log(&format!(
+                            "f180 short press at ({px_short:.0},{py_short:.0})"
+                        ));
+                        phase.set(4);
+                        t.set(0);
+                    }
+                    4 => {
+                        if ui.get_hold_ms() >= 120 {
+                            release(&win, px_short, py_short, PointerEventButton::Right);
+                            crate::debug_log("f180 short released at 120ms");
+                            phase.set(5);
+                            t.set(0);
+                        }
+                    }
+                    // Press then move 40px: the 16px cancel line must fire.
+                    5 => {
+                        if t.get() >= 200 {
+                            pointer(&win, px_move, py_move, PointerEventButton::Right);
+                            crate::debug_log(&format!(
+                                "f180 move press at ({px_move:.0},{py_move:.0})"
+                            ));
+                            phase.set(6);
+                            t.set(0);
+                        }
+                    }
+                    6 => {
+                        if ui.get_hold_ms() >= 64 {
+                            moved(&win, px_move + 40.0, py_move + 20.0);
+                            crate::debug_log("f180 move +40px");
+                            phase.set(7);
+                            t.set(0);
+                        }
+                    }
+                    7 => {
+                        if t.get() >= 64 {
+                            release(&win, px_move + 40.0, py_move + 20.0, PointerEventButton::Right);
+                            phase.set(8);
+                            t.set(0);
+                        }
+                    }
+                    // A right press on the first card must reach the card (and
+                    // its own mode-1 action), never this gesture layer.
+                    8 => {
+                        if t.get() >= 200 {
+                            let cx = ui.get_qa_card_x();
+                            let cy = ui.get_qa_card_y();
+                            if cx > 0.0 && cy > 0.0 {
+                                let card_px = cx - 60.0;
+                                let card_py = cy + 40.0;
+                                crate::debug_log(&format!(
+                                    "f180 card mark=({cx:.0},{cy:.0}) press=({card_px:.0},{card_py:.0})"
+                                ));
+                                pointer(&win, card_px, card_py, PointerEventButton::Right);
+                            } else {
+                                crate::debug_log("f180 card probe skipped (no rect)");
+                            }
+                            phase.set(9);
+                            t.set(0);
+                        }
+                    }
+                    9 => {
+                        if t.get() >= 96 {
+                            let cx = ui.get_qa_card_x();
+                            let cy = ui.get_qa_card_y();
+                            if cx > 0.0 && cy > 0.0 {
+                                release(&win, cx - 60.0, cy + 40.0, PointerEventButton::Right);
+                            }
+                            phase.set(10);
+                            t.set(0);
+                        }
+                    }
+                    _ => {
+                        if t.get() >= 1_500 {
+                            crate::debug_log("f180 done shots=4");
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            });
+        });
+    });
+}
+
+// ------------------ f188 QA: 卡片上的长按右键（不再开新窗口） ------------------
+//
+// `BILI_F188_TEST=<delay_ms>` drives the SAME real pointer path as f180 and
+// proves the f188 contract on three pages (推荐流 / 搜索结果 / 番剧海报):
+//
+//   card, held 600ms       `hold refresh done` + a page refresh + NO `card open`
+//                          (screenshot `f188_card_hold.png`, ring ON the card)
+//   card, released <200ms  `card open ... mode=1` (screenshot `f188_card_quick.png`
+//                          of the NEW player window)
+//   blank area, held       refresh (unchanged)
+//   blank area, tapped     nothing at all
+//   card, moved >16px      `cancel ... reason=move`, then the short-press action
+//
+// The open-player count is logged around every press (`players=`), so "no new
+// window" is a number in the log, not an absence of a line.
+fn start_f188_test(weak: Weak<AppWindow>, delay: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay));
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            use slint::platform::{PointerEventButton, WindowEvent};
+
+            fn pointer(win: &slint::Window, x: f32, y: f32, button: PointerEventButton) {
+                let position = slint::LogicalPosition::new(x, y);
+                win.dispatch_event(WindowEvent::PointerMoved { position });
+                win.dispatch_event(WindowEvent::PointerPressed { position, button });
+            }
+            fn moved(win: &slint::Window, x: f32, y: f32) {
+                win.dispatch_event(WindowEvent::PointerMoved {
+                    position: slint::LogicalPosition::new(x, y),
+                });
+            }
+            fn release(win: &slint::Window, x: f32, y: f32, button: PointerEventButton) {
+                win.dispatch_event(WindowEvent::PointerReleased {
+                    position: slint::LogicalPosition::new(x, y),
+                    button,
+                });
+            }
+
+            let scale = ui.window().scale_factor().max(0.2) as f32;
+            let width = ui.window().size().width as f32 / scale;
+            let height = ui.window().size().height as f32 / scale;
+
+            // Grid metrics, replicated from `AppTheme.grid_columns` and the
+            // window's card formula: the search page publishes no probe, so its
+            // first card is placed from the same arithmetic the UI lays out.
+            let avail = (width - 56.0).max(200.0);
+            let cols: i32 = if avail >= 1260.0 {
+                5
+            } else if avail >= 980.0 {
+                4
+            } else if avail >= 720.0 {
+                3
+            } else if avail >= 400.0 {
+                2
+            } else {
+                1
+            };
+            let card_w = ((avail - 12.0 * (cols - 1) as f32) / cols as f32).max(120.0);
+            let row_w = card_w * cols as f32 + 12.0 * (cols - 1) as f32;
+            let card_x = (width - row_w) / 2.0;
+            // 番剧 posters: `min(width,1120)` column, `pgc_cols` 12px columns.
+            let pgc_col_w = width.min(1120.0);
+            let pgc_col_x = ((width - pgc_col_w) / 2.0).max(0.0);
+            let pgc_cols: i32 = if pgc_col_w >= 1200.0 {
+                7
+            } else if pgc_col_w >= 980.0 {
+                6
+            } else if pgc_col_w >= 760.0 {
+                5
+            } else if pgc_col_w >= 520.0 {
+                4
+            } else if pgc_col_w >= 340.0 {
+                3
+            } else {
+                2
+            };
+            let pgc_card_w =
+                ((pgc_col_w - 12.0 * (pgc_cols - 1) as f32) / pgc_cols as f32).max(86.0);
+
+            crate::debug_log(&format!(
+                "f188 start window={width:.0}x{height:.0} cols={cols} card_w={card_w:.0} \
+                 card_x={card_x:.0} pgc_col_w={pgc_col_w:.0} pgc_card_w={pgc_card_w:.0} delay={delay}"
+            ));
+
+            let phase = Rc::new(Cell::new(0i32));
+            let t = Rc::new(Cell::new(0i32));
+            let bits = Rc::new(Cell::new(0u32));
+            // `BILI_F188_TAPS=0` skips every phase that OPENS a player window.
+            // A player window on top freezes the main window's presented surface
+            // (PrintWindow then returns the frame from before it appeared), so a
+            // screenshot run has to stay window-free; a tap run proves the
+            // short-press half.
+            let no_taps = std::env::var("BILI_F188_TAPS")
+                .map(|v| v.trim() == "0")
+                .unwrap_or(false);
+
+            // Feed card point and the page column's top edge (see phase 1).
+            let fx = Rc::new(Cell::new(0.0f32));
+            let fy = Rc::new(Cell::new(0.0f32));
+            let col_top = Rc::new(Cell::new(0.0f32));
+            // Search page's first-card point (set in phase 13).
+            let sx = Rc::new(Cell::new(0.0f32));
+            let sy = Rc::new(Cell::new(0.0f32));
+            // 番剧 poster point (set in phase 20).
+            let px = Rc::new(Cell::new(0.0f32));
+            let py = Rc::new(Cell::new(0.0f32));
+            // Blank background point: the top strip's empty band (f180's spot),
+            // bare page background on every page.
+            let bx = (width / 2.0).clamp(40.0, (width - 240.0).max(40.0));
+            let by = 34.0f32;
+
+            let timer = Rc::new(slint::Timer::default());
+            keep_qa_timer(timer.clone());
+            let tick_timer = timer.clone();
+            let tick_ui = ui.as_weak();
+            tick_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
+                let Some(ui) = tick_ui.upgrade() else { return; };
+                let win = ui.window();
+                t.set(t.get() + 16);
+                let ring = || {
+                    format!(
+                        "active={} hold_ms={} fired={} view={} players={}",
+                        u8::from(ui.get_hold_active()),
+                        ui.get_hold_ms(),
+                        u8::from(ui.get_hold_fired()),
+                        ui.get_view_mode(),
+                        f145_players()
+                    )
+                };
+                let shot = |tag: &str, ring: String| {
+                    let path = qa_capture_path(tag);
+                    match capture_window_png(&win, &path) {
+                        Some((w, h)) => format!("{tag}.png {w}x{h} {ring}"),
+                        None => format!("{tag}.png FAILED {ring}"),
+                    }
+                };
+                // A phase that never completes must not hang the app.
+                if phase.get() >= 1 && phase.get() <= 24 && t.get() > 15_000 {
+                    crate::debug_log(&format!("f188 timeout phase={} {}", phase.get(), ring()));
+                    std::process::exit(6);
+                }
+                match phase.get() {
+                    // Warm-up: a logged-in feed with a first page on screen.
+                    0 => {
+                        if ui.get_logged_in() && ui.get_feed_items().row_count() > 0 {
+                            ui.set_qa_probe_card(0);
+                            phase.set(1);
+                            t.set(0);
+                            crate::debug_log(&format!(
+                                "f188 warm rows={} logged_in=1 {}",
+                                ui.get_feed_items().row_count(),
+                                ring()
+                            ));
+                        }
+                    }
+                    // The card probe publishes the queue mark of feed card 0:
+                    // its x is the card's right edge - 38px, its y the card's top
+                    // + 10px. Press 60px left of it and 40px lower = mid-cover.
+                    1 => {
+                        let cx = ui.get_qa_card_x();
+                        let cy = ui.get_qa_card_y();
+                        if cx > 0.0 && cy > 0.0 {
+                            fx.set(cx - 60.0);
+                            fy.set(cy + 40.0);
+                            col_top.set(cy - 10.0);
+                            crate::debug_log(&format!(
+                                "f188 feed card mark=({cx:.0},{cy:.0}) point=({:.0},{:.0}) \
+                                 col_top={:.0}",
+                                fx.get(),
+                                fy.get(),
+                                col_top.get()
+                            ));
+                            phase.set(2);
+                            t.set(0);
+                        }
+                    }
+                    // 1) 推荐流: a 600ms hold ON the card - ring + refresh, no window.
+                    2 => {
+                        if t.get() >= 100 {
+                            crate::debug_log(&format!(
+                                "f188 feed card hold press=({:.0},{:.0}) {}",
+                                fx.get(),
+                                fy.get(),
+                                ring()
+                            ));
+                            pointer(&win, fx.get(), fy.get(), PointerEventButton::Right);
+                            phase.set(3);
+                            t.set(0);
+                        }
+                    }
+                    3 => {
+                        if bits.get() & 1 == 0 && ui.get_hold_ms() >= 300 {
+                            bits.set(bits.get() | 1);
+                            crate::debug_log(&format!(
+                                "f188 {}",
+                                shot("f188_card_hold", ring())
+                            ));
+                        }
+                        if ui.get_hold_fired() {
+                            crate::debug_log(&format!(
+                                "f188 feed card hold FIRED (must be 0 new windows) {}",
+                                ring()
+                            ));
+                            release(&win, fx.get(), fy.get(), PointerEventButton::Right);
+                            phase.set(4);
+                            t.set(0);
+                        }
+                    }
+                    // 2) 推荐流: a 120ms tap on the same card - the new window.
+                    4 => {
+                        if no_taps {
+                            phase.set(7);
+                            t.set(0);
+                        } else if t.get() >= 900 {
+                            crate::debug_log(&format!(
+                                "f188 feed card quick press=({:.0},{:.0}) players={}",
+                                fx.get(),
+                                fy.get(),
+                                f145_players()
+                            ));
+                            pointer(&win, fx.get(), fy.get(), PointerEventButton::Right);
+                            phase.set(5);
+                            t.set(0);
+                        }
+                    }
+                    5 => {
+                        if ui.get_hold_ms() >= 120 {
+                            release(&win, fx.get(), fy.get(), PointerEventButton::Right);
+                            crate::debug_log(&format!(
+                                "f188 feed card quick released at 120ms {}",
+                                ring()
+                            ));
+                            phase.set(6);
+                            t.set(0);
+                        }
+                    }
+                    // The new window is captured, then HIDDEN: a player window
+                    // on top freezes the main window's surface, and every later
+                    // capture would be a stale frame.
+                    6 => {
+                        if t.get() >= 1_500 {
+                            let players = f145_players();
+                            let mut line = format!("f188 feed card quick players={players}");
+                            if let Some(session) = f145_latest_player() {
+                                let path = qa_capture_path("f188_card_quick");
+                                let size = capture_window_png(&session.window.window(), &path)
+                                    .map(|(w, h)| format!("{w}x{h}"))
+                                    .unwrap_or_else(|| "FAILED".to_string());
+                                line.push_str(&format!(" shot=f188_card_quick.png {size}"));
+                                let _ = session.window.hide();
+                                line.push_str(" hidden=1");
+                            }
+                            crate::debug_log(&line);
+                            phase.set(7);
+                            t.set(0);
+                        }
+                    }
+                    // 3) Blank background: a hold still refreshes.
+                    7 => {
+                        crate::debug_log(&format!(
+                            "f188 blank hold press=({bx:.0},{by:.0}) players={}",
+                            f145_players()
+                        ));
+                        pointer(&win, bx, by, PointerEventButton::Right);
+                        phase.set(8);
+                        t.set(0);
+                    }
+                    8 => {
+                        if ui.get_hold_fired() {
+                            crate::debug_log(&format!("f188 blank hold FIRED {}", ring()));
+                            release(&win, bx, by, PointerEventButton::Right);
+                            phase.set(9);
+                            t.set(0);
+                        }
+                    }
+                    // 4) Blank background: a tap does nothing at all.
+                    9 => {
+                        if t.get() >= 700 {
+                            crate::debug_log(&format!(
+                                "f188 blank tap press=({bx:.0},{by:.0}) players={}",
+                                f145_players()
+                            ));
+                            pointer(&win, bx, by, PointerEventButton::Right);
+                            phase.set(10);
+                            t.set(0);
+                        }
+                    }
+                    10 => {
+                        if ui.get_hold_ms() >= 120 {
+                            release(&win, bx, by, PointerEventButton::Right);
+                            crate::debug_log(&format!("f188 blank tap released {}", ring()));
+                            phase.set(11);
+                            t.set(0);
+                        }
+                    }
+                    // 5) Card press + >16px move + release: cancel the hold, keep
+                    // the short-press action (a new window).
+                    11 => {
+                        if no_taps {
+                            phase.set(14);
+                            t.set(0);
+                        } else if t.get() >= 700 {
+                            crate::debug_log(&format!(
+                                "f188 card move press=({:.0},{:.0}) players={}",
+                                fx.get(),
+                                fy.get(),
+                                f145_players()
+                            ));
+                            pointer(&win, fx.get(), fy.get(), PointerEventButton::Right);
+                            phase.set(12);
+                            t.set(0);
+                        }
+                    }
+                    12 => {
+                        if ui.get_hold_ms() >= 100 {
+                            moved(&win, fx.get() + 40.0, fy.get() + 20.0);
+                            crate::debug_log(&format!("f188 card move +40px {}", ring()));
+                            phase.set(13);
+                            t.set(0);
+                        }
+                    }
+                    13 => {
+                        if t.get() >= 120 {
+                            release(
+                                &win,
+                                fx.get() + 40.0,
+                                fy.get() + 20.0,
+                                PointerEventButton::Right,
+                            );
+                            let hidden = f145_latest_player()
+                                .map(|session| session.window.hide().is_ok())
+                                .unwrap_or(false);
+                            crate::debug_log(&format!(
+                                "f188 card move released (short-press action) players={} hidden={}",
+                                f145_players(),
+                                u8::from(hidden)
+                            ));
+                            phase.set(14);
+                            t.set(0);
+                        }
+                    }
+                    // 6) 搜索结果: submit a query and wait for the grid.
+                    14 => {
+                        if t.get() >= 900 {
+                            crate::debug_log("f188 search submit");
+                            ui.invoke_do_search("猫".into());
+                            phase.set(15);
+                            t.set(0);
+                        }
+                    }
+                    15 => {
+                        if ui.get_view_mode() == 1 && ui.get_search_items().row_count() > 0 {
+                            // Chips row 30 + 8 spacing below the page top; 90px
+                            // into the 227px card.
+                            sx.set(card_x + 60.0);
+                            sy.set(col_top.get() + 38.0 + 90.0);
+                            crate::debug_log(&format!(
+                                "f188 search rows={} tap=({:.0},{:.0}) players={}",
+                                ui.get_search_items().row_count(),
+                                sx.get(),
+                                sy.get(),
+                                f145_players()
+                            ));
+                            if no_taps {
+                                phase.set(17);
+                                t.set(0);
+                            } else {
+                                pointer(&win, sx.get(), sy.get(), PointerEventButton::Right);
+                                phase.set(16);
+                                t.set(0);
+                            }
+                        }
+                    }
+                    // The search grid's card: a tap opens a window (proof the
+                    // point really is a card), and that window is hidden at once
+                    // so the capture of the hold below is a live frame.
+                    16 => {
+                        if ui.get_hold_ms() >= 120 {
+                            release(&win, sx.get(), sy.get(), PointerEventButton::Right);
+                            let hidden = f145_latest_player()
+                                .map(|session| session.window.hide().is_ok())
+                                .unwrap_or(false);
+                            crate::debug_log(&format!(
+                                "f188 search card quick released {} hidden={}",
+                                ring(),
+                                u8::from(hidden)
+                            ));
+                            phase.set(17);
+                            t.set(0);
+                        }
+                    }
+                    // 7) 搜索结果: the same point, held - ring + refresh, no window.
+                    17 => {
+                        if t.get() >= 1_600 {
+                            crate::debug_log(&format!(
+                                "f188 search card hold press=({:.0},{:.0}) players={}",
+                                sx.get(),
+                                sy.get(),
+                                f145_players()
+                            ));
+                            pointer(&win, sx.get(), sy.get(), PointerEventButton::Right);
+                            phase.set(18);
+                            t.set(0);
+                        }
+                    }
+                    18 => {
+                        if bits.get() & 2 == 0 && ui.get_hold_ms() >= 300 {
+                            bits.set(bits.get() | 2);
+                            crate::debug_log(&format!(
+                                "f188 {}",
+                                shot("f188_search_hold", ring())
+                            ));
+                        }
+                        if ui.get_hold_fired() {
+                            crate::debug_log(&format!(
+                                "f188 search card hold FIRED (must be 0 new windows) {}",
+                                ring()
+                            ));
+                            release(&win, sx.get(), sy.get(), PointerEventButton::Right);
+                            phase.set(19);
+                            t.set(0);
+                        }
+                    }
+                    // 8) 番剧: switch to the poster tab and hold on a poster.
+                    19 => {
+                        if t.get() >= 900 {
+                            crate::debug_log("f188 pgc poster tab");
+                            ui.invoke_pgc_tab_pick(1);
+                            phase.set(20);
+                            t.set(0);
+                        }
+                    }
+                    20 => {
+                        if ui.get_view_mode() == 22 && ui.get_pgc_items().row_count() > 0 {
+                            px.set(pgc_col_x + pgc_card_w / 2.0);
+                            py.set(col_top.get() + 42.0 + 90.0);
+                            crate::debug_log(&format!(
+                                "f188 pgc items={} tap=({:.0},{:.0}) players={}",
+                                ui.get_pgc_items().row_count(),
+                                px.get(),
+                                py.get(),
+                                f145_players()
+                            ));
+                            pointer(&win, px.get(), py.get(), PointerEventButton::Right);
+                            phase.set(21);
+                            t.set(0);
+                        }
+                    }
+                    // A poster has no right-click action: a tap must do NOTHING
+                    // (only the ring's own cancel in the log).
+                    21 => {
+                        if ui.get_hold_ms() >= 120 {
+                            release(&win, px.get(), py.get(), PointerEventButton::Right);
+                            crate::debug_log(&format!(
+                                "f188 pgc poster tap released (no action) {}",
+                                ring()
+                            ));
+                            phase.set(22);
+                            t.set(0);
+                        }
+                    }
+                    22 => {
+                        if t.get() >= 800 {
+                            crate::debug_log(&format!(
+                                "f188 pgc poster hold press=({:.0},{:.0}) players={}",
+                                px.get(),
+                                py.get(),
+                                f145_players()
+                            ));
+                            pointer(&win, px.get(), py.get(), PointerEventButton::Right);
+                            phase.set(23);
+                            t.set(0);
+                        }
+                    }
+                    23 => {
+                        if bits.get() & 4 == 0 && ui.get_hold_ms() >= 300 {
+                            bits.set(bits.get() | 4);
+                            crate::debug_log(&format!("f188 {}", shot("f188_pgc_hold", ring())));
+                        }
+                        if ui.get_hold_fired() {
+                            crate::debug_log(&format!(
+                                "f188 pgc poster hold FIRED {}",
+                                ring()
+                            ));
+                            release(&win, px.get(), py.get(), PointerEventButton::Right);
+                            phase.set(24);
+                            t.set(0);
+                        }
+                    }
+                    _ => {
+                        if t.get() >= 1_200 {
+                            crate::debug_log(&format!(
+                                "f188 {}",
+                                shot("f188_pgc_after", ring())
+                            ));
+                            crate::debug_log(&format!("f188 done shots=4 {}", ring()));
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            });
+        });
+    });
+}
+
 pub(crate) fn main() -> Result<()> {
     // f174: the sink for everything below the app (wgpu, wgpu_hal, the
     // renderers). First statement that can run: the renderer's own start-up
@@ -924,11 +1714,28 @@ pub(crate) fn main() -> Result<()> {
     // worker thread is created.
     win::tune_priorities();
     debug_log("priority process=normal ui-thread=highest");
+    // Where this copy of the app keeps its files. A packaged build resolves to
+    // its own folder, so this line is the first thing to look at when a user
+    // reports that settings or models are "missing".
+    debug_log(&format!(
+        "paths root={} ffmpeg_dir={} whisper={}",
+        paths::root().display(),
+        paths::ffmpeg_dir().display(),
+        paths::root().join("tools/whisper-cli/whisper-cli.exe").display()
+    ));
 
     // Born frameless: the WH_CBT create hook rewrites winit's CREATESTRUCTW
     // style before the first window exists, so the native title bar is never
     // painted - not even for one frame. Must precede AppWindow::new() below.
     win::install_create_hook();
+
+    // f194: the platform, before anything can create a Slint context
+    // (`set_platform` is process-global and one-shot, and a `slint::Timer`
+    // built first would bind the default selector). This is the winit backend
+    // plus the player-window branch; see `src/dcomp/platform.rs`.
+    if let Err(error) = dcomp::install_platform() {
+        debug_log(&format!("dcomp platform install failed: {error}"));
+    }
 
     // Kill all ffmpeg/ffplay children when this process dies, even abruptly.
     job::init();
@@ -1082,6 +1889,8 @@ pub(crate) fn main() -> Result<()> {
         ui.global::<AppTheme>()
             .set_backdrop_blur(guard.backdrop_blur as i32);
         ui.set_list_page_size(guard.page_size as i32);
+        // f199: 历史 显示条数, as the row cap (0 = 全部).
+        ui.set_history_limit(guard.history_limit as i32);
     }
 
     // Search / detail view state, shared with their background workers.
@@ -1091,9 +1900,6 @@ pub(crate) fn main() -> Result<()> {
     let detail_state: Arc<Mutex<Option<DetailState>>> = Arc::new(Mutex::new(None));
     let detail_seq = Arc::new(AtomicU64::new(0));
     let related_bvids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    // The in-flight 离线下载, if any; only the newest download is retained.
-    let download_control: Arc<Mutex<Option<Arc<download::DownloadControl>>>> =
-        Arc::new(Mutex::new(None));
 
     let folder_state: Arc<Mutex<FolderState>> = Arc::new(Mutex::new(FolderState::default()));
     let folder_bvids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1876,58 +2682,8 @@ pub(crate) fn main() -> Result<()> {
         });
     }
 
-    // Detail view: 离线下载 the selected 分P to a local .mp4.
-    {
-        let weak = weak.clone();
-        let session_slot = session_slot.clone();
-        let detail_state = detail_state.clone();
-        let download_control = download_control.clone();
-        ui.on_download_detail(move || {
-            let selected = weak
-                .upgrade()
-                .map(|ui| ui.get_detail_selected_part())
-                .unwrap_or(0)
-                .max(0) as usize;
-            let info = detail_state.lock().ok().and_then(|guard| {
-                guard.as_ref().map(|detail| {
-                    let cid = detail.parts.get(selected).copied().unwrap_or(detail.cid);
-                    (detail.bvid.clone(), detail.title.clone(), cid)
-                })
-            });
-            let Some((bvid, title, cid)) = info else {
-                return;
-            };
-            let Some(session) = active_session(&session_slot) else {
-                return;
-            };
-            let control = download::DownloadControl::new();
-            if let Ok(mut guard) = download_control.lock() {
-                if let Some(old) = guard.take() {
-                    old.cancel();
-                }
-                *guard = Some(control.clone());
-            }
-            if let Some(ui) = weak.upgrade() {
-                ui.set_download_busy(true);
-                ui.set_download_status("正在准备下载…".into());
-            }
-            download::spawn(session, bvid, cid, title, weak.clone(), control);
-        });
-    }
-
-    // Detail view: cancel the in-flight 离线下载.
-    {
-        let download_control = download_control.clone();
-        ui.on_cancel_download(move || {
-            if let Ok(guard) = download_control.lock() {
-                if let Some(control) = guard.as_ref() {
-                    control.cancel();
-                }
-            }
-        });
-    }
-
-    // Subscription list navigation: 收藏夹 / 历史 / 稍后再看.
+    // Subscription list navigation: 收藏夹 / 历史. (稍后看's UI entry is gone in
+    // f179; its loader stays behind `nav_toview`, which nothing renders.)
     {
         let weak = weak.clone();
         let session_slot = session_slot.clone();
@@ -1963,6 +2719,7 @@ pub(crate) fn main() -> Result<()> {
                 history_kids.clone(),
                 history_bvids.clone(),
                 false,
+                None,
                 None,
             );
         });
@@ -2225,6 +2982,7 @@ pub(crate) fn main() -> Result<()> {
                             history_bvids,
                             false,
                             None,
+                            Some("已删除 1 条".to_string()),
                         );
                     }
                     Err(err) => {
@@ -2255,35 +3013,114 @@ pub(crate) fn main() -> Result<()> {
             let history_page = history_page.clone();
             let history_kids = history_kids.clone();
             let history_bvids = history_bvids.clone();
+            // The rows the user is actually looking at: the batch endpoint
+            // clears the whole account history, the loop below the fallback,
+            // and both count what this page had loaded.
+            let loaded = weak
+                .upgrade()
+                .map(|ui| {
+                    let rows = ui.get_history_items().row_count();
+                    ui.set_history_clearing(true);
+                    ui.set_history_status("正在清空历史记录…".into());
+                    publish_refresh(&ui, true, 0.0);
+                    rows
+                })
+                .unwrap_or(0);
+            let kids: Vec<String> = history_kids
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
             crate::netpool::submit(crate::netpool::Prio::Normal, Box::new(move || {
                 let Some(runtime) = crate::bilibili::shared_runtime() else {
                     return;
                 };
+                // 1. the batch endpoint (x/v2/history/clear). It is one request
+                //    and clears the account's whole list, so it is tried first.
+                let mut removed = loaded;
+                let mut failures = 0usize;
                 match runtime.block_on(session.history_clear()) {
                     Ok(()) => {
-                        if let Ok(mut state) = history_page.lock() {
-                            *state = HistoryPageState::default();
-                        }
-                        load_history(
-                            weak,
-                            session_slot,
-                            history_page,
-                            history_kids,
-                            history_bvids,
-                            false,
-                            None,
-                        );
+                        crate::debug_log(&format!(
+                            "history clear removed={removed} via=api ok=1 loaded={loaded}"
+                        ));
                     }
                     Err(err) => {
-                        crate::debug_log(&format!("history_clear err={err:#}"));
-                        let message = format!("清空失败：{err}");
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = weak.upgrade() {
-                                ui.set_history_status(message.into());
+                        // 2. fallback: delete the loaded entries one by one at a
+                        //    fixed pace (11 req/s: well under the endpoint's
+                        //    limit, and slow enough to show real progress). A
+                        //    batch of failures means the session is rejected, so
+                        //    the loop stops early instead of hammering it.
+                        crate::debug_log(&format!(
+                            "history clear api failed err={err} fallback=delete-each n={}",
+                            kids.len()
+                        ));
+                        removed = 0;
+                        let total = kids.len();
+                        let weak_progress = weak.clone();
+                        for (index, kid) in kids.iter().enumerate() {
+                            match runtime.block_on(session.history_delete(kid)) {
+                                Ok(()) => removed += 1,
+                                Err(err) => {
+                                    failures += 1;
+                                    crate::debug_log(&format!(
+                                        "history clear delete err at={index} err={err:#}"
+                                    ));
+                                    if failures >= 3 && removed == 0 {
+                                        break;
+                                    }
+                                }
                             }
-                        });
+                            let done = index + 1;
+                            let progress = done as f32 / total.max(1) as f32;
+                            let weak_row = weak_progress.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = weak_row.upgrade() {
+                                    ui.set_history_status(
+                                        format!("正在清空 {done}/{total}…").into(),
+                                    );
+                                    publish_refresh(&ui, true, progress);
+                                    update_page_bar(&ui);
+                                }
+                            });
+                            std::thread::sleep(Duration::from_millis(90));
+                        }
+                        crate::debug_log(&format!(
+                            "history clear removed={removed} via=delete-each ok={} failures={failures} loaded={loaded}",
+                            u8::from(failures == 0)
+                        ));
                     }
                 }
+                // 3. back to page 1 and reload: on success the list comes back
+                //    empty (the 空态), on a partial clear it shows what is left.
+                //    The notice is what keeps the result visible after the load.
+                if let Ok(mut state) = history_page.lock() {
+                    *state = HistoryPageState::default();
+                }
+                let notice = if failures == 0 {
+                    format!("已清空 {removed} 条")
+                } else {
+                    format!("已删除 {removed} 条，{failures} 条失败")
+                };
+                {
+                    let weak_done = weak.clone();
+                    let post = notice.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak_done.upgrade() {
+                            ui.set_history_clearing(false);
+                            ui.set_history_status(post.into());
+                        }
+                    });
+                }
+                load_history(
+                    weak,
+                    session_slot,
+                    history_page,
+                    history_kids,
+                    history_bvids,
+                    false,
+                    None,
+                    Some(notice),
+                );
             }));
         });
     }
@@ -2301,6 +3138,7 @@ pub(crate) fn main() -> Result<()> {
                 history_kids.clone(),
                 history_bvids.clone(),
                 true,
+                None,
                 None,
             );
         });
@@ -2660,6 +3498,7 @@ pub(crate) fn main() -> Result<()> {
                                     history_bvids.clone(),
                                     true,
                                     Some(page + 1),
+                                    None,
                                 );
                             }
                         }
@@ -2674,6 +3513,7 @@ pub(crate) fn main() -> Result<()> {
                                 history_kids.clone(),
                                 history_bvids.clone(),
                                 false,
+                                None,
                                 None,
                             );
                         }
@@ -2793,6 +3633,21 @@ pub(crate) fn main() -> Result<()> {
         let dispatch = dispatch_page.clone();
         ui.on_page_refresh(move || dispatch(PageAction::Refresh));
     }
+
+    // 长按右键刷新: the gesture, the ring and the refresh all live in the UI
+    // (`hold_gesture` + `refresh-page`, which is the toolbar's 刷新 button).
+    // Rust only records the three edges, so a run can prove the press, the
+    // completed hold (with its elapsed ms and the view it refreshed) and the two
+    // cancel paths without guessing from the pixels.
+    ui.on_hold_refresh_press(|x, y| {
+        crate::debug_log(&format!("hold refresh press x={x} y={y}"));
+    });
+    ui.on_hold_refresh_done(|ms, view| {
+        crate::debug_log(&format!("hold refresh done ms={ms} view={view}"));
+    });
+    ui.on_hold_refresh_cancel(|ms, reason| {
+        crate::debug_log(&format!("hold refresh cancel ms={ms} reason={reason}"));
+    });
 
     // 分区浏览: the region list is static; picking one loads its latest videos.
     {
@@ -3691,6 +4546,54 @@ pub(crate) fn main() -> Result<()> {
             }
         });
     }
+    // 历史 显示条数 (f199): the pills report 0/1/2/3 = 50/100/200/全部. The
+    // stored value is the row count itself (0 = no cap). A shrink trims the
+    // loaded model on the spot (no fetch); a grow asks for ONE more cursor page
+    // when the old cap still holds rows back, so the backend stays page-at-a-time.
+    {
+        let weak = weak.clone();
+        let settings_store = settings_store.clone();
+        let session_slot = session_slot.clone();
+        let history_page = history_page.clone();
+        let history_kids = history_kids.clone();
+        let history_bvids = history_bvids.clone();
+        ui.on_history_limit_changed(move |index| {
+            let step = settings::HISTORY_LIMITS[(index.max(0) as usize).min(3)];
+            let snapshot = update_settings(&settings_store, |prefs| prefs.history_limit = step);
+            let limit = snapshot.history_limit;
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            ui.set_history_limit(limit as i32);
+            let kept = trim_history(&ui, &history_page, &history_kids, &history_bvids);
+            crate::debug_log(&format!(
+                "history limit pick={index} limit={limit} kept={kept}"
+            ));
+            // The client page can now sit past the last one.
+            let size = list_page_size(&ui);
+            let page = client_page(5);
+            let pages = page_count(size, kept);
+            if page >= pages {
+                set_client_page(5, pages.saturating_sub(1));
+            }
+            publish_list_offset(&ui);
+            update_page_bar(&ui);
+            let grow = limit == 0 || kept < limit as usize;
+            let more = history_page.lock().map(|state| state.has_more).unwrap_or(false);
+            if grow && more {
+                load_history(
+                    weak.clone(),
+                    session_slot.clone(),
+                    history_page.clone(),
+                    history_kids.clone(),
+                    history_bvids.clone(),
+                    true,
+                    None,
+                    None,
+                );
+            }
+        });
+    }
     {
         let state = player_state.clone();
         let settings_store = settings_store.clone();
@@ -4083,11 +4986,29 @@ pub(crate) fn main() -> Result<()> {
     maybe_start_f147_test(weak.clone());
     maybe_start_f148_test(weak.clone());
     maybe_start_f149_test(weak.clone(), session_slot.clone(), settings_store.clone());
+    // f199: the three-page scroll frame table (before/after the scroll-time
+    // clip budget). See `qa/f199.rs`.
+    maybe_start_f199_test(weak.clone());
     maybe_start_f150_test(weak.clone());
     maybe_start_f151_test(weak.clone());
     maybe_start_f152_test(
         weak.clone(),
         session_slot.clone(),
+        settings_store.clone(),
+    );
+    // QA chain (`BILI_F183_TEST=1`): external fullscreen cover must NOT pause,
+    // two of our own player windows still must. See the block in `qa/hooks.rs`.
+    maybe_start_f183_test(
+        weak.clone(),
+        session_slot.clone(),
+        settings_store.clone(),
+    );
+    // QA chain (`BILI_F190_TEST=1`): the 平滑 menu is a picker (a press opens
+    // it and changes no mode) and the 评论区 asks for page 1 on its own.
+    maybe_start_f190_test(
+        weak.clone(),
+        session_slot.clone(),
+        feed_store.clone(),
         settings_store.clone(),
     );
     maybe_start_f154_test(weak.clone());
@@ -5256,6 +6177,10 @@ pub(crate) fn main() -> Result<()> {
             });
         }
 
+        // ---- 语音识别模型：设置里的下载 / 取消 / 删除 / 目录 / 源站 ----
+        // 只读磁盘（四档 stat），启动不做任何网络探测：没装就是「未安装」。
+        models_install(&ui, fish.clone());
+
         // First publish so the page is correct before it is ever opened.
         if let Some(engine) = engine.as_ref() {
             let weak = weak.clone();
@@ -5577,6 +6502,144 @@ pub(crate) fn main() -> Result<()> {
             });
         });
     }
+    // QA hook (`BILI_F187_OPEN=<delay_ms>`): open feed card 0 in a player
+    // window once the feed has rows. It is the entry point for the two
+    // player-window captures of this round (`BILI_F187_FAV_SHOT` /
+    // `BILI_F187_PREVIEW_SHOT`, both in `src/app/player_host.rs`), which need a
+    // real player and run their own small state machines once it exists.
+    if let Ok(spec) = std::env::var("BILI_F187_OPEN") {
+        let delay = spec
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(6_000)
+            .clamp(1_000, 180_000);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                let weak_ui = ui.as_weak();
+                let waited = Rc::new(Cell::new(0u32));
+                let timer = Rc::new(slint::Timer::default());
+                let timer_a = timer.clone();
+                keep_qa_timer(timer.clone());
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    Duration::from_millis(700),
+                    move || {
+                        let Some(ui) = weak_ui.upgrade() else {
+                            timer_a.stop();
+                            return;
+                        };
+                        let rows = ui.get_feed_items().row_count();
+                        if rows == 0 {
+                            waited.set(waited.get() + 1);
+                            if waited.get() > 80 {
+                                crate::debug_log("f187 open feed empty abort");
+                                timer_a.stop();
+                            }
+                            return;
+                        }
+                        crate::debug_log(&format!("f187 open card=0 rows={rows}"));
+                        ui.invoke_card_open(0, 0);
+                        timer_a.stop();
+                    },
+                );
+            });
+        });
+    }
+    // QA hook (`BILI_F187_SETTINGS_SHOT=<tag>[,<delay_ms>]`): open 设置 → 系统
+    // (tab 5) once the home page is really up - the app resets `view_mode` to
+    // the feed when the saved session lands, so a fixed-delay open can be
+    // overwritten by it - then capture the 检查更新 row, press 检查 through the
+    // row's own callback and capture the result line under it.
+    if let Ok(spec) = std::env::var("BILI_F187_SETTINGS_SHOT") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "f187_update_settings".to_string());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(6_000)
+            .clamp(1_000, 180_000);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                let weak_ui = ui.as_weak();
+                let step = Rc::new(Cell::new(0u8));
+                let waited = Rc::new(Cell::new(0u32));
+                let timer = Rc::new(slint::Timer::default());
+                let timer_a = timer.clone();
+                keep_qa_timer(timer.clone());
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    Duration::from_millis(1_200),
+                    move || {
+                        let Some(ui) = weak_ui.upgrade() else {
+                            timer_a.stop();
+                            return;
+                        };
+                        match step.get() {
+                            0 => {
+                                let rows = ui.get_feed_items().row_count();
+                                if !ui.get_logged_in() || rows == 0 {
+                                    waited.set(waited.get() + 1);
+                                    if waited.get() > 80 {
+                                        crate::debug_log("f187 settings shot feed empty abort");
+                                        timer_a.stop();
+                                    }
+                                    return;
+                                }
+                                ui.invoke_open_settings();
+                                ui.set_settings_tab(5);
+                                crate::debug_log(&format!(
+                                    "f187 settings shot open view={} rows={rows}",
+                                    ui.get_view_mode()
+                                ));
+                                step.set(1);
+                            }
+                            1 => {
+                                let path = qa_capture_path(&tag);
+                                match capture_window_png(&ui.window(), &path) {
+                                    Some((w, h)) => crate::debug_log(&format!(
+                                        "f187 settings shot png={} {w}x{h} current={:?}",
+                                        path.display(),
+                                        ui.get_update_current()
+                                    )),
+                                    None => crate::debug_log("f187 settings shot png=FAILED"),
+                                }
+                                ui.invoke_update_check_now();
+                                crate::debug_log("f187 settings shot press check");
+                                step.set(2);
+                            }
+                            2 => {
+                                let path = qa_capture_path(&format!("{tag}_checked"));
+                                match capture_window_png(&ui.window(), &path) {
+                                    Some((w, h)) => crate::debug_log(&format!(
+                                        "f187 settings checked png={} {w}x{h} status={:?}",
+                                        path.display(),
+                                        ui.get_update_status()
+                                    )),
+                                    None => crate::debug_log("f187 settings checked png=FAILED"),
+                                }
+                                timer_a.stop();
+                            }
+                            _ => timer_a.stop(),
+                        }
+                    },
+                );
+            });
+        });
+    }
     // QA hook (`BILI_SETTINGS_TAB_TEST=<tag>[,<delay_ms>]`): log the bar rect,
     // call the real `open_settings()` and log the bar rect + view_mode + the
     // nine nav-label widths again, then capture the page. Proves 设置 is a
@@ -5656,6 +6719,10 @@ pub(crate) fn main() -> Result<()> {
             });
         });
     }
+
+    // QA hook (`BILI_F199_SHOT=<kind>`): the login / fish drag and the 历史
+    // 清空 + 显示条数 shots. See `qa/f199.rs`.
+    maybe_start_f199_shot(weak.clone());
 
     // QA hook (`BILI_NAV_TEST=1`): walk every bar destination through its REAL
     // callback and log the view_mode plus the bar's computed rect, so "the bar
@@ -5901,11 +6968,15 @@ pub(crate) fn main() -> Result<()> {
     // pointer sampling no longer means 125-1000 window invalidations per second.
     let main_drag_stats = Rc::new(DragFlushStats::new());
     let main_drag_timer = Rc::new(slint::Timer::default());
+    // f199: one "window drag move" line per drag (the move callback runs at the
+    // pointer's own rate; logging every one would drown the file).
+    let drag_move_logged = Rc::new(Cell::new(false));
     {
         let weak = weak.clone();
         let drag = main_drag.clone();
         let timer = main_drag_timer.clone();
         let stats = main_drag_stats.clone();
+        let moved_logged = drag_move_logged.clone();
         ui.on_window_drag_start(move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -5914,9 +6985,10 @@ pub(crate) fn main() -> Result<()> {
                 crate::debug_log(&format!("drag denied reason={reason} source=main"));
                 return;
             }
+            moved_logged.set(false);
             stats.begin();
             crate::debug_log(&format!(
-                "drag start ok=1 source={} pos={}",
+                "window drag start ok=1 source={} pos={}",
                 drag_source(&ui.window(), "main"),
                 drag_pos(&ui.window()),
             ));
@@ -5959,7 +7031,7 @@ pub(crate) fn main() -> Result<()> {
                     }
                     if !main_drag_button_held() {
                         crate::debug_log(&format!(
-                            "drag end reason=pointer-up deferred=0 moved={moved}"
+                            "window drag end ok=1 reason=pointer-up deferred=0 moved={moved}"
                         ));
                         tick_stats.finish("main");
                         tick_drag.end();
@@ -5972,9 +7044,19 @@ pub(crate) fn main() -> Result<()> {
     {
         let drag = main_drag.clone();
         let stats = main_drag_stats.clone();
+        let moved_logged = drag_move_logged.clone();
         ui.on_window_drag_move(move || {
+            // A bare hover also reaches this callback (the window-wide drag
+            // layer forwards every move): only a live drag counts, otherwise a
+            // pointer pass would log a "drag move" with no start.
+            if !drag.is_dragging() {
+                return;
+            }
             stats.event();
             drag.move_to();
+            if !moved_logged.replace(true) {
+                crate::debug_log("window drag move source=main n=1");
+            }
         });
     }
     {
@@ -5989,7 +7071,7 @@ pub(crate) fn main() -> Result<()> {
                     // (the window it just moved jumped away from the cursor).
                     // Not a release: keep the drag and let the tick finish it.
                     crate::debug_log(&format!(
-                        "drag end reason=lost-grab deferred=1 {}",
+                        "window drag end ok=0 reason=lost-grab deferred=1 {}",
                         drag_state(&ui.window())
                     ));
                     return;
@@ -5997,14 +7079,22 @@ pub(crate) fn main() -> Result<()> {
                 timer.stop();
                 // Apply the last pending position exactly, then close the
                 // profile.
-                if drag.flush(&ui.window()) {
+                let moved = drag.flush(&ui.window());
+                if moved {
                     stats.placement();
                 }
+                timer.stop();
+                stats.finish("main");
+                drag.end();
+                crate::debug_log(&format!(
+                    "window drag end ok=1 reason=pointer-up deferred=0 moved={moved}"
+                ));
+                return;
             }
             timer.stop();
             stats.finish("main");
             drag.end();
-            crate::debug_log("drag end reason=pointer-up deferred=0");
+            crate::debug_log("window drag end ok=1 reason=pointer-up deferred=0 moved=false");
         });
     }
 
@@ -6195,6 +7285,13 @@ pub(crate) fn main() -> Result<()> {
 
     start_tray(&weak);
     crate::debug_log(&format!("autostart registry enabled={}", autostart::is_enabled()));
+
+    // 检查更新: the startup + hourly GitHub check, the 新版本 dialog and the
+    // 设置 → 系统 → 检查 row. Registers its own three callbacks and starts its
+    // own Slint timers; must run on the UI thread before `ui.run()` (a timer
+    // stops when its last handle drops, and `update` keeps them for the whole
+    // process).
+    update::install(&ui);
 
     // Keep feed batches preloaded from the moment a session exists: the filler
     // waits in the background during the login view, so the home page can open
@@ -6982,6 +8079,232 @@ pub(crate) fn main() -> Result<()> {
         };
         publish();
         now_timer.start(slint::TimerMode::Repeated, Duration::from_secs(60), publish);
+    }
+
+    // QA hook (`BILI_F180_TEST=<delay_ms>`): drive the hold-right-click gesture
+    // through the real pointer path and capture the four required instants.
+    if let Ok(spec) = std::env::var("BILI_F180_TEST") {
+        let delay = spec
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(12_000)
+            .clamp(1_000, 120_000);
+        start_f180_test(weak.clone(), delay);
+    }
+
+    // QA hook (`BILI_F188_TEST=<delay_ms>`): a right press ON a card holds for
+    // the refresh instead of opening a window at once; the tap still opens it.
+    // Runs the same real pointer path on 推荐流 / 搜索结果 / 番剧海报.
+    if let Ok(spec) = std::env::var("BILI_F188_TEST") {
+        let delay = spec
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(12_000)
+            .clamp(1_000, 120_000);
+        start_f188_test(weak.clone(), delay);
+    }
+
+    // QA probe (`BILI_HOLD_PROBE=1` or `BILI_HOLD_PROBE=x,y;x,y;…`): dispatch ONE
+    // right press at each probe point and log whether `hold refresh press`
+    // reached the gesture layer, so a point that a page surface swallows is
+    // identifiable from the log instead of from a screenshot. No capture and no
+    // refresh (every press is released well before 500 ms).
+    if let Ok(spec) = std::env::var("BILI_HOLD_PROBE") {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(9_000));
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                use slint::platform::{PointerEventButton, WindowEvent};
+                let win = ui.window();
+                let scale = win.scale_factor().max(0.2) as f32;
+                let width = win.size().width as f32 / scale;
+                let height = win.size().height as f32 / scale;
+                // `BILI_HOLD_PROBE=<x>,<y>[;<x>,<y>…]`; plain `1` keeps the
+                // original six defaults.
+                let mut points: Vec<(f32, f32)> = Vec::new();
+                for pair in spec.split(';') {
+                    let mut nums = pair.split(',');
+                    let (Some(x), Some(y)) = (nums.next(), nums.next()) else {
+                        continue;
+                    };
+                    let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) else {
+                        continue;
+                    };
+                    points.push((x, y));
+                }
+                if points.is_empty() {
+                    points = vec![
+                        (width / 2.0, 34.0),
+                        (width / 2.0, 8.0),
+                        (12.0, height / 2.0),
+                        (width - 12.0, height / 2.0),
+                        (width / 2.0, height - 30.0),
+                        (width / 2.0, 120.0),
+                    ];
+                }
+                crate::debug_log(&format!(
+                    "hold probe start window={width:.0}x{height:.0} logged_in={} rows={} view={}",
+                    u8::from(ui.get_logged_in()),
+                    ui.get_feed_items().row_count(),
+                    ui.get_view_mode()
+                ));
+                let step = Rc::new(Cell::new(0usize));
+                let timer = Rc::new(slint::Timer::default());
+                let timer_a = timer.clone();
+                let probe_ui = ui.as_weak();
+                keep_qa_timer(timer.clone());
+                timer.start(slint::TimerMode::Repeated, Duration::from_millis(400), move || {
+                    let Some(ui) = probe_ui.upgrade() else {
+                        timer_a.stop();
+                        return;
+                    };
+                    let win = ui.window();
+                    let i = step.get();
+                    if i >= points.len() * 2 {
+                        crate::debug_log("hold probe done");
+                        timer_a.stop();
+                        return;
+                    }
+                    let (x, y) = points[i / 2];
+                    let position = slint::LogicalPosition::new(x, y);
+                    if i % 2 == 0 {
+                        win.dispatch_event(WindowEvent::PointerMoved { position });
+                        win.dispatch_event(WindowEvent::PointerPressed {
+                            position,
+                            button: PointerEventButton::Right,
+                        });
+                    } else {
+                        crate::debug_log(&format!(
+                            "hold probe point=({x:.0},{y:.0}) active={} ms={} fired={}",
+                            u8::from(ui.get_hold_active()),
+                            ui.get_hold_ms(),
+                            u8::from(ui.get_hold_fired())
+                        ));
+                        win.dispatch_event(WindowEvent::PointerReleased {
+                            position,
+                            button: PointerEventButton::Right,
+                        });
+                    }
+                    step.set(i + 1);
+                });
+            });
+        });
+    }
+
+    // QA hook (`BILI_F187_HOLD_SHOT=<tag>[,<x>,<y>][,<delay_ms>]`): drive the
+    // REAL hold-right-click gesture (Slint pointer events, no OS input) at
+    // (x, y) - the top band by default - and capture the ring at 250 ms, then
+    // hold to completion so the run also logs `hold refresh done` and the page
+    // refresh. The ring's own `hold_ms` decides both instants, so a slow
+    // `PrintWindow` can never desync the picture from the clock.
+    if let Ok(spec) = std::env::var("BILI_F187_HOLD_SHOT") {
+        let mut parts = spec.split(',');
+        let tag = parts
+            .next()
+            .map(|part| part.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| "f187_hold_ring".to_string());
+        let x = parts.next().and_then(|part| part.trim().parse::<f32>().ok());
+        let y = parts.next().and_then(|part| part.trim().parse::<f32>().ok());
+        let delay = parts
+            .next()
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(9_000)
+            .clamp(1_000, 120_000);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = slint::invoke_from_event_loop(move || {
+                use slint::platform::{PointerEventButton, WindowEvent};
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                let win = ui.window();
+                let scale = win.scale_factor().max(0.2) as f32;
+                let width = win.size().width as f32 / scale;
+                let x = x.unwrap_or(width / 2.0).clamp(4.0, width - 4.0);
+                let y = y.unwrap_or(34.0);
+                crate::debug_log(&format!(
+                    "f187 hold start press=({x:.0},{y:.0}) rows={} logged_in={}",
+                    ui.get_feed_items().row_count(),
+                    u8::from(ui.get_logged_in())
+                ));
+                let position = slint::LogicalPosition::new(x, y);
+                win.dispatch_event(WindowEvent::PointerMoved { position });
+                win.dispatch_event(WindowEvent::PointerPressed {
+                    position,
+                    button: PointerEventButton::Right,
+                });
+                let step = Rc::new(Cell::new(0u8));
+                let timer = Rc::new(slint::Timer::default());
+                let timer_a = timer.clone();
+                let ui_after = ui.as_weak();
+                let settle = Rc::new(Cell::new(0u32));
+                keep_qa_timer(timer.clone());
+                timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
+                    let Some(ui) = ui_after.upgrade() else {
+                        timer_a.stop();
+                        return;
+                    };
+                    let win = ui.window();
+                    match step.get() {
+                        // Half way: the arc is half drawn.
+                        0 => {
+                            if ui.get_hold_ms() >= 250 {
+                                let path = qa_capture_path(&tag);
+                                let shot = capture_window_png(&win, &path)
+                                    .map(|(w, h)| format!("{w}x{h}"))
+                                    .unwrap_or_else(|| "FAILED".to_string());
+                                crate::debug_log(&format!(
+                                    "f187 hold ring png={} {shot} hold_ms={} fired={}",
+                                    path.display(),
+                                    ui.get_hold_ms(),
+                                    u8::from(ui.get_hold_fired())
+                                ));
+                                step.set(1);
+                            }
+                        }
+                        // Completion: `hold refresh done` is logged by the
+                        // callback; the page refresh follows.
+                        1 => {
+                            if ui.get_hold_fired() {
+                                crate::debug_log(&format!(
+                                    "f187 hold fired hold_ms={} view={}",
+                                    ui.get_hold_ms(),
+                                    ui.get_view_mode()
+                                ));
+                                step.set(2);
+                            }
+                        }
+                        // ~1.2 s of refreshed page, then release.
+                        2 => {
+                            if settle.get() < 75 {
+                                settle.set(settle.get() + 1);
+                                return;
+                            }
+                            let path = qa_capture_path(&format!("{tag}_after"));
+                            let shot = capture_window_png(&win, &path)
+                                .map(|(w, h)| format!("{w}x{h}"))
+                                .unwrap_or_else(|| "FAILED".to_string());
+                            crate::debug_log(&format!(
+                                "f187 hold after png={} {shot}",
+                                path.display()
+                            ));
+                            win.dispatch_event(WindowEvent::PointerReleased {
+                                position,
+                                button: PointerEventButton::Right,
+                            });
+                            crate::debug_log("f187 hold released");
+                            timer_a.stop();
+                        }
+                        _ => timer_a.stop(),
+                    }
+                });
+            });
+        });
     }
 
     ui.run()?;

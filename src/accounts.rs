@@ -41,7 +41,7 @@ struct LegacyAccounts {
 
 /// `accounts.json` lives in the project root regardless of the current dir.
 pub fn accounts_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("accounts.json")
+    crate::paths::root().join("accounts.json")
 }
 
 /// Read the saved account. `None` when the file is missing or unparsable; a

@@ -40,6 +40,9 @@ const TICKET_HMAC_KEY: &str = "XgwSnGZ1p";
 const FEED_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd";
 const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/type";
 const VIEW_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/view";
+/// 进度条悬停预览的雪碧图 (storyboard) 描述，B站 web 播放器的同一个端点。
+/// 需要登录 cookie（未登录 code≠0，调用方据此降级为“只显示时间”）。
+const VIDEOSHOT_URL: &str = "https://api.bilibili.com/x/player/videoshot";
 const PLAYURL_URL: &str = "https://api.bilibili.com/x/player/wbi/playurl";
 /// 大会员卡券/特权状态 (`GET`, SESSDATA).
 const VIP_PRIVILEGE_URL: &str = "https://api.bilibili.com/x/vip/privilege/my";
@@ -73,6 +76,7 @@ const HEARTBEAT_URL: &str = "https://api.bilibili.com/x/click-interface/web/hear
 const COIN_STATE_URL: &str = "https://api.bilibili.com/x/web-interface/archive/coins";
 const COIN_ADD_URL: &str = "https://api.bilibili.com/x/web-interface/coin/add";
 const FAV_FOLDERS_URL: &str = "https://api.bilibili.com/x/v3/fav/folder/created/list-all";
+const FAV_FOLDER_ADD_URL: &str = "https://api.bilibili.com/x/v3/fav/folder/add";
 const FAV_FAVOURED_URL: &str = "https://api.bilibili.com/x/v2/fav/video/favoured";
 const FAV_DEAL_URL: &str = "https://api.bilibili.com/x/v3/fav/resource/deal";
 const FAV_LIST_URL: &str = "https://api.bilibili.com/x/v3/fav/resource/list";
@@ -82,7 +86,6 @@ const HISTORY_URL: &str = "https://api.bilibili.com/x/web-interface/history/curs
 const HISTORY_DELETE_URL: &str = "https://api.bilibili.com/x/v2/history/delete";
 const HISTORY_CLEAR_URL: &str = "https://api.bilibili.com/x/v2/history/clear";
 const TOVIEW_URL: &str = "https://api.bilibili.com/x/v2/history/toview";
-const TOVIEW_ADD_URL: &str = "https://api.bilibili.com/x/v2/history/toview/add";
 const TOVIEW_DEL_URL: &str = "https://api.bilibili.com/x/v2/history/toview/del";
 const REGION_URL: &str = "https://api.bilibili.com/x/web-interface/dynamic/region";
 const REGION_NEWLIST_URL: &str = "https://api.bilibili.com/x/web-interface/newlist";
@@ -286,7 +289,7 @@ pub struct Token {
 
 /// `token.json` lives in the project root regardless of the current dir.
 pub fn token_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("token.json")
+    crate::paths::root().join("token.json")
 }
 
 pub fn load_token() -> Option<Token> {
@@ -491,6 +494,100 @@ fn up_card_store(mid: i64, name: &str, avatar: &str, fans: u64, videos: u64) {
             ),
         );
     }
+}
+
+/// 进度条悬停预览要用的雪碧图描述（B站 `x/player/videoshot`）。
+///
+/// 一张雪碧图是 `cols x rows` 的格子（实测 10x10 = 100 格），每格
+/// `cell_w x cell_h`（实测 480x270）。`image` 是 1..N 张 jpg，格子按
+/// “先第 1 张、行优先、再第 2 张”连续编号；`times[k]` 是第 k 格对应的时间
+/// （秒），长度不超过 N*cols*rows。`times` 已去掉 B站 `index` 数组首位的 0
+/// 哨兵（实测 `[0,0,5,10,…]` → `[0,5,10,…]`）。
+#[derive(Clone, Debug, Default)]
+pub struct VideoShot {
+    pub cols: u32,
+    pub rows: u32,
+    pub cell_w: u32,
+    pub cell_h: u32,
+    /// 补全了 `https:` 的图片 URL（接口返回的是 `//…` 开头）。
+    pub sheets: Vec<String>,
+    /// 每格的时间戳（秒），单调不减。
+    pub times: Vec<f32>,
+}
+
+/// `x/player/videoshot` 的响应外壳。`data` 缺失时按“没有雪碧图”处理。
+#[derive(Deserialize, Default)]
+struct ShotResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: Option<ShotData>,
+}
+
+#[derive(Deserialize, Default)]
+struct ShotData {
+    #[serde(default)]
+    img_x_len: u32,
+    #[serde(default)]
+    img_y_len: u32,
+    #[serde(default)]
+    img_x_size: u32,
+    #[serde(default)]
+    img_y_size: u32,
+    /// 接口字段名是单数 `image`，值是字符串数组。
+    #[serde(default, rename = "image")]
+    sheets: Vec<String>,
+    /// 每格的时间（秒），首位实测是重复的 0 哨兵。
+    #[serde(default)]
+    index: Vec<f64>,
+}
+
+/// `ShotData` -> [`VideoShot`]：补全 URL 协议、去掉 `index` 的 0 哨兵、把时间戳
+/// 截到格子数以内。纯函数，网络与 UI 之外的映射规则只有这一处。
+fn videoshot_from(data: ShotData) -> Result<VideoShot> {
+    let cols = data.img_x_len.max(1);
+    let rows = data.img_y_len.max(1);
+    if data.img_x_size == 0 || data.img_y_size == 0 || data.sheets.is_empty() {
+        bail!("videoshot: 响应缺少雪碧图");
+    }
+    let sheets: Vec<String> = data
+        .sheets
+        .iter()
+        .map(|url| {
+            let url = url.trim();
+            if let Some(rest) = url.strip_prefix("//") {
+                format!("https://{rest}")
+            } else {
+                url.to_string()
+            }
+        })
+        .collect();
+    // 首位是重复的 0 哨兵：`[0,0,5,10,…]` -> `[0,5,10,…]`。没有哨兵的视频
+    // （首两个时间不同）原样使用。
+    let mut times: Vec<f32> = if data.index.len() >= 2 && data.index[0] == data.index[1] {
+        data.index.iter().skip(1).map(|value| *value as f32).collect()
+    } else {
+        data.index.iter().map(|value| *value as f32).collect()
+    };
+    if times.is_empty() {
+        bail!("videoshot: index 为空");
+    }
+    if times.windows(2).any(|pair| pair[0] > pair[1]) {
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    // 时间戳不可能比格子多，多出来的（接口偶尔给整段而不是切片）截掉。
+    let cells = (sheets.len() as u64 * u64::from(cols) * u64::from(rows)) as usize;
+    times.truncate(cells);
+    Ok(VideoShot {
+        cols,
+        rows,
+        cell_w: data.img_x_size,
+        cell_h: data.img_y_size,
+        sheets,
+        times,
+    })
 }
 
 impl Session {
@@ -1107,6 +1204,86 @@ impl Session {
         Ok(folders)
     }
 
+    /// Every favourite folder of the active account, **including** the default
+    /// folder and empty ones - the player's 收藏 picker must show all of them.
+    ///
+    /// `rid` (`aid`, `type=2`) asks the same endpoint for the account's own
+    /// membership: each row then carries the API's `fav_state`
+    /// (`1` = this video is already in that folder). `rid == 0` omits the
+    /// parameter and every row comes back with `member == None`, which the UI
+    /// renders as **未确认** rather than a guessed check mark.
+    pub async fn fav_folders_all(&self, rid: i64) -> Result<Vec<FavFolderState>> {
+        let mid = self.fav_mid().await?;
+        let mut query: Vec<(&str, String)> = vec![
+            ("up_mid", mid.to_string()),
+            ("web_location", "333.1387".to_string()),
+        ];
+        if rid > 0 {
+            query.push(("rid", rid.to_string()));
+            query.push(("type", "2".to_string()));
+        }
+        let resp: FavFoldersResp = self
+            .client
+            .get(FAV_FOLDERS_URL)
+            .query(&query)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.code != 0 {
+            return Err(fav_error("获取收藏夹失败", resp.code, &resp.message));
+        }
+        let folders = fav_folder_states_from(resp.data);
+        crate::debug_log(&format!(
+            "fav picker mid={mid} rid={rid} n={} known={} member={}",
+            folders.len(),
+            folders.iter().filter(|folder| folder.member.is_some()).count(),
+            folders.iter().filter(|folder| folder.member == Some(true)).count()
+        ));
+        Ok(folders)
+    }
+
+    /// Create a favourite folder (`privacy` 0 公开 / 1 私密) and return its
+    /// `media_id`, which is the id [`Session::fav_deal`] takes.
+    pub async fn fav_create(&self, title: &str, privacy: i64) -> Result<i64> {
+        let title = title.trim();
+        if title.is_empty() {
+            bail!("收藏夹名称不能为空");
+        }
+        let csrf = self.csrf_cookie()?;
+        let body = format!(
+            "title={}&privacy={}&csrf={}",
+            encode_component(title),
+            if privacy == 0 { 0 } else { 1 },
+            encode_component(&csrf),
+        );
+        let response = self
+            .client
+            .post(FAV_FOLDER_ADD_URL)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(REFERER, "https://www.bilibili.com/")
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let text = response.text().await?;
+        let resp: FavCreateResp = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+            .map_err(|err| anyhow!("新建收藏夹响应解析失败（HTTP {status}）：{err}"))?;
+        crate::debug_log(&format!(
+            "fav_create http={status} code={} msg={} privacy={}",
+            resp.code, resp.message, privacy
+        ));
+        if resp.code != 0 {
+            return Err(fav_error("新建收藏夹失败", resp.code, &resp.message));
+        }
+        let id = resp.data.map(|data| data.id).unwrap_or(0);
+        if id <= 0 {
+            bail!("新建收藏夹失败：响应缺少 id");
+        }
+        crate::debug_log(&format!("fav_create ok id={id} title={title:?}"));
+        Ok(id)
+    }
+
     /// One page (`page` is 1-based) of a favourite folder for the 收藏推荐
     /// stream, plus whether the folder has more pages. Cached for
     /// [`FAV_PAGE_TTL`] per `(media_id, page)`.
@@ -1213,6 +1390,12 @@ impl Session {
 
     /// Add `rid` (an `aid`, `type=2`) to `add` folders and remove it from `del`.
     pub async fn fav_deal(&self, rid: i64, add: &[i64], del: &[i64]) -> Result<()> {
+        if rid <= 0 {
+            bail!("收藏失败：缺少 aid");
+        }
+        if add.is_empty() && del.is_empty() {
+            return Ok(());
+        }
         let csrf = self.csrf_cookie()?;
         let body = format!(
             "rid={rid}&type=2&add_media_ids={}&del_media_ids={}&csrf={}",
@@ -1220,8 +1403,17 @@ impl Session {
             encode_component(&join_ids(del)),
             encode_component(&csrf),
         );
-        self.post_form(FAV_DEAL_URL, "https://www.bilibili.com/", body)
-            .await
+        let (code, message) = self
+            .post_form_code("fav_deal", FAV_DEAL_URL, "https://www.bilibili.com/", body)
+            .await?;
+        if code != 0 {
+            return Err(fav_error("收藏操作失败", code, &message));
+        }
+        crate::debug_log(&format!(
+            "fav_deal ok rid={rid} add={:?} del={:?}",
+            add, del
+        ));
+        Ok(())
     }
 
     /// One page (`pn` is 1-based) of a favourite folder's contents. `ps` is the
@@ -1400,18 +1592,6 @@ impl Session {
         })
     }
 
-    /// Add `bvid` to 稍后再看.
-    pub async fn toview_add(&self, bvid: &str) -> Result<()> {
-        let csrf = self.csrf_cookie()?;
-        let body = format!(
-            "bvid={}&csrf={}",
-            encode_component(bvid),
-            encode_component(&csrf)
-        );
-        self.post_form(TOVIEW_ADD_URL, "https://www.bilibili.com/", body)
-            .await
-    }
-
     /// Remove the 稍后再看 entry for `aid`.
     pub async fn toview_del(&self, aid: i64) -> Result<()> {
         let csrf = self.csrf_cookie()?;
@@ -1544,6 +1724,48 @@ impl Session {
         // it is kept for the tier fallback of the very next `playurl` call.
         remember_native_height(&data.bvid, data.dimension.as_ref().map(|size| size.height).unwrap_or(0));
         Ok(detail_from_view(data))
+    }
+
+    /// 进度条悬停预览的雪碧图 (storyboard)。
+    ///
+    /// B站 web 播放器 hover 进度条时显示的那张预览图就来自这里：一张
+    /// `img_x_len x img_y_len`（实测 10x10）的格子图，每格 `img_x_size x
+    /// img_y_size`（实测 480x270），`image` 给出 1..N 张 jpg，`index` 给出每格
+    /// 的时间戳（秒）。未登录 / 视频没有切片时 `code != 0`，这里返回 `Err`，
+    /// 调用方据此降级成“只显示时间”，不向用户报错。
+    pub async fn videoshot(&self, bvid: &str, cid: u64) -> Result<VideoShot> {
+        if bvid.trim().is_empty() || cid == 0 {
+            bail!("videoshot: 缺少 bvid/cid");
+        }
+        let params: Vec<(&str, String)> = vec![
+            ("bvid", bvid.trim().to_string()),
+            ("cid", cid.to_string()),
+            ("index", "1".to_string()),
+        ];
+        let referer = format!("https://www.bilibili.com/video/{}", bvid.trim());
+        let resp: ShotResp = self
+            .get_query_json(VIDEOSHOT_URL, &params, Some(&referer))
+            .await?;
+        if resp.code != 0 {
+            let message = resp.message.trim();
+            if message.is_empty() {
+                bail!("videoshot 不可用（code={}）", resp.code);
+            }
+            bail!("videoshot 不可用：{message}（code={}）", resp.code);
+        }
+        let data = resp.data.unwrap_or_default();
+        let shot = videoshot_from(data)?;
+        crate::debug_log(&format!(
+            "videoshot ok bvid={} cid={cid} sheets={} cols={} rows={} cell={}x{} tiles={}",
+            bvid.trim(),
+            shot.sheets.len(),
+            shot.cols,
+            shot.rows,
+            shot.cell_w,
+            shot.cell_h,
+            shot.times.len()
+        ));
+        Ok(shot)
     }
 
     // -- 视频评论 (comments) ------------------------------------------------
@@ -5648,6 +5870,27 @@ struct FavFolderItem {
     title: String,
     #[serde(default)]
     media_count: u32,
+    /// Only present when the request carried `rid`: 1 = that video is in this
+    /// folder, 0 = it is not. Missing (`None`) means the payload did not say,
+    /// which the picker shows as 未确认.
+    #[serde(default)]
+    fav_state: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct FavCreateResp {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: Option<FavCreateData>,
+}
+
+#[derive(Deserialize)]
+struct FavCreateData {
+    #[serde(default)]
+    id: i64,
 }
 
 #[derive(Deserialize)]
@@ -6405,6 +6648,65 @@ impl NumOrStr {
 struct Durl {
     #[serde(default)]
     url: String,
+}
+
+#[cfg(test)]
+mod storyboard_tests {
+    use super::{videoshot_from, ShotData};
+
+    fn data(index: Vec<f64>, sheets: usize) -> ShotData {
+        ShotData {
+            img_x_len: 10,
+            img_y_len: 10,
+            img_x_size: 480,
+            img_y_size: 270,
+            sheets: (1..=sheets).map(|n| format!("//x/{n}.jpg")).collect(),
+            index,
+        }
+    }
+
+    /// 实测 356 s 视频: `[0,0,5,…,355]`，首位是重复的 0 哨兵。
+    #[test]
+    fn sentinel_zero_is_dropped() {
+        let mut index = vec![0.0, 0.0];
+        index.extend((1..72).map(|k| f64::from(k) * 5.0));
+        let shot = match videoshot_from(data(index, 1)) {
+            Ok(shot) => shot,
+            Err(_) => return assert!(false, "356 s storyboard did not normalise"),
+        };
+        assert_eq!(shot.times.len(), 72);
+        assert_eq!(shot.times[0], 0.0);
+        assert_eq!(shot.times[71], 355.0);
+        assert!(shot.sheets[0].starts_with("https://"));
+    }
+
+    /// 没有哨兵时不动第一位。
+    #[test]
+    fn times_without_sentinel_are_kept() {
+        let shot = match videoshot_from(data(vec![0.0, 5.0, 10.0], 1)) {
+            Ok(shot) => shot,
+            Err(_) => return assert!(false, "storyboard did not normalise"),
+        };
+        assert_eq!(shot.times, vec![0.0, 5.0, 10.0]);
+    }
+
+    /// 时间戳多于格子数时截断（每张图 10x10）。
+    #[test]
+    fn tiles_are_capped_by_cells() {
+        let index: Vec<f64> = (0..150).map(f64::from).collect();
+        let shot = match videoshot_from(data(index, 1)) {
+            Ok(shot) => shot,
+            Err(_) => return assert!(false, "storyboard did not normalise"),
+        };
+        assert_eq!(shot.times.len(), 100);
+    }
+
+    #[test]
+    fn missing_sheets_is_an_error() {
+        let mut broken = data(vec![0.0, 0.0, 5.0], 0);
+        broken.sheets.clear();
+        assert!(videoshot_from(broken).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -7775,6 +8077,17 @@ pub struct FavFolder {
     pub count: u32,
 }
 
+/// One row of the player's 收藏 picker: a folder of any size (default and empty
+/// folders included) plus what the endpoint said about this video's membership.
+pub struct FavFolderState {
+    pub id: i64,
+    pub name: String,
+    pub count: u32,
+    /// `Some(true)` = already in this folder, `Some(false)` = not in it,
+    /// `None` = the payload did not report it (shown as 未确认, never guessed).
+    pub member: Option<bool>,
+}
+
 /// One page of a favourite folder's contents.
 pub struct FavListPage {
     pub title: String,
@@ -8943,6 +9256,26 @@ fn fav_folders_from(data: Option<FavFoldersData>) -> Vec<FavFolder> {
         .collect()
 }
 
+/// Fold one `folder/created/list-all` payload into picker rows: EVERY folder
+/// (the default one and empty ones too), and each row's `fav_state` kept as
+/// `Option<bool>` so "not in it" and "the payload did not say" stay distinct.
+fn fav_folder_states_from(data: Option<FavFoldersData>) -> Vec<FavFolderState> {
+    let Some(data) = data else {
+        return Vec::new();
+    };
+    data.list
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| item.id > 0)
+        .map(|item| FavFolderState {
+            id: item.id,
+            name: item.title,
+            count: item.media_count,
+            member: item.fav_state.map(|state| state != 0),
+        })
+        .collect()
+}
+
 /// Fold one `fav/resource/list` page into feed items. `null` entries (deleted
 /// videos) and entries without a `bvid` are skipped; `has_more` is the API's own
 /// flag.
@@ -9009,12 +9342,27 @@ fn related_from(data: Vec<Option<RelatedItem>>) -> Vec<FeedVideo> {
 
 /// `<label>（code=<code>）` with the API message appended when there is one.
 fn fav_error(label: &str, code: i64, message: &str) -> anyhow::Error {
+    // Name the states the user can act on, in Chinese, before the endpoint's own
+    // text: 未登录 / 风控 / 权限. Everything else keeps the API message.
+    let hint = match code {
+        -101 => Some("未登录"),
+        -352 | -412 => Some("触发风控，请稍后再试"),
+        -403 => Some("没有权限"),
+        _ => None,
+    };
     let message = message.trim();
-    if message.is_empty() {
-        anyhow!("{label}（code={code}）")
-    } else {
-        anyhow!("{label}：{message}（code={code}）")
+    let mut text = String::from(label);
+    if let Some(hint) = hint {
+        text.push('（');
+        text.push_str(hint);
+        text.push('）');
     }
+    if !message.is_empty() {
+        text.push('：');
+        text.push_str(message);
+    }
+    text.push_str(&format!("（code={code}）"));
+    anyhow!("{text}")
 }
 
 /// Convert one wire comment (and its inlined preview replies) to a [`Comment`].

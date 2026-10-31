@@ -426,6 +426,12 @@ struct Session {
     buf_cur: Com,
     buf_next: Com,
     buf_flow: Com,
+    /// f200: shader-resource views of the three textures above, created here
+    /// because this file is the one that owns the raw handles. The video sink's
+    /// warp pipeline takes ownership of them (see `Ofa::views`).
+    srv_cur: Com,
+    srv_next: Com,
+    srv_flow: Com,
     /// Readback target: `gw * gh` vectors of two `i16`.
     flow: Vec<i16>,
 }
@@ -446,6 +452,9 @@ impl Session {
             buf_cur: std::ptr::null_mut(),
             buf_next: std::ptr::null_mut(),
             buf_flow: std::ptr::null_mut(),
+            srv_cur: std::ptr::null_mut(),
+            srv_next: std::ptr::null_mut(),
+            srv_flow: std::ptr::null_mut(),
             flow: Vec::new(),
         }
     }
@@ -456,6 +465,9 @@ pub struct Ofa {
     /// D3D11 device and immediate context, created on the first `ensure`.
     device: Com,
     context: Com,
+    /// f200: the device/context were handed over by their owner (the video
+    /// sink) and must not be released here.
+    borrowed: bool,
     adapter: String,
     session: Option<Session>,
     /// A pair has been submitted whose flow has not been read yet.
@@ -517,6 +529,7 @@ impl Ofa {
         Self {
             device: std::ptr::null_mut(),
             context: std::ptr::null_mut(),
+            borrowed: false,
             adapter: String::new(),
             session: None,
             pending: false,
@@ -620,6 +633,53 @@ impl Ofa {
 
     pub fn flow_ms(&self) -> f32 {
         self.flow_ms
+    }
+
+    /// f200: build the engine on a device/context the caller already owns.
+    ///
+    /// The video sink presents on its own D3D11 device and immediate context, and
+    /// the whole point of f200 is that the flow field, the two source frames and
+    /// the warped output all stay on that one device: no cross-device shared
+    /// texture, no staging round trip, no third device in the process. The
+    /// pointers are **borrowed** - they are released by their owner.
+    ///
+    /// # Safety
+    /// `device`/`context` must be a live `ID3D11Device`/`ID3D11DeviceContext`
+    /// pair that lives longer than the returned engine, and only one thread may
+    /// use the immediate context at a time.
+    pub unsafe fn attach(device: *mut c_void, context: *mut c_void) -> Self {
+        let mut engine = Self::new();
+        engine.device = device;
+        engine.context = context;
+        engine.borrowed = true;
+        engine
+    }
+
+    /// The three shader-resource views of the live session, **ownership
+    /// transferred** (the caller releases them; this engine forgets them).
+    pub fn take_views(&mut self) -> Option<(*mut c_void, *mut c_void, *mut c_void)> {
+        let session = self.session.as_mut()?;
+        let views = (session.srv_cur, session.srv_next, session.srv_flow);
+        if views.0.is_null() || views.1.is_null() || views.2.is_null() {
+            return None;
+        }
+        session.srv_cur = std::ptr::null_mut();
+        session.srv_next = std::ptr::null_mut();
+        session.srv_flow = std::ptr::null_mut();
+        Some(views)
+    }
+
+    /// `(grid_w, grid_h)` of the flow field.
+    pub fn grid(&self) -> Option<(u32, u32)> {
+        self.session.as_ref().map(|session| (session.gw, session.gh))
+    }
+
+    /// Whether the session's input textures hold RGBA (so a BGRA output needs a
+    /// red/blue swap).
+    pub fn input_is_rgba(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.input_format == DXGI_FORMAT_R8G8B8A8_UNORM)
     }
 
     /// Drop the pair in flight without reading it (a seek, a mode change or a
@@ -731,13 +791,87 @@ impl Ofa {
         true
     }
 
+    /// f209: run the engine on a pair that is **already on the GPU**.
+    ///
+    /// `a` and `b` are `ID3D11Texture2D` pointers (as raw COM) holding the two
+    /// pictures in this session's own input format and size - the video sink
+    /// converted the decoder's NV12 surfaces into them. Nothing is uploaded: the
+    /// two textures are copied into the session's input textures with
+    /// `CopyResource`, which is a GPU copy, so the zero-upload contract of the
+    /// NV12 path survives into the optical-flow engine.
+    ///
+    /// The pair is always taken as non-continuous: the caller converts both
+    /// frames anyway (they come from two different decoder surfaces), so
+    /// skipping one copy would only risk a stale frame.
+    ///
+    /// # Safety
+    /// `a`/`b` must be live `ID3D11Texture2D` objects created on this session's
+    /// device, with this session's input format and size.
+    pub unsafe fn submit_textures(&mut self, a: *mut c_void, b: *mut c_void) -> bool {
+        if self.off.is_some() || a.is_null() || b.is_null() {
+            return false;
+        }
+        let api = match api() {
+            Ok(api) => api,
+            Err(reason) => {
+                self.fail(reason);
+                return false;
+            }
+        };
+        let context = self.context;
+        let started = Instant::now();
+        let session = match self.session.as_mut() {
+            Some(session) => session,
+            None => return false,
+        };
+        // ID3D11DeviceContext::CopyResource is index 47 (IUnknown 0..=2,
+        // ID3D11DeviceChild 3..=6, then the context methods).
+        let copy: CopyResourceFn = vtbl(context, 47);
+        copy(context, session.tex_cur, a);
+        copy(context, session.tex_next, b);
+        let input = ExecuteInput {
+            input_frame: session.buf_cur,
+            reference_frame: session.buf_next,
+            external_hints: std::ptr::null_mut(),
+            disable_temporal_hints: NV_OF_TRUE,
+            padding: 0,
+            priv_data: std::ptr::null_mut(),
+            padding2: 0,
+            num_rois: 0,
+            roi_data: std::ptr::null(),
+        };
+        let mut output = ExecuteOutput {
+            output_buffer: session.buf_flow,
+            output_cost_buffer: std::ptr::null_mut(),
+            priv_data: std::ptr::null_mut(),
+            bwd_output_buffer: std::ptr::null_mut(),
+            bwd_output_cost_buffer: std::ptr::null_mut(),
+            global_flow_buffer: std::ptr::null_mut(),
+        };
+        let status = (api.execute)(session.handle, &input, &mut output);
+        if status != NV_OF_SUCCESS {
+            crate::debug_log(&format!(
+                "ofa execute status={status} err={}",
+                error_text(&api, session.handle)
+            ));
+            self.fail("execute_failed");
+            return false;
+        }
+        std::mem::swap(&mut session.tex_cur, &mut session.tex_next);
+        std::mem::swap(&mut session.buf_cur, &mut session.buf_next);
+        self.pending = true;
+        self.continuous = false;
+        self.submits = self.submits.saturating_add(1);
+        self.last_ms = started.elapsed().as_secs_f32() * 1000.0;
+        true
+    }
+
     /// The flow field of the pair submitted one interval ago:
     /// `(flow, grid_w, grid_h)` with two `i16` per cell (x, y in S10.5).
     ///
     /// `None` when nothing is pending (the previous interval did not submit) or
     /// when the engine failed; the caller then blends that interval.
-    pub fn try_flow(&mut self) -> Option<(Vec<i16>, u32, u32)> {
-        if self.off.is_some() || !self.pending {
+    pub fn try_flow(&mut self) -> Option<(Vec<i16>, u32, u32)> {        if self.off.is_some() || !self.pending {
             return None;
         }
         self.pending = false;
@@ -795,9 +929,13 @@ impl Drop for Ofa {
         // SAFETY: each interface pointer is released once, in reverse creation
         // order. The runtime stays loaded for the process (see `system_entry`),
         // so no function pointer can outlive its module.
-        unsafe {
-            release(self.context);
-            release(self.device);
+        if !self.borrowed {
+            // SAFETY: an owned pair was created by `create_device` and released
+            // once; a borrowed one belongs to the caller (the video sink).
+            unsafe {
+                release(self.context);
+                release(self.device);
+            }
         }
         self.context = std::ptr::null_mut();
         self.device = std::ptr::null_mut();
@@ -1118,6 +1256,30 @@ unsafe fn fill_session(
         D3D11_CPU_ACCESS_READ,
     )?;
 
+    // f200: the views the GPU warp binds. Created here, through the same raw
+    // vtable the textures were created with (ID3D11Device::CreateShaderResourceView
+    // is index 7), because that is the only path proven to reach these objects:
+    // reconstructing a `windows` interface over the raw pointer and calling
+    // through it faults (measured: access violation on the very first call).
+    type CreateSrvFn =
+        unsafe extern "system" fn(Com, Com, *const c_void, *mut Com) -> i32;
+    let create_srv: CreateSrvFn = vtbl(device, 7);
+    for (texture, slot) in [
+        (session.tex_cur, &mut session.srv_cur),
+        (session.tex_next, &mut session.srv_next),
+        (session.tex_flow, &mut session.srv_flow),
+    ] {
+        let mut view: Com = std::ptr::null_mut();
+        let hr = create_srv(device, texture, std::ptr::null(), &mut view);
+        if hr < 0 || view.is_null() {
+            crate::debug_log(&format!(
+                "ofa create_srv failed hr={hr:#x} texture={texture:p}"
+            ));
+            return Err("shader_resource_view_failed");
+        }
+        *slot = view;
+    }
+
     // Registering an app texture is what makes it usable in `nvOFExecute`.
     // `ID3D11Texture2D` derives from `ID3D11Resource`, so the pointer is passed
     // as-is (single inheritance: same vtable prefix, no QueryInterface needed).
@@ -1152,6 +1314,9 @@ unsafe fn close_session(api: &Api, session: &mut Session) {
     }
     if !session.handle.is_null() {
         (api.destroy)(session.handle);
+    }
+    for view in [session.srv_flow, session.srv_next, session.srv_cur] {
+        release(view);
     }
     for tex in [
         session.tex_read,

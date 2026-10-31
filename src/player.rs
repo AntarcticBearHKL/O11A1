@@ -17,13 +17,15 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::danmaku::Danmaku;
 use crate::prefetch::{self, PrefetchConfig, PrefetchHandle, PrefetchStats};
@@ -40,8 +42,18 @@ use crate::{
 mod motion;
 // Hardware optical flow (mode 3). Same reasoning: it is the pacer's private
 // dependency, reachable through `PlaybackControl`'s mode byte only.
+//
+// f200: `pub(crate)`, because the video sink builds the session on its *own*
+// D3D11 device now (`crate::dcomp::video`): the flow field, the two source
+// frames and the warped backbuffer have to live on one device, so the engine
+// belongs to the thread that presents.
 #[path = "ofa.rs"]
-mod ofa;
+pub(crate) mod ofa;
+// The 120 fps picture surface: the frame leaves the Slint window and is blitted
+// into its own window behind it (see `video_surface.rs`). Under `player` for the
+// same reason as the two above: it shares `FrameBuf` and the blend pool.
+#[path = "video_surface.rs"]
+mod video_surface;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -583,14 +595,25 @@ const AUDIO_CLOCK_GUARD_MS: u64 = 400;
 /// `ffplay` looks exactly like that; the device artefact does not (the next
 /// burst returns to the content position).
 const AUDIO_CLOCK_CONFIRM_MS: u64 = 150;
+/// Every forward report inside [`AUDIO_CLOCK_RESUME_QUIET_MS`] of a release is
+/// the audio **device** clock, and the device counts the suspended time. Even a
+/// short suspension makes its first report lead the content by more than the
+/// ±30 ms steady jitter (measured: 107-196 ms for a 2.5 s pause, one or two
+/// samples), which used to become the new baseline and show up as a `delta_ms`
+/// spike in the 暂停恢复 phase. Anything above this floor is therefore a
+/// baseline artefact, not content: it is dropped and the clock keeps the
+/// content trajectory the release re-anchored it to (logged as
+/// `audio clock resume baseline reset`).
+const AUDIO_CLOCK_RESUME_FLOOR_MS: i64 = 40;
 /// How long after a suspension is released `ffplay` still reports the audio
 /// **device** position. Its first `-stats` line then reads "frozen content +
 /// the suspension's length" (measured +1.03 s for a 1.2 s suspension) and the
-/// next line returns to the content. Inside this window a forward jump is the
-/// device, never the content, so it is dropped without even becoming a
-/// candidate ([`SHADOW_RESUME_QUIET_MS`] does the same for a seek shadow's own
-/// process). Confirmation is deliberately not offered here: two device samples
-/// in a row must never re-seed the clock either.
+/// next line returns to the content. Inside this window any forward lead above
+/// [`AUDIO_CLOCK_RESUME_FLOOR_MS`] is the device, never the content: it is
+/// dropped and the clock keeps the baseline the release re-anchored it to
+/// ([`SHADOW_RESUME_QUIET_MS`] does the same for a seek shadow's own process).
+/// Confirmation is deliberately not offered here: two device samples in a row
+/// must never re-seed the clock either.
 const AUDIO_CLOCK_RESUME_QUIET_MS: u64 = 800;
 /// A seek's silent window used to be decided from the proxy's read-ahead while
 /// the old picture kept playing. f151 freezes the picture on the release, so the
@@ -724,6 +747,25 @@ const SEEK_SHADOW_PREROLL_FRAMES: usize = 6;
 /// the A/V relation is worth the longer wait.
 const SEEK_SHADOW_LOCAL_AUDIO_WAIT_MS: u64 = 40;
 
+/// How long an in-place zero-copy seek waits for the decoder to report the new
+/// position before it gives the seek back to the restart path.
+///
+/// `MfVideoDecoder::seek` is a flush plus `SetCurrentPosition` — measured 0.9–4.9
+/// ms on a 1080p stream — so this is a *failure* bound, not a budget. It is kept
+/// generous (1.2 s) on purpose: a reposition that has to wait for the proxy to
+/// hand over a byte range, or for the compositor to finish a frame, can take
+/// most of a second — and restarting the session
+/// *also* repositions — it just pays a teardown, a stream resolution and an
+/// `ffplay` spawn on top. While the bound runs, the picture is frozen and the
+/// overlay is armed at [`SEEK_FREEZE_OVERLAY_MS`], so a slow decoder is a slow
+/// seek either way; only a decoder that never answers is worth restarting.
+const SEEK_INPLACE_TIMEOUT_MS: u64 = 1_200;
+
+/// How long an in-place seek may wait for its first display slot before the
+/// seek is given back to the restart path. A frozen picture with no bound would
+/// be a hang; this is the "never worse than the restart" guarantee.
+const SEEK_INPLACE_GIVE_UP_MS: u64 = 3_000;
+
 /// Monotonic milliseconds since the first call, for cross-thread freshness
 /// checks (`Instant` itself cannot live in an atomic).
 fn monotonic_ms() -> u64 {
@@ -829,9 +871,351 @@ impl InterpMode {
 /// copy, p95 11.8 ms), so 60 is the only rate that holds at that size, and a
 /// single ceiling for all sizes is one budget the UI can promise.
 const INTERP_MAX_OUT_HZ: u32 = 60;
+
+/// Experimental 4x ceiling: 30 fps → 120 fps on a 120 Hz display.
+///
+/// Not a product mode and not reachable from the UI: only `BILI_INTERP_4X=1`
+/// raises the ceiling (see [`interp_out_ceiling`]), and the measured report
+/// behind the switch is `docs`-less by design — the numbers live in the QA
+/// lines this file writes (`spike_interp_4x_*` and the `interp mode=…` line's
+/// `out_hz`/`shown_s`). The pacer side is the same grid and the same passes as
+/// 60 fps: with `out_hz = 120` a 30 fps interval is four slots, one of which
+/// starts at phase 0, so three frames are generated per source frame. Mode 3
+/// warps all three from one optical-flow pair. Mode 2 still runs at most one
+/// block-matching pair per interval (the mode's design), so at 4x it is one
+/// warped slot plus two blends, and at 1080p it does not run at all.
+const INTERP_MAX_OUT_HZ_4X: u32 = 120;
+
+/// Largest frame that may use the 120 Hz grid: 720p and below.
+///
+/// f198 measured the composite player at 1920x1080 with `BILI_INTERP_4X=1` and
+/// the 120 grid: the pacer produced 96-109 pictures/s with 9-22 drops/s, and
+/// the bottleneck is memory traffic, not arithmetic — one 1080p interval is
+/// four full-frame passes (4 x 25 MB with the blend), the video sink stages
+/// 8.3 MB per presented frame (measured 5-11 ms per stage at that point), and
+/// the comment layer clears ~5.8 MB per paint. The AVX2 blend alone is 2.3 ms
+/// isolated (`interp blend` probe) but 8.5 ms under that three-thread load, so
+/// the 120 grid cannot hold at 1080p on the CPU path. The picture therefore
+/// stays on the 60 Hz grid there: solid 60 with no drops beats 105 fps with
+/// 15 drops/s. 1280x720 is the largest size that does hold 120 (measured
+/// 120.0/s, 0 drops).
+const INTERP_4X_MAX_PIXELS: u64 = 1280 * 720;
+
+/// Whether the experimental 4x path was requested (`BILI_INTERP_4X=1`).
+fn interp_four_x() -> bool {
+    static FOUR_X: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUR_X.get_or_init(|| {
+        std::env::var("BILI_INTERP_4X")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// The output ceiling for one session's frame size.
+///
+/// [`INTERP_MAX_OUT_HZ`] unless the 120 fps grid was asked for — by the user's
+/// 插帧 menu (`settings.interp_120`, the shipped way in) or by the older
+/// `BILI_INTERP_4X=1` QA switch — and the decoded frame is 720p or smaller.
+/// The caller resolves it once per session, like the rest of the plan, so a
+/// mid-play toggle has no effect until the next video (or seek).
+/// The 120 Hz output ceiling for a frame size.
+///
+/// The pixel cap exists because the CPU blend costs ~8 ms at 1080p. The
+/// zero-copy path (f209) has no CPU blend at all - the sink warps on the GPU -
+/// which is what makes 4x at 1080p affordable; `gpu_blend` says so.
+#[cfg(test)]
+fn interp_out_ceiling(size: FrameSize, want_120: bool) -> u32 {
+    interp_out_ceiling_for(size, want_120, false)
+}
+
+fn interp_out_ceiling_for(size: FrameSize, want_120: bool, gpu_blend: bool) -> u32 {
+    let capped = !gpu_blend
+        && u64::from(size.w) * u64::from(size.h) > INTERP_4X_MAX_PIXELS;
+    if (want_120 || interp_four_x()) && !capped {
+        INTERP_MAX_OUT_HZ_4X
+    } else {
+        INTERP_MAX_OUT_HZ
+    }
+}
+
+/// UI-thread cadence probe, `BILI_INTERP_PROBE=1` (QA only).
+///
+/// A 4 ms `slint::Timer` on the event-loop thread that paints the player records
+/// the gap between its own ticks. Idle, the gap is the timer's interval plus
+/// slack; a callback that runs long (a full-window recomposite, a texture
+/// upload, a pointer handler) shows up as a gap over the display period, which
+/// is exactly the time in which no displayed frame could have been shown. The
+/// `interp mode=…` line prints the window's p50/p95 and how many gaps crossed
+/// 8.3 ms (one 120 Hz frame) and 16.7 ms (one 60 Hz frame).
+///
+/// The whole probe is inert without the variable: no timer, no allocation.
+const UI_GAP_BUCKETS: usize = 128;
+const UI_GAP_BUCKET_MS: f64 = 0.25;
+static UI_GAPS: [AtomicU64; UI_GAP_BUCKETS] = [const { AtomicU64::new(0) }; UI_GAP_BUCKETS];
+
+fn interp_ui_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BILI_INTERP_PROBE")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Start the probe on the event loop thread, once per process. Safe to call
+/// from the pacer: the timer is created inside the posted closure.
+fn start_interp_ui_probe(window: &slint::Weak<PlayerWindow>) {
+    if !interp_ui_probe_enabled() {
+        return;
+    }
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let weak = window.clone();
+    let _ = weak.upgrade_in_event_loop(move |_window| {
+        thread_local! {
+            /// Kept alive for the process: a `slint::Timer` stops as soon as
+            /// its last reference drops.
+            static TIMER: std::cell::RefCell<Option<Rc<slint::Timer>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        TIMER.with(|slot| {
+            let timer = Rc::new(slint::Timer::default());
+            let mut last = Instant::now();
+            let mut primed = false;
+            timer.start(slint::TimerMode::Repeated, Duration::from_millis(4), move || {
+                let now = Instant::now();
+                let gap_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+                last = now;
+                // The first tick measures "installed -> timer running".
+                if !primed {
+                    primed = true;
+                    return;
+                }
+                let bucket = ((gap_ms / UI_GAP_BUCKET_MS) as usize).min(UI_GAP_BUCKETS - 1);
+                UI_GAPS[bucket].fetch_add(1, Ordering::Relaxed);
+            });
+            *slot.borrow_mut() = Some(timer);
+        });
+        crate::debug_log("interp probe ui_gap installed tick_ms=4");
+    });
+}
+
+/// Snapshot of the UI gap histogram.
+fn ui_gap_snapshot() -> Vec<u64> {
+    UI_GAPS
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed))
+        .collect()
+}
+
+/// `(p50, p95, over_8_3, over_16_7, samples)` for the difference between two
+/// snapshots, in ms (each value is its bucket's upper edge).
+fn ui_gap_window(before: &[u64], after: &[u64]) -> (f64, f64, u64, u64, u64) {
+    let delta: Vec<u64> = after
+        .iter()
+        .zip(before.iter())
+        .map(|(now, was)| now.saturating_sub(*was))
+        .collect();
+    let total: u64 = delta.iter().sum();
+    if total == 0 {
+        return (0.0, 0.0, 0, 0, 0);
+    }
+    let edge = |index: usize| (index + 1) as f64 * UI_GAP_BUCKET_MS;
+    let pick = |percent: f64| -> f64 {
+        let mut seen = 0u64;
+        for (index, count) in delta.iter().enumerate() {
+            seen += count;
+            if seen as f64 >= (total as f64 * percent).ceil() {
+                return edge(index);
+            }
+        }
+        edge(delta.len() - 1)
+    };
+    // The timer's own interval is 4 ms, so "missed a display frame" is a gap
+    // over one 120 Hz period from the *previous tick*, i.e. over 8.3 ms.
+    let over_83: u64 = delta
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| edge(*index) > 8.3)
+        .map(|(_, count)| *count)
+        .sum();
+    let over_167: u64 = delta
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| edge(*index) > 16.7)
+        .map(|(_, count)| *count)
+        .sum();
+    (pick(0.50), pick(0.95), over_83, over_167, total)
+}
+
+// ---- Present-path probe (`BILI_INTERP_PROBE=1`) ----------------------------
+//
+// The UI gap histogram above says *that* the event loop is busy; it cannot say
+// which part of getting one frame onto the screen spent the time. This section
+// splits one presented frame into three measured parts plus the period they
+// have to fit in, all in milliseconds and all with a p50/p95:
+//
+//   conv   reader thread: NV12 → RGBA for one decoded frame (a rate, not a
+//          per-present cost: the ring decouples it from the display)
+//   hand   UI thread: `Image::from_rgba8` + the `frame` property write plus the
+//          mailbox bookkeeping — the hand-over to Slint, before anything is
+//          drawn
+//   dm     the danmaku fast tick itself (model writes, no painting)
+//
+// The paint itself is deliberately left to the UI gap histogram above
+// (`ui_p50`/`ui_p95`): its p50 minus the timer's 4 ms interval is the time the
+// UI thread is blocked by one present, which is the number a present budget is
+// actually about.
+//
+// Deliberately *not* the renderer's `set_rendering_notifier`: installing it
+// changes the femtovg render path (an extra clear pass and command submit per
+// frame) and measured a 33 ms period where the uninstrumented window does 16.7,
+// i.e. the instrument doubled the thing it measured. A posted marker costs one
+// proxy event and leaves the paint untouched.
+mod present_probe {
+    use super::*;
+
+    pub(super) const CONV: usize = 0;
+    pub(super) const HAND: usize = 1;
+    pub(super) const DM: usize = 2;
+    pub(super) const SERIES: usize = 3;
+
+    pub(super) const NAMES: [&str; SERIES] = ["conv", "hand", "dm"];
+
+    /// 0.1 ms buckets up to 51.2 ms: the whole present path fits, and a 120 Hz
+    /// period (8.3 ms) is resolved to 1.2 %.
+    const BUCKETS: usize = 512;
+    const BUCKET_MS: f64 = 0.1;
+
+    pub(super) struct Probe {
+        series: [Vec<AtomicU64>; SERIES],
+    }
+
+    impl Probe {
+        fn new() -> Self {
+            Self {
+                series: std::array::from_fn(|_| (0..BUCKETS).map(|_| AtomicU64::new(0)).collect()),
+            }
+        }
+
+        fn add(&self, series: usize, ms: f64) {
+            if !ms.is_finite() || ms < 0.0 {
+                return;
+            }
+            let bucket = ((ms / BUCKET_MS) as usize).min(BUCKETS - 1);
+            self.series[series][bucket].fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn snapshot(&self) -> Vec<Vec<u64>> {
+            self.series
+                .iter()
+                .map(|buckets| {
+                    buckets
+                        .iter()
+                        .map(|bucket| bucket.load(Ordering::Relaxed))
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    static PROBE: OnceLock<Probe> = OnceLock::new();
+
+    fn probe() -> Option<&'static Probe> {
+        if !interp_ui_probe_enabled() {
+            return None;
+        }
+        Some(PROBE.get_or_init(Probe::new))
+    }
+
+    pub(super) fn enabled() -> bool {
+        interp_ui_probe_enabled()
+    }
+
+    pub(super) fn add(series: usize, ms: f64) {
+        if let Some(probe) = probe() {
+            probe.add(series, ms);
+        }
+    }
+
+    /// Time `body`, record it under `series`, return its result.
+    pub(super) fn timed<T>(series: usize, body: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return body();
+        }
+        let started = Instant::now();
+        let value = body();
+        add(series, started.elapsed().as_secs_f64() * 1000.0);
+        value
+    }
+
+    /// Hand-over done: record how long the property write took.
+    pub(super) fn hand_over(started: Instant) {
+        add(HAND, started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    pub(super) fn snapshot() -> Option<Vec<Vec<u64>>> {
+        probe().map(Probe::snapshot)
+    }
+
+    /// `(p50, p95, samples)` for one series between two snapshots.
+    pub(super) fn window(before: &[Vec<u64>], after: &[Vec<u64>], series: usize) -> (f64, f64, u64) {
+        let (Some(was), Some(now)) = (before.get(series), after.get(series)) else {
+            return (0.0, 0.0, 0);
+        };
+        let delta: Vec<u64> = now
+            .iter()
+            .zip(was.iter())
+            .map(|(now, was)| now.saturating_sub(*was))
+            .collect();
+        let total: u64 = delta.iter().sum();
+        if total == 0 {
+            return (0.0, 0.0, 0);
+        }
+        let pick = |percent: f64| -> f64 {
+            let mut seen = 0u64;
+            for (index, count) in delta.iter().enumerate() {
+                seen += count;
+                if seen as f64 >= (total as f64 * percent).ceil() {
+                    return (index + 1) as f64 * BUCKET_MS;
+                }
+            }
+            BUCKETS as f64 * BUCKET_MS
+        };
+        (pick(0.50), pick(0.95), total)
+    }
+}
+
+/// Whether the 120 fps picture surface may take the frames (`BILI_VIDEO_SURFACE=1`).
+///
+/// Not a product mode: see [`FrameMailbox::external_surface`] for the blocker.
+fn video_surface_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BILI_VIDEO_SURFACE")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Present-interval histogram: 0.25 ms buckets up to 32 ms. A 120 Hz grid has
+/// an 8.33 ms period (bucket 33) and a 60 Hz one 16.7 ms (bucket 67), so the
+/// p95 that decides the 120 fps self-check resolves both to 0.25 ms.
+const PRESENT_HIST_BUCKETS: usize = 128;
+const PRESENT_HIST_BUCKET_MS: f64 = 0.25;
+
 /// Blending only pays off when the output is meaningfully faster than the track;
 /// a 60 Hz display against a 59.94 fps track is not worth a full-frame pass.
 const INTERP_MIN_GAIN: f64 = 1.01;
+
+/// `BILI_INTERP_PROBE=1`: record one danmaku fast tick in the present probe, so
+/// its cost can be reported next to the paint it causes. Inert otherwise.
+pub(crate) fn probe_danmaku_tick<T>(body: impl FnOnce() -> T) -> T {
+    present_probe::timed(present_probe::DM, body)
+}
+
 /// Pair-time histogram for the QA line: 0.5 ms buckets up to 32 ms.
 const BM_HIST_BUCKETS: usize = 64;
 const BM_HIST_BUCKET_MS: f32 = 0.5;
@@ -869,25 +1253,29 @@ struct InterpPlan {
 /// pointless (the display is not faster than the track).
 ///
 /// The caps, enforced here rather than in the caller:
-/// * the output grid is `min(60, display_hz)` for **every** mode and every
-///   frame size — there is no 120 fps path any more (see
-///   [`INTERP_MAX_OUT_HZ`]);
-/// * a display faster than 60 logs `blend cap …`;
-/// * below 60 the display rate is kept as-is, so the grid still matches the
-///   phase the compositor presents at.
-fn interp_plan_for(display_hz: u32, track_fps: f64) -> Option<InterpPlan> {
+/// * the output grid is `min(ceiling, display_hz)` — `60` for every mode and
+///   frame size, or `120` for 720p and below when the experimental
+///   `BILI_INTERP_4X=1` is set (see [`interp_out_ceiling`]); there is no 120 fps
+///   path in the product;
+/// * a display faster than the ceiling logs `blend cap …`;
+/// * below the ceiling the display rate is kept as-is, so the grid still
+///   matches the phase the compositor presents at.
+fn interp_plan_for(display_hz: u32, track_fps: f64, ceiling: u32) -> Option<InterpPlan> {
     if !(track_fps.is_finite() && track_fps > 1.0) {
         return None;
     }
-    let out_hz = display_hz.min(INTERP_MAX_OUT_HZ);
+    let ceiling = ceiling.max(1);
+    let out_hz = display_hz.min(ceiling);
     if out_hz as f64 <= track_fps * INTERP_MIN_GAIN {
         // The track already fills the display: no frames to generate.
         return None;
     }
-    Some(InterpPlan {
-        out_hz,
-        reason: (display_hz > INTERP_MAX_OUT_HZ).then_some("60fps_cap"),
-    })
+    let reason = (display_hz > ceiling).then_some(if ceiling > INTERP_MAX_OUT_HZ {
+        "120fps_cap"
+    } else {
+        "60fps_cap"
+    });
+    Some(InterpPlan { out_hz, reason })
 }
 
 /// Whether frame generation must pause because a window is being dragged.
@@ -921,7 +1309,8 @@ fn interp_paused_for_drag() -> bool {
 /// Above 1280x720 the cost of the search + warp exceeds the display slot on
 /// this machine, so mode 2 degrades to plain blending (the pacer logs
 /// `blockmatch unsupported frame=WxH → blend` once per session). The output
-/// grid itself is the same 60 fps one every mode uses (see [`interp_plan_for`]).
+/// grid is the session's own (see [`interp_plan_for`]): 60 fps, or the
+/// experimental 4x grid for 1080p and below.
 fn interp_motion_supported(size: FrameSize) -> bool {
     motion::MotionInterp::supports(size.w, size.h)
 }
@@ -1117,6 +1506,18 @@ fn blend_rgba_into(out: &mut [u8], a: &[u8], b: &[u8], weight: u16) {
     let weight = weight.min(256);
     #[cfg(target_arch = "x86_64")]
     {
+        // AVX2 when the CPU has it: the same arithmetic, eight pixels per
+        // iteration instead of four. f198 measured the 1080p pass at 7.2 ms
+        // (SSE2) and this is the one pass that stands between a 33.3 ms source
+        // interval and a 120 Hz grid at that size, so the instruction count
+        // matters. `is_x86_feature_detected!` is a cached static, not a cpuid
+        // per frame.
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the pointers are valid for `len` bytes and the routine
+            // stays inside that range; its head/tail is the scalar loop below.
+            unsafe { blend_rgba_avx2(out.as_mut_ptr(), a.as_ptr(), b.as_ptr(), len, weight) };
+            return;
+        }
         // SSE2 is part of the x86_64 baseline, so no runtime dispatch is needed.
         // SAFETY: the pointers are valid for `len` bytes and the loop stays
         // inside that range; the tail is handled by the scalar loop below.
@@ -1131,6 +1532,77 @@ fn blend_rgba_into(out: &mut [u8], a: &[u8], b: &[u8], weight: u16) {
         }
         for pixel in out[..len].chunks_exact_mut(4) {
             pixel[3] = 255;
+        }
+    }
+}
+
+/// Two frames at 256-bit width: same fixed-point blend as [`blend_rgba_sse2`],
+/// eight pixels per iteration.
+///
+/// The head/tail (fewer than eight pixels, and at most half a register of
+/// misalignment for the aligned stores) is the scalar loop with the alpha fix,
+/// so the result is byte-identical to the SSE2 path for every length.
+///
+/// # Safety
+/// `out`, `a` and `b` must each be valid for `len` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn blend_rgba_avx2(out: *mut u8, a: *const u8, b: *const u8, len: usize, weight: u16) {
+    use std::arch::x86_64::*;
+    let zero = _mm256_setzero_si256();
+    let w = weight as i16;
+    let inv = 256 - w;
+    let wv = _mm256_set1_epi16(w);
+    let invv = _mm256_set1_epi16(inv);
+    let round = _mm256_set1_epi16(128);
+    let alpha = _mm256_set1_epi32(0xFF00_0000u32 as i32);
+    // Plain (non-temporal would skip the write-allocate but the staged copy
+    // reads this buffer back immediately, so a normal store keeps it in cache).
+    // 32-byte blocks aligned down to the buffer's own alignment: `loadu`/`storeu`
+    // mean no alignment requirement at all, which is what keeps this path a
+    // drop-in for the pooled buffers (they are plain `Vec<u8>`s).
+    let mut offset = 0usize;
+    // SAFETY: every access below is a full 32-byte block inside `len`.
+    unsafe {
+        while offset + 32 <= len {
+            let av = _mm256_loadu_si256(a.add(offset) as *const __m256i);
+            let bv = _mm256_loadu_si256(b.add(offset) as *const __m256i);
+            // `unpack` and `pack` are both lane-local, so the low/high halves
+            // round-trip in order: lane 0 keeps bytes 0..8 + 8..16, lane 1
+            // keeps 16..24 + 24..32.
+            let alo = _mm256_unpacklo_epi8(av, zero);
+            let ahi = _mm256_unpackhi_epi8(av, zero);
+            let blo = _mm256_unpacklo_epi8(bv, zero);
+            let bhi = _mm256_unpackhi_epi8(bv, zero);
+            let lo = _mm256_srli_epi16(
+                _mm256_add_epi16(
+                    _mm256_add_epi16(_mm256_mullo_epi16(alo, invv), _mm256_mullo_epi16(blo, wv)),
+                    round,
+                ),
+                8,
+            );
+            let hi = _mm256_srli_epi16(
+                _mm256_add_epi16(
+                    _mm256_add_epi16(_mm256_mullo_epi16(ahi, invv), _mm256_mullo_epi16(bhi, wv)),
+                    round,
+                ),
+                8,
+            );
+            let packed = _mm256_packus_epi16(lo, hi);
+            let opaque = _mm256_or_si256(packed, alpha);
+            _mm256_storeu_si256(out.add(offset) as *mut __m256i, opaque);
+            offset += 32;
+        }
+        let inv = 256 - weight as u32;
+        let w = weight as u32;
+        for i in offset..len {
+            *out.add(i) = ((*a.add(i) as u32 * inv + *b.add(i) as u32 * w + 128) >> 8) as u8;
+        }
+        // Force alpha opaque in the tail as well.
+        let mut tail = offset + 3;
+        while tail < len {
+            *out.add(tail) = 255;
+            tail += 4;
         }
     }
 }
@@ -1670,6 +2142,8 @@ fn install_panic_log() {
 
 /// `THREAD_PRIORITY_BELOW_NORMAL` (winbase.h).
 const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+/// `THREAD_PRIORITY_ABOVE_NORMAL` (winbase.h).
+const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
 /// `NORMAL_PRIORITY_CLASS` (winbase.h): the class every media child runs in.
 ///
 /// `main` puts the whole process in `BELOW_NORMAL_PRIORITY_CLASS` (see
@@ -1713,6 +2187,33 @@ fn lower_current_thread_priority() {
     unsafe {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
+}
+
+/// Raise the event-loop thread above normal, once per process.
+///
+/// The player presents from the UI thread, and presentation is a hard deadline
+/// (16.7 ms for 60 fps, 8.3 ms for 120): a scheduler delay of a few
+/// milliseconds on that thread is a dropped picture. Everything that competes
+/// with it is deliberately below normal — the pipe reader/converter
+/// ([`lower_current_thread_priority`]) — except the prefetch workers, which are
+/// normal and, at 16 connections, saturate a 6-core host for the first seconds
+/// of a video. Measured on this machine: a cold prefetch alone took the present
+/// rate from 59 to 31 fps without touching a single paint cost. `ABOVE_NORMAL`
+/// lets the frame win those few milliseconds without making the process
+/// unresponsive (it is one notch, and the OS still round-robins).
+///
+/// Called from the UI thread (a thread priority is per-thread); idempotent.
+pub(crate) fn raise_ui_thread_priority() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // SAFETY: GetCurrentThread returns a pseudo handle that is always valid and
+    // must not be closed; SetThreadPriority only changes this thread's class.
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    crate::debug_log("ui thread priority above_normal");
 }
 
 /// Put a decoder/audio child process into the normal class.
@@ -2167,8 +2668,8 @@ pub(crate) fn ensure_high_res_timer() {
 /// scaled by `frame_w / 960`: the overlay's own band mapping already is that
 /// transform, and applying it here too would double-scale every item (a 16:9
 /// frame is not 960 wide). See [`active_items`].
-const VIDEO_W: f32 = 960.0;
-const VIDEO_H: f32 = 540.0;
+pub(crate) const VIDEO_W: f32 = 960.0;
+pub(crate) const VIDEO_H: f32 = 540.0;
 /// Rows available for scrolling danmaku.
 const LANES: usize = 14;
 const LANE_H: f32 = 28.0;
@@ -2318,6 +2819,12 @@ impl Prof {
 /// current position (used by volume / mute, so the picture never stutters).
 pub struct PlaybackControl {
     closed: AtomicBool,
+    /// f212: the HWND of the window this player decode loop draws into (`0`
+    /// until the UI thread publishes it). It lets the decode thread ask the
+    /// DComp side whether that window can take a video layer *without* an event
+    /// loop round trip — the answer is written at window creation, so a busy UI
+    /// thread can no longer make the zero-copy decoder look unavailable.
+    window_hwnd: AtomicIsize,
     /// Whether this player's one history reporter thread was started (see
     /// [`HistoryReporter`]). `run` is re-entered after a pacer panic; the claim
     /// keeps that restart from opening a second reporter for the same session.
@@ -2525,6 +3032,11 @@ pub struct PlaybackControl {
     /// This is what makes a release read as "the picture stops where I let go"
     /// instead of "the number changed and the video kept playing for 0.6 s".
     seek_freeze_at: AtomicU64,
+    /// f211: the segment clock of the seek in flight (see [`SeekSegments`]).
+    /// Written by the release and by every stage between it and the first
+    /// picture, so one `seek trace` line says where the wait went instead of
+    /// leaving `first_frame_ms` to be guessed at.
+    seek_seg: SeekSegments,
     /// Content position (ms) of the most recently presented picture frame.
     /// Unlike `position_ms` (which the release immediately points at the
     /// target) this is where the pixels on screen really are: the frozen
@@ -2644,6 +3156,21 @@ pub struct PlaybackControl {
     /// or when the display is not faster than the track). Published to the UI
     /// as `<hz> fps` beside the measured cost.
     interp_out_hz: AtomicU64,
+    /// 插帧 120: the user's 120 fps toggle (`settings.interp_120`). The pacer
+    /// reads it when it resolves the session's plan, so a change applies to the
+    /// next video or seek, exactly like a mode change.
+    interp_120: AtomicBool,
+    /// Present-interval histogram: one bucket per 0.25 ms up to 16 ms, filled by
+    /// whichever path put the last frame on screen (the Slint mailbox or the
+    /// 120 fps surface). It is what the 120 fps self-check reads: the question
+    /// "does this machine hold an 8.3 ms grid" is answered by the measured
+    /// interval, not by a guess from the paint cost.
+    present_hist: [AtomicU64; PRESENT_HIST_BUCKETS],
+    /// Last receipt from the 120 fps surface: frames it blitted, and the
+    /// average blit cost in µs. Read by the 120 fps self-check so its log line
+    /// can say *which* path produced the interval it judged.
+    surface_shown: AtomicU64,
+    surface_blit_us: AtomicU64,
 }
 
 /// The video one player window is on. A 选集 pick replaces this in place; the
@@ -2895,6 +3422,7 @@ impl PlaybackControl {
     pub fn new() -> Arc<Self> {
         let control = Arc::new(Self {
             closed: AtomicBool::new(false),
+            window_hwnd: AtomicIsize::new(0),
             history_claimed: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             occluded: AtomicBool::new(false),
@@ -2973,6 +3501,7 @@ impl PlaybackControl {
             seek_buffering: AtomicBool::new(false),
             seek_buffering_at: AtomicU64::new(0),
             seek_freeze_at: AtomicU64::new(0),
+            seek_seg: SeekSegments::default(),
             presented_ms: AtomicU64::new(0),
             source: std::sync::Mutex::new(PlaybackSource::default()),
             source_seq: AtomicU64::new(0),
@@ -3020,8 +3549,24 @@ impl PlaybackControl {
             interp_ofa_submits: AtomicU64::new(0),
             interp_ofa_hist: std::array::from_fn(|_| AtomicU64::new(0)),
             interp_out_hz: AtomicU64::new(0),
+            interp_120: AtomicBool::new(false),
+            present_hist: std::array::from_fn(|_| AtomicU64::new(0)),
+            surface_shown: AtomicU64::new(0),
+            surface_blit_us: AtomicU64::new(0),
         });
         control
+    }
+
+    /// f212: publish the HWND this player draws into (UI thread, once per
+    /// window). The decode thread reads it to ask the DComp side about the
+    /// video layer without an event-loop round trip.
+    pub fn set_window_hwnd(&self, hwnd: isize) {
+        self.window_hwnd.store(hwnd, Ordering::SeqCst);
+    }
+
+    /// The window handle published by [`Self::set_window_hwnd`] (`0` = unknown).
+    pub fn window_hwnd(&self) -> isize {
+        self.window_hwnd.load(Ordering::SeqCst)
     }
 
     pub fn close(&self) {
@@ -3568,6 +4113,11 @@ impl PlaybackControl {
         }
         let next = !self.paused.load(Ordering::SeqCst);
         self.paused.store(next, Ordering::SeqCst);
+        if !next {
+            // f211: the samples after a release measure the resync, not the
+            // steady state (see `qa::f211`).
+            crate::qa::f211::avsync_phase("resume");
+        }
         next
     }
 
@@ -3937,20 +4487,23 @@ impl PlaybackControl {
                     "clk age_ms={age} reported_ms={position_ms} extrapolated_ms={extrapolated} err_ms={error} speed={speed:.3}"
                 ));
             }
-            if error > AUDIO_CLOCK_JUMP_MS as i64 {
-                // After a suspension the process' first report is the audio
-                // device (frozen content + the suspension's length), never the
-                // content: that is the measured t≈6 s dip. It is dropped here
-                // and the clock simply keeps extrapolating from the position the
-                // sound was frozen at.
-                let quiet = self.resume_age_ms(now) <= AUDIO_CLOCK_RESUME_QUIET_MS;
-                if quiet {
-                    self.clear_jump_candidate();
-                    self.audio_clock_ms.store(extrapolated, Ordering::SeqCst);
-                    self.clock_jump_log(
-                        now, age, extrapolated, position_ms, error, false, "resume-device",
-                    );
-                } else if error as u64 <= AUDIO_CLOCK_GUARD_MS {
+            // f212: a report inside the resume quiet window is the audio
+            // **device**, whose clock counts the suspended time. Whatever its
+            // size (a 2.5 s pause reads 107-196 ms ahead, a 1.2 s one reads
+            // +1.03 s), that is never content: the sample is dropped, the clock
+            // keeps the trajectory the release re-anchored it to, and this is
+            // the baseline reset the 暂停恢复 phase needed. Adopting it was the
+            // "first two samples after resume jump to 190 ms" report.
+            let quiet = self.resume_age_ms(now) <= AUDIO_CLOCK_RESUME_QUIET_MS;
+            if quiet && error > AUDIO_CLOCK_RESUME_FLOOR_MS {
+                self.clear_jump_candidate();
+                self.audio_clock_ms.store(extrapolated, Ordering::SeqCst);
+                self.audio_clock_ppm.store(0, Ordering::SeqCst);
+                crate::debug_log(&format!(
+                    "audio clock resume baseline reset reported_ms={position_ms} kept_ms={extrapolated} dropped_ms={error} age_ms={age}"
+                ));
+            } else if error > AUDIO_CLOCK_JUMP_MS as i64 {
+                if error as u64 <= AUDIO_CLOCK_GUARD_MS {
                     // A small lurch is cheaper to take: the pacer's cost is at
                     // most the guard's own lead budget.
                     self.clear_jump_candidate();
@@ -4352,6 +4905,10 @@ impl PlaybackControl {
         }
         self.last_seek_target.store(target, Ordering::SeqCst);
         self.last_seek_at.store(now, Ordering::SeqCst);
+        // f211: open a fresh segment trace for this seek. Every stage between
+        // here and the first presented frame stamps itself, so one `seek trace`
+        // line carries the whole walk (see [`SeekSegments`]).
+        self.seek_seg_start(now.max(1));
         // A seek is a play command: the end-of-track state is not a pause, so a
         // seek after the last frame must start the new session immediately.
         if self.ended.load(Ordering::SeqCst) {
@@ -4504,6 +5061,68 @@ impl PlaybackControl {
 
     /// Output rate the pacer resolved for this episode (`0` = nothing to
     /// interpolate, or the mode is off).
+    /// One presented frame's interval (ms since the previous one), from either
+    /// present path. Always on: it is one relaxed atomic add per frame.
+    pub(crate) fn note_present_interval(&self, ms: f64) {
+        if !ms.is_finite() || ms < 0.0 {
+            return;
+        }
+        let bucket = ((ms / PRESENT_HIST_BUCKET_MS) as usize).min(PRESENT_HIST_BUCKETS - 1);
+        self.present_hist[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(p50, p95, samples)` of the present interval, ms.
+    pub fn present_percentiles(&self) -> (f64, f64, u64) {
+        let total: u64 = self
+            .present_hist
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .sum();
+        if total == 0 {
+            return (0.0, 0.0, 0);
+        }
+        let pick = |percent: f64| -> f64 {
+            let mut seen = 0u64;
+            for (index, bucket) in self.present_hist.iter().enumerate() {
+                seen += bucket.load(Ordering::Relaxed);
+                if seen as f64 >= (total as f64 * percent).ceil() {
+                    return (index + 1) as f64 * PRESENT_HIST_BUCKET_MS;
+                }
+            }
+            PRESENT_HIST_BUCKETS as f64 * PRESENT_HIST_BUCKET_MS
+        };
+        (pick(0.50), pick(0.95), total)
+    }
+
+    /// Publishes the last `(presented frames, average blit µs)` the 120 fps
+    /// surface reported, for the self-check line. `(0, 0)` until a session has
+    /// used the surface.
+    pub(crate) fn set_surface_receipt(&self, shown: u64, blit_us: u64) {
+        self.surface_shown.store(shown, Ordering::Relaxed);
+        self.surface_blit_us.store(blit_us, Ordering::Relaxed);
+    }
+
+    pub(crate) fn surface_receipt(&self) -> (u64, u64) {
+        (
+            self.surface_shown.load(Ordering::Relaxed),
+            self.surface_blit_us.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether the 120 fps grid is enabled for the next session.
+    pub fn interp_120(&self) -> bool {
+        self.interp_120.load(Ordering::Relaxed)
+    }
+
+    /// 帧率档位: `true` = 120 fps, `false` = 60 fps. Stored on the control and
+    /// read by the next session's plan; a running 120 grid keeps its rate until
+    /// it restarts (see `interp_plan_for`).
+    pub fn set_interp_120(&self, on: bool) {
+        if self.interp_120.swap(on, Ordering::SeqCst) != on {
+            crate::debug_log(&format!("interp fps request hz={}", if on { 120 } else { 60 }));
+        }
+    }
+
     pub fn interp_out_hz(&self) -> u32 {
         self.interp_out_hz.load(Ordering::Relaxed).min(u32::MAX as u64) as u32
     }
@@ -4971,6 +5590,9 @@ impl PlaybackControl {
     /// Set the paused state explicitly (used by the 睡眠定时).
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
+        if !paused {
+            crate::qa::f211::avsync_phase("resume");
+        }
     }
 
     /// Preferred video codec (`0` = 自动, else a DASH `codecid`).
@@ -5418,6 +6040,66 @@ impl PlaybackControl {
         self.last_seek_at.load(Ordering::SeqCst)
     }
 
+    // ---- f211: the seek's segment clock -----------------------------------
+    //
+    // Each stamp is one store, and each is guarded by "a seek is in flight"
+    // (`release != 0`), so a quality/speed restart — which moves the same
+    // generation counter — can never write into a trace that belongs to a
+    // seek. The release clears the trace when its own line is written.
+
+    fn seek_seg_start(&self, release_ms: u64) {
+        self.seek_seg.reset(release_ms);
+    }
+
+    fn seek_seg_stamp(&self, field: fn(&SeekSegments) -> &AtomicU64) {
+        let seg = &self.seek_seg;
+        if seg.release.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        field(seg).store(monotonic_ms().max(1), Ordering::SeqCst);
+    }
+
+    /// Set a boundary only the first time: a seek that falls back to a hard
+    /// restart crosses "old session gone" twice, and the trace must keep the
+    /// order of the *first* walk, not let a later stamp jump behind an earlier
+    /// one.
+    fn seek_seg_stamp_once(&self, field: fn(&SeekSegments) -> &AtomicU64) {
+        let seg = &self.seek_seg;
+        if seg.release.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let _ = field(seg).compare_exchange(0, monotonic_ms().max(1), Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn seek_seg_retire(&self) {
+        self.seek_seg_stamp_once(|seg| &seg.retire);
+    }
+
+    fn seek_seg_teardown(&self) {
+        self.seek_seg_stamp_once(|seg| &seg.teardown);
+    }
+
+    fn seek_seg_session_once(&self) {
+        self.seek_seg_stamp_once(|seg| &seg.session);
+    }
+
+    fn seek_seg_decoder(&self, kind: u64) {
+        self.seek_seg_stamp(|seg| &seg.decoder);
+        if self.seek_seg.release.load(Ordering::SeqCst) != 0 {
+            self.seek_seg.kind.store(kind, Ordering::SeqCst);
+        }
+    }
+
+    fn seek_seg_audio(&self) {
+        self.seek_seg_stamp(|seg| &seg.audio);
+    }
+
+    fn seek_seg_kind(&self, kind: u64) {
+        if self.seek_seg.release.load(Ordering::SeqCst) != 0 {
+            self.seek_seg.kind.store(kind, Ordering::SeqCst);
+        }
+    }
+
     /// Compact, comparable view of the download map the 下载分布 panel draws:
     /// `(digest, ranges, bytes)`. Two dumps with the same digest describe the
     /// same byte ranges, which is how the seek test proves the map does not
@@ -5794,16 +6476,16 @@ impl PlaybackControl {
     }
 
     /// Record the frame size the running decode session produces.
-    fn set_frame_size(&self, size: FrameSize) {
+    pub(crate) fn set_frame_size(&self, size: FrameSize) {
         self.frame_w.store(size.w as u64, Ordering::Relaxed);
         self.frame_h.store(size.h as u64, Ordering::Relaxed);
     }
 
-    fn frame_width(&self) -> u32 {
+    pub(crate) fn frame_width(&self) -> u32 {
         self.frame_w.load(Ordering::Relaxed).min(u32::MAX as u64) as u32
     }
 
-    fn frame_height(&self) -> u32 {
+    pub(crate) fn frame_height(&self) -> u32 {
         self.frame_h.load(Ordering::Relaxed).min(u32::MAX as u64) as u32
     }
 
@@ -5973,6 +6655,14 @@ impl PlaybackControl {
     /// Whether audio is currently muted.
     pub fn muted(&self) -> bool {
         self.muted.load(Ordering::SeqCst)
+    }
+
+    /// Whether this session's sound is still held silent until a first frame.
+    ///
+    /// 仅音频 has no frame to wait for, so the latch must never be armed in that
+    /// mode (see [`arm_audio_hold`]). The QA receipt reads it through here.
+    pub fn audio_hold(&self) -> bool {
+        self.audio_hold_silent.load(Ordering::SeqCst)
     }
 
     /// Set the mute state through the session (restart only when it is not up).
@@ -7698,6 +8388,54 @@ fn run(
             });
         }
     }
+    // f211: the 音画同步 sampler (`BILI_AVSYNC_TEST=<tag>`). A plain thread
+    // reading the two published positions, so the report can put a delta on
+    // every phase (playing, after a seek, after a switch, after a resume)
+    // instead of trusting one hand-picked instant.
+    crate::qa::f211::spawn_avsync(control.clone());
+    // f211 QA (`BILI_PAUSE_AT=<secs>[,<hold_ms>]`): a real user pause and
+    // resume through `toggle_paused` — the same call the space bar and the
+    // play/pause button make — so the 暂停→恢复 A/V samples are of the shipped
+    // path and not of a synthetic suspend.
+    if let Some(spec) = crate::qa::env::var("BILI_PAUSE_AT") {
+        let at_ms = spec
+            .split(',')
+            .next()
+            .and_then(|part| part.trim().parse::<f64>().ok())
+            .filter(|secs| *secs >= 0.0)
+            .map(|secs| (secs * 1000.0) as u64);
+        let hold_ms = spec
+            .split(',')
+            .nth(1)
+            .and_then(|part| part.trim().parse::<u64>().ok())
+            .unwrap_or(2_000)
+            .clamp(200, 30_000);
+        if let Some(at_ms) = at_ms {
+            let control = control.clone();
+            std::thread::spawn(move || {
+                for _ in 0..600 {
+                    if control.is_closed() {
+                        return;
+                    }
+                    if control.presented_position_ms() >= at_ms {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let paused = control.toggle_paused();
+                crate::debug_log(&format!(
+                    "pause-at resume=0 at_ms={at_ms} paused={}",
+                    u8::from(paused)
+                ));
+                std::thread::sleep(Duration::from_millis(hold_ms));
+                let paused = control.toggle_paused();
+                crate::debug_log(&format!(
+                    "pause-at resume=1 hold_ms={hold_ms} paused={}",
+                    u8::from(paused)
+                ));
+            });
+        }
+    }
     // QA hook (`BILI_SEEK_AT=<secs,secs,...>`): issue a scripted sequence of
     // real user seeks through `PlaybackControl::seek`, one every
     // `BILI_SEEK_AT_EVERY_MS` (default 3000) after `BILI_SEEK_AT_DELAY_MS`
@@ -8769,6 +9507,61 @@ fn log_seek_served(control: &PlaybackControl, wait: &SeekWait, pushes: u64) {
         wait.buffered,
         u8::from(map_same)
     ));
+    // f211: the next samples are the served seek's own A/V relation.
+    crate::qa::f211::avsync_phase("seek");
+    log_seek_trace(control);
+}
+
+/// The segment table of the seek that just served, one line.
+///
+/// `seek served` says how long the user waited; this says where the time went.
+/// The six numbers chain: `ui_ms` (release → the pacer notices), `teardown_ms`
+/// (old session killed and joined), `setup_ms` (new session: stream resolved,
+/// size decided), `decoder_ms` (MF seek/reopen, or the ffmpeg spawn), `audio_ms`
+/// (ffplay restarted at the target), `present_ms` (first frame on screen). A
+/// `-` is a stage this seek never crossed (a pre-rolled shadow has no teardown).
+fn log_seek_trace(control: &PlaybackControl) {
+    let (release, retire, teardown, session, decoder, audio, kind) = control.seek_seg.snapshot();
+    if release == 0 {
+        return;
+    }
+    let served = monotonic_ms().max(1);
+    let seg = |from: u64, to: u64| -> String {
+        if from == 0 || to == 0 || to < from {
+            "-".to_string()
+        } else {
+            (to - from).to_string()
+        }
+    };
+    let kind = match kind {
+        SeekSegments::KIND_FFMPEG => "ffmpeg",
+        SeekSegments::KIND_MF_SEEK => "mf-seek",
+        SeekSegments::KIND_MF_OPEN => "mf-open",
+        SeekSegments::KIND_SHADOW => "shadow",
+        SeekSegments::KIND_MF_INPLACE => "mf-inplace",
+        _ => "?",
+    };
+    // An in-place seek crosses no session boundary, so it has no `session`
+    // stamp: the decoder segment then starts where the pacer noticed the
+    // release, and the teardown/setup columns stay `-` (there was none).
+    let setup_from = if session != 0 {
+        session
+    } else {
+        teardown.max(retire)
+    };
+    crate::debug_log(&format!(
+        "seek trace kind={kind} total_ms={} ui_ms={} teardown_ms={} setup_ms={} decoder_ms={} audio_ms={} present_ms={} ring={}",
+        seg(release, served),
+        seg(release, retire),
+        seg(retire, teardown),
+        seg(teardown, session),
+        seg(setup_from, decoder),
+        seg(decoder, audio),
+        seg(if audio != 0 { audio } else { decoder }, served),
+        control.ring_len()
+    ));
+    // One trace per seek: the next release opens a new one.
+    control.seek_seg.release.store(0, Ordering::SeqCst);
 }
 
 /// Arm the seek overlay once the release's silent window has expired.
@@ -9558,6 +10351,8 @@ fn log_session_first_present(control: &PlaybackControl, stream: Option<(i64, i64
         "session first present qn={qn} codecid={codecid} bandwidth={bandwidth} switch_qn={want_qn} switch_after_ms={after_ms} matched={}",
         u8::from(qn == want_qn)
     ));
+    // f211: the samples that follow belong to the tier that just came up.
+    crate::qa::f211::avsync_phase("switch");
 }
 
 /// How the A/V guard silences the audio child.
@@ -9998,6 +10793,8 @@ fn decode_loop(
     let mut ofa_engine = ofa::Ofa::new();
     // The engine has a live device and an OF session (set by the attach worker).
     let mut ofa_engine_open = false;
+    // f200: logged once when the pacer starts handing pairs to the GPU warp.
+    let mut gpu_warp_logged = false;
     // Sticky for this decode loop: mode 3 gave up, every later interval blends.
     // `None` means the mode may still attach; a user mode change clears it so a
     // later re-entry can retry.
@@ -10010,10 +10807,17 @@ fn decode_loop(
     // A target the pacer took for a shadow and could not keep (a fallback, or a
     // session end while it pre-rolled): the next session starts exactly here.
     let mut restart_at: Option<u64> = None;
+    // f211: an in-place zero-copy seek waiting for its first display slot. The
+    // picture is frozen by the release, the decoder already moved; this holds
+    // the receipt (and the give-up bound) for it.
+    let mut seek_inplace: Option<SeekWait> = None;
     loop {
         if control.is_closed() {
             return Ok(());
         }
+        // f211: a new session is starting — if it is serving a seek, this is the
+        // boundary between "old session gone" and "stream resolved".
+        control.seek_seg_session_once();
         // 选集 switch: this decode session belongs to the video being left. The
         // `run` loop re-arms on the new source (new playurl / tracks / danmaku),
         // so this one exits here — before a paused hold could keep it alive.
@@ -10035,7 +10839,9 @@ fn decode_loop(
             restart_at.take().or_else(|| control.take_pending_seek())
         };
         let mut seen_seek = control.seek_seq();
-        let start_ms = adopted
+        // `mut`: an in-place seek moves this session's timeline to the new
+        // target without ending the session (see the pacer's seek branch).
+        let mut start_ms = adopted
             .as_ref()
             .map(|shadow| shadow.target_ms)
             .or(pending_seek)
@@ -10168,6 +10974,22 @@ fn decode_loop(
             Some(path) => (path.display().to_string(), true),
             None => (video_url, false),
         };
+        // f209 QA (`BILI_QA_MF_FILE`): play a local sample instead of the
+        // network stream. The decoder, the sink and the pacer all run exactly as
+        // they do on a DASH stream (the sample is real H.264 1080p30), which is
+        // how the zero-copy path is accepted on a machine whose account cannot
+        // reach 1080p. The session's own audio is dropped: the sample has none,
+        // and the pacer then paces on the wall clock.
+        let qa_file = crate::qa::env::var("BILI_QA_MF_FILE");
+        let (video_url, local_play) = match qa_file.as_deref() {
+            Some(path) => (path.to_string(), true),
+            None => (video_url, local_play),
+        };
+        if qa_file.is_some() {
+            // The sample is 60 s (same shape `scripts/qa-f209.ps1` generates);
+            // the API duration belongs to the video the app *thinks* it opened.
+            control.set_duration_ms(60_000);
+        }
         let via = if local_play {
             "cache-file"
         } else if video_url.starts_with("http://127.0.0.1:") {
@@ -10282,7 +11104,12 @@ fn decode_loop(
         let decode = target_frame_size(source_size.0, source_size.1);
         // What the ring and the UI carry: the window's picture band (默认) or
         // the source size when 原始分辨率 is on.
-        let out = reader_output_size(decode, (display_w, display_h), control.native_frame_size());
+        let out = reader_output_size(
+            decode,
+            (display_w, display_h),
+            control.native_frame_size(),
+            control.interp_mode() != 0,
+        );
         // An adopted shadow's ring was produced at the size it was started with:
         // the session must keep exactly that size, whatever the window says now.
         let (out, capacity) = match adopted.as_ref() {
@@ -10336,7 +11163,16 @@ fn decode_loop(
         // The swap receipt, logged at the first frame the adopted session
         // presents (the instant the user's target becomes visible).
         let mut swap_trace: Option<SwapTrace> = None;
-        let audio_url = control.audio_url_for(info);
+        // f209: this session decodes through Media Foundation, and the sink owns
+        // the picture. `mf_sink` is what the pacer hands its display slots to.
+        let mut mf_video = false;
+        let audio_url = if qa_file.is_some() {
+            // The QA sample has no audio track: no ffplay, and the pacer paces
+            // on the wall clock exactly as it does when a stream has no sound.
+            None
+        } else {
+            control.audio_url_for(info)
+        };
         // Snapshot the audio-restart trigger *before* this session starts its
         // audio process: a request that lands during the spawn is then still
         // seen by the loop below instead of being swallowed.
@@ -10387,7 +11223,15 @@ fn decode_loop(
                 control.audio_hold_silent.store(false, Ordering::SeqCst);
             }
         } else {
-            video_child = if audio_only {
+            // f209: the zero-copy path first. It needs the DComp video layer,
+            // a video track and an open decoder; every failure is logged as
+            // `decode fallback reason=…` and the pipe below runs unchanged.
+            if !audio_only {
+                mf_video =
+                    start_mf_session(mailbox, control, &video_url, local_play, start_ms, out)
+                        .is_some();
+            }
+            video_child = if audio_only || mf_video {
                 None
             } else {
                 Some(
@@ -10436,7 +11280,7 @@ fn decode_loop(
                 });
             control.decoder_live.store(true, Ordering::SeqCst);
 
-            let stdout = if audio_only {
+            let stdout = if audio_only || mf_video {
                 None
             } else {
                 match video_child.as_mut().and_then(|child| child.stdout.take()) {
@@ -10462,6 +11306,25 @@ fn decode_loop(
             source = stdout.map(|stdout| {
                 FrameSource::spawn(stdout, control.clone(), spawn_ms, out, frame_ms, capacity)
             });
+            if mf_video {
+                // No pipe, no frame: the sink's decoder is the picture. The
+                // pacer still gets one item per source interval so everything
+                // that measures time (the clock, the position, the grid) runs
+                // exactly as it does on the pipe.
+                source = Some(FrameSource::phantom(
+                    control.clone(),
+                    spawn_ms,
+                    out,
+                    frame_ms,
+                    start_ms,
+                    control.duration_ms(),
+                ));
+            }
+            // f211: the decoder of this session is up (the ffmpeg pipe was just
+            // spawned; the MF case stamped itself inside `start_mf_session`).
+            if !mf_video {
+                control.seek_seg_decoder(SeekSegments::KIND_FFMPEG);
+            }
             // Now that the video reader owns the pipe, start the sound for this
             // session (silent until the first frame, see above).
             audio_child = audio_url
@@ -10469,6 +11332,10 @@ fn decode_loop(
                 .and_then(|url| start_audio(url, start_ms, speed, !audio_only, control));
             has_audio = audio_child.is_some();
             audio_start_attempted = has_audio;
+            // f211: the sound for this session exists (or there is none to
+            // start). The seek trace separates this from the picture's own
+            // first frame, so "the audio restart" can be judged on its own.
+            control.seek_seg_audio();
             if has_audio {
                 audio_gate.set_pid(control.audio_pid());
                 // The sound is suspended until this session's first frame —
@@ -10484,7 +11351,14 @@ fn decode_loop(
                 // Suspended, its clock stands at the session's start position,
                 // which is the held frame, and `first_frame_handover` releases
                 // it in the same instant as the push.
-                if audio_gate.pause(false) {
+                //
+                // 仅音频 is the exception: this session decodes NO video, so the
+                // first frame that releases the sound can never arrive and a
+                // suspend here left the switch silent for its whole life (the
+                // 仅音频 QA run measured `audible=none`, `audio_clock=0` and a
+                // frozen `fps_presented`). The sound IS the picture there, so it
+                // starts and keeps running.
+                if !audio_only && audio_gate.pause(false) {
                     crate::debug_log(&format!(
                         "av audio pid={} action=pause via=suspend reason={}",
                         control.audio_pid(),
@@ -10578,6 +11452,12 @@ fn decode_loop(
         // not faster than the track.
         let mut interp_plan: Option<InterpPlan> = None;
         let mut interp_plan_checked = false;
+        // f209: the MF path degraded its grid once (no GPU warp) - logged once.
+        let mut mf_plan_degraded = false;
+        // The wall clock of the last display slot handed to the MF sink, so the
+        // slots are spaced one display period apart even when the clock hold
+        // released a whole interval at once.
+        let mut last_mf_slot: Option<Instant> = None;
         // Display tick grid; reset whenever interpolation (re)starts.
         let mut interp_ticker: Option<InterpTicker> = None;
         // The rate the current grid steps at (`1000 / out_hz` of video time). A
@@ -10645,6 +11525,9 @@ fn decode_loop(
             .map(|value| value == "1")
             .unwrap_or(false);
         let mut last_beat = Instant::now();
+        // 仅音频's startup receipt: logged once when its clock first appears (see
+        // the `None` arm below), so the log can tell "no clock" from "no sound".
+        let mut audio_only_receipt = false;
 
         match source.as_ref() {
             Some(source) => {
@@ -10823,6 +11706,9 @@ fn decode_loop(
                     // newer release replaces the shadow in flight: one pre-roll at
                     // a time, the last target wins.
                     if control.seek_seq() != seen_seek || control.has_pending_seek() {
+                        // f211: the pacer has noticed the release and is about
+                        // to stop presenting this session — the first segment.
+                        control.seek_seg_retire();
                         if let Some(target) = control.take_pending_seek() {
                             let seq = control.seek_seq();
                             let same_target =
@@ -10838,15 +11724,92 @@ fn decode_loop(
                                 if let Some(previous) = shadow.take() {
                                     previous.dispose("replaced");
                                 }
+                                // A newer release replaces an in-place seek that
+                                // has not presented yet: the last target wins,
+                                // exactly like the shadow path.
+                                seek_inplace = None;
+                                // f211: the zero-copy path moves the session it
+                                // already has. `mf_seek` is a flush plus a
+                                // reposition, so there is nothing to tear down
+                                // and nothing to resolve again — the seek is
+                                // served from the display grid that is already
+                                // running (see [`start_inplace_seek`]).
+                                if mf_video
+                                    && pushes > 0
+                                    && !audio_only
+                                    && start_inplace_seek(
+                                        control,
+                                        mailbox,
+                                        target,
+                                        &mut audio_child,
+                                        &mut audio_gate,
+                                    )
+                                {
+                                    // The pacer's own timeline starts again at
+                                    // the target: this session's clock, its
+                                    // display grid and its A/V seed all rebase
+                                    // here, which is why the next iteration
+                                    // anchors `played` at `target` (frames = 0)
+                                    // and the sink is asked for pictures of the
+                                    // new position from its very next slot.
+                                    start_ms = target;
+                                    frames = 0;
+                                    last = Instant::now();
+                                    played = Duration::from_millis(target);
+                                    interp_ticker = None;
+                                    // The first slot of the new position is due
+                                    // now, not on the grid the old position
+                                    // left: the user is waiting for it.
+                                    last_mf_slot = None;
+                                    ofa_prev = None;
+                                    ofa_pending_prev = None;
+                                    seed_done = false;
+                                    let requested_at_ms = control.seek_requested_at_ms();
+                                    let waited = monotonic_ms().saturating_sub(requested_at_ms);
+                                    seek_inplace = Some(SeekWait {
+                                        target,
+                                        published: control.seek_buffering(),
+                                        buffered: false,
+                                        deadline: Instant::now()
+                                            + Duration::from_millis(
+                                                SEEK_FREEZE_OVERLAY_MS.saturating_sub(waited),
+                                            ),
+                                        requested_at_ms,
+                                        map_before: control.prefetch_map_dump(),
+                                        bytes_before: control
+                                            .prefetch_raw_stats()
+                                            .map(|stats| stats.bytes_fetched)
+                                            .unwrap_or(0),
+                                    });
+                                    seen_seek = seq;
+                                    continue;
+                                }
                                 // The picture is what makes a shadow worth it:
                                 // with no frame of this session on screen there
                                 // is nothing to keep, and the hard restart is
                                 // already the shortest path.
-                                if pushes > 0 && !audio_only {
+                                //
+                                // f209: a shadow is an *ffmpeg* session
+                                // (`SeekShadow::start` spawns a decoder of its
+                                // own), and adopting one after a seek would
+                                // quietly leave the zero-copy path for the rest
+                                // of the session. With MF the seek goes through
+                                // `MfVideoDecoder::seek` instead, which is the
+                                // decoder's own flush + reposition.
+                                if pushes > 0 && !audio_only && !mf_video {
                                     match SeekShadow::start(
                                         control, info, target, seq, hwaccel, speed,
                                     ) {
-                                        Ok(started) => shadow = Some(started),
+                                        Ok(started) => {
+                                            // f211: a shadow serves the seek
+                                            // without a session restart, so the
+                                            // trace keeps the release and reports
+                                            // the rest as `-`.
+                                            control.seek_seg_kind(
+                                                SeekSegments::KIND_SHADOW,
+                                            );
+                                            shadow = Some(started)
+                                        }
                                         Err(err) => {
                                             crate::debug_log(&format!(
                                                 "seek shadow failed target_ms={target} err={err}"
@@ -10918,6 +11881,32 @@ fn decode_loop(
                                 break;
                             }
                         }
+                    }
+                    // ---- f211: an in-place seek, waiting for its first slot ---
+                    // The decoder is already at the new position; what is left is
+                    // the display grid's next slot. The release closed the
+                    // mailbox gate, so this reopens it here — a whole session
+                    // earlier than the restart path could. If no picture lands
+                    // inside the give-up bound (a sink that stopped drawing),
+                    // the seek goes back to the restart path rather than leaving
+                    // the player frozen.
+                    if let Some(wait) = seek_inplace.as_mut() {
+                        let overdue =
+                            monotonic_ms().saturating_sub(wait.requested_at_ms)
+                                >= SEEK_INPLACE_GIVE_UP_MS;
+                        if overdue {
+                            let target = wait.target;
+                            crate::debug_log(&format!(
+                                "seek inplace fallback target_ms={target} reason=no-picture gave_up_ms={}",
+                                monotonic_ms().saturating_sub(wait.requested_at_ms)
+                            ));
+                            seek_inplace = None;
+                            restart_at = Some(target);
+                            seeking = true;
+                            break;
+                        }
+                        arm_seek_overlay(control, wait);
+                        control.end_picture_freeze();
                     }
                     // ---- f151: the release froze the picture ------------------
                     // A seek no longer keeps the old session playing while the
@@ -11416,7 +12405,19 @@ fn decode_loop(
                     );
                     if want_active && !interp_plan_checked {
                         interp_plan_checked = true;
-                        interp_plan = interp_plan_for(display_refresh_hz(), 1000.0 / frame_ms);
+                        interp_plan = interp_plan_for(
+                            display_refresh_hz(),
+                            1000.0 / frame_ms,
+                            interp_out_ceiling_for(
+                                target,
+                                control.interp_120(),
+                                mf_video,
+                            ),
+                        );
+                        // `BILI_INTERP_PROBE=1`: the UI thread's own cadence,
+                        // so a 120 Hz grid that the window cannot paint is
+                        // visible as gaps rather than inferred from fps alone.
+                        start_interp_ui_probe(window);
                         match interp_plan {
                         Some(plan) => {
                             if let Some(reason) = plan.reason {
@@ -11450,6 +12451,29 @@ fn decode_loop(
                     // one-push-per-source-frame path runs instead. Audio, the
                     // decoder and the clock are untouched.
                     let interp_ready = want_active && interp_plan.is_some();
+                    // f209: the MF path interpolates only through the GPU warp.
+                    // If that did not build (no `nvofapi64.dll`, a refused
+                    // session), the grid degrades to 2x - 60 real pictures from a
+                    // 30 fps source - instead of showing the same picture four
+                    // times in a row. Said once, per session.
+                    if mf_video && interp_ready && !mf_plan_degraded && pushes >= 60 {
+                        if let Some(plan) = interp_plan {
+                            if plan.out_hz > 60 && !mailbox.mf_warp() {
+                                mf_plan_degraded = true;
+                                interp_plan = interp_plan_for(
+                                    display_refresh_hz(),
+                                    1000.0 / frame_ms,
+                                    60,
+                                );
+                                crate::debug_log(&format!(
+                                    "interp degrade out_hz=60 reason=mf_no_ofa display_hz={} frame={}x{}",
+                                    display_refresh_hz(),
+                                    target.w,
+                                    target.h
+                                ));
+                            }
+                        }
+                    }
                     let drag_paused = interp_ready && interp_paused_for_drag();
                     let interp_active = interp_ready && !drag_paused;
                     // Mode 2 keeps the same display grid; only its mid-interval
@@ -11482,6 +12506,14 @@ fn decode_loop(
                     // if it fails or overruns its budget) every interval is a
                     // plain blend, so the picture keeps moving.
                     let ofa_mode = interp_active && interp_mode == InterpMode::Ofa;
+                    // f200: mode 3 on the GPU. The sink warps the pair into the
+                    // video layer's backbuffer itself, so this loop only hands
+                    // over (a, b, phase) and the CPU never touches a frame - no
+                    // upload, no readback, no warp, no staging copy. Resolved
+                    // before the attach chain so the pacer does not build an
+                    // optical-flow session of its own (on a second device) when
+                    // the sink is going to own it.
+                    let gpu_warp = ofa_mode && mailbox.dcomp_warp_ready();
                     if !ofa_mode {
                         // Leaving the mode abandons an in-flight attempt and
                         // clears the sticky failure so a later re-entry retries.
@@ -11492,10 +12524,16 @@ fn decode_loop(
                         ofa_disabled = None;
                     }
                     let mut ofa_ok = ofa_mode && ofa_disabled.is_none() && ofa_ready;
-                    if ofa_mode && ofa_disabled.is_none() && !ofa_ok {
-                        if pushes == 0 {
+                    if ofa_mode && !gpu_warp && ofa_disabled.is_none() && !ofa_ok {
+                        if pushes < 2 {
                             // The first source frame is presented now; OFA must
-                            // not do any work before it reaches the UI.
+                            // not do any work before it reaches the UI. Two
+                            // frames (not one) because the DComp path only
+                            // publishes its sink to this loop from the UI
+                            // thread's first `show()` - one frame later the
+                            // sink is known and `gpu_warp` can be answered here
+                            // without building a second optical-flow session on
+                            // a second device.
                         } else if !interp_ofa_size_ok(target) {
                             ofa_disabled = Some("frame_too_large");
                             announce_ofa_disabled(window, "frame_too_large", target);
@@ -11621,6 +12659,20 @@ fn decode_loop(
                         ofa_pending_prev = None;
                         ofa_flow = None;
                         ofa_budget = OfaBudget::new();
+                    }
+                    // f200: mode 3 on the GPU. The sink warps the pair into the
+                    // video layer's backbuffer itself, so this loop only hands
+                    // over (a, b, phase) and the CPU never touches a frame.
+                    // `warp_ready` is false until the sink has built the shaders
+                    // and the optical-flow session on its own device, and goes
+                    // back to false if any of that fails - in both cases the
+                    // staged path below runs unchanged.
+                    if gpu_warp && !gpu_warp_logged {
+                        gpu_warp_logged = true;
+                        crate::debug_log(&format!(
+                            "ofa gpu warp active frame={}x{} device=video-sink",
+                            target.w, target.h
+                        ));
                     }
                     // The rate is the plan's, not the (possibly suspended)
                     // generation state: while a drag is in flight the label
@@ -12190,7 +13242,7 @@ fn decode_loop(
                     // readback + warp). The gate is consulted once per interval;
                     // the submit at its end obeys the same answer.
                     let mut ofa_interval = false;
-                    if ofa_ok {
+                    if ofa_ok && !gpu_warp {
                         // A pair costs roughly a third of the interval it runs
                         // in; the rest belongs to the blend/push of its slots.
                         if !ofa_budget_logged {
@@ -12275,6 +13327,15 @@ fn decode_loop(
                                 (ticker.step_ms / speed.max(1.0e-3)) as f32;
                             let pair_budget_ms = (wall_slot_ms * 0.9).clamp(5.0, 30.0);
                             while ticker.next_ms < tick_end {
+                                // f211: a release must not wait for the rest of
+                                // this interval's display slots. At 120 Hz that
+                                // is up to three slots — 25 ms of latency the
+                                // user pays for a picture that is already
+                                // obsolete. Leaving here hands the release to
+                                // the next pacer iteration, which serves it.
+                                if control.has_pending_seek() {
+                                    break;
+                                }
                                 let live = interp_clock_ms(
                                     control,
                                     use_audio,
@@ -12299,6 +13360,31 @@ fn decode_loop(
                                     ticker.next_ms,
                                 );
                                 dip.interp(tick_wait);
+                                // f209: the MF path draws on the sink's own
+                                // thread, and a burst of four slots is four
+                                // presents inside one compositor interval - three
+                                // of them lost. The slots are therefore also
+                                // spaced on the wall clock, one display period
+                                // apart, whatever the clock hold above did.
+                                if mf_video {
+                                    // Pace to a fixed grid (`last + step`), not to
+                                    // "step after I finished": the sleep granularity
+                                    // here is ~1 ms, and accumulating it turned
+                                    // 120 slots/s into 116 (one skipped slot every
+                                    // few intervals). Landing on the grid absorbs
+                                    // the overshoot instead of compounding it.
+                                    let step = Duration::from_secs_f64(
+                                        (ticker.step_ms / speed.max(1.0e-3) / 1000.0).max(0.0),
+                                    );
+                                    let due = last_mf_slot
+                                        .map(|at| at + step)
+                                        .unwrap_or_else(Instant::now);
+                                    let now_slot = Instant::now();
+                                    if due > now_slot {
+                                        std::thread::sleep(due - now_slot);
+                                    }
+                                    last_mf_slot = Some(due);
+                                }
                                 // Phase from the audio clock: the blend matches the
                                 // sound position, not the wall clock.
                                 let live = interp_clock_ms(
@@ -12340,11 +13426,42 @@ fn decode_loop(
                                 // does for a fraction of the cost.
                                 let warp_slot = ofa_pair.is_some()
                                     && (0.125..=0.875).contains(&phase);
-                                let mut buffer = blend_pool.take(target);
+                                // f200: with the GPU warp the whole slot is one
+                                // draw inside the sink - no pool buffer, no
+                                // CPU pass, no upload. The pair rides along with
+                                // every slot; the sink uploads it once.
+                                let mut gpu_sent = false;
+                                if mf_video {
+                                    // f209: the picture never leaves the GPU.
+                                    // The slot names an instant; the sink picks
+                                    // the decoder surfaces around it and draws
+                                    // them (warp or copy) itself.
+                                    gpu_sent =
+                                        mailbox.submit_tick(video_ms.max(0) as u64, frames);
+                                } else if gpu_warp {
+                                    if let Some(next) = next_frame.as_ref() {
+                                        gpu_sent = mailbox.submit_warp(
+                                            frame.clone(),
+                                            next.clone(),
+                                            phase as f32,
+                                            frames,
+                                        );
+                                    }
+                                }
+                                let mut buffer = if gpu_sent {
+                                    // Nothing is written to it (the sink draws),
+                                    // and it must not come from the pool: the
+                                    // pool would starve and never be refilled.
+                                    FrameBuf::new(1, 1)
+                                } else {
+                                    blend_pool.take(target)
+                                };
                                 let buffer_bytes = buffer.make_mut_bytes();
                                 let pass_start = Instant::now();
                                 let mut pair_ms = None;
-                                let mut warped = false;
+                                // `warped` also silences the CPU fills below when
+                                // the GPU took the slot.
+                                let mut warped = gpu_sent;
                                 if warp_slot {
                                     if let Some((flow, gw, gh)) = ofa_flow.as_ref() {
                                         let warp_start = Instant::now();
@@ -12504,10 +13621,43 @@ fn decode_loop(
                                 control
                                     .presented_ms
                                     .store(video_ms.max(0) as u64, Ordering::SeqCst);
-                                mailbox.push(MailFrame {
-                                    buffer,
-                                    pooled: true,
-                                });
+                                if gpu_sent {
+                                    // The sink drew this slot into the
+                                    // backbuffer; the pool buffer taken for it
+                                    // was never written.
+                                    if !mf_video {
+                                        blend_pool.recycle(buffer);
+                                    }
+                                    // f211: the first slot the sink took after an
+                                    // in-place seek *is* the new position's
+                                    // picture — the receipt, and the instant the
+                                    // rebuilt sound of that position may be
+                                    // heard.
+                                    if let Some(wait) = seek_inplace.take() {
+                                        control.clear_position_hold();
+                                        log_seek_served(control, &wait, pushes);
+                                        // The sound of the position that just
+                                        // went on screen starts *behind* it: a
+                                        // `ffplay` spawn never delays the
+                                        // picture, and the pair is audible
+                                        // together a few ms later.
+                                        restart_audio_holding_at(
+                                            control,
+                                            &mut audio_child,
+                                            &mut audio_gate,
+                                            info,
+                                            video_ms.max(0) as u64,
+                                            speed,
+                                            "seek",
+                                        );
+                                        control.release_audio_hold_now();
+                                    }
+                                } else {
+                                    mailbox.push(MailFrame {
+                                        buffer,
+                                        pooled: true,
+                                    });
+                                }
                                 if first_tick {
                                     first_tick = false;
                                     // The seek is served: the picture the user
@@ -12589,7 +13739,11 @@ fn decode_loop(
                             // reference counted, so keeping it costs one atomic
                             // increment here and no copy at all — the copy only
                             // happens when a screenshot is actually taken.
-                            control.store_last_frame(&frame, target);
+                            // (The MF path has no CPU picture to keep: 截图 on that
+                            // path falls back to the OS capture.)
+                            if !mf_video {
+                                control.store_last_frame(&frame, target);
+                            }
                             last_push = Instant::now();
                         }
                     } else if !behind {
@@ -12702,10 +13856,36 @@ fn decode_loop(
                         control
                             .presented_ms
                             .store(video_ms.max(0) as u64, Ordering::SeqCst);
-                        mailbox.push(MailFrame {
-                            buffer: frame,
-                            pooled: false,
-                        });
+                        if mf_video {
+                            // f209: the sink draws from the decoder's surfaces;
+                            // this frame is a placeholder that carries the clock.
+                            let taken = mailbox.submit_tick(video_ms.max(0) as u64, frames);
+                            // f211: the first slot the sink took after an
+                            // in-place seek is the new position's picture.
+                            if taken {
+                                if let Some(wait) = seek_inplace.take() {
+                                    control.clear_position_hold();
+                                    log_seek_served(control, &wait, pushes);
+                                    // The sound follows the picture here too
+                                    // (see the display-rate path).
+                                    restart_audio_holding_at(
+                                        control,
+                                        &mut audio_child,
+                                        &mut audio_gate,
+                                        info,
+                                        video_ms.max(0) as u64,
+                                        speed,
+                                        "seek",
+                                    );
+                                    control.release_audio_hold_now();
+                                }
+                            }
+                        } else {
+                            mailbox.push(MailFrame {
+                                buffer: frame,
+                                pooled: false,
+                            });
+                        }
                         // The seek is served: the picture the user picked is on
                         // screen, so the overlay closes in this same frame.
                         if let Some(wait) = seek_wait.take() {
@@ -12809,11 +13989,14 @@ fn decode_loop(
                             ));
                         }
                     }
+                    let (_, mailbox_coalesced, _, mailbox_shown) = mailbox.counters();
                     interp_log.tick(
                         control,
                         interp_mode.as_u8(),
                         out_hz,
                         blend_pool.misses(),
+                        (mailbox_shown, mailbox_coalesced),
+                        mailbox.surface_counters(),
                     );
                     profiler.tick(control, now);
                 }
@@ -12829,6 +14012,25 @@ fn decode_loop(
             None => loop {
                 if control.is_closed() {
                     break;
+                }
+                if !audio_only_receipt {
+                    if let Some(clock_ms) = control.audio_clock() {
+                        audio_only_receipt = true;
+                        let pid = control.audio_pid();
+                        let audible = crate::win::audio_session_get(pid)
+                            .map(|(level, mute)| !mute && level > 0.001);
+                        crate::debug_log(&format!(
+                            "audio-only on pid={pid} hold={} clock_ms={clock_ms} pos_ms={} muted={} audible={}",
+                            u8::from(control.audio_hold()),
+                            control.playback_position_ms(),
+                            u8::from(control.muted()),
+                            match audible {
+                                Some(true) => "1",
+                                Some(false) => "0",
+                                None => "none",
+                            },
+                        ));
+                    }
                 }
                 if control.is_paused() || control.occluded() {
                     // 仅音频: the sound *is* the picture, so a pause holds this
@@ -13024,6 +14226,12 @@ fn decode_loop(
             tag_here("pacer:join-reader");
             source.stop();
         }
+        // f209: the MF session belongs to this decode session. It is *kept* for
+        // the next one (a seek then costs `MfVideoDecoder::seek` instead of a
+        // reopen), and `mf_open` replaces it when the stream itself changed.
+        // Nothing decodes while no tick arrives, and the queue holds at most a
+        // couple of surfaces, so a paused player does not stockpile frames.
+
         if let Some(proc) = audio_child.take() {
             tag_here("pacer:audio-stop");
             proc.stop();
@@ -13042,6 +14250,10 @@ fn decode_loop(
             return Ok(());
         }
         if seeking || mode_changed {
+            // f211: everything this session owned is gone (decoder killed,
+            // reader joined, sound stopped). The next session's setup is the
+            // next segment.
+            control.seek_seg_teardown();
             continue;
         }
         // A decoder read failure away from the end restarts the session at the
@@ -13094,6 +14306,10 @@ struct FrameRing {
 struct FrameSource {
     ring: Arc<(Mutex<FrameRing>, Condvar)>,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// f209: a source with **no pipe**. The MF sink owns the picture, so the
+    /// pacer only needs one item per source interval to keep its clock, its
+    /// position and its display grid moving; nothing here carries pixels.
+    phantom: Option<PhantomSource>,
     /// Profiler counters: the reader counts decoded frames and publishes the
     /// ring occupancy, and the pacer updates it after every pop.
     control: Arc<PlaybackControl>,
@@ -13228,7 +14444,9 @@ impl FrameSource {
                             // carries the size the UI draws (ffmpeg's swscale is
                             // SSE2-optimised; the scalar downscale this used to
                             // do on the reader cost 0.74 cores at 1080p→668p).
-                            nv12_to_rgba(slot.make_mut_bytes(), &pipe_buffer, pixel_w, pixel_h);
+                            present_probe::timed(present_probe::CONV, || {
+                                nv12_to_rgba(slot.make_mut_bytes(), &pipe_buffer, pixel_w, pixel_h)
+                            });
                         }
                         tag_here("reader:wait-ring");
                         let Ok(mut guard) = lock.lock() else { return };
@@ -13302,6 +14520,7 @@ impl FrameSource {
         Self {
             ring,
             reader: Some(reader),
+            phantom: None,
             control,
             publish,
             first_at_ms,
@@ -13311,6 +14530,71 @@ impl FrameSource {
     /// Whether this source's ring belongs to the player (see [`Self::publish`]).
     fn publish(&self) -> bool {
         self.publish.load(Ordering::Relaxed)
+    }
+
+    /// f209: the clock-only source of a session whose pictures come from the
+    /// Media Foundation decoder inside the video sink.
+    ///
+    /// Every pacer path stays exactly as it was - the same clock, the same
+    /// position bookkeeping, the same A/V guard, the same display grid - and the
+    /// only thing that changes is where the pixels come from. The frame handed
+    /// out is a 2x2 placeholder that no one draws: the pacer forwards its own
+    /// `video_ms` to the sink and the sink picks the decoder surface for it.
+    ///
+    /// The buffer guards read one number (`ring_len`), and for this path the
+    /// honest one is "the engine holds a couple of decoded pictures": publishing
+    /// 0 would make the player believe it is buffering forever.
+    fn phantom(
+        control: Arc<PlaybackControl>,
+        spawn_ms: u64,
+        _size: FrameSize,
+        frame_ms: f64,
+        start_ms: u64,
+        duration_ms: u64,
+    ) -> Self {
+        let ring = Arc::new((
+            Mutex::new(FrameRing {
+                frames: VecDeque::new(),
+                done: false,
+                failed: false,
+                stopped: false,
+            }),
+            Condvar::new(),
+        ));
+        control.note_ring_len(PHANTOM_RING);
+        Self {
+            ring,
+            reader: None,
+            phantom: Some(PhantomSource {
+                start_ms,
+                frame_ms,
+                duration_ms,
+                handed: AtomicU64::new(0),
+                spawn_ms,
+            }),
+            control,
+            publish: Arc::new(AtomicBool::new(true)),
+            first_at_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The next clock tick of a phantom source; `None` at the stream's end.
+    fn phantom_frame(&self) -> Option<FrameBuf> {
+        let phantom = self.phantom.as_ref()?;
+        let handed = phantom.handed.fetch_add(1, Ordering::Relaxed);
+        let video_ms = phantom.start_ms as f64 + handed as f64 * phantom.frame_ms;
+        if phantom.duration_ms > 0 && video_ms >= phantom.duration_ms as f64 {
+            return None;
+        }
+        if handed == 0 && phantom.spawn_ms > 0 {
+            self.first_at_ms.store(monotonic_ms(), Ordering::Relaxed);
+            self.control
+                .note_first_frame(monotonic_ms().saturating_sub(phantom.spawn_ms));
+        }
+        // Deliberately tiny: nothing draws this buffer (the sink draws the
+        // decoder's own surfaces), and a full-size placeholder would allocate
+        // `w * h * 4` bytes per source frame - exactly what this path removes.
+        Some(FrameBuf::new(2, 2))
     }
 
     /// Start publishing the ring and decode counters (the shadow is adopted by
@@ -13344,6 +14628,9 @@ impl FrameSource {
     /// (clean end of stream or a read error), and `Err(())` when the wait timed
     /// out with the ring still empty - the caller treats that as a stall.
     fn next_frame(&self, timeout: Duration) -> Result<Option<FrameBuf>, ()> {
+        if self.phantom.is_some() {
+            return Ok(self.phantom_frame());
+        }
         let (lock, cvar) = &*self.ring;
         let Ok(mut guard) = lock.lock() else {
             return Ok(None);
@@ -13375,6 +14662,12 @@ impl FrameSource {
 
     /// Publish the occupancy after a pop, unless this ring is a shadow's.
     fn note_pop(&self, ring_len: usize) {
+        if self.phantom.is_some() {
+            // A phantom ring is always "as full as the engine is": the guards
+            // only need to know that this session is not buffering.
+            self.control.note_ring_len(PHANTOM_RING);
+            return;
+        }
         if self.publish() {
             self.control.note_ring_len(ring_len);
         }
@@ -13411,6 +14704,9 @@ impl FrameSource {
     /// the timeout: no frame is requested from the decoder and nothing blocks,
     /// so the pacer can keep scheduling display ticks.
     fn try_next_frame(&self) -> Option<FrameBuf> {
+        if self.phantom.is_some() {
+            return self.phantom_frame();
+        }
         let (lock, cvar) = &*self.ring;
         let Ok(mut guard) = lock.lock() else {
             return None;
@@ -13443,9 +14739,29 @@ impl FrameSource {
     }
 }
 
+/// f209: the ring occupancy a phantom source publishes.
+///
+/// The MF path has no ring: the decoder writes into the sink's device and the
+/// engine holds only the pictures it is about to show. Every guard in the pacer
+/// (pre-roll gate, buffer overlay, auto-pause) reads this one number, and they
+/// all mean "can the next picture arrive in time?" - which for this path is
+/// always yes, because the engine decodes ahead on demand. So the phantom
+/// publishes the depth a 1080p FFmpeg session would aim for.
+const PHANTOM_RING: usize = 16;
+
+/// The clock-only half of a [`FrameSource`] (see [`FrameSource::phantom`]).
+struct PhantomSource {
+    start_ms: u64,
+    frame_ms: f64,
+    /// `0` = unknown: the phantom then never ends the stream by itself.
+    duration_ms: u64,
+    /// Frames handed to the pacer so far; the clock is `start + n * frame`.
+    handed: AtomicU64,
+    spawn_ms: u64,
+}
+
 /// Read exactly one full frame; `Ok(false)` at a clean end of stream.
-fn read_frame(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<bool> {
-    let mut filled = 0;
+fn read_frame(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<bool> {    let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
             Ok(0) => return Ok(false),
@@ -13558,7 +14874,22 @@ fn gpu_frame_scale(hwaccel: bool, local: bool, size: FrameSize, decode: FrameSiz
 /// The pipe is the reason this exists: a 1080p source writes 3.1 MB/frame
 /// (NV12) into the rawvideo pipe, a 1188×668 picture 1.19 MB. The scale itself
 /// belongs on the GPU when it is available — see [`frame_gpu_enabled`].
-fn reader_output_size(decode: FrameSize, display: (u32, u32), native: bool) -> FrameSize {
+///
+/// **插帧 forces it** (`interp`): with interpolation on, the window presents up
+/// to 120 pictures a second, and every one of them pays the upload of the ring
+/// frame. A 960×540 window showing a 1920×1080 ring frame uploaded 8.3 MB per
+/// present — 8 ms of the 17.9 ms period the 60 fps goal has to fit in, and a
+/// hard floor for 120. Interpolated output therefore always follows the window,
+/// whatever 原始分辨率 says: the screen cannot show the difference (the picture
+/// is scaled down to the same band either way) and the pacer's own blend pass
+/// gets 9× cheaper too (7.9 → 1.6 ms at 960×540). The setting keeps meaning
+/// "decode the full frame" for the non-interpolated player and for screenshots.
+fn reader_output_size(
+    decode: FrameSize,
+    display: (u32, u32),
+    native: bool,
+    interp: bool,
+) -> FrameSize {
     // `BILI_FRAME_GPU=1` needs the display-sized path: the GPU scaler is given
     // exactly the size the ring carries, so the download is already the size
     // the UI draws.
@@ -13569,7 +14900,7 @@ fn reader_output_size(decode: FrameSize, display: (u32, u32), native: bool) -> F
     {
         Some("0") => false,
         Some("1") => true,
-        _ => frame_gpu_enabled() || !native,
+        _ => frame_gpu_enabled() || !native || interp,
     };
     if !enabled || frame_path_legacy() || display.0 == 0 || display.1 == 0 {
         return decode;
@@ -13729,6 +15060,228 @@ unsafe fn nv12_to_rgba_sse2(dst: *mut u8, src: *const u8, w: usize, h: usize) {
     }
 }
 
+/// f209: whether a session may decode through Media Foundation (zero-copy) or
+/// has to use the ffmpeg pipe.
+///
+/// `BILI_DECODE=ffmpeg` (or `0`/`off`) forces the pipe for one run - the A/B
+/// handle for the comparison table; `BILI_DECODE=mf` forces the decoder on even
+/// when `settings.json` says otherwise; with neither, the setting decides.
+fn mf_decode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("BILI_DECODE") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "ffmpeg" | "pipe" | "0" | "off" | "no" | "false"
+        ),
+        Err(_) => crate::settings::load().player_mf_decode,
+    })
+}
+
+/// The headers a B 站 DASH stream needs: the CDN refuses a bare request, and
+/// MF's byte stream sends exactly what this map says.
+fn mf_headers() -> Vec<(String, String)> {
+    vec![
+        ("Referer".to_string(), "https://www.bilibili.com".to_string()),
+        ("Origin".to_string(), "https://www.bilibili.com".to_string()),
+        ("User-Agent".to_string(), crate::bilibili::UA.to_string()),
+    ]
+}
+
+/// f209: start the zero-copy decoder for one session, or explain why not.
+///
+/// The decoder lives on the video sink's thread and writes into that thread's
+/// device, so this only asks for the session and waits for its verdict: `Some`
+/// means pictures are already arriving as D3D11 textures, `None` means the
+/// session keeps the ffmpeg pipe (the caller never has to know which).
+/// How many sessions may fail to open the decoder before the rest of the run
+/// stays on the ffmpeg pipe. A machine without a hardware decoder for this
+/// codec fails every time, and paying a 4 s probe per session would be a
+/// regression, not a fallback.
+static MF_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// f212: how long one session may wait for its window's video layer.
+///
+/// The layer is built on the UI thread, and that thread is not always free: the
+/// 搜索 entry (and a window opened while the previous one closes) publishes a
+/// whole page of cards on it — measured at 0.9 s, and up to several seconds for
+/// the *first* search of a run. The wait is the cheap side of that trade: the
+/// ffmpeg picture is presented by the same thread, so nothing reaches the screen
+/// while it is busy, while falling back costs the session its zero-copy path for
+/// its whole life (the f211 report). A window that genuinely cannot take a layer
+/// says so at once (`prime_refused`), so this ceiling is only ever reached by a
+/// thread that never comes back.
+const PRIME_WAIT_MS: u64 = 8_000;
+/// How often the wait above re-asks for the layer (a lost wake-up costs one
+/// repost, not the session).
+const PRIME_REPOST_MS: u64 = 250;
+/// A layer that took longer than this to appear is logged (`dcomp prime slow`)
+/// — normal is 0-40 ms (measured), so anything past 150 ms is the UI thread
+/// being busy, and a run that shows it is not a regression.
+const SLOW_PRIME_MS: u128 = 150;
+
+fn start_mf_session(
+    mailbox: &Arc<FrameMailbox>,
+    control: &Arc<PlaybackControl>,
+    url: &str,
+    local: bool,
+    start_ms: u64,
+    out: FrameSize,
+) -> Option<Arc<crate::dcomp::VideoSink>> {
+    use crate::dcomp::MfSource;
+    if !mf_decode_enabled() {
+        return None;
+    }
+    let failures = MF_FAILURES.load(Ordering::Relaxed);
+    if failures >= 2 {
+        if failures == 2 {
+            MF_FAILURES.store(3, Ordering::Relaxed);
+            crate::debug_log("decode fallback reason=mf_disabled (2 failed sessions, using ffmpeg)");
+        }
+        return None;
+    }
+    // The zero-copy decoder draws with the DComp video layer's device: with the
+    // factory (winit) player window there is no such layer, so no decoder can
+    // be opened here at all. Asking anyway costs the full sink timeout on every
+    // session — measured at 900 ms on the winit path, paid again on every
+    // quality switch and every hard-restart seek, which is exactly the "seek
+    // takes a second" report. The question is answered before the wait.
+    if !crate::dcomp::platform::enabled() {
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        LOGGED.get_or_init(|| {
+            crate::debug_log("decode fallback reason=no_dcomp_platform (画面直出 off)");
+        });
+        return None;
+    }
+    // f212: first the answer that needs no event loop at all. The DComp side
+    // writes "this window has its composition attached" at window creation, so
+    // a session for a window that is not a DComp player (the winit fallback, a
+    // window already gone) is answered here instead of waiting out a timeout.
+    let hwnd = control.window_hwnd();
+    if hwnd != 0 && !crate::dcomp::attached(hwnd) {
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        LOGGED.get_or_init(|| {
+            crate::debug_log(&format!(
+                "decode fallback reason=no_dcomp_window hwnd={hwnd}"
+            ));
+        });
+        return None;
+    }
+    // The picture has to exist before the first frame: the layer is built on
+    // the UI thread, without one.
+    let waited = Instant::now();
+    mailbox.prime_video_layer((out.w, out.h));
+    // Now the layer itself. It is built on the UI thread, so the verdict waits
+    // on that thread — and a window whose owner is publishing a feed page (a
+    // measured ~1 s on this machine, and exactly what the 搜索 entry does) has
+    // no time for the request for a moment. Falling back there was the f211
+    // report: two entries silently lost zero-copy because the *UI thread* was
+    // busy, not because the window lacked a layer. The picture cannot be drawn
+    // before that same thread runs again on the ffmpeg path either, so the
+    // session waits instead of falling back, re-asking every
+    // [`PRIME_REPOST_MS`] (a lost wake-up then costs one repost, not the
+    // session), and gives up only when the window actually says no or the hard
+    // ceiling is reached.
+    let deadline = waited + Duration::from_millis(PRIME_WAIT_MS);
+    let mut repost_at = waited + Duration::from_millis(PRIME_REPOST_MS);
+    let sink = loop {
+        if let Some(sink) = mailbox.dcomp_sink() {
+            break sink;
+        }
+        if mailbox.prime_refused() {
+            crate::debug_log("decode fallback reason=no_dcomp_video_sink");
+            return None;
+        }
+        let now = Instant::now();
+        if now > deadline {
+            crate::debug_log(&format!(
+                "decode fallback reason=no_dcomp_video_sink timeout state={} paints={} waited_ms={}",
+                mailbox.prime_state(),
+                crate::dcomp::ui_paints_total(),
+                waited.elapsed().as_millis()
+            ));
+            return None;
+        }
+        if control.is_closed() {
+            return None;
+        }
+        if now > repost_at {
+            repost_at = now + Duration::from_millis(PRIME_REPOST_MS);
+            mailbox.prime_video_layer((out.w, out.h));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let waited_ms = waited.elapsed().as_millis();
+    if waited_ms > SLOW_PRIME_MS {
+        crate::debug_log(&format!(
+            "dcomp prime slow waited_ms={waited_ms} paints={} (UI thread was busy, layer reused)",
+            crate::dcomp::ui_paints_total()
+        ));
+    }
+    let source = if local {
+        MfSource::Path(url.to_string())
+    } else {
+        MfSource::Url {
+            url: url.to_string(),
+            headers: mf_headers(),
+        }
+    };
+    let key = source.key();
+    // 插帧 in this path is the GPU warp or nothing: the CPU blend needs frames
+    // that no longer exist. A mode picked for the pipe is therefore upgraded to
+    // 光流 (and says so once).
+    if control.interp_mode() != 0 && control.interp_mode() != INTERP_MODE_OFA {
+        crate::debug_log(&format!(
+            "interp mode forced={} reason=mf_decode ({} needs the GPU warp)",
+            INTERP_MODE_OFA,
+            control.interp_mode()
+        ));
+        control.set_interp_mode(INTERP_MODE_OFA);
+    }
+    sink.set_mf_interp(control.interp_mode() == INTERP_MODE_OFA);
+    let reused = sink.mf_reuse(&key);
+    if reused {
+        // Same stream, new position: the decoder seeks (f208's `seek`, which
+        // flushes and lands on the keyframe before the target; the sink drops
+        // the pictures before it by pts).
+        sink.mf_seek(start_ms);
+    } else {
+        sink.mf_open(source, start_ms);
+    }
+    let seek_kind = if reused {
+        SeekSegments::KIND_MF_SEEK
+    } else {
+        SeekSegments::KIND_MF_OPEN
+    };
+    let deadline = Instant::now() + Duration::from_millis(4000);
+    loop {
+        match sink.mf_state() {
+            crate::dcomp::MfState::Ready => {
+                // A session that opened is proof the decoder works on this
+                // machine: the counter is a failure streak, not a total.
+                MF_FAILURES.store(0, Ordering::Relaxed);
+                control.seek_seg_decoder(seek_kind);
+                return Some(sink);
+            }
+            crate::dcomp::MfState::Failed => {
+                MF_FAILURES.fetch_add(1, Ordering::Relaxed);
+                sink.mf_close();
+                return None;
+            }
+            _ => {}
+        }
+        if Instant::now() > deadline {
+            crate::debug_log("decode fallback reason=mf_open_timeout");
+            MF_FAILURES.fetch_add(1, Ordering::Relaxed);
+            sink.mf_close();
+            return None;
+        }
+        if control.is_closed() || control.switch_pending() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// `BILI_FRAME_PATH=legacy`: the pre-optimisation frame hand-off, kept as the
 /// before/after baseline for the UI-load measurement (the same role
 /// `BILI_DRAG_INTERP` plays for the drag measurements). It is not a product
@@ -13803,6 +15356,29 @@ struct FrameMailbox {
     shown: AtomicU64,
     /// `BILI_FRAME_PATH=legacy` (the QA baseline, see [`frame_path_legacy`]).
     legacy: bool,
+    /// The 120 fps picture surface (see [`video_surface`]), created the first
+    /// time a session resolves a 120 Hz grid and kept for the window's life.
+    surface: Mutex<Option<Arc<video_surface::VideoSurface>>>,
+    /// What the surface was last told (band, fit, aspect); a cheap compare
+    /// before a property read keeps the layout publish off the per-frame path.
+    surface_layout: Mutex<Option<video_surface::SurfaceLayout>>,
+    /// Whether the window is currently in `external_video` mode.
+    external: AtomicBool,
+    /// f194: the DComp player window's video layer, once the first frame has
+    /// gone through the UI thread and proved there is one. The pacer then hands
+    /// every frame to it directly - the event loop is not part of the 120 fps
+    /// path any more (the same shape `external_surface_ready` uses).
+    dcomp: Mutex<Option<Arc<crate::dcomp::VideoSink>>>,
+    /// UI thread: when the previous frame was put on screen, for the present
+    /// interval histogram the 120 fps self-check reads.
+    last_present: Mutex<Option<Instant>>,
+    /// f211: the verdict of the last [`Self::prime_video_layer`]: `0` pending,
+    /// `1` a sink was published, `2` this window has no video layer.
+    /// `start_mf_session` waits on this instead of on a blind timeout — a
+    /// second player window opened while the event loop is still building it
+    /// used to miss a fixed 900 ms budget and silently fall back to the ffmpeg
+    /// pipe, which is the "关闭重开以后就不零拷贝了" report.
+    prime_state: std::sync::atomic::AtomicU8,
 }
 
 struct MailboxInner {
@@ -13829,6 +15405,8 @@ impl FrameMailbox {
         pool: Arc<BlendPool>,
         control: Arc<PlaybackControl>,
     ) -> Self {
+        // `BILI_INTERP_PROBE=1`: the renderer notifier that splits one present
+        // into queue / paint / present (see `present_probe`). Inert otherwise.
         Self {
             inner: Mutex::new(MailboxInner {
                 frame: None,
@@ -13844,6 +15422,12 @@ impl FrameMailbox {
             posted: AtomicU64::new(0),
             shown: AtomicU64::new(0),
             legacy: frame_path_legacy(),
+            surface: Mutex::new(None),
+            surface_layout: Mutex::new(None),
+            external: AtomicBool::new(false),
+            dcomp: Mutex::new(None),
+            last_present: Mutex::new(None),
+            prime_state: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -13860,6 +15444,38 @@ impl FrameMailbox {
             return;
         }
         self.pushed.fetch_add(1, Ordering::Relaxed);
+        // 120 fps, after the first frame has published the surface: hand the
+        // picture straight to the surface thread. The event loop is not part of
+        // it any more, so 120 pictures a second cost the UI thread nothing and
+        // the surface's own one-slot mailbox does the coalescing.
+        if !self.legacy {
+            // f194: the DComp window's video layer takes the frame on this
+            // thread. One `Map` + `CopyResource` + `Present` per frame, no
+            // event-loop round trip - which is what keeps the picture at the
+            // pacer's rate while the UI thread is busy drawing the overlay.
+            let sink = self.dcomp.lock().ok().and_then(|slot| slot.clone());
+            if let Some(sink) = sink {
+                if sink.is_closed() {
+                    if let Ok(mut slot) = self.dcomp.lock() {
+                        *slot = None;
+                    }
+                } else if !self.mini_open() {
+                    sink.submit(frame.buffer, frame.pooled);
+                    for (buffer, pooled) in sink.take_retired() {
+                        if pooled {
+                            self.pool.recycle(buffer);
+                        }
+                    }
+                    self.shown.fetch_add(1, Ordering::Relaxed);
+                    self.note_present();
+                    return;
+                }
+            }
+            if let Some(surface) = self.external_surface_ready() {
+                surface.submit(frame.buffer, frame.pooled);
+                return;
+            }
+        }
         if self.legacy {
             // QA baseline: one event and one full-frame copy per frame, exactly
             // like the old `push_frame` / `push_recycled_frame`.
@@ -13921,9 +15537,166 @@ impl FrameMailbox {
         }
     }
 
+    /// Whether a mini player is open (its picture still comes from Slint, so
+    /// the direct path must stand aside). Reads the slot only - no upgrade.
+    fn mini_open(&self) -> bool {
+        self.mini.lock().map(|slot| slot.is_some()).unwrap_or(false)
+    }
+
+    /// f200: whether the DComp sink this mailbox feeds can warp on the GPU.
+    ///
+    /// Consulted once per source interval, never per display slot: it takes the
+    /// sink slot's lock and reads one relaxed flag.
+    fn dcomp_warp_ready(&self) -> bool {
+        match self.dcomp.lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .is_some_and(|sink| !sink.is_closed() && sink.warp_ready()),
+            Err(_) => false,
+        }
+    }
+
+    /// f209: create the DComp video layer before any frame exists, so the MF
+    /// decoder can be opened on the layer's own device.
+    ///
+    /// Posted to the UI thread (the composition tree lives there); the pacer
+    /// then polls [`Self::dcomp_sink`] for the result.
+    fn prime_video_layer(self: &Arc<Self>, frame: (u32, u32)) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Already published: a repost of the wait is a no-op (the floor above is
+        // 250 ms, and a busy UI thread collects a handful).
+        if self.dcomp_sink().is_some() {
+            self.prime_state.store(1, SeqCst);
+            return;
+        }
+        let this = self.clone();
+        this.prime_state.store(0, SeqCst);
+        let posted = Instant::now();
+        crate::debug_log(&format!(
+            "dcomp prime post frame={}x{} paints={}",
+            frame.0,
+            frame.1,
+            crate::dcomp::ui_paints_total()
+        ));
+        let _ = slint::invoke_from_event_loop(move || {
+            if this.dcomp_sink().is_some() {
+                // A repost that lost the race with the first one: the layer is
+                // already there and published.
+                this.prime_state.store(1, SeqCst);
+                return;
+            }
+            crate::debug_log(&format!(
+                "dcomp prime run after_ms={} paints={}",
+                posted.elapsed().as_millis(),
+                crate::dcomp::ui_paints_total()
+            ));
+            let Some(window) = this.window.upgrade() else {
+                crate::debug_log("dcomp prime run reason=window_gone");
+                this.prime_state.store(2, SeqCst);
+                return;
+            };
+            let Some(hwnd) = crate::win::hwnd_of(window.window()) else {
+                crate::debug_log("dcomp prime run reason=no_hwnd");
+                this.prime_state.store(2, SeqCst);
+                return;
+            };
+            let layout = this.dcomp_layout(&window);
+            let started = Instant::now();
+            match crate::dcomp::prime_video_layer(hwnd, frame, layout) {
+                Some(sink) => {
+                    if let Ok(mut slot) = this.dcomp.lock() {
+                        *slot = Some(sink);
+                    }
+                    if !window.get_external_video() {
+                        window.set_external_video(true);
+                    }
+                    crate::debug_log(&format!(
+                        "dcomp prime ok hwnd={hwnd} build_ms={} since_post_ms={}",
+                        started.elapsed().as_millis(),
+                        posted.elapsed().as_millis()
+                    ));
+                    this.prime_state.store(1, SeqCst);
+                }
+                None => {
+                    crate::debug_log(&format!(
+                        "dcomp prime: no sink for this window build_ms={} since_post_ms={}",
+                        started.elapsed().as_millis(),
+                        posted.elapsed().as_millis()
+                    ));
+                    this.prime_state.store(2, SeqCst);
+                }
+            }
+        });
+    }
+
+    /// f211: whether the last prime told us this window has no video layer at
+    /// all (`false` while it is still being built — a busy event loop is not a
+    /// missing layer).
+    fn prime_refused(&self) -> bool {
+        self.prime_state.load(std::sync::atomic::Ordering::SeqCst) == 2
+    }
+
+    /// The raw [`Self::prime_state`] (QA diagnostics for the timeout line).
+    fn prime_state(&self) -> u8 {
+        self.prime_state.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The DComp sink, once the UI thread has published it.
+    fn dcomp_sink(&self) -> Option<Arc<crate::dcomp::VideoSink>> {
+        self.dcomp.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// f209: whether this sink's MF session has its GPU warp (so the pacer can
+    /// keep a 120 Hz grid instead of degrading to 60).
+    fn mf_warp(&self) -> bool {
+        self.dcomp_sink()
+            .is_some_and(|sink| sink.mf_warp() && !sink.is_closed())
+    }
+
+    /// f209: hand one display slot to the MF sink, which picks the decoder
+    /// surface for `video_ms`. No pixels are passed: the sink already owns them.
+    fn submit_tick(&self, video_ms: u64, pair: u64) -> bool {
+        if self.control.seek_freeze() || self.mini_open() {
+            return false;
+        }
+        let Some(sink) = self.dcomp_sink() else {
+            return false;
+        };
+        if sink.is_closed() || !sink.submit_tick(video_ms, pair) {
+            return false;
+        }
+        // The engine holds a couple of pictures, never a ring of frames.
+        self.shown.fetch_add(1, Ordering::Relaxed);
+        self.note_present();
+        true
+    }
+
+    /// f200: hand one display slot of an optical-flow pair to the sink's GPU
+    /// warp. `false` means the slot still has to be produced on the CPU.
+    fn submit_warp(&self, a: FrameBuf, b: FrameBuf, phase: f32, pair: u64) -> bool {        // The same two gates `push` applies: a release freezes the picture, and
+        // an open mini player draws from Slint.
+        if self.control.seek_freeze() || self.mini_open() {
+            return false;
+        }
+        let sink = match self.dcomp.lock() {
+            Ok(slot) => slot.clone(),
+            Err(_) => None,
+        };
+        let Some(sink) = sink else {
+            return false;
+        };
+        if !sink.submit_warp(a, b, phase, pair) {
+            return false;
+        }
+        self.shown.fetch_add(1, Ordering::Relaxed);
+        self.note_present();
+        true
+    }
+
     /// UI thread: put one frame on screen and retire the previous one.
     fn show(&self, frame: MailFrame) {
         tag_here("ui:publish");
+        let probe_at = present_probe::enabled().then(Instant::now);
         let MailFrame { buffer, pooled } = frame;
         // f151: the same freeze the pacer checks, re-read on the UI thread. A
         // delivery that was queued before the release runs *after* the seek's
@@ -13936,6 +15709,75 @@ impl FrameMailbox {
             return;
         }
         self.shown.fetch_add(1, Ordering::Relaxed);
+        self.note_present();
+        // f194: the DComp player window owns the picture. The frame goes to its
+        // video layer (its own thread, its own swapchain) and the Slint UI in
+        // the same window draws over it, per-pixel transparent. This is the
+        // first branch on purpose: when it accepts the frame, nothing below
+        // runs - no `Image`, no full-window repaint, no external surface.
+        if let Some(window) = self.window.upgrade() {
+            if let Some(hwnd) = crate::win::hwnd_of(window.window()) {
+                if crate::dcomp::accepts_video(hwnd) {
+                    let layout = self.dcomp_layout(&window);
+                    // The mini player draws the picture from Slint, so it needs
+                    // the clone before the frame is handed over (the same rule
+                    // the external surface path below follows).
+                    let mini = self
+                        .mini
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .and_then(|weak| weak.upgrade());
+                    if let Some(mini) = mini {
+                        mini.set_frame(slint::Image::from_rgba8(buffer.clone()));
+                    }
+                    match crate::dcomp::submit_frame(hwnd, buffer, pooled, layout) {
+                        Ok(retired) => {
+                            if !window.get_external_video() {
+                                window.set_external_video(true);
+                            }
+                            if let Some(sink) = crate::dcomp::sink_for(hwnd) {
+                                if let Ok(mut slot) = self.dcomp.lock() {
+                                    *slot = Some(sink);
+                                }
+                            }
+                            for (buffer, pooled) in retired {
+                                if pooled {
+                                    self.pool.recycle(buffer);
+                                }
+                            }
+                        }
+                        Err((buffer, pooled)) => {
+                            if pooled {
+                                self.pool.recycle(buffer);
+                            }
+                            if window.get_external_video() {
+                                window.set_external_video(false);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        // 120 fps: the picture leaves this window (see `video_surface`). The
+        // grid the pacer resolved is what decides it, so 60 fps playback and
+        // every non-interpolated session keep the Slint path byte for byte.
+        if let Some(surface) = self.external_surface() {
+            // The mini player is its own window and still takes the picture
+            // from Slint; only an open mini pays for the image handle here.
+            let mini = self
+                .mini
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .and_then(|weak| weak.upgrade());
+            if let Some(mini) = mini {
+                mini.set_frame(slint::Image::from_rgba8(buffer.clone()));
+            }
+            surface.submit(buffer, pooled);
+            return;
+        }
         let image = slint::Image::from_rgba8(buffer.clone());
         {
             let view = crate::player_view::SlintPlayerView(self.window.clone());
@@ -13950,6 +15792,9 @@ impl FrameMailbox {
             .and_then(|weak| weak.upgrade());
         if let Some(mini) = mini {
             mini.set_frame(image);
+        }
+        if let Some(started) = probe_at {
+            present_probe::hand_over(started);
         }
         // The window's property now holds the new image and has dropped the
         // previous one, so the buffer that was displayed a moment ago has no
@@ -13998,6 +15843,163 @@ impl FrameMailbox {
         }
     }
 
+    /// The picture slot the DComp video layer must occupy, in logical px.
+    ///
+    /// Same properties the UI uses to lay the band out (`surface_*` / `fit_mode`),
+    /// so the composition layer and the transparent hole in the UI cannot
+    /// disagree. The frame size only affects the transform: the video swapchain
+    /// is built at the engine's 960x540 and scaled by DComp.
+    fn dcomp_layout(&self, window: &PlayerWindow) -> crate::dcomp::VideoLayout {
+        let width = self.control.frame_width();
+        let height = self.control.frame_height();
+        let frame = if width > 0 && height > 0 {
+            (width, height)
+        } else {
+            (VIDEO_W as u32, VIDEO_H as u32)
+        };
+        crate::dcomp::VideoLayout {
+            band: (
+                window.get_surface_x(),
+                window.get_surface_y(),
+                window.get_surface_w(),
+                window.get_surface_h(),
+            ),
+            scale: window.window().scale_factor(),
+            fit: window.get_fit_mode().clamp(0, 2) as u8,
+            frame,
+        }
+    }
+
+    /// The surface, if this window is currently presenting through it. Called
+    /// from the pacer thread, so it only reads the already-created handle and
+    /// the flag the UI thread set: it never creates the window (`slint::Weak`
+    /// does not upgrade off the UI thread).
+    fn external_surface_ready(&self) -> Option<Arc<video_surface::VideoSurface>> {
+        if !self.external.load(Ordering::Relaxed) {
+            return None;
+        }
+        let guard = self.surface.lock().ok()?;
+        guard.clone()
+    }
+
+    /// Record this frame's interval for the control's histogram.
+    fn note_present(&self) {
+        let now = Instant::now();
+        if let Ok(mut slot) = self.last_present.lock() {
+            if let Some(previous) = slot.replace(now) {
+                self.control
+                    .note_present_interval(now.duration_since(previous).as_secs_f64() * 1000.0);
+            }
+        }
+    }
+
+    /// The surface to hand this frame to, or `None` for the Slint path.
+    ///
+    /// The 120 fps grid is the only mode that uses it, and only while the band
+    /// can be handed over whole: a brightness scrim covers the picture when it
+    /// is not 0, so those sessions stay on the Slint path instead of losing the
+    /// picture (the surface cannot be tinted by the UI).
+    fn external_surface(&self) -> Option<Arc<video_surface::VideoSurface>> {
+        // Opt-in only. The surface reaches 119-120 fps (see `video_surface`),
+        // but a Slint window on Windows cannot be per-pixel transparent: its
+        // swapchain only advertises `Opaque` composite alpha for an HWND
+        // surface, so the band paints black instead of showing the window
+        // behind it. The picture would be invisible under the overlay, which
+        // is why this path is a measurement tool until that changes.
+        if !video_surface_enabled() {
+            return None;
+        }
+        let window = self.window.upgrade()?;
+        let wanted = self.control.interp_out_hz() >= 120
+            && window.get_brightness() == 0
+            && window.get_fit_mode() >= 0;
+        if !wanted {
+            if self.external.swap(false, Ordering::Relaxed) {
+                window.set_external_video(false);
+                crate::debug_log("video surface off reason=not_120");
+            }
+            return None;
+        }
+        let mut slot = self.surface.lock().ok()?;
+        if slot.is_none() {
+            let hwnd = crate::win::hwnd_of(window.window()).unwrap_or(0);
+            match video_surface::VideoSurface::create(
+                hwnd,
+                self.pool.clone(),
+                self.control.clone(),
+            ) {
+                Some(surface) => *slot = Some(surface),
+                None => {
+                    // No surface (no HWND, or the window could not be created):
+                    // the 120 grid still runs, the picture just stays in Slint.
+                    if !self.external.swap(false, Ordering::Relaxed) {
+                        window.set_external_video(false);
+                    }
+                    return None;
+                }
+            }
+        }
+        let surface = slot.clone()?;
+        drop(slot);
+        self.publish_surface_layout(&surface, &window);
+        if !self.external.swap(true, Ordering::Relaxed) {
+            window.set_external_video(true);
+            crate::debug_log(&format!(
+                "video surface on out_hz={} band={}x{}",
+                self.control.interp_out_hz(),
+                window.get_surface_w(),
+                window.get_surface_h()
+            ));
+        }
+        Some(surface)
+    }
+
+    /// Publish the band rectangle / fit mode / frame aspect to the surface.
+    /// Cheap: the window's own properties are read and compared, and the
+    /// surface only repositions when the tuple actually changed.
+    fn publish_surface_layout(
+        &self,
+        surface: &Arc<video_surface::VideoSurface>,
+        window: &PlayerWindow,
+    ) {
+        let width = self.control.frame_width();
+        let height = self.control.frame_height();
+        let aspect = if width > 0 && height > 0 {
+            width as f64 / height as f64
+        } else {
+            16.0 / 9.0
+        };
+        let backdrop = window.global::<crate::AppTheme>().get_player_backdrop();
+        let layout = video_surface::SurfaceLayout {
+            band: (
+                window.get_surface_x().round() as i32,
+                window.get_surface_y().round() as i32,
+                window.get_surface_w().round() as i32,
+                window.get_surface_h().round() as i32,
+            ),
+            scale: window.window().scale_factor(),
+            fit: window.get_fit_mode().clamp(0, 2) as u8,
+            aspect,
+            // `as_argb_encoded()` is 0xAARRGGBB; the surface wants 0xRRGGBB.
+            backdrop: backdrop.as_argb_encoded() & 0x00FF_FFFF,
+        };
+        if let Ok(mut slot) = self.surface_layout.lock() {
+            if slot.as_ref() != Some(&layout) {
+                *slot = Some(layout);
+                surface.set_layout(layout);
+            }
+        }
+    }
+
+    /// `(pushed, shown, coalesced, blit_us)` of the 120 fps surface, or `None`
+    /// when this window never created one.
+    fn surface_counters(&self) -> Option<(u64, u64, u64, u64)> {
+        let guard = self.surface.lock().ok()?;
+        let surface = guard.as_ref()?;
+        let (pushed, shown, coalesced) = surface.counters();
+        Some((pushed, shown, coalesced, surface.blit_us()))
+    }
+
     /// `frames coalesced` counters, for the QA line.
     fn counters(&self) -> (u64, u64, u64, u64) {
         (
@@ -14021,6 +16023,19 @@ struct InterpLog {
     last_mode: u8,
     /// Cumulative optical-flow submits at the last line, for the pairs/s rate.
     last_ofa_submits: u64,
+    /// Mailbox frames the UI actually showed, and the ones it replaced before
+    /// getting to them, at the last line. The pacer counts a frame as presented
+    /// when it *pushes* it; these two are the only place the log can tell a
+    /// 120 Hz grid that reaches the screen from one the UI coalesces back to 60.
+    last_shown: u64,
+    last_coalesced: u64,
+    /// UI gap histogram at the last line (`BILI_INTERP_PROBE=1` only).
+    last_ui: Vec<u64>,
+    /// Present-path histograms at the last line (`BILI_INTERP_PROBE=1` only).
+    last_present: Vec<Vec<u64>>,
+    /// `(pushed, shown, coalesced)` of the 120 fps picture surface at the last
+    /// line, and the average blit time in µs.
+    last_surface: Option<(u64, u64, u64, u64)>,
 }
 
 impl InterpLog {
@@ -14039,6 +16054,11 @@ impl InterpLog {
             last_misses: 0,
             last_mode: 0,
             last_ofa_submits: 0,
+            last_shown: 0,
+            last_coalesced: 0,
+            last_ui: Vec::new(),
+            last_present: Vec::new(),
+            last_surface: None,
         }
     }
 
@@ -14051,11 +16071,31 @@ impl InterpLog {
     /// (one per source interval when nothing is dropping frames). The QA-only
     /// tail (`drop`/`min_ms`/`max_ms`/`pool_miss`) separates a slow pass from a
     /// preempted pacer thread; `drop` counts the display slots that were lost
-    /// because they were late.
-    fn tick(&mut self, control: &PlaybackControl, mode: u8, out_hz: u32, pool_misses: u64) {
+    /// because they were late. `shown_s`/`coal_s` come from the mailbox: the
+    /// frames the UI thread actually put on screen and the ones it replaced
+    /// before they were seen, so a grid the pacer produces but the window
+    /// coalesces back down cannot pass as a real output rate.
+    fn tick(
+        &mut self,
+        control: &PlaybackControl,
+        mode: u8,
+        out_hz: u32,
+        pool_misses: u64,
+        mailbox: (u64, u64),
+        surface: Option<(u64, u64, u64, u64)>,
+    ) {
         if !self.enabled {
             return;
         }
+        let (shown, coalesced) = mailbox;
+        // `BILI_INTERP_PROBE=1`: one 1 KiB histogram copy per second, and
+        // nothing at all without the variable.
+        let ui_now = if interp_ui_probe_enabled() {
+            ui_gap_snapshot()
+        } else {
+            Vec::new()
+        };
+
         let now = Instant::now();
         let (generated, dropped, avg_ms) = control.interp_stats();
         let bm_ms = control.interp_bm_ms();
@@ -14074,6 +16114,11 @@ impl InterpLog {
             self.last_misses = pool_misses;
             self.last_mode = mode;
             self.last_ofa_submits = ofa_submits;
+            self.last_shown = shown;
+            self.last_coalesced = coalesced;
+            self.last_ui = ui_now;
+            self.last_present = present_probe::snapshot().unwrap_or_default();
+            self.last_surface = surface;
             return;
         };
         // A mode change (or the counter reset it performs) starts a new window.
@@ -14081,6 +16126,8 @@ impl InterpLog {
             || generated < self.last_generated
             || dropped < self.last_dropped
             || ofa_submits < self.last_ofa_submits
+            || shown < self.last_shown
+            || coalesced < self.last_coalesced
         {
             self.last = Some(now);
             self.last_generated = generated;
@@ -14088,6 +16135,11 @@ impl InterpLog {
             self.last_misses = pool_misses;
             self.last_mode = mode;
             self.last_ofa_submits = ofa_submits;
+            self.last_shown = shown;
+            self.last_coalesced = coalesced;
+            self.last_ui = ui_now;
+            self.last_present = present_probe::snapshot().unwrap_or_default();
+            self.last_surface = surface;
             return;
         }
         let elapsed = now.duration_since(last);
@@ -14101,14 +16153,58 @@ impl InterpLog {
         let (min_ms, max_ms) = control.interp_cost_range();
         let miss_s = per_s(pool_misses, self.last_misses);
         let ofa_sub_s = per_s(ofa_submits, self.last_ofa_submits);
+        let shown_s = per_s(shown, self.last_shown);
+        let coal_s = per_s(coalesced, self.last_coalesced);
+        // The 120 fps picture surface: `surface_shown_s` is the rate frames
+        // actually reached the screen through it, i.e. the real output rate of
+        // that mode (`shown_s` stays the mailbox's, which is 0 there).
+        let surface_tail = match (surface, self.last_surface) {
+            (Some(now), Some(was)) => format!(
+                " surface_shown_s={}/s surface_coal_s={}/s blit_us={}",
+                per_s(now.1, was.1),
+                per_s(now.2, was.2),
+                now.3
+            ),
+            (Some(now), None) => format!(" surface_shown_s=0/s surface_coal_s=0/s blit_us={}", now.3),
+            _ => String::new(),
+        };
+        let ui = if ui_now.is_empty() {
+            None
+        } else {
+            Some(ui_gap_window(&self.last_ui, &ui_now))
+        };
         self.last = Some(now);
         self.last_generated = generated;
         self.last_dropped = dropped;
         self.last_misses = pool_misses;
         self.last_mode = mode;
         self.last_ofa_submits = ofa_submits;
+        self.last_shown = shown;
+        self.last_coalesced = coalesced;
+        self.last_ui = ui_now;
+        self.last_surface = surface;
+        let ui_tail = ui.map_or_else(String::new, |(p50, p95, over83, over167, samples)| {
+            format!(
+                " ui_p50_ms={p50:.2} ui_p95_ms={p95:.2} ui_over8_3={over83} ui_over16_7={over167} ui_n={samples}"
+            )
+        });
+        // Present-path split (`BILI_INTERP_PROBE=1`): one window per second, the
+        // same shape as the UI tail so a run's lines can be diffed and averaged.
+        let mut present_tail = String::new();
+        if let Some(now_present) = present_probe::snapshot() {
+            if !self.last_present.is_empty() {
+                for (index, name) in present_probe::NAMES.iter().enumerate() {
+                    let (p50, p95, samples) =
+                        present_probe::window(&self.last_present, &now_present, index);
+                    present_tail.push_str(&format!(
+                        " {name}_p50_ms={p50:.2} {name}_p95_ms={p95:.2} {name}_n={samples}"
+                    ));
+                }
+            }
+            self.last_present = now_present;
+        }
         crate::debug_log(&format!(
-            "interp mode={mode} generated={gen_s}/s out_hz={out_hz} avg_ms={avg_ms:.3} bm_ms={bm_ms:.3} bm_p50_ms={bm_p50:.3} bm_p95_ms={bm_p95:.3} bm_n={bm_n} ofa_pair_ms={ofa_ms:.3} ofa_p50_ms={ofa_p50:.3} ofa_p95_ms={ofa_p95:.3} ofa_flow_ms={ofa_flow_ms:.3} ofa_submit_s={ofa_sub_s} ofa_n={ofa_n} drop={drop_s}/s min_ms={min_ms:.3} max_ms={max_ms:.3} pool_miss={miss_s}/s"
+            "interp mode={mode} generated={gen_s}/s out_hz={out_hz} avg_ms={avg_ms:.3} bm_ms={bm_ms:.3} bm_p50_ms={bm_p50:.3} bm_p95_ms={bm_p95:.3} bm_n={bm_n} ofa_pair_ms={ofa_ms:.3} ofa_p50_ms={ofa_p50:.3} ofa_p95_ms={ofa_p95:.3} ofa_flow_ms={ofa_flow_ms:.3} ofa_submit_s={ofa_sub_s} ofa_n={ofa_n} drop={drop_s}/s min_ms={min_ms:.3} max_ms={max_ms:.3} pool_miss={miss_s}/s shown_s={shown_s}/s coal_s={coal_s}/s{ui_tail}{present_tail}{surface_tail}"
         ));
     }
 }
@@ -14373,11 +16469,9 @@ fn audio_quality_rows(tracks: &[bilibili::AudioTrack], request: i64) -> Vec<Audi
     rows
 }
 
-/// Directory holding `ffmpeg.exe` / `ffplay.exe`; overridable via env.
+/// Directory holding `ffmpeg.exe` / `ffplay.exe`; see `paths::ffmpeg_dir`.
 fn ffmpeg_dir() -> PathBuf {
-    std::env::var("BILI_FFMPEG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Programs\ffmpeg-unpack\bin"))
+    crate::paths::ffmpeg_dir()
 }
 
 fn base_command(exe: &str) -> Command {
@@ -14896,6 +16990,142 @@ impl ShadowAudio {
     }
 }
 
+/// The stamps of one seek, from the release to the first picture.
+///
+/// A seek used to be reported as a single number (`seek served first_frame_ms`),
+/// which says *how long* but never *where*. These five monotonic stamps sit on
+/// the boundaries the session actually crosses:
+///
+/// ```text
+/// release ─ retire ─ teardown ─ session ─ decoder ─ audio ─ first frame
+///   UI       pacer     old        new       MF seek    ffplay    present
+///  seek()   noticed  session    session     / open    restarted
+///                     killed     begins
+/// ```
+///
+/// `0` means "this seek never reached that stage" (a seek served by a pre-rolled
+/// shadow never tears a session down), and the trace line prints it as `-`.
+#[derive(Default)]
+struct SeekSegments {
+    /// Monotonic ms of the release, `0` = no seek in flight.
+    release: AtomicU64,
+    retire: AtomicU64,
+    teardown: AtomicU64,
+    session: AtomicU64,
+    decoder: AtomicU64,
+    audio: AtomicU64,
+    /// How the picture was obtained: see [`SeekSegments::KIND_*`].
+    kind: AtomicU64,
+}
+
+impl SeekSegments {
+    const KIND_FFMPEG: u64 = 1;
+    const KIND_MF_SEEK: u64 = 2;
+    const KIND_MF_OPEN: u64 = 3;
+    const KIND_SHADOW: u64 = 4;
+    /// f211: the zero-copy session was moved in place — no restart at all.
+    const KIND_MF_INPLACE: u64 = 5;
+
+    fn reset(&self, release: u64) {
+        self.release.store(release, Ordering::SeqCst);
+        for field in [
+            &self.retire,
+            &self.teardown,
+            &self.session,
+            &self.decoder,
+            &self.audio,
+        ] {
+            field.store(0, Ordering::SeqCst);
+        }
+        self.kind.store(0, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+        (
+            self.release.load(Ordering::SeqCst),
+            self.retire.load(Ordering::SeqCst),
+            self.teardown.load(Ordering::SeqCst),
+            self.session.load(Ordering::SeqCst),
+            self.decoder.load(Ordering::SeqCst),
+            self.audio.load(Ordering::SeqCst),
+            self.kind.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// f211: move the **running** zero-copy session to `target` instead of
+/// restarting it around the decoder.
+///
+/// With Media Foundation the decoder *is* the session, and `mf_seek` is a flush
+/// plus `SetCurrentPosition` (measured 1–3 ms). Restarting the session around
+/// that paid for a teardown, a stream re-resolution and an `ffplay` spawn on top
+/// of it — 45–85 ms of bookkeeping for a 2 ms seek. Here the picture is frozen by
+/// the release, the decoder moves, the sound is restarted *behind* the picture
+/// (held silent until the new position's first frame), and the display grid
+/// continues from the new position.
+///
+/// Returns `false` — and the caller keeps the restart path — when there is no
+/// sink, the decoder refuses the seek, or it does not report ready in
+/// [`SEEK_INPLACE_TIMEOUT_MS`]. The fallback is the shipped restart, so a
+/// decoder that cannot seek in place can only make a seek slower, never break it.
+fn start_inplace_seek(
+    control: &Arc<PlaybackControl>,
+    mailbox: &Arc<FrameMailbox>,
+    target: u64,
+    audio_child: &mut Option<AudioProc>,
+    audio_gate: &mut AudioGate,
+) -> bool {
+    let Some(sink) = mailbox.dcomp_sink() else {
+        return false;
+    };
+    if sink.is_closed() {
+        return false;
+    }
+    let started = Instant::now();
+    sink.mf_seek(target);
+    // The flush is what the next display slot waits for: without this wait the
+    // pacer's next tick would be answered with the picture the decoder had
+    // queued before the release.
+    let deadline = started + Duration::from_millis(SEEK_INPLACE_TIMEOUT_MS);
+    loop {
+        match sink.mf_state() {
+            crate::dcomp::MfState::Ready => break,
+            crate::dcomp::MfState::Failed => {
+                crate::debug_log(&format!(
+                    "seek inplace fallback target_ms={target} reason=mf-failed"
+                ));
+                return false;
+            }
+            _ => {}
+        }
+        if Instant::now() > deadline || control.is_closed() {
+            crate::debug_log(&format!(
+                "seek inplace fallback target_ms={target} reason=not-ready waited_ms={}",
+                started.elapsed().as_millis()
+            ));
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    control.seek_seg_decoder(SeekSegments::KIND_MF_INPLACE);
+    // The **old** sound belongs to the position the user left: it stops here,
+    // with the picture. The new process is started once the new picture is on
+    // screen (the receipt), so a `ffplay` spawn is never on the seek's critical
+    // path — the picture does not need the sound, and the sound must not be the
+    // thing the user waits for.
+    if let Some(proc) = audio_child.take() {
+        proc.stop();
+        control.set_audio_pid(0);
+    }
+    audio_gate.forget();
+    crate::debug_log(&format!(
+        "seek inplace target_ms={target} decoder_wait_ms={} since_release_ms={}",
+        started.elapsed().as_millis(),
+        monotonic_ms().saturating_sub(control.seek_requested_at_ms())
+    ));
+    true
+}
+
 /// One poll's verdict for a pre-rolling seek shadow.
 enum SeekStep {
     /// Keep the old picture: the shadow still needs frames or its sound.
@@ -15014,7 +17244,12 @@ impl SeekShadow {
             display_h = DEFAULT_DISPLAY_H;
         }
         let decode = target_frame_size(track.width, track.height);
-        let size = reader_output_size(decode, (display_w, display_h), control.native_frame_size());
+        let size = reader_output_size(
+            decode,
+            (display_w, display_h),
+            control.native_frame_size(),
+            control.interp_mode() != 0,
+        );
         let capacity = ring_capacity_for(size.bytes());
         let frame_ms = frame_ms_for(Some(track));
         let spawned_ms = monotonic_ms();
@@ -17320,28 +19555,33 @@ mod tests {
         let decode = target_frame_size(1920, 1080);
         // 默认: the window's picture band, aspect preserved.
         assert_eq!(
-            reader_output_size(decode, (1216, 684), false),
+            reader_output_size(decode, (1216, 684), false, false),
             FrameSize { w: 1216, h: 684 }
         );
         // A big window never upscales: the source size is the ceiling.
-        assert_eq!(reader_output_size(decode, (2560, 1440), false), decode);
+        assert_eq!(reader_output_size(decode, (2560, 1440), false, false), decode);
         // 原始分辨率 keeps the source size whatever the window says.
-        assert_eq!(reader_output_size(decode, (1216, 684), true), decode);
+        assert_eq!(reader_output_size(decode, (1216, 684), true, false), decode);
+        // 插帧 outranks 原始分辨率: the upload is the present budget.
+        assert_eq!(
+            reader_output_size(decode, (1216, 684), true, true),
+            FrameSize { w: 1216, h: 684 }
+        );
         // A window taller than 16:9 is bounded by the width.
         assert_eq!(
-            reader_output_size(decode, (1920, 1440), false),
+            reader_output_size(decode, (1920, 1440), false, false),
             FrameSize { w: 1920, h: 1080 }
         );
         // A 4:3 source in a wide window keeps its own aspect.
         let four_three = target_frame_size(1440, 1080);
         assert_eq!(
-            reader_output_size(four_three, (1200, 900), false),
+            reader_output_size(four_three, (1200, 900), false, false),
             FrameSize { w: 1200, h: 900 }
         );
         // Without a published window size (0x0) the source size is used.
-        assert_eq!(reader_output_size(decode, (0, 0), false), decode);
+        assert_eq!(reader_output_size(decode, (0, 0), false, false), decode);
         // Odd window sizes are made even, never zero.
-        let odd = reader_output_size(decode, (1217, 685), false);
+        let odd = reader_output_size(decode, (1217, 685), false, false);
         assert_eq!(odd.w % 2, 0);
         assert_eq!(odd.h % 2, 0);
         assert!(odd.w > 0 && odd.h > 0);
@@ -18074,6 +20314,20 @@ mod tests {
             (12_000..12_100).contains(&after),
             "the content position must be followed ({after})"
         );
+
+        // f212: the same artefact at a *small* size. A 2.5 s pause leaves
+        // `ffplay`'s first report 107-196 ms ahead — under the jump threshold, so
+        // it used to be adopted by the slew path and showed up as a `delta_ms`
+        // spike for one or two samples. Inside the resume window it is the
+        // device clock at any size, and the release's own baseline is kept.
+        control.freeze_audio_clock_at(20_000);
+        control.rebase_audio_clock(true);
+        assert!(control.set_audio_clock_ms(generation, 20_196));
+        let after = control.audio_clock().unwrap_or(0);
+        assert!(
+            after < 20_060,
+            "a small post-resume lead must not become the baseline ({after})"
+        );
     }
 
     // ---- frame-blending interpolation ------------------------------------
@@ -18089,21 +20343,51 @@ mod tests {
         // makes generation possible and it sets the phase grid) but the output
         // grid is min(60, display_hz).
         for display_hz in [90u32, 120, 144, 165, 240, 500] {
-            let plan = interp_plan_for(display_hz, 30.0).expect("a 120 Hz class display blends");
+            let plan = interp_plan_for(display_hz, 30.0, INTERP_MAX_OUT_HZ)
+                .expect("a 120 Hz class display blends");
             assert_eq!(plan.out_hz, INTERP_MAX_OUT_HZ, "display {display_hz} Hz");
             assert_eq!(plan.out_hz, 60);
             assert_eq!(plan.reason, Some("60fps_cap"));
         }
         // At or below 60 the grid is the display's own rate, unclamped.
-        let plan = interp_plan_for(60, 24.0).expect("60 Hz above a 24 fps track");
+        let plan = interp_plan_for(60, 24.0, INTERP_MAX_OUT_HZ).expect("60 Hz above a 24 fps track");
         assert_eq!(plan.out_hz, 60);
         assert_eq!(plan.reason, None);
-        let plan = interp_plan_for(50, 24.0).expect("50 Hz above a 24 fps track");
+        let plan = interp_plan_for(50, 24.0, INTERP_MAX_OUT_HZ).expect("50 Hz above a 24 fps track");
         assert_eq!(plan.out_hz, 50);
         assert_eq!(plan.reason, None);
         // Degenerate readings: no display, no plan.
-        assert!(interp_plan_for(0, 24.0).is_none());
-        assert!(interp_plan_for(1, 24.0).is_none());
+        assert!(interp_plan_for(0, 24.0, INTERP_MAX_OUT_HZ).is_none());
+        assert!(interp_plan_for(1, 24.0, INTERP_MAX_OUT_HZ).is_none());
+    }
+
+    /// The experimental ceiling (`BILI_INTERP_4X=1`) is the only way to 120:
+    /// four slots for a 30 fps track on a 120 Hz display, and never more than
+    /// the display itself.
+    #[test]
+    fn interp_plan_4x_is_opt_in_and_never_exceeds_the_display() {
+        let plan = interp_plan_for(120, 30.0, INTERP_MAX_OUT_HZ_4X).expect("30 fps on 120 Hz");
+        assert_eq!(plan.out_hz, 120);
+        assert_eq!(plan.reason, None);
+        // A 144 Hz display is still capped at 120, with its own reason.
+        let plan = interp_plan_for(144, 30.0, INTERP_MAX_OUT_HZ_4X).expect("30 fps on 144 Hz");
+        assert_eq!(plan.out_hz, 120);
+        assert_eq!(plan.reason, Some("120fps_cap"));
+        // The 4x ceiling only raises the grid: it never decides the rate.
+        let plan = interp_plan_for(60, 30.0, INTERP_MAX_OUT_HZ_4X).expect("60 Hz display");
+        assert_eq!(plan.out_hz, 60);
+        assert_eq!(plan.reason, None);
+        // Size gate: 720p gets it, anything larger keeps 60. 1080p is the size
+        // the measurement says the CPU path cannot hold at 120 (see
+        // `INTERP_4X_MAX_PIXELS`).
+        let hd = interp_frame(1280, 720);
+        let hd_plus = interp_frame(1920, 1080);
+        assert_eq!(interp_out_ceiling(hd, false), INTERP_MAX_OUT_HZ);
+        assert_eq!(interp_out_ceiling(hd_plus, false), INTERP_MAX_OUT_HZ);
+        // The product's 120 fps switch raises the same ceiling the QA variable
+        // does, and the size gate still applies.
+        assert_eq!(interp_out_ceiling(hd, true), INTERP_MAX_OUT_HZ_4X);
+        assert_eq!(interp_out_ceiling(hd_plus, true), INTERP_MAX_OUT_HZ);
     }
 
     /// Every generating mode runs on the same 60 Hz grid at 120 Hz: the mode
@@ -18111,7 +20395,8 @@ mod tests {
     /// rate, and the frame size is not part of the resolution at all.
     #[test]
     fn interp_plan_never_exceeds_60hz_for_any_mode() {
-        let plan = interp_plan_for(120, 30.0).expect("a 30 fps track on a 120 Hz display");
+        let plan = interp_plan_for(120, 30.0, INTERP_MAX_OUT_HZ)
+            .expect("a 30 fps track on a 120 Hz display");
         assert_eq!(plan.out_hz, 60);
         for mode in [InterpMode::Blend, InterpMode::BlockMatch, InterpMode::Ofa] {
             let ticker = InterpTicker::new(plan.out_hz, 1.0, 0.0);
@@ -18126,14 +20411,17 @@ mod tests {
 
     #[test]
     fn interp_plan_requires_a_faster_display_than_the_track() {
-        assert!(interp_plan_for(60, 60.0).is_none());
-        assert!(interp_plan_for(60, 59.94).is_none());
-        assert!(interp_plan_for(30, 30.0).is_none());
-        assert!(interp_plan_for(24, 25.0).is_none());
-        assert!(interp_plan_for(60, 0.0).is_none());
-        assert!(interp_plan_for(60, f64::NAN).is_none());
+        assert!(interp_plan_for(60, 60.0, INTERP_MAX_OUT_HZ).is_none());
+        assert!(interp_plan_for(60, 59.94, INTERP_MAX_OUT_HZ).is_none());
+        assert!(interp_plan_for(30, 30.0, INTERP_MAX_OUT_HZ).is_none());
+        assert!(interp_plan_for(24, 25.0, INTERP_MAX_OUT_HZ).is_none());
+        assert!(interp_plan_for(60, 0.0, INTERP_MAX_OUT_HZ).is_none());
+        assert!(interp_plan_for(60, f64::NAN, INTERP_MAX_OUT_HZ).is_none());
         // 60 Hz exists above a 24 fps track.
-        assert_eq!(interp_plan_for(60, 24.0).map(|p| p.out_hz), Some(60));
+        assert_eq!(
+            interp_plan_for(60, 24.0, INTERP_MAX_OUT_HZ).map(|p| p.out_hz),
+            Some(60)
+        );
     }
 
     /// The pacer produces display frames on the ticker grid: from a 30 fps
@@ -18421,6 +20709,404 @@ mod tests {
                 budget / worst.max(1.0e-9),
             ));
         }
+    }
+
+    // ===================== 4x report: the measurements =====================
+    //
+    // Three ignored spikes behind the "1080p 到 120 fps?" question:
+    //
+    // * `spike_interp_cost_1080p` prices one frame of each pass at 1080p
+    //   (blend, block match, and the optical-flow pair split into upload /
+    //   readback / warp), p50 and p95.
+    // * `spike_interp_4x_pipe_1080p` runs the production passes on the real
+    //   120 Hz grid (four slots per 30 fps interval) for six seconds per mode
+    //   and reports the achieved slot rate, per-slot cost and deadline misses.
+    //   That is the pacer's side only: the window's own paint is measured in the
+    //   app run (`interp mode=… shown_s=… ui_p95_ms=…`).
+    // * `spike_interp_frames_compare` turns two REAL decoded frames (raw RGBA,
+    //   paths in `BILI_F189_FRAME_A`/`_B`) into the pictures of one interval —
+    //   source, linear blend, block match, optical flow — and writes them as
+    //   panels for the labelled montage.
+    //
+    // Run: `cargo test --release player::tests::spike_interp -- --ignored
+    // --nocapture --test-threads=1` with `BILI_DEBUG_LOG` set.
+
+    /// A synthetic pair at real 1080p cost: one frame is a textured pan (the
+    /// block search needs gradients, not noise) and the other is the same
+    /// picture `shift` px to the right with edge replication, which is also what
+    /// a real camera pan looks like to both engines.
+    fn spike_pair(w: u32, h: u32, shift: i32) -> (Vec<u8>, Vec<u8>) {
+        let (wu, hu) = (w as usize, h as usize);
+        let mut a = vec![0u8; wu * hu * 4];
+        for y in 0..hu {
+            for x in 0..wu {
+                // 48 px cells of pseudo-random tone plus a gradient: structure
+                // at several scales, like a real frame.
+                let cell = ((x / 48) * 7 + (y / 48) * 11) as u32;
+                let noise = cell.wrapping_mul(0x9E37_79B9) >> 24;
+                let ramp = (x * 255 / wu) as u32;
+                let i = (y * wu + x) * 4;
+                a[i] = (noise * 3 + ramp / 2) as u8;
+                a[i + 1] = (noise * 2 + (y * 255 / hu) as u32 / 2) as u8;
+                a[i + 2] = (noise ^ ramp) as u8;
+                a[i + 3] = 255;
+            }
+        }
+        let mut b = vec![0u8; a.len()];
+        for y in 0..hu {
+            for x in 0..wu {
+                let sx = (x as i32 - shift).clamp(0, wu as i32 - 1) as usize;
+                let si = (y * wu + sx) * 4;
+                let di = (y * wu + x) * 4;
+                b[di..di + 4].copy_from_slice(&a[si..si + 4]);
+            }
+        }
+        (a, b)
+    }
+
+    /// `(p50, p95, mean)` of a set of timings, ms.
+    fn spike_percentiles(mut times: Vec<f64>) -> (f64, f64, f64) {
+        if times.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |fraction: f64| -> f64 {
+            times[((times.len() as f64 * fraction) as usize).min(times.len() - 1)]
+        };
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        (at(0.50), at(0.95), mean)
+    }
+
+    #[test]
+    #[ignore = "spike measurement: ~20 s; run explicitly with --ignored"]
+    fn spike_interp_cost_1080p() {
+        let (w, h) = (1920u32, 1080u32);
+        let bytes = w as usize * h as usize * 4;
+        let (a, b) = spike_pair(w, h, 16);
+        // A pool-shaped rotation: four buffers, like `BlendPool`, so the pass
+        // writes different pages instead of one hot one.
+        let mut pool: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; bytes]).collect();
+
+        // ---- blend ----
+        for index in 0..8 {
+            blend_rgba_into(&mut pool[index % 4], &a, &b, 128);
+        }
+        let mut blend = Vec::with_capacity(160);
+        for index in 0..160 {
+            let started = Instant::now();
+            blend_rgba_into(&mut pool[index % 4], &a, &b, 128);
+            std::hint::black_box(&pool[index % 4]);
+            blend.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let (bp50, bp95, bavg) = spike_percentiles(blend);
+
+        // ---- block match, product path (720p, the largest size it accepts) ----
+        let (a720, b720) = spike_pair(1280, 720, 8);
+        let mut engine = motion::MotionInterp::new();
+        let mut bm720 = Vec::new();
+        for index in 0..40 {
+            let out = &mut pool[index % 4];
+            if engine.interpolate(out, &a720, &b720, 1280, 720, 0.5, 30.0) && index >= 6 {
+                bm720.push(f64::from(engine.last_pair_ms()));
+            }
+        }
+        let (bm7_p50, bm7_p95, bm7_avg) = spike_percentiles(bm720.clone());
+
+        // ---- block match at 1080p: the product refuses this size, so the pass
+        // is priced through the measurement entry point ----
+        let mut engine = motion::MotionInterp::new();
+        let mut bm1080 = Vec::new();
+        for index in 0..24 {
+            let out = &mut pool[index % 4];
+            if engine.interpolate_beyond_cap(out, &a, &b, w, h, 0.5, 30.0) && index >= 4 {
+                bm1080.push(f64::from(engine.last_pair_ms()));
+            }
+        }
+        let (bm_p50, bm_p95, bm_avg) = spike_percentiles(bm1080.clone());
+
+        // ---- optical flow: upload, readback and warp, separately ----
+        let mut submit = Vec::new();
+        let mut readback = Vec::new();
+        let mut warp = Vec::new();
+        if ofa::Ofa::available() {
+            let mut engine = ofa::Ofa::new();
+            if engine.ensure(w, h) {
+                for index in 0..40 {
+                    if !engine.submit(&a, &b, w, h) {
+                        break;
+                    }
+                    if index >= 4 {
+                        submit.push(f64::from(engine.last_ms()));
+                    }
+                    // The binding has no fence: give the engine its interval.
+                    std::thread::sleep(Duration::from_millis(9));
+                    let Some((flow, gw, gh)) = engine.try_flow() else {
+                        break;
+                    };
+                    if index >= 4 {
+                        readback.push(f64::from(engine.flow_ms()));
+                    }
+                    let started = Instant::now();
+                    let ok =
+                        ofa::warp(&mut pool[index % 4], &a, &b, &flow, gw, gh, w, h, 0.5);
+                    let ms = started.elapsed().as_secs_f64() * 1000.0;
+                    if ok && index >= 4 {
+                        warp.push(ms);
+                    }
+                    std::hint::black_box(&pool[index % 4]);
+                }
+            }
+        }
+        let (s_p50, s_p95, s_avg) = spike_percentiles(submit.clone());
+        let (f_p50, f_p95, f_avg) = spike_percentiles(readback.clone());
+        let (w_p50, w_p95, w_avg) = spike_percentiles(warp.clone());
+        // The 4x interval: one upload, one readback, three warps, one blend.
+        let ofa_interval = s_avg + f_avg + 3.0 * w_avg + bavg;
+        crate::debug_log(&format!(
+            "spike interp cost 1080p frame={w}x{h} blend_p50_ms={bp50:.3} blend_p95_ms={bp95:.3} blend_avg_ms={bavg:.3} \
+             bm720_p50_ms={bm7_p50:.3} bm720_p95_ms={bm7_p95:.3} bm720_avg_ms={bm7_avg:.3} \
+             bm1080_p50_ms={bm_p50:.3} bm1080_p95_ms={bm_p95:.3} bm1080_avg_ms={bm_avg:.3} \
+             ofa_upload_p50_ms={s_p50:.3} ofa_upload_p95_ms={s_p95:.3} ofa_upload_avg_ms={s_avg:.3} \
+             ofa_readback_p50_ms={f_p50:.3} ofa_readback_p95_ms={f_p95:.3} ofa_readback_avg_ms={f_avg:.3} \
+             ofa_warp_p50_ms={w_p50:.3} ofa_warp_p95_ms={w_p95:.3} ofa_warp_avg_ms={w_avg:.3} \
+             ofa_warp_n={} ofa_interval_4x_avg_ms={ofa_interval:.3} \
+             ofa_n={} bm720_n={} bm1080_n={}",
+            warp.len(),
+            submit.len(),
+            bm720.len(),
+            bm1080.len(),
+        ));
+    }
+
+    /// The 120 Hz grid on the production passes, six seconds per mode.
+    ///
+    /// One 30 fps interval is four slots. Mode 1 blends all four; mode 3 pays
+    /// one optical-flow pair and warps the three interior slots (the slot at
+    /// phase 0 is a blend, exactly like the shipped loop); mode 2 at 1080p is
+    /// four blends, because the block-matching path refuses that size.
+    #[test]
+    #[ignore = "spike measurement: ~30 s; run explicitly with --ignored"]
+    fn spike_interp_4x_pipe_1080p() {
+        let (w, h) = (1920u32, 1080u32);
+        let bytes = w as usize * h as usize * 4;
+        // A real chain of five frames, 8 px apart: every optical-flow pair is
+        // `(f[k], f[k+1])`, so the engine sees the same shared-frame shape the
+        // pacer produces (its continuous upload only works on that shape).
+        let chain: Vec<Vec<u8>> = (0..5).map(|k| spike_pair(w, h, 8 * k).0).collect();
+        let mut pool: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; bytes]).collect();
+        let mut motion_engine = motion::MotionInterp::new();
+        let mut ofa_engine = if ofa::Ofa::available() {
+            let mut engine = ofa::Ofa::new();
+            if engine.ensure(w, h) {
+                Some(engine)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // The field of the first pair, so the first interval has one to warp
+        // with (production reads its predecessor's field at the interval start).
+        let mut flow: Option<(Vec<i16>, u32, u32)> = None;
+        let mut upload_ms = Vec::new();
+        let mut readback_ms = Vec::new();
+        if let Some(engine) = ofa_engine.as_mut() {
+            if engine.submit(&chain[0], &chain[1], w, h) {
+                std::thread::sleep(Duration::from_millis(9));
+                flow = engine.try_flow();
+            }
+        }
+
+        for mode in ["blend", "bm", "ofa"] {
+            let run = Duration::from_secs(6);
+            let slot_hz = 120u32;
+            let period = 1.0 / f64::from(slot_hz);
+            let mut slots: Vec<f64> = Vec::new();
+            let mut blend_slots: Vec<f64> = Vec::new();
+            let mut warp_slots: Vec<f64> = Vec::new();
+            let mut misses = 0u64;
+            let mut produced = 0u64;
+            let started = Instant::now();
+            let mut tick = 0u64;
+            let mut phase_index = 0usize;
+            while started.elapsed() < run {
+                let deadline = started + Duration::from_secs_f64(period * tick as f64);
+                let now = Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline - now);
+                }
+                tick += 1;
+                let interval = phase_index / 4;
+                let phase = (phase_index % 4) as f32 * 0.25;
+                // Odd intervals pan the other way? No: the chain is monotonic,
+                // so pair k is (f[k], f[k+1]) and the A/B of this interval are
+                // the pair's own frames.
+                let pair = interval % (chain.len() - 1);
+                let (frame_a, frame_b) = (&chain[pair], &chain[pair + 1]);
+                // Production: the field of the pair submitted last interval is
+                // read at the start of this one.
+                if mode == "ofa" && phase_index % 4 == 0 {
+                    if let Some(engine) = ofa_engine.as_mut() {
+                        if let Some(next) = engine.try_flow() {
+                            flow = Some(next);
+                            readback_ms.push(f64::from(engine.flow_ms()));
+                        }
+                    }
+                }
+                let out = &mut pool[(tick as usize) % 4];
+                phase_index += 1;
+                let slot_start = Instant::now();
+                let mut was_warp = false;
+                match mode {
+                    "bm" => {
+                        // Product shape at 1080p: the search refuses, the slot
+                        // is a blend like mode 1.
+                        if !motion_engine.interpolate(out, frame_a, frame_b, w, h, phase, 8.0) {
+                            blend_rgba_into(out, frame_a, frame_b, (phase * 256.0) as u16);
+                        }
+                    }
+                    "ofa" => {
+                        let warped = match (flow.as_ref(), true) {
+                            (Some((field, gw, gh)), true) if (0.125..=0.875).contains(&phase) => {
+                                ofa::warp(out, frame_a, frame_b, field, *gw, *gh, w, h, phase)
+                            }
+                            _ => false,
+                        };
+                        was_warp = warped;
+                        if !warped {
+                            blend_rgba_into(out, frame_a, frame_b, (phase * 256.0) as u16);
+                        }
+                    }
+                    _ => blend_rgba_into(out, frame_a, frame_b, (phase * 256.0) as u16),
+                }
+                std::hint::black_box(&*out);
+                let cost = slot_start.elapsed().as_secs_f64() * 1000.0;
+                if started.elapsed() >= Duration::from_millis(500) {
+                    slots.push(cost);
+                    if was_warp {
+                        warp_slots.push(cost);
+                    } else {
+                        blend_slots.push(cost);
+                    }
+                }
+                if cost > period * 1000.0 {
+                    misses += 1;
+                }
+                produced += 1;
+                // The pair is submitted after the interval's last slot, like
+                // `decode_loop` does, so the upload never delays a tick.
+                if mode == "ofa" && phase_index % 4 == 0 {
+                    if let Some(engine) = ofa_engine.as_mut() {
+                        if engine.submit(frame_a, frame_b, w, h) {
+                            upload_ms.push(f64::from(engine.last_ms()));
+                        }
+                    }
+                }
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            let (p50, p95, avg) = spike_percentiles(slots.clone());
+            let (bl_p50, bl_p95, bl_avg) = spike_percentiles(blend_slots.clone());
+            let (wp_p50, wp_p95, wp_avg) = spike_percentiles(warp_slots.clone());
+            let (up_avg, _, _) = spike_percentiles(upload_ms.clone());
+            let (rb_avg, _, _) = spike_percentiles(readback_ms.clone());
+            let interval_ms = 4.0 * avg + up_avg + rb_avg;
+            crate::debug_log(&format!(
+                "spike interp 4x pipe mode={mode} frame={w}x{h} target_hz={slot_hz} \
+                 achieved_s={:.1} produced={produced} cost_p50_ms={p50:.3} cost_p95_ms={p95:.3} \
+                 cost_avg_ms={avg:.3} blend_p50_ms={bl_p50:.3} blend_p95_ms={bl_p95:.3} \
+                 blend_avg_ms={bl_avg:.3} blend_n={} warp_p50_ms={wp_p50:.3} warp_p95_ms={wp_p95:.3} \
+                 warp_avg_ms={wp_avg:.3} warp_n={} upload_avg_ms={up_avg:.3} readback_avg_ms={rb_avg:.3} \
+                 interval_4x_ms={interval_ms:.3} over_slot={misses} slot_ms={:.3} window_s={elapsed:.2}",
+                produced as f64 / elapsed,
+                blend_slots.len(),
+                warp_slots.len(),
+                period * 1000.0,
+            ));
+        }
+    }
+
+    /// Source / blend / block match / optical flow of one real 30 fps interval.
+    ///
+    /// The two frames come from the same decoded stream, 33 ms apart, so these
+    /// are the pictures the 4x grid would show between them — not a synthetic
+    /// pattern. Panels are written as RGBA PNGs into `BILI_CAPTURE_DIR`
+    /// (`target/qa` by default); the labelled montage is assembled from them.
+    #[test]
+    #[ignore = "spike measurement: needs BILI_F189_FRAME_A/_B; run with --ignored"]
+    fn spike_interp_frames_compare() {
+        let (w, h) = (1920u32, 1080u32);
+        let bytes = w as usize * h as usize * 4;
+        let read = |name: &str| -> Option<Vec<u8>> {
+            let path = std::env::var(name).ok()?;
+            let data = std::fs::read(path).ok()?;
+            (data.len() >= bytes).then(|| data[..bytes].to_vec())
+        };
+        let (Some(a), Some(b)) = (read("BILI_F189_FRAME_A"), read("BILI_F189_FRAME_B")) else {
+            crate::debug_log("spike interp frames skipped reason=no-frames");
+            return;
+        };
+        let dir = std::env::var_os("BILI_CAPTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/qa"));
+        let _ = std::fs::create_dir_all(&dir);
+        let save = |name: &str, data: &[u8]| -> bool {
+            let Some(image) = image::RgbaImage::from_raw(w, h, data.to_vec()) else {
+                return false;
+            };
+            let path = dir.join(name);
+            match image.save(&path) {
+                Ok(()) => {
+                    crate::debug_log(&format!(
+                        "spike interp frame panel={} path={} size={w}x{h}",
+                        name,
+                        path.display()
+                    ));
+                    true
+                }
+                Err(err) => {
+                    crate::debug_log(&format!("spike interp frame panel={name} err={err}"));
+                    false
+                }
+            }
+        };
+        let mut out = vec![0u8; bytes];
+        // Source frame A: the interval's own picture (phase 0).
+        save("f189_src.png", &a);
+        // Linear blend at the midpoint: the ghosting baseline.
+        blend_rgba_into(&mut out, &a, &b, 128);
+        save("f189_blend_mid.png", &out);
+        // Block match at the midpoint. The product path refuses 1080p, so this
+        // is the measurement path; the report says so.
+        let mut engine = motion::MotionInterp::new();
+        let started = Instant::now();
+        let bm_ok = engine.interpolate_beyond_cap(&mut out, &a, &b, w, h, 0.5, 60.0);
+        let bm_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if bm_ok {
+            save("f189_bm_mid.png", &out);
+        }
+        // Optical flow at the midpoint: the real engine's field and the
+        // production warp.
+        let mut ofa_ms = 0.0f64;
+        let mut ofa_ok = false;
+        if ofa::Ofa::available() {
+            let mut engine = ofa::Ofa::new();
+            if engine.ensure(w, h) && engine.submit(&a, &b, w, h) {
+                std::thread::sleep(Duration::from_millis(12));
+                if let Some((flow, gw, gh)) = engine.try_flow() {
+                    let started = Instant::now();
+                    ofa_ok = ofa::warp(&mut out, &a, &b, &flow, gw, gh, w, h, 0.5);
+                    ofa_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    if ofa_ok {
+                        save("f189_ofa_mid.png", &out);
+                    }
+                }
+            }
+        }
+        crate::debug_log(&format!(
+            "spike interp frames compare frame={w}x{h} bm_ok={} bm_ms={bm_ms:.3} ofa_ok={ofa_ok} ofa_warp_ms={ofa_ms:.3} dir={}",
+            u8::from(bm_ok),
+            dir.display(),
+        ));
     }
 
     /// Per-frame blend cost at the two sizes the player actually decodes.

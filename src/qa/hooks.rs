@@ -127,6 +127,25 @@ pub(crate) fn maybe_start_window_probe(state: &Rc<PlayerState>) {
     );
 }
 
+/// The queue engine's end-to-end proof (`BILI_PLAYLIST_TEST=1`).
+///
+/// Every step goes through the same Slint callbacks the UI fires
+/// (`card_enqueue` / `playlist_play` / `cycle_play_mode` / `playlist_remove` /
+/// `playlist_clear`), and an end-of-track is produced through the real code
+/// path: the harness seeks to `duration - 2s`, then the player's 250ms tick
+/// latches `PlaybackControl::track_ended` and the queue handles it exactly as
+/// it would at a natural end. Nothing here fabricates queue state.
+///
+/// Contract under test (f186): a natural end REMOVES the finished row before it
+/// decides next / shuffle / stop, so the panel never keeps a watched card.
+///
+///   1. three rows, mode 1: end row 0 → two rows left, row 0 is the old row 1,
+///      playback continues on it (`f186_after_end.png`).
+///   2. one row, mode 1: end it → queue empty, bar stopped, empty panel
+///      (`f186_empty.png`).
+///   3. three rows, mode 0: end row 0 → removed + stopped, `action=stop`.
+///   4. manual ✕ close: its own (pre-existing) path is logged with the same
+///      before/after counts, so the two gestures stay distinguishable.
 pub(crate) fn maybe_start_playlist_test(ui: &AppWindow) {
     let enabled = env::flag("BILI_PLAYLIST_TEST");
     if !enabled || PLAYLIST_TEST_STARTED.swap(true, Ordering::SeqCst) {
@@ -135,8 +154,11 @@ pub(crate) fn maybe_start_playlist_test(ui: &AppWindow) {
     crate::debug_log("playlist test start hook=BILI_PLAYLIST_TEST");
     let weak = ui.as_weak();
     let phase = Rc::new(Cell::new(0u32));
-    let first_random = Rc::new(Cell::new(usize::MAX));
-    let quiet = Rc::new(Cell::new(0u32));
+    // The three bvids the mode-1 pass enqueued, in queue order.
+    let bvids = Rc::new(RefCell::new(Vec::<String>::new()));
+    let items_before_close = Rc::new(Cell::new(0usize));
+    let stall = Rc::new(Cell::new(0u32));
+    let last_phase = Rc::new(Cell::new(u32::MAX));
     let timer = Rc::new(slint::Timer::default());
     let timer_a = timer.clone();
     PLAYLIST_TEST_TIMER.with(|slot| {
@@ -144,6 +166,31 @@ pub(crate) fn maybe_start_playlist_test(ui: &AppWindow) {
             *slot = Some(timer.clone());
         }
     });
+    // Queue length as the playlist host sees it (not the model, which lags a
+    // publish by nothing but would still read as "the UI's copy").
+    fn queue_len() -> usize {
+        playlist()
+            .map(|host| host.queue.borrow().items.len())
+            .unwrap_or(0)
+    }
+    fn queue_state() -> (Vec<String>, Option<usize>) {
+        playlist()
+            .map(|host| {
+                let (items, current, _) = host.snapshot();
+                (items, current)
+            })
+            .unwrap_or_default()
+    }
+    fn newest() -> Option<PlayerWindow> {
+        playlist()
+            .and_then(|host| host.state.upgrade())
+            .and_then(|state| newest_player(&state))
+    }
+    fn track_started() -> bool {
+        player::active_control()
+            .map(|control| control.duration_ms() > 0 && !control.track_ended())
+            .unwrap_or(false)
+    }
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(500),
@@ -153,15 +200,45 @@ pub(crate) fn maybe_start_playlist_test(ui: &AppWindow) {
                 return;
             };
             let current = phase.get();
+            // A waiting phase must never hold the app hostage: 30s on one
+            // phase means the run's premise is gone (login, feed, network).
+            if current != last_phase.get() {
+                last_phase.set(current);
+                stall.set(0);
+            } else {
+                stall.set(stall.get() + 1);
+                if stall.get() > 60 {
+                    crate::debug_log(&format!("f186 abort phase={current} reason=stall"));
+                    timer_a.stop();
+                    request_quit("f186 playlist qa stalled");
+                    return;
+                }
+            }
             let next = match current {
+                // ---- 1: three rows, mode 1, the first one plays to the end ----
                 0 => {
-                    // 1. Enqueue three feed rows through the real card callback.
-                    crate::debug_log("playlist test step=enqueue count=3 via=card_enqueue");
                     ui.invoke_card_enqueue(0);
                     ui.invoke_card_enqueue(1);
                     ui.invoke_card_enqueue(2);
-                    log_playlist_state("after-enqueue");
-                    1
+                    if queue_len() < 3 {
+                        crate::debug_log(&format!(
+                            "playlist test enqueue pending items={}",
+                            queue_len()
+                        ));
+                        0
+                    } else {
+                        *bvids.borrow_mut() = queue_state().0;
+                        crate::debug_log(&format!(
+                            "playlist test step=enqueue count=3 via=card_enqueue queue={:?}",
+                            bvids.borrow()
+                        ));
+                        ui.set_playlist_open(true);
+                        ui.set_play_mode(1);
+                        ui.invoke_cycle_play_mode();
+                        crate::debug_log("playlist test step=mode-1 via=cycle_play_mode");
+                        log_playlist_state("after-enqueue");
+                        1
+                    }
                 }
                 1 => {
                     crate::debug_log("playlist test step=play-index-0 via=playlist_play");
@@ -169,205 +246,204 @@ pub(crate) fn maybe_start_playlist_test(ui: &AppWindow) {
                     2
                 }
                 2 => {
-                    // Wait for playurl to land, then pin mode 1 (automatic) the
-                    // same way the UI does: set the property, fire the callback.
-                    let ready = player::active_control()
-                        .map(|control| control.duration_ms() > 0)
-                        .unwrap_or(false);
-                    if !ready {
-                        2
+                    if track_started() && seek_near_track_end() {
+                        3
                     } else {
-                        ui.set_play_mode(1);
-                        ui.invoke_cycle_play_mode();
-                        crate::debug_log("playlist test step=mode-1 via=cycle_play_mode");
-                        if seek_near_track_end() {
-                            3
-                        } else {
-                            2
-                        }
+                        2
                     }
                 }
                 3 => {
-                    if playlist().and_then(|host| host.current()) == Some(1) {
-                        log_playlist_state("mode-1-advanced");
-                        crate::debug_log("playlist test assert mode=1 from=0 to=1 ok=1");
-                        ui.set_play_mode(2);
-                        ui.invoke_cycle_play_mode();
-                        crate::debug_log("playlist test step=mode-2 via=cycle_play_mode");
-                        4
-                    } else {
+                    let (items, current) = queue_state();
+                    if items.len() != 2 || current != Some(0) {
                         3
+                    } else {
+                        let expected = bvids.borrow().get(1).cloned().unwrap_or_default();
+                        let successor_ok = items.first() == Some(&expected);
+                        crate::debug_log(&format!(
+                            "playlist test assert end-mode1 removed=1 items={} current={current:?} row0={} expected={} successor_ok={}",
+                            items.len(),
+                            items.first().cloned().unwrap_or_default(),
+                            expected,
+                            u8::from(successor_ok)
+                        ));
+                        let control = player::active_control();
+                        crate::debug_log(&format!(
+                            "playlist test assert end-mode1 continues playing={} duration_ms={} position_ms={} ended={}",
+                            u8::from(ui.get_now_playing()),
+                            control.as_ref().map(|c| c.duration_ms()).unwrap_or(0),
+                            control
+                                .as_ref()
+                                .map(|c| c.playback_position_ms())
+                                .unwrap_or(0),
+                            u8::from(
+                                control
+                                    .as_ref()
+                                    .map(|c| c.track_ended())
+                                    .unwrap_or(true)
+                            )
+                        ));
+                        crate::debug_log(&format!(
+                            "playlist test assert end-mode1 panel_rows={} now_playing={}",
+                            ui.get_playlist().row_count(),
+                            u8::from(ui.get_now_playing())
+                        ));
+                        log_playlist_state("mode-1-advanced");
+                        let path = qa_capture_path("f186_after_end");
+                        let size = capture_window_png(&ui.window(), &path);
+                        crate::debug_log(&format!(
+                            "f186 capture tag=f186_after_end path={} size={size:?}",
+                            path.display()
+                        ));
+                        4
                     }
                 }
+                // ---- 2: a single queued row ends -> empty queue, stopped bar ----
                 4 => {
-                    let ready = player::active_control()
-                        .map(|control| control.duration_ms() > 0)
-                        .unwrap_or(false);
-                    if ready {
-                        if seek_near_track_end() {
-                            5
-                        } else {
-                            4
-                        }
-                    } else {
-                        4
+                    crate::debug_log("playlist test step=single-item close=1 clear=1");
+                    if let Some(player) = newest() {
+                        player.invoke_player_closed();
                     }
+                    ui.invoke_playlist_clear();
+                    log_playlist_state("after-clear");
+                    5
                 }
                 5 => {
-                    let current = playlist().and_then(|host| host.current());
-                    match current {
-                        Some(index) if index != 1 => {
-                            first_random.set(index);
-                            log_playlist_state("mode-2-first");
-                            crate::debug_log(&format!(
-                                "playlist test assert mode=2 first={index} repeat=0"
-                            ));
-                            6
-                        }
-                        _ => 5,
+                    ui.invoke_card_enqueue_only(0);
+                    if queue_len() != 1 {
+                        crate::debug_log(&format!(
+                            "playlist test single-item pending items={}",
+                            queue_len()
+                        ));
+                        5
+                    } else {
+                        crate::debug_log("playlist test step=single-item enqueued=1 play=1");
+                        ui.invoke_playlist_play(0);
+                        6
                     }
                 }
                 6 => {
-                    let ready = player::active_control()
-                        .map(|control| control.duration_ms() > 0)
-                        .unwrap_or(false);
-                    if ready {
-                        if seek_near_track_end() {
-                            7
-                        } else {
-                            6
-                        }
+                    if track_started() && seek_near_track_end() {
+                        7
                     } else {
                         6
                     }
                 }
                 7 => {
-                    let current = playlist().and_then(|host| host.current());
-                    let first = first_random.get();
-                    match current {
-                        Some(index) if index != first => {
-                            log_playlist_state("mode-2-second");
-                            crate::debug_log(&format!(
-                                "playlist test assert mode=2 first={first} second={index} repeat={}",
-                                usize::from(index == first)
-                            ));
-                            ui.set_play_mode(0);
-                            ui.invoke_cycle_play_mode();
-                            crate::debug_log("playlist test step=mode-0 via=cycle_play_mode");
-                            8
-                        }
-                        _ => 7,
-                    }
-                }
-                8 => {
-                    let ready = player::active_control()
-                        .map(|control| control.duration_ms() > 0)
-                        .unwrap_or(false);
-                    if ready {
-                        if seek_near_track_end() {
-                            quiet.set(0);
-                            9
-                        } else {
-                            8
-                        }
+                    let (items, current) = queue_state();
+                    let playing = ui.get_now_playing();
+                    if !items.is_empty() || current.is_some() || playing {
+                        7
                     } else {
+                        crate::debug_log(&format!(
+                            "playlist test assert end-single removed=1 items=0 current=None panel_rows={} now_playing={} stopped=1",
+                            ui.get_playlist().row_count(),
+                            u8::from(playing)
+                        ));
+                        log_playlist_state("single-empty");
+                        let path = qa_capture_path("f186_empty");
+                        let size = capture_window_png(&ui.window(), &path);
+                        crate::debug_log(&format!(
+                            "f186 capture tag=f186_empty path={} size={size:?}",
+                            path.display()
+                        ));
                         8
                     }
                 }
-                9 => {
-                    // Give the 250ms tick time to handle the end, then confirm
-                    // it stopped: the current index must not move.
-                    let ticks = quiet.get() + 1;
-                    quiet.set(ticks);
-                    if ticks < 4 {
-                        9
+                // ---- 3: three rows, mode 0, the first one ends -> remove + stop ----
+                8 => {
+                    ui.invoke_card_enqueue_only(0);
+                    ui.invoke_card_enqueue_only(1);
+                    ui.invoke_card_enqueue_only(2);
+                    if queue_len() < 3 {
+                        8
                     } else {
-                        log_playlist_state("mode-0-stopped");
-                        crate::debug_log(&format!(
-                            "playlist test assert mode=0 stopped=1 now_playing={}",
-                            ui.get_now_playing()
-                        ));
-                        // Status → toast: exactly the call `player::set_status`
-                        // makes, twice, to prove one event shows one toast. The
-                        // active player window is still open at this point.
-                        crate::toast_active("播放结束", crate::TOAST_KIND_INFO);
-                        crate::toast_active("播放结束", crate::TOAST_KIND_INFO);
-                        crate::debug_log("playlist test toast-active twice second-must-skip");
+                        crate::debug_log("playlist test step=mode0 enqueue=3 play=0");
+                        ui.invoke_playlist_play(0);
+                        ui.set_play_mode(0);
+                        ui.invoke_cycle_play_mode();
+                        crate::debug_log("playlist test step=mode-0 via=cycle_play_mode");
+                        9
+                    }
+                }
+                9 => {
+                    if track_started() && seek_near_track_end() {
                         10
+                    } else {
+                        9
                     }
                 }
                 10 => {
-                    crate::debug_log("playlist test step=remove-index-0");
-                    ui.invoke_playlist_remove(0);
-                    log_playlist_state("after-remove");
-                    11
+                    let (items, current) = queue_state();
+                    let playing = ui.get_now_playing();
+                    if items.len() != 2 || playing {
+                        10
+                    } else {
+                        crate::debug_log(&format!(
+                            "playlist test assert end-mode0 removed=1 items={} current={current:?} panel_rows={} now_playing=0 stopped=1",
+                            items.len(),
+                            ui.get_playlist().row_count()
+                        ));
+                        log_playlist_state("mode-0-stopped");
+                        11
+                    }
                 }
+                // ---- 4: manual ✕ close, logged with the same counters ----
                 11 => {
-                    crate::debug_log("playlist test step=clear");
-                    ui.invoke_playlist_clear();
-                    log_playlist_state("after-clear");
-                    // Persistence check: the cleared queue is what the file
-                    // holds right now.
-                    let stored = settings::load();
+                    ui.set_play_mode(1);
+                    ui.invoke_cycle_play_mode();
+                    crate::debug_log("playlist test step=manual-close play=0");
+                    ui.invoke_playlist_play(0);
+                    12
+                }
+                12 => {
+                    if !track_started() {
+                        12
+                    } else {
+                        items_before_close.set(queue_len());
+                        crate::debug_log(&format!(
+                            "playlist test step=close-window via=player_closed items_before={}",
+                            items_before_close.get()
+                        ));
+                        match newest() {
+                            Some(player) => {
+                                player.invoke_player_closed();
+                                13
+                            }
+                            None => 13,
+                        }
+                    }
+                }
+                13 => {
+                    log_playlist_state("after-manual-close");
                     crate::debug_log(&format!(
-                        "playlist test stored-after-clear items={} current={:?} mode={}",
-                        stored.playlist.len(),
-                        stored.playlist_current,
-                        stored.play_mode
+                        "f186 manual-close via=window-close items_before={} items_after={} removed={} policy=window-close-removes",
+                        items_before_close.get(),
+                        queue_len(),
+                        items_before_close.get().saturating_sub(queue_len())
                     ));
-                    // Leave three entries behind (append only: no autoplay) so
-                    // the relaunch can prove restore without starting anything.
-                    crate::debug_log("playlist test step=reseed count=3 via=card_enqueue_only");
+                    // Clean up and leave three rows behind (append only, no
+                    // autoplay) so a relaunch can prove restore.
+                    ui.invoke_playlist_clear();
                     ui.invoke_card_enqueue_only(0);
                     ui.invoke_card_enqueue_only(1);
                     ui.invoke_card_enqueue_only(2);
                     log_playlist_state("after-reseed");
-                    12
+                    14
                 }
-                12 => {
+                14 => {
                     let stored = settings::load();
                     crate::debug_log(&format!(
                         "playlist test stored-for-restore items={} current={:?} mode={} autoplay={}",
                         stored.playlist.len(),
                         stored.playlist_current,
                         stored.play_mode,
-                        ui.get_now_playing()
+                        u8::from(ui.get_now_playing())
                     ));
-                    crate::debug_log(
-                        "playlist test done relaunch=BILI_PLAYLIST_TEST=1&restore-check",
-                    );
-                    13
-                }
-                13 => {
-                    // The ✕ path (both close paths share `close_player_window`):
-                    // a user close means "done with this video", so its queue row
-                    // goes with it. Auto-advance uses tag=replace and is skipped,
-                    // which the mode-2 step above already proves (items=3 after
-                    // the shuffle advance).
-                    let current = playlist().and_then(|host| host.current());
-                    let items_before = playlist()
-                        .map(|host| host.queue.borrow().items.len())
-                        .unwrap_or(0);
-                    let window = playlist()
-                        .and_then(|host| host.state.upgrade())
-                        .and_then(|state| newest_player(&state));
-                    match window {
-                        Some(player) => {
-                            crate::debug_log("playlist test step=close-window via=player_closed");
-                            player.invoke_player_closed();
-                            log_playlist_state("after-close");
-                            let items_after = playlist()
-                                .map(|host| host.queue.borrow().items.len())
-                                .unwrap_or(0);
-                            crate::debug_log(&format!(
-                                "playlist test assert close current_before={current:?} now_playing={} items_before={items_before} items_after={items_after} removed={} keep-current=0 remove-on-close=1",
-                                ui.get_now_playing(),
-                                items_before.saturating_sub(items_after)
-                            ));
-                            14
-                        }
-                        None => 14,
-                    }
+                    crate::debug_log("playlist test done");
+                    crate::debug_log("f186 done");
+                    timer_a.stop();
+                    request_quit("f186 playlist qa done");
+                    return;
                 }
                 _ => {
                     timer_a.stop();
@@ -5361,6 +5437,927 @@ pub(crate) fn maybe_start_f152_test(
         std::thread::sleep(Duration::from_millis(8000));
         run_f152_test(weak, session_slot, settings_store);
     });
+}
+
+// ===================== f183 QA: only our own players occlude ===============
+//
+// `BILI_F183_TEST=1` proves the narrowed occlusion rule on the REAL windows and
+// the real Win32 z-order:
+//   1. An independent, always-on-top, borderless MAXIMISED PowerShell WinForms
+//      window is put over a playing player for 10 s. It is not one of our
+//      windows, so it must NOT pause: `presented_frames` keeps advancing at the
+//      stream rate, `OCCLUDED_PAUSES` does not move and no
+//      `player occluded pause` line is written. Two `take_snapshot` frames 10 s
+//      apart are diffed to show the picture itself advanced under the cover.
+//   2. The same external window covering only the LEFT HALF must not pause
+//      either.
+//   3. Two of OUR player windows, completely overlapping, still pause the back
+//      one (`player occluded pause ... occluders=[...]`), and moving the front
+//      one away resumes it. Closing the front one while the back is held also
+//      resumes it - the closed handle must leave the allow-list first.
+// Captures: `f183_external_fullscreen.png` (desktop grab of the external cover
+// beside the player's own frame), `f183_two_players.png` (the overlapping pair
+// with the pause receipt rendered under it), plus the frames used for the
+// diffs. Every line is prefixed `f183 `.
+
+/// The PowerShell WinForms program behind the "independent external window".
+///
+/// Pure window API: a real top-level window with `FormBorderStyle=None`,
+/// `TopMost=true` and (for the fullscreen case) `WindowState=Maximized`. It is a
+/// separate PROCESS, so it exercises exactly the case the rule is about: some
+/// other program covering the player. The script writes its HWND to
+/// `F183_HWND_FILE` so the test can log which window was really in front, and
+/// closes itself after `F183_SECONDS`.
+const F183_OVERLAY_PS: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$ErrorActionPreference = 'Stop'
+$f = New-Object System.Windows.Forms.Form
+$f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$f.ShowInTaskbar = $false
+$f.TopMost = $true
+$f.Text = 'f183 external overlay'
+$f.BackColor = [System.Drawing.Color]::FromArgb(14, 36, 22)
+$f.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$f.Bounds = New-Object System.Drawing.Rectangle ([int]$env:F183_X), ([int]$env:F183_Y), ([int]$env:F183_W), ([int]$env:F183_H)
+if ($env:F183_FULL -eq '1')
+{
+    $f.WindowState = [System.Windows.Forms.FormWindowState]::Maximized
+}
+$f.Show()
+$f.Activate()
+[System.IO.File]::WriteAllText($env:F183_HWND_FILE, $f.Handle.ToInt64().ToString())
+$until = [DateTime]::UtcNow.AddSeconds([int]$env:F183_SECONDS)
+while ([DateTime]::UtcNow -lt $until)
+{
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 50
+}
+$f.Close()
+"#;
+
+/// Compose the overlap evidence image: the real desktop grab on top, the pause
+/// receipt lines rendered underneath (System.Drawing text, same file the report
+/// cites). Inputs: `F183_RAW`, `F183_LOG`, output `F183_OUT`.
+const F183_COMPOSE_PS: &str = r#"
+Add-Type -AssemblyName System.Drawing
+$img = [System.Drawing.Image]::FromFile($env:F183_RAW)
+$lines = @()
+if (Test-Path -LiteralPath $env:F183_LOG) { $lines = @(Get-Content -LiteralPath $env:F183_LOG) }
+$lineHeight = 19
+$pad = 10
+$extra = $pad * 2 + [Math]::Max(1, $lines.Count) * $lineHeight
+$bmp = New-Object System.Drawing.Bitmap $img.Width, ($img.Height + $extra)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.Clear([System.Drawing.Color]::FromArgb(12, 12, 14))
+$g.DrawImage($img, 0, 0, $img.Width, $img.Height)
+$font = New-Object System.Drawing.Font 'Consolas', 11
+$brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(222, 222, 222))
+$y = $img.Height + $pad
+foreach ($line in $lines)
+{
+    $g.DrawString($line, $font, $brush, 6, $y)
+    $y += $lineHeight
+}
+$g.Dispose()
+$bmp.Save($env:F183_OUT, [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose()
+$img.Dispose()
+"#;
+
+/// One live external overlay process, killed and its temp files removed on drop.
+struct F183Overlay {
+    child: std::process::Child,
+    hwnd: isize,
+    script: std::path::PathBuf,
+    hwnd_file: std::path::PathBuf,
+}
+
+impl F183Overlay {
+    fn wait(&mut self) {
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for F183Overlay {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.script);
+        let _ = std::fs::remove_file(&self.hwnd_file);
+    }
+}
+
+/// Start the external PowerShell window and wait (bounded) for its HWND.
+fn f183_spawn_overlay(full: bool, rect: WinRect, seconds: u64) -> Option<F183Overlay> {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+    let base = std::env::temp_dir().join(format!(
+        "bili_f183_overlay_{}_{seq}",
+        std::process::id()
+    ));
+    let script = base.with_extension("ps1");
+    let hwnd_file = base.with_extension("hwnd");
+    let _ = std::fs::remove_file(&hwnd_file);
+    std::fs::write(&script, F183_OVERLAY_PS).ok()?;
+    let mut child = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .env("F183_FULL", if full { "1" } else { "0" })
+        .env("F183_X", rect.x.to_string())
+        .env("F183_Y", rect.y.to_string())
+        .env("F183_W", rect.w.to_string())
+        .env("F183_H", rect.h.to_string())
+        .env("F183_SECONDS", seconds.to_string())
+        .env("F183_HWND_FILE", &hwnd_file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut hwnd = 0isize;
+    for _ in 0..150 {
+        if let Ok(text) = std::fs::read_to_string(&hwnd_file) {
+            if let Ok(parsed) = text.trim().parse::<isize>() {
+                if parsed != 0 {
+                    hwnd = parsed;
+                    break;
+                }
+            }
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if hwnd == 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&hwnd_file);
+        return None;
+    }
+    Some(F183Overlay {
+        child,
+        hwnd,
+        script,
+        hwnd_file,
+    })
+}
+
+/// The player's outer rect in physical px, from its live window.
+fn f183_player_rect(weak: &Weak<AppWindow>, id: u64) -> Option<WinRect> {
+    f145_on_ui(weak, move |_ui| {
+        let state = WALLPAPER_STATE.with(|slot| slot.borrow().clone())?;
+        let session = player_sessions(&state)
+            .into_iter()
+            .find(|session| session.id == id)?;
+        let (x, y, w, h) = win::window_rect(session.window.window())?;
+        Some(WinRect { x, y, w, h })
+    })
+    .flatten()
+}
+
+/// One row of the f152 report, or `None` when the player is gone. Reads the
+/// thread-local player state on the UI thread, like every other player query.
+fn f183_row(weak: &Weak<AppWindow>, id: u64) -> Option<(u64, bool, bool, u64, u64, u32, Option<u64>)> {
+    f145_on_ui(weak, move |_ui| {
+        f152_player_rows().into_iter().find(|row| row.0 == id)
+    })
+    .flatten()
+}
+
+/// A frame count plus the instant it was read, so the caller measures the real
+/// presented rate over something longer than one sample.
+fn f183_frames(weak: &Weak<AppWindow>, id: u64) -> Option<(u64, Instant)> {
+    f145_on_ui(weak, move |_ui| {
+        f152_player_rows()
+            .into_iter()
+            .find(|row| row.0 == id)
+            .map(|row| (row.3, Instant::now()))
+    })
+    .flatten()
+}
+
+pub(crate) fn maybe_start_f183_test(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    settings_store: Arc<Mutex<settings::Settings>>,
+) {
+    if !env::flag("BILI_F183_TEST") {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(8000));
+        run_f183_test(weak, session_slot, settings_store);
+    });
+}
+
+/// f190 evidence: the 平滑 menu (a picker, not a cycle) and the 评论区's first
+/// page. Both are UI-side contracts the data layer cannot prove.
+///
+/// `BILI_F190_TEST=1` opens one REAL feed video (a card carries an aid, which
+/// the comment panel needs), then:
+///   1. presses the 平滑 cell through its real handler and reads the mode back
+///      in the same turn - the press must NOT change it any more (the old
+///      cycle behaviour), it opens the menu;
+///   2. picks OFA through the menu row's real handler and captures the cell,
+///      which now reads OFA;
+///   3. switches the right panel to 评论 and waits for rows WITHOUT touching
+///      热门 / 按时间 - the bug was that nothing asked for page 1 at all;
+///   4. re-enters the 评论 tab (and reopens the panel) and proves the log holds
+///      exactly one first page for the video.
+pub(crate) fn maybe_start_f190_test(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    feed_store: Arc<Mutex<Vec<bilibili::FeedVideo>>>,
+    settings_store: Arc<Mutex<settings::Settings>>,
+) {
+    if !env::flag("BILI_F190_TEST") {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(9000));
+        run_f190_test(weak, session_slot, feed_store, settings_store);
+    });
+}
+
+pub(crate) fn f190_log(line: impl AsRef<str>) {
+    crate::debug_log(&format!("f190 {}", line.as_ref()));
+}
+
+/// One env-driven run (`BILI_F190_TEST=1`), see the comment above.
+pub(crate) fn run_f190_test(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    feed_store: Arc<Mutex<Vec<bilibili::FeedVideo>>>,
+    settings_store: Arc<Mutex<settings::Settings>>,
+) {
+    f190_log("start rule=interp-menu-is-a-picker+comments-first-page");
+
+    // ---- 0: one real player, chrome held up ----
+    let _ = f145_on_ui(&weak, |_ui| f147_close_players());
+    std::thread::sleep(Duration::from_millis(600));
+    let mut feed_rows = 0usize;
+    for _ in 0..120 {
+        feed_rows = f145_on_ui(&weak, |ui| ui.get_feed_items().row_count()).unwrap_or(0);
+        if feed_rows >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    f190_log(format!("feed rows={feed_rows}"));
+    let opened = {
+        let slot = session_slot.clone();
+        let store = settings_store.clone();
+        let feed = feed_store.clone();
+        f145_on_ui(&weak, move |_ui| {
+            let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+                return false;
+            };
+            // Index 0 of the published feed: a real bvid/aid, so the 评论 tab
+            // has something to fetch.
+            open_player(0, &slot, &feed, &state, &store);
+            true
+        })
+        .unwrap_or(false)
+    };
+    f190_log(format!("player open={opened}"));
+    if !opened {
+        f190_log("abort reason=no-player");
+        return;
+    }
+    let playing = f152_wait_playing(&weak, 1, Duration::from_secs(90));
+    let player_id = f145_on_ui(&weak, |_ui| f145_latest_player().map(|session| session.id)).flatten();
+    f190_log(format!("playing={playing} player={player_id:?}"));
+    let Some(player_id) = player_id else {
+        f190_log("abort reason=no-session");
+        return;
+    };
+    // The pill is what these captures are about: hold the chrome up and let the
+    // 220ms slide finish before the first shot.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_qa_hold_chrome(true);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ---- 1: a press on the 平滑 cell opens the menu and changes no mode ----
+    let before = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            // Start from 关闭 so the menu's check mark and the OFA pick below
+            // are both real transitions.
+            session.control.set_interp_mode(0);
+            session.window.set_interp_mode(0);
+            session
+                .window
+                .set_interp_mode_text(session.control.interp_mode_text().into());
+            session.window.get_interp_mode()
+        })
+    })
+    .flatten()
+    .unwrap_or(-1);
+    std::thread::sleep(Duration::from_millis(120));
+    let after_press = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            // The REAL button handler (what its TouchArea calls): it toggles the
+            // menu only. Reading the mode in this same turn is the proof that a
+            // press no longer advances 关闭 -> 混合 like the old cycle did.
+            session.window.invoke_interp_menu_toggle();
+            (
+                session.window.get_interp_mode(),
+                session.window.get_interp_mode_text().to_string(),
+                session.window.get_qa_interp_menu_open(),
+                session.window.get_qa_interp_pop_x(),
+                session.window.get_qa_interp_pop_y(),
+                session.window.get_qa_interp_pop_w(),
+                session.window.get_qa_interp_pop_h(),
+                session.window.get_qa_interp_x(),
+                session.window.get_qa_interp_y(),
+                session.window.get_qa_interp_w(),
+                session.window.get_qa_interp_h(),
+            )
+        })
+    })
+    .flatten();
+    if let Some((mode, text, menu_open, px, py, pw, ph, bx, by, bw, bh)) = after_press {
+        f190_log(format!(
+            "interp button press mode_before={before} mode_after={mode} text={text:?} changed={} menu_open={} checked_row={mode}",
+            u8::from(mode != before),
+            u8::from(menu_open)
+        ));
+        // The plate must sit ABOVE the cell and inside the window: its bottom
+        // edge is 8px over the cell's top, and the plate is centred on it.
+        f190_log(format!(
+            "interp menu geometry btn=({bx},{by},{bw}x{bh}) plate=({px},{py},{pw}x{ph}) above={} centre_dx={:.1}",
+            u8::from(py + ph <= by),
+            (px + pw / 2.0) - (bx + bw / 2.0)
+        ));
+    } else {
+        f190_log("interp button press missing=1");
+    }
+    std::thread::sleep(Duration::from_millis(320));
+    f152_capture_player(&weak, player_id, "f190_interp_menu");
+
+    // ---- 2: pick OFA from the menu (the row's real handler) ----
+    let picked = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            session.window.invoke_interp_menu_choose(3);
+            (
+                session.window.get_interp_mode(),
+                session.window.get_interp_mode_text().to_string(),
+                session.window.get_qa_interp_menu_open(),
+                i32::from(session.control.interp_mode()),
+            )
+        })
+    })
+    .flatten();
+    match picked {
+        Some((mode, text, menu_open, control_mode)) => f190_log(format!(
+            "interp menu pick row=3 mode={mode} control={control_mode} text={text:?} menu_open={} ofa_present={}",
+            u8::from(menu_open),
+            u8::from(player::ofa_present())
+        )),
+        None => f190_log("interp menu pick missing=1"),
+    }
+    std::thread::sleep(Duration::from_millis(320));
+    f152_capture_player(&weak, player_id, "f190_interp_after");
+
+    // ---- 3: 评论区 first page, with NO sort press ----
+    // Exactly the pill's 评论 click: the panel opens on tab 1. Only the tab
+    // change may ask for page 1 - nothing here calls a sort.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(0);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(1);
+            session.window.set_right_tab(1);
+        }
+    });
+    for _ in 0..100 {
+        let items = f145_on_ui(&weak, |_ui| {
+            f145_latest_player().map(|session| session.window.get_comment_items().row_count())
+        })
+        .flatten()
+        .unwrap_or(0);
+        if items > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let state = f145_on_ui(&weak, |_ui| {
+        f145_latest_player().map(|session| {
+            (
+                session.window.get_comment_items().row_count(),
+                session.window.get_comments_loading(),
+                session.window.get_comments_total(),
+                session.window.get_right_tab(),
+            )
+        })
+    })
+    .flatten();
+    if let Some((rows, loading, total, tab)) = state {
+        f190_log(format!(
+            "comments render tab={tab} items={rows} rendering={} total={total} sort_presses=0",
+            u8::from(loading)
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    f152_capture_player(&weak, player_id, "f190_comments_first");
+
+    // ---- 4: the same tab again must NOT ask twice ----
+    // Leaving and re-entering 评论 (twice) plus a close/reopen in the SAME turn
+    // is the worst case for a duplicate: the rows are already there, and Rust
+    // has not republished `comments_loading` synchronously.
+    for _ in 0..2 {
+        let _ = f145_on_ui(&weak, |_ui| {
+            if let Some(session) = f145_latest_player() {
+                session.window.set_right_tab(2);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = f145_on_ui(&weak, |_ui| {
+            if let Some(session) = f145_latest_player() {
+                session.window.set_right_tab(1);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // Close + reopen on 评论 in one turn: both `changed` edges fire, the latch
+    // is what keeps it to zero requests.
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_right_panel(0);
+            session.window.set_right_panel(1);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    let pages = f190_count_lines("comments loaded aid=");
+    // Page 1 is logged with `append=false`; infinite scroll appends with
+    // `append=true`, so this is the count that must stay at one.
+    let firsts = f190_count_lines("append=false");
+    f190_log(format!(
+        "comments dedupe reload_edges=5 loaded_lines={pages} first_pages={firsts}"
+    ));
+    let _ = f145_on_ui(&weak, |_ui| {
+        if let Some(session) = f145_latest_player() {
+            session.window.set_qa_hold_chrome(false);
+        }
+    });
+    f190_log("done");
+}
+
+/// How many lines in `BILI_DEBUG_LOG` contain `needle`. Read whole (a QA run's
+/// log is small compared to the f152 traces) so the count is about THIS run,
+/// not about a tail window.
+pub(crate) fn f190_count_lines(needle: &str) -> usize {
+    let Ok(path) = std::env::var("BILI_DEBUG_LOG") else {
+        return 0;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    text.lines().filter(|line| line.contains(needle)).count()
+}
+
+/// One env-driven run (`BILI_F183_TEST=1`), see the comment above.
+pub(crate) fn run_f183_test(
+    weak: Weak<AppWindow>,
+    session_slot: SessionSlot,
+    settings_store: Arc<Mutex<settings::Settings>>,
+) {
+    f183_log("start rule=only-own-player-windows-occlude");
+
+    // ---- 0: clean home, no players ----
+    let _ = f145_on_ui(&weak, |_ui| f147_close_players());
+    std::thread::sleep(Duration::from_millis(900));
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.set_search_open(false);
+        ui.set_playlist_open(false);
+        ui.invoke_back_to_feed();
+        ui.window().set_size(slint::LogicalSize::new(1280.0, 800.0));
+        ui.window().set_position(slint::LogicalPosition::new(40.0, 40.0));
+        // The home window must not sit above the players (or above the external
+        // overlay in the desktop grabs). It is never an occluder either way.
+        win::set_topmost(ui.window(), false);
+    });
+    let mut feed_rows = 0usize;
+    for _ in 0..120 {
+        feed_rows = f145_on_ui(&weak, |ui| ui.get_feed_items().row_count()).unwrap_or(0);
+        if feed_rows >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    f183_log(format!("feed rows={feed_rows}"));
+
+    // ---- 1: one playing player on a known rect ----
+    let opened = {
+        let slot = session_slot.clone();
+        let store = settings_store.clone();
+        f145_on_ui(&weak, move |_ui| {
+            let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+                return false;
+            };
+            let opened = f152_open_cached(&slot, &state, &store);
+            if let Some(session) = player_sessions(&state).last() {
+                win::set_topmost(session.window.window(), true);
+            }
+            opened
+        })
+        .unwrap_or(false)
+    };
+    let mut playing = f152_wait_playing(&weak, 1, Duration::from_secs(60));
+    let home = WinRect {
+        x: 120,
+        y: 100,
+        w: 1000,
+        h: 640,
+    };
+    let placed = f145_on_ui(&weak, move |_ui| {
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            return false;
+        };
+        player_sessions(&state)
+            .first()
+            .map(|session| set_player_window_rect(&session.window.window(), home))
+            .unwrap_or(false)
+    })
+    .unwrap_or(false);
+    // A resize restarts the decoder after its 400 ms debounce.
+    std::thread::sleep(Duration::from_millis(1400));
+    playing &= f152_wait_playing(&weak, 1, Duration::from_secs(40));
+    let player = f145_on_ui(&weak, |_ui| {
+        let state = WALLPAPER_STATE.with(|slot| slot.borrow().clone())?;
+        let session = player_sessions(&state).first()?.clone();
+        let hwnd = win::hwnd_of(session.window.window())?;
+        Some((session.id, hwnd))
+    })
+    .flatten();
+    let Some((id, hwnd)) = player else {
+        f183_log("abort reason=no-player-window");
+        request_quit("f183 qa done");
+        return;
+    };
+    let rect = f183_player_rect(&weak, id).unwrap_or(home);
+    f183_log(format!(
+        "player ready id=win{id} hwnd={hwnd} opened={} placed={} playing={} rect={rect}",
+        u8::from(opened),
+        u8::from(placed),
+        u8::from(playing)
+    ));
+    if !playing {
+        f183_log("abort reason=player-not-playing");
+        request_quit("f183 qa done");
+        return;
+    }
+
+    // ---- 2: external FULLSCREEN cover for 10 s: must NOT pause ----
+    // The cached track is ~22 s: restart it so the 10 s window is a MOVING
+    // picture, not the tail of the clip.
+    let _ = f145_on_ui(&weak, move |_ui| {
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        if let Some(session) = player_sessions(&state).first() {
+            session.control.seek(0);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    let pauses_before = OCCLUDED_PAUSES.load(Ordering::Relaxed);
+    let mut overlay = f183_spawn_overlay(true, rect, 16);
+    let overlay_hwnd = overlay.as_ref().map(|value| value.hwnd).unwrap_or(0);
+    f183_log(format!(
+        "external fullscreen up hwnd={overlay_hwnd} rect={rect}"
+    ));
+    if overlay.is_none() {
+        f183_log("abort reason=overlay-spawn");
+        request_quit("f183 qa done");
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    let start = f183_frames(&weak, id);
+    let frame_a = f183_player_frame(&weak, id, "f183_external_frame_a");
+    // The desktop grab at the player's own rect: with the external window in
+    // front this is the external window's pixels, i.e. proof it really covers.
+    let desktop = f150_grab_screen(rect).and_then(|(w, h, rgba)| {
+        f183_save_rgba("f183_external_overlay_desktop", w, h, rgba)
+    });
+    std::thread::sleep(Duration::from_secs(10));
+    let end = f183_frames(&weak, id);
+    let frame_b = f183_player_frame(&weak, id, "f183_external_frame_b");
+    let after = f183_row(&weak, id);
+    let pauses_after = OCCLUDED_PAUSES.load(Ordering::Relaxed);
+    let fps = match (start, end) {
+        (Some((a, at)), Some((b, bt))) => {
+            let seconds = bt.duration_since(at).as_secs_f64().max(0.001);
+            (b.saturating_sub(a)) as f64 / seconds
+        }
+        _ => 0.0,
+    };
+    let pixel = match (&frame_a, &frame_b) {
+        (Some((_, w, h, a)), Some((_, _, _, b))) => {
+            f183_frame_diff(&(*w, *h, a.clone()), &(*w, *h, b.clone()))
+        }
+        _ => None,
+    };
+    let frames = match (start, end) {
+        (Some((a, _)), Some((b, _))) => (a, b, b.saturating_sub(a)),
+        _ => (0, 0, 0),
+    };
+    f183_log(format!(
+        "external_fullscreen seconds=10 fps={fps:.2} frames={}->{} delta={} pixel_diff={pixel:?} occluded={} paused={} pauses_before={pauses_before} pauses_after={pauses_after}",
+        frames.0,
+        frames.1,
+        frames.2,
+        u8::from(after.map(|row| row.1).unwrap_or(false)),
+        u8::from(after.map(|row| row.2).unwrap_or(false)),
+    ));
+    let external_shot = match (&desktop, frame_a.as_ref().map(|value| &value.0)) {
+        (Some(left), Some(right)) => {
+            f149_montage_side(&[left.clone(), right.clone()], &qa_capture_path("f183_external_fullscreen"))
+        }
+        _ => None,
+    };
+    f183_log(format!(
+        "external_fullscreen capture={external_shot:?} desktop={desktop:?}"
+    ));
+    if let Some(overlay) = overlay.as_mut() {
+        overlay.wait();
+    }
+    drop(overlay);
+    std::thread::sleep(Duration::from_millis(700));
+    let resumed_after_external = f152_wait_playing(&weak, 1, Duration::from_secs(10));
+    f183_log(format!(
+        "external fullscreen closed playing={}",
+        u8::from(resumed_after_external)
+    ));
+
+    // ---- 3: external HALF cover: must NOT pause either ----
+    let pauses_before_partial = OCCLUDED_PAUSES.load(Ordering::Relaxed);
+    let half = WinRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w / 2,
+        h: rect.h,
+    };
+    let mut partial = f183_spawn_overlay(false, half, 8);
+    let partial_hwnd = partial.as_ref().map(|value| value.hwnd).unwrap_or(0);
+    f183_log(format!("external half up hwnd={partial_hwnd} rect={half}"));
+    if partial.is_some() {
+        std::thread::sleep(Duration::from_millis(600));
+        let before = f183_frames(&weak, id);
+        std::thread::sleep(Duration::from_secs(3));
+        let after = f183_frames(&weak, id);
+        let row = f183_row(&weak, id);
+        let pauses_after_partial = OCCLUDED_PAUSES.load(Ordering::Relaxed);
+        let fps = match (before, after) {
+            (Some((a, at)), Some((b, bt))) => {
+                let seconds = bt.duration_since(at).as_secs_f64().max(0.001);
+                (b.saturating_sub(a)) as f64 / seconds
+            }
+            _ => 0.0,
+        };
+        f183_log(format!(
+            "external_half seconds=3 fps={fps:.2} occluded={} paused={} pauses_before={pauses_before_partial} pauses_after={pauses_after_partial}",
+            u8::from(row.map(|row| row.1).unwrap_or(false)),
+            u8::from(row.map(|row| row.2).unwrap_or(false)),
+        ));
+        if let Some(partial) = partial.as_mut() {
+            partial.wait();
+        }
+    }
+    drop(partial);
+    std::thread::sleep(Duration::from_millis(700));
+
+    // ---- 4: two of OUR players, completely overlapping: must pause ----
+    // Restart the cached track first: the pause must be the occlusion hold, not
+    // the end of the clip freezing the picture.
+    let _ = f145_on_ui(&weak, |_ui| {
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        if let Some(session) = player_sessions(&state).first() {
+            session.control.seek(0);
+        }
+    });
+    let _ = f145_on_ui(&weak, |ui| {
+        ui.invoke_card_open(0, 1);
+    });
+    std::thread::sleep(Duration::from_millis(1800));
+    // If the feed did not yield a card (no network), open the cached video a
+    // second time: the test only needs a second opaque window of THIS program.
+    let two = f145_on_ui(&weak, |_ui| {
+        WALLPAPER_STATE
+            .with(|slot| slot.borrow().clone())
+            .map(|state| player_sessions(&state).len())
+            .unwrap_or(0)
+    })
+    .unwrap_or(0);
+    if two < 2 {
+        let slot = session_slot.clone();
+        let store = settings_store.clone();
+        let _ = f145_on_ui(&weak, move |_ui| {
+            let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+                return false;
+            };
+            f152_open_cached(&slot, &state, &store)
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    let overlap = WinRect {
+        x: 220,
+        y: 150,
+        w: 900,
+        h: 560,
+    };
+    let pair = f145_on_ui(&weak, move |_ui| {
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            return 0usize;
+        };
+        let sessions = player_sessions(&state);
+        for session in sessions.iter().take(2) {
+            set_player_window_rect(&session.window.window(), overlap);
+            win::set_topmost(session.window.window(), true);
+        }
+        // Within the topmost band the LAST raise is on top: win2 covers win1.
+        if let Some(first) = sessions.first() {
+            win::raise(&first.window.window());
+        }
+        if let Some(second) = sessions.get(1) {
+            win::raise(&second.window.window());
+        }
+        sessions.len().min(2)
+    })
+    .unwrap_or(0);
+    f183_log(format!(
+        "two_players overlap={overlap} placed={pair} sessions={:?}",
+        f145_on_ui(&weak, |_ui| f152_player_rows()).unwrap_or_default()
+    ));
+    let rows = f145_on_ui(&weak, |_ui| f152_player_rows()).unwrap_or_default();
+    if rows.len() < 2 {
+        f183_log("abort reason=two-players");
+        request_quit("f183 qa done");
+        return;
+    }
+    let back = rows[0].0;
+    let front = rows[1].0;
+    let paused_wait = f152_wait_occluded(&weak, back, true, Duration::from_secs(10));
+    let after_pause = f145_on_ui(&weak, |_ui| f152_player_rows()).unwrap_or_default();
+    let pause_lines = f183_log_tail(&["player occluded pause", "player window registered"]);
+    f183_log(format!(
+        "two_players pause back=win{back} front=win{front} wait_ms={paused_wait:?} rows={after_pause:?} pauses={}",
+        OCCLUDED_PAUSES.load(Ordering::Relaxed)
+    ));
+    // Frozen-picture evidence: two frames ~900 ms apart must be identical
+    // while the back window is held, even though the front one keeps playing.
+    let held_a = f183_player_frame(&weak, back, "f183_two_players_back_a");
+    let frames_held_a = f183_frames(&weak, back);
+    std::thread::sleep(Duration::from_millis(900));
+    let held_b = f183_player_frame(&weak, back, "f183_two_players_back_b");
+    let frames_held_b = f183_frames(&weak, back);
+    let held_pixel = match (&held_a, &held_b) {
+        (Some((_, w, h, a)), Some((_, _, _, b))) => {
+            f183_frame_diff(&(*w, *h, a.clone()), &(*w, *h, b.clone()))
+        }
+        _ => None,
+    };
+    f183_log(format!(
+        "two_players held frames={:?}->{:?} pixel_diff={held_pixel:?}",
+        frames_held_a.map(|value| value.0),
+        frames_held_b.map(|value| value.0)
+    ));
+    let raw = f150_grab_screen(overlap)
+        .and_then(|(w, h, rgba)| f183_save_rgba("f183_two_players_raw", w, h, rgba));
+    write_evidence_image(raw, &pause_lines, "f183_two_players");
+
+    // ---- 5: move the front away: the back must resume ----
+    let moved = f145_on_ui(&weak, move |_ui| {
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            return false;
+        };
+        player_sessions(&state)
+            .get(1)
+            .map(|session| {
+                set_player_window_rect(
+                    &session.window.window(),
+                    WinRect {
+                        x: 60,
+                        y: 60,
+                        w: 620,
+                        h: 400,
+                    },
+                )
+            })
+            .unwrap_or(false)
+    })
+    .unwrap_or(false);
+    let resumed_wait = f152_wait_occluded(&weak, back, false, Duration::from_secs(4));
+    f183_log(format!(
+        "two_players resume back=win{back} moved={} wait_ms={resumed_wait:?} resumes={}",
+        u8::from(moved),
+        OCCLUDED_RESUMES.load(Ordering::Relaxed)
+    ));
+
+    // ---- 6: close the front while the back is held: registry must release ----
+    let repaused = f145_on_ui(&weak, move |_ui| {
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            return false;
+        };
+        let sessions = player_sessions(&state);
+        // Keep the back's picture alive for the second hold.
+        if let Some(first) = sessions.first() {
+            first.control.seek(0);
+        }
+        if let Some(second) = sessions.get(1) {
+            set_player_window_rect(
+                &second.window.window(),
+                WinRect {
+                    x: 220,
+                    y: 150,
+                    w: 900,
+                    h: 560,
+                },
+            );
+            win::set_topmost(second.window.window(), true);
+            win::raise(second.window.window());
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false);
+    let reheld = f152_wait_occluded(&weak, back, true, Duration::from_secs(10));
+    let closed = f145_on_ui(&weak, |_ui| {
+        let Some(state) = WALLPAPER_STATE.with(|slot| slot.borrow().clone()) else {
+            return false;
+        };
+        match player_sessions(&state).get(1) {
+            Some(session) => {
+                session.window.invoke_player_closed();
+                true
+            }
+            None => false,
+        }
+    })
+    .unwrap_or(false);
+    let released = f152_wait_occluded(&weak, back, false, Duration::from_secs(5));
+    f183_log(format!(
+        "two_players close_front repaused={} reheld={reheld:?} closed={} released={released:?} rows={:?}",
+        u8::from(repaused),
+        u8::from(closed),
+        f145_on_ui(&weak, |_ui| f152_player_rows()).unwrap_or_default()
+    ));
+
+    f183_log("done");
+    let _ = f145_on_ui(&weak, |_ui| f147_close_players());
+    request_quit("f183 qa done");
+}
+
+/// Save the overlap evidence: the desktop grab with the receipt lines under it.
+///
+/// `f183_two_players.png` is the composed file the report cites; the raw grab and
+/// the extracted lines stay next to it so both halves are inspectable.
+fn write_evidence_image(
+    raw: Option<std::path::PathBuf>,
+    lines: &[String],
+    tag: &str,
+) {
+    let Some(raw) = raw else {
+        f183_log(format!("evidence tag={tag} err=no-desktop-grab"));
+        return;
+    };
+    let log_path = qa_capture_path(tag).with_extension("log");
+    let text = lines
+        .iter()
+        .map(|line| {
+            let trimmed: String = line.chars().take(118).collect();
+            trimmed
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let _ = std::fs::write(&log_path, text);
+    let out = qa_capture_path(tag);
+    let composed = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command"])
+        .arg(F183_COMPOSE_PS)
+        .env("F183_RAW", &raw)
+        .env("F183_LOG", &log_path)
+        .env("F183_OUT", &out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    f183_log(format!(
+        "evidence tag={tag} raw={} lines={} out={} compose={:?}",
+        raw.display(),
+        lines.len(),
+        out.display(),
+        composed.map(|status| status.code())
+    ));
 }
 
 /// f159: the card surface (flat tint vs frosted wallpaper).
@@ -10479,5 +11476,175 @@ pub(crate) fn run_fav_view_test(
             None => crate::debug_log("fav view test masonry_open skipped reason=no-cards"),
         }
         crate::debug_log("fav view test done");
+    });
+}
+
+/// QA (`BILI_AUDIO_ONLY_TEST=<delay_ms>`): the 仅音频 sound acceptance.
+///
+/// Flips the REAL `toggle_audio_only` callback on the open player (the same one
+/// the 仅音频 menu row calls), then samples the session's own state every
+/// second for `BILI_AUDIO_ONLY_SECS` (default 20, clamped 3..=60), captures
+/// `f184_audio_only.png`, flips back to video and captures
+/// `f184_back_to_video.png` when the picture is back.
+///
+/// The hook deliberately does not measure loudness: the harness proves the
+/// sound itself by reading the `ffplay` WASAPI session's
+/// `IAudioMeterInformation` peak. This hook prints the state that has to agree
+/// with it (`hold`, `muted`, `audible`, a moving position) plus the numbers of
+/// the switch back (first frame latency, A/V delta comes from the player's own
+/// `startup first present` line).
+pub(crate) fn maybe_start_audio_only_test(
+    player: Weak<PlayerWindow>,
+    control: Arc<crate::player::PlaybackControl>,
+) {
+    let Some(value) = env::var("BILI_AUDIO_ONLY_TEST") else {
+        return;
+    };
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let delay = value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 1)
+        .unwrap_or(9_000)
+        .clamp(1_000, 120_000);
+    let secs = env::var("BILI_AUDIO_ONLY_SECS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(20)
+        .clamp(3, 60);
+    crate::debug_log(&format!(
+        "f184 arg delay_ms={delay} secs={secs} capture={}",
+        qa_capture_path("f184_audio_only").display()
+    ));
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay));
+        // The player is opened by `BILI_OPEN_BVID` on its own thread: wait for
+        // its picture and sound clock instead of assuming a fixed latency.
+        let wait_at = Instant::now();
+        while wait_at.elapsed() < Duration::from_secs(90)
+            && (control.presented_frames() < 5 || control.audio_clock().is_none())
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        crate::debug_log(&format!(
+            "f184 start presented={} pid={} hold={} clock_ms={} pos_ms={} muted={}",
+            control.presented_frames(),
+            control.audio_pid(),
+            u8::from(control.audio_hold()),
+            control
+                .audio_clock()
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            control.playback_position_ms(),
+            u8::from(control.muted()),
+        ));
+        if control.presented_frames() < 5 {
+            crate::debug_log("f184 abort reason=no-picture");
+            return;
+        }
+        // The real UI callback, the same path the menu row takes.
+        let _ = player.upgrade_in_event_loop(|p| p.invoke_toggle_audio_only());
+        let on_at = Instant::now();
+        let mut next_sample = 0u64;
+        let mut shot = false;
+        while on_at.elapsed() < Duration::from_secs(secs) {
+            std::thread::sleep(Duration::from_millis(200));
+            let ms = on_at.elapsed().as_millis() as u64;
+            if !shot && ms >= 2_000 {
+                shot = true;
+                capture_audio_only(&player, "f184_audio_only");
+            }
+            if ms >= next_sample {
+                next_sample = ms + 2_000;
+                let pid = control.audio_pid();
+                let audible = crate::win::audio_session_get(pid)
+                    .map(|(level, mute)| !mute && level > 0.001);
+                crate::debug_log(&format!(
+                    "f184 audio_only t_ms={ms} pid={pid} hold={} clock_ms={} pos_ms={} muted={} audible={} presented={} audio_restarts={} buffering={}",
+                    u8::from(control.audio_hold()),
+                    control
+                        .audio_clock()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    control.playback_position_ms(),
+                    u8::from(control.muted()),
+                    match audible {
+                        Some(true) => "1",
+                        Some(false) => "0",
+                        None => "none",
+                    },
+                    control.presented_frames(),
+                    control.audio_restart_count(),
+                    u8::from(control.buffering()),
+                ));
+            }
+        }
+        // ---- back to the picture -------------------------------------------
+        let before = control.presented_frames();
+        let back_at = Instant::now();
+        let _ = player.upgrade_in_event_loop(|p| p.invoke_toggle_audio_only());
+        crate::debug_log(&format!("f184 back_to_video presented_before={before}"));
+        let mut first_frame_ms = None;
+        while back_at.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(100));
+            if control.presented_frames() > before {
+                first_frame_ms = Some(back_at.elapsed().as_millis() as u64);
+                break;
+            }
+        }
+        crate::debug_log(&format!(
+            "f184 back_to_video first_frame_ms={} presented={} clock_ms={}",
+            first_frame_ms
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            control.presented_frames(),
+            control
+                .audio_clock()
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+        std::thread::sleep(Duration::from_millis(1_200));
+        capture_audio_only(&player, "f184_back_to_video");
+        std::thread::sleep(Duration::from_millis(400));
+        crate::debug_log("f184 done");
+        request_quit("f184 audio-only qa done");
+    });
+}
+
+/// Snapshot one player window into `<BILI_CAPTURE_DIR>/<tag>.png`.
+///
+/// A Slint snapshot, not a desktop grab: it carries the window's own tree (the
+/// video frame included) whatever is in front of it.
+fn capture_audio_only(player: &Weak<PlayerWindow>, tag: &str) {
+    let tag = tag.to_string();
+    let _ = player.upgrade_in_event_loop(move |player| {
+        let Some(buffer) = player.window().take_snapshot().ok() else {
+            crate::debug_log(&format!("f184 capture failed tag={tag}"));
+            return;
+        };
+        let path = qa_capture_path(&tag);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let bytes: Vec<u8> = buffer
+            .as_slice()
+            .iter()
+            .flat_map(|pixel| [pixel.r, pixel.g, pixel.b, pixel.a])
+            .collect();
+        match image::RgbaImage::from_raw(buffer.width(), buffer.height(), bytes) {
+            Some(png) => {
+                let _ = png.save(&path);
+                crate::debug_log(&format!(
+                    "f184 capture tag={tag} path={} size={}x{}",
+                    path.display(),
+                    buffer.width(),
+                    buffer.height()
+                ));
+            }
+            None => crate::debug_log(&format!("f184 capture failed tag={tag} reason=raw")),
+        }
     });
 }

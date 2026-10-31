@@ -238,8 +238,8 @@ impl Default for WatchConfig {
             asr: AsrOptions::default(),
             vision: VisionOptions::default(),
             deepseek: DeepseekOptions::default(),
-            model_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/whisper"),
-            audio_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache/fishaudio"),
+            model_dir: crate::paths::root().join("models/whisper"),
+            audio_dir: crate::paths::root().join("cache/fishaudio"),
             work_dir: std::env::temp_dir().join("o11a1-fishwatch"),
             ffmpeg: "ffmpeg".to_string(),
         }

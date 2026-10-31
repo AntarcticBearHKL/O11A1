@@ -3239,6 +3239,8 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "i-slint-backend-winit",
+ "i-slint-core",
  "image",
  "log",
  "md-5",
@@ -3254,6 +3256,9 @@ dependencies = [
  "slint",
  "slint-build",
  "tokio",
+ "windows",
+ "windows-core",
+ "windows-numerics",
  "windows-sys 0.59.0",
  "winres",
 ]

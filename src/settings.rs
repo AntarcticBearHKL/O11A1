@@ -41,7 +41,8 @@ pub struct QueueEntry {
 /// retired capture-engine slot, kept only so old files still round-trip.
 /// `page_size`: cards per page in the
 /// no-scroll lists, one of [`PAGE_SIZES`]. `close_action`: what ✕ / Alt+F4 /
-/// the taskbar's 关闭 does, one of [`CLOSE_ACTIONS`]. `feed_prefetch_batches`:
+/// the taskbar's 关闭 does, one of [`CLOSE_ACTIONS`]. `history_limit`: how many
+/// watch-history rows the 历史 page keeps loaded, one of [`HISTORY_LIMITS`]. `feed_prefetch_batches`:
 /// how many recommendation batches the home feed keeps preloaded
 /// (`0..=FEED_PREFETCH_MAX`). `cdn_select` / `prefetch_proxy`: player-side
 /// opt-outs that are persisted here and read by a later pass. `seek_points`:
@@ -92,6 +93,35 @@ pub struct Settings {
     /// "原始分辨率" switch: the old behaviour, at the old cost.
     #[serde(default)]
     pub player_native_size: bool,
+    /// 画质增强档位：`0` = 关闭, `1` = 锐化, `2` = Anime4K, `3` = FSR（RTX VSR 已移除，旧值 4 会被夹到 0）
+    /// （顺序即菜单顺序，见 `dcomp::enhance::MODES`）。只在画面直出（DComp）
+    /// 路径上有意义：档位不可用时菜单置灰，存储值若正落在不可用的档位，播放器
+    /// 启动时把它当作关闭（见 `player_host::publish_enhance`）。
+    #[serde(default)]
+    pub player_enhance: u32,
+    /// 画面直出（DComp 播放路径）开关，默认 `true`（f212）。
+    /// `true` 时播放器窗口走 `src/dcomp` 的合成树，画质增强的 1–3 档才有意义，
+    /// f209 的零拷贝解码（[`Self::player_mf_decode`]）也才有可写的设备：这一
+    /// 项是 120 帧 + 零上传那条路径的总开关。
+    /// 只在启动时求值一次（`dcomp::platform::enabled` 的 `OnceLock`），所以菜单
+    /// 里打开/关闭只写文件，重启后才生效。`BILI_PLAYER_DCOMP` 环境变量优先于
+    /// 本字段（QA 脚本按次切换路径，不碰用户的 `settings.json`）；`=0` 是逃生阀，
+    /// 一键回到改动前的 winit 窗口 + ffmpeg 管道。
+    #[serde(default = "default_player_dcomp")]
+    pub player_dcomp: bool,
+    /// 零拷贝解码（Media Foundation 硬件解码 → NV12 纹理直接上屏），f209。
+    /// 默认 `true`：解码器把画面留在 GPU 上，播放器不再每帧上传 8.3 MB；
+    /// 打不开（没有硬件解码器 / 没有 DComp 视频层）时自动回退 ffmpeg 管道，
+    /// 日志写 `decode fallback reason=…`。`BILI_DECODE=ffmpeg` 按次关闭。
+    ///
+    /// f211：这条路径**只在画面直出（[`Self::player_dcomp`]）开启时有意义** ——
+    /// 解码器写进 DComp 视频层的设备，winit 画面路径没有那个层，也没有可写的
+    /// 设备。画面直出关闭时它不会尝试（日志 `decode fallback
+    /// reason=no_dcomp_platform`，一次），播放行为与改动前完全一致；开启后
+    /// 只要解码器能打开，seek / 换档 / 起播都走零拷贝，120 帧插帧也才有 GPU
+    /// 光流可做。
+    #[serde(default = "default_player_mf_decode")]
+    pub player_mf_decode: bool,
     #[serde(default = "default_player_speed")]
     pub player_speed: u32,
     #[serde(default = "default_hwaccel")]
@@ -137,6 +167,12 @@ pub struct Settings {
     /// `list_page_size` property and the paging helpers from this value.
     #[serde(default = "default_page_size")]
     pub page_size: i64,
+    /// 历史记录最多显示多少条: one of [`HISTORY_LIMITS`] (50 / 100 / 200 / 0 =
+    /// 全部), default 100. The history page still fetches one cursor page at a
+    /// time; this only caps how many loaded rows the grid keeps (see
+    /// `feed::load_history`), so the cap can never turn into one big fetch.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: i64,
     /// 关闭主窗口（✕ / Alt+F4 / 任务栏关闭）后的行为：1 = 隐藏到系统托盘,
     /// 2 = 直接退出程序. 旧的 0（最小化到任务栏）已下线，读到就迁移成 1
     /// （[`normalise_close_action`]）。
@@ -201,6 +237,12 @@ pub struct Settings {
     /// 未知值在加载时归一为 0。见 [`normalise_interp_mode`]。
     #[serde(default)]
     pub interp_mode: u8,
+    /// 插帧输出 120 fps（默认 60）。只有和 [`Self::interp_mode`] 一起才有
+    /// 意义：关闭插帧时它什么也不做。120 走「画面单独一个窗口」的
+    /// `player::video_surface` 路径，进入前由播放器自检上屏能力（见
+    /// `player::interp_120_self_check`），不达标就退回 60 并在界面提示。
+    #[serde(default)]
+    pub interp_120: bool,
     /// DeepSeek API key（`sk-...`），养鱼引擎用它替用户看视频。空串 = 未配置，
     /// 此时引擎只报 `NeedsKey`、不发任何网络请求。界面上只显示
     /// [`mask_key`] 的脱敏结果。
@@ -290,6 +332,10 @@ pub struct Settings {
     /// 模型目录；空串 = 项目根下的 `models/whisper`。
     #[serde(default)]
     pub fish_asr_model_dir: String,
+    /// 模型下载源：`auto` | `official` | `mirror`。见 [`normalise_fish_model_mirror`]。
+    /// `auto` 先走官方，连续 3 次失败或 10 秒没有进度就切 hf-mirror。
+    #[serde(default = "default_fish_model_mirror")]
+    pub fish_model_mirror: String,
     /// DeepSeek 视觉的图片精度：`low`（先缩到 512×512，省 token）或 `original`。
     #[serde(default = "default_fish_vision_detail")]
     pub fish_vision_detail: String,
@@ -308,6 +354,9 @@ pub const PLAYER_KEY_CANDIDATES: usize = 15;
 /// Cards-per-page steps offered by the 设置 menu and accepted by
 /// [`normalise_page_size`].
 pub const PAGE_SIZES: [i64; 4] = [12, 24, 36, 48];
+/// 历史记录「显示条数」的档位，按 UI 里的顺序排列。`0` = 全部（不裁剪）。
+/// [`normalise_history_limit`] 只接受这四个值。
+pub const HISTORY_LIMITS: [i64; 4] = [50, 100, 200, 0];
 /// 番剧索引的排序键，按这个顺序就是 UI 下拉里的顺序（见 [`Settings::pgc_sorts`]）。
 ///
 /// 每一个键都对应 `pgc/season/index/result` 的一个 `order` 值，而且语义是对着
@@ -425,8 +474,11 @@ pub const FISH_TIER_CUSTOM: u32 = 5;
 pub const FISH_ASR_ENGINES: [&str; 3] = ["auto", "faster-whisper", "whisper.cpp"];
 /// ASR 设备。
 pub const FISH_ASR_DEVICES: [&str; 2] = ["gpu", "cpu"];
-/// ASR 模型档位。
-pub const FISH_ASR_MODELS: [&str; 3] = ["small", "turbo", "medium"];
+/// ASR 模型档位。tiny/base/small/medium 是 whisper.cpp 的 GGML 四档，
+/// turbo 只有 faster-whisper / GGML-large-v3-turbo 两套清单。
+pub const FISH_ASR_MODELS: [&str; 5] = ["tiny", "base", "small", "turbo", "medium"];
+/// 语音识别模型的下载源（`auto` = 先官方，不顺就切镜像）。
+pub const FISH_MODEL_MIRRORS: [&str; 3] = ["auto", "official", "mirror"];
 /// ASR 线程数上限（whisper.cpp 的 `-t`，faster-whisper 的 `cpu_threads`）。
 pub const FISH_ASR_THREADS_MAX: u32 = 16;
 /// DeepSeek 视觉的两种图片精度。
@@ -474,6 +526,27 @@ fn default_hwaccel() -> bool {
     true
 }
 
+/// 零拷贝解码默认 **开启**（f212）。
+///
+/// f211 曾把它改回 `false`：搜索入口与同进程内关闭重开（新窗口）拿不到 DComp
+/// 视频层，播放器按设计回退 ffmpeg，起播多约 0.9 s。根因在 `src/dcomp` 的视频层
+/// 发布时机，f212 修掉了：窗口的合成树在创建时登记（`dcomp::attached`），会话等
+/// 视频层时不再把"UI 线程正忙"当成"这个窗口没有层"，两个入口连续 10+10 次全部
+/// `decode=mf`（`docs/f212.md`）。两个逃生阀都保留：`BILI_DECODE=ffmpeg` 按次
+/// 退回 ffmpeg 管道，设置里的 `player_mf_decode` 也仍然是开关。
+fn default_player_mf_decode() -> bool {
+    true
+}
+
+/// 画面直出默认 **开启**（f212）。
+///
+/// f204 引入时它是 opt-in，理由只有一条：新路径要用户显式同意才切换。f212
+/// 的两个入口问题修掉之后，没有理由让出厂配置停在 winit + ffmpeg（1080p 上
+/// 视频 60 帧、每帧一次上屏），零拷贝路径 120 帧、零上传、seek p50 39 ms。
+fn default_player_dcomp() -> bool {
+    true
+}
+
 /// Default starting quality: 自动 (`0`) = the highest tier the source offers.
 /// f176: the owner asked for "open on the best source", so 4K is no longer
 /// something you have to pick by hand.
@@ -516,6 +589,20 @@ pub fn default_glass_blur() -> f32 {
 
 pub fn default_page_size() -> i64 {
     24
+}
+
+/// 历史记录默认显示 100 条：够翻，又不会让一个滚到底的页面变成一次大请求。
+pub fn default_history_limit() -> i64 {
+    100
+}
+
+/// 只接受 [`HISTORY_LIMITS`] 里的档位；其它值（旧文件、手改坏的值）回落到默认。
+pub fn normalise_history_limit(value: i64) -> i64 {
+    if HISTORY_LIMITS.contains(&value) {
+        value
+    } else {
+        default_history_limit()
+    }
 }
 
 /// 默认关闭行为：隐藏到系统托盘。
@@ -668,6 +755,11 @@ pub fn default_fish_asr_threads() -> u32 {
     4
 }
 
+/// 模型下载源：`auto`（官方优先，失败切镜像）。
+pub fn default_fish_model_mirror() -> String {
+    "auto".to_string()
+}
+
 pub fn default_fish_vision_detail() -> String {
     "low".to_string()
 }
@@ -725,6 +817,17 @@ pub fn normalise_fish_vision_detail(value: &str) -> String {
         trimmed.to_string()
     } else {
         default_fish_vision_detail()
+    }
+}
+
+/// 模型下载源：`auto` / `official` / `mirror`，其它值回落 `auto`（先官方，
+/// 不顺再切镜像），这样手改坏了也不会让下载直接失败。
+pub fn normalise_fish_model_mirror(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_MODEL_MIRRORS.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_model_mirror()
     }
 }
 
@@ -1038,6 +1141,13 @@ impl Default for Settings {
             player_quality: default_player_quality(),
             // f176: decode at the stream's own size unless the owner opts out.
             player_native_size: true,
+            player_enhance: 0,
+            // f212: the composite picture path is the shipped default (the
+            // two entries that used to miss the video layer are fixed);
+            // `BILI_PLAYER_DCOMP=0` still returns the winit window + ffmpeg.
+            player_dcomp: default_player_dcomp(),
+            // f209: the zero-copy decode path is on unless a run turns it off.
+            player_mf_decode: default_player_mf_decode(),
             player_speed: default_player_speed(),
             hwaccel: default_hwaccel(),
             codec_pref: 0,
@@ -1050,6 +1160,7 @@ impl Default for Settings {
             glass_blur: default_glass_blur(),
             backdrop_blur: default_backdrop_blur(),
             page_size: default_page_size(),
+            history_limit: default_history_limit(),
             close_action: default_close_action(),
             player_layout: None,
             feed_prefetch_batches: default_feed_prefetch_batches(),
@@ -1062,6 +1173,7 @@ impl Default for Settings {
             playlist_current: None,
             play_mode: default_play_mode(),
             interp_mode: 0,
+            interp_120: false,
             deepseek_key: String::new(),
             fish_model: default_fish_model(),
             fish_instruction: default_fish_instruction(),
@@ -1087,6 +1199,7 @@ impl Default for Settings {
             fish_asr_model: default_fish_asr_model(),
             fish_asr_threads: default_fish_asr_threads(),
             fish_asr_model_dir: String::new(),
+            fish_model_mirror: default_fish_model_mirror(),
             fish_vision_detail: default_fish_vision_detail(),
             pgc_sorts: BTreeMap::new(),
         }
@@ -1094,7 +1207,31 @@ impl Default for Settings {
 }
 
 pub fn settings_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("settings.json")
+    crate::paths::root().join("settings.json")
+}
+
+/// `player_dcomp` alone, straight from `settings.json`.
+///
+/// [`crate::dcomp::platform::enabled`] is evaluated once, during platform
+/// installation, **before** the settings store is built. Calling [`load`] there
+/// would pull the whole normalisation pass (and its best-effort write-back) into
+/// start-up, and would couple the two modules' initialisation; this reads the
+/// one field with a tolerant parse instead. A missing file, an unreadable file
+/// or a missing key all mean the shipped default of [`default_player_dcomp`]
+/// (`true` since f212); only an explicit `false` — or `BILI_PLAYER_DCOMP=0`,
+/// which the caller checks first — turns the path off.
+pub fn read_player_dcomp() -> bool {
+    /// Only the field we need: `serde` ignores the rest of the document.
+    #[derive(Deserialize)]
+    struct StoredPath {
+        #[serde(default = "default_player_dcomp")]
+        player_dcomp: bool,
+    }
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|data| serde_json::from_str::<StoredPath>(&data).ok())
+        .map(|stored| stored.player_dcomp)
+        .unwrap_or_else(default_player_dcomp)
 }
 
 /// Load preferences, clamping corrupted values and falling back to defaults.
@@ -1127,6 +1264,11 @@ pub fn load() -> Settings {
         blocked_regex: settings.blocked_regex,
         player_quality: normalise_player_quality(settings.player_quality),
         player_native_size: settings.player_native_size,
+        // Unknown tiers (a hand-edited file, a build from another branch) load as
+        // 关闭 rather than as a tier number the menu cannot name.
+        player_enhance: settings.player_enhance.min(3),
+        player_dcomp: settings.player_dcomp,
+        player_mf_decode: settings.player_mf_decode,
         player_speed: settings.player_speed.clamp(500, 2000),
         hwaccel: settings.hwaccel,
         codec_pref: match settings.codec_pref {
@@ -1147,6 +1289,7 @@ pub fn load() -> Settings {
         glass_blur: normalise_glass(settings.glass_blur, default_glass_blur()),
         backdrop_blur: normalise_backdrop_blur(settings.backdrop_blur),
         page_size: normalise_page_size(settings.page_size),
+        history_limit: normalise_history_limit(settings.history_limit),
         close_action: normalise_close_action(settings.close_action),
         player_layout: normalise_player_layout(settings.player_layout),
         feed_prefetch_batches: normalise_feed_prefetch_batches(settings.feed_prefetch_batches),
@@ -1159,6 +1302,7 @@ pub fn load() -> Settings {
         playlist_current,
         play_mode: normalise_play_mode(settings.play_mode),
         interp_mode: normalise_interp_mode(settings.interp_mode),
+        interp_120: settings.interp_120,
         deepseek_key: settings.deepseek_key.trim().to_string(),
         fish_model: normalise_fish_model(&settings.fish_model),
         fish_instruction: normalise_fish_instruction(&settings.fish_instruction),
@@ -1184,6 +1328,7 @@ pub fn load() -> Settings {
         fish_asr_model: normalise_fish_asr_model(&settings.fish_asr_model),
         fish_asr_threads: normalise_fish_asr_threads(settings.fish_asr_threads),
         fish_asr_model_dir: settings.fish_asr_model_dir.trim().to_string(),
+        fish_model_mirror: normalise_fish_model_mirror(&settings.fish_model_mirror),
         fish_vision_detail: normalise_fish_vision_detail(&settings.fish_vision_detail),
         pgc_sorts: normalise_pgc_sorts(settings.pgc_sorts),
     };
@@ -1278,7 +1423,7 @@ pub const CONTINUE_MAX_SEASONS: usize = 200;
 impl ContinueStore {
     /// `continue.json` beside `settings.json`.
     pub fn path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("continue.json")
+        crate::paths::root().join("continue.json")
     }
 
     pub fn load() -> Self {
@@ -2115,6 +2260,25 @@ mod tests {
         assert_eq!(normalise_fish_vision_detail("high"), "low");
         assert_eq!(normalise_fish_asr_threads(0), 4);
         assert_eq!(normalise_fish_asr_threads(99), FISH_ASR_THREADS_MAX);
+    }
+
+    #[test]
+    fn model_mirror_defaults_to_auto_and_normalises() {
+        assert_eq!(Settings::default().fish_model_mirror, "auto");
+        for value in FISH_MODEL_MIRRORS {
+            assert_eq!(normalise_fish_model_mirror(value), value);
+        }
+        for bad in ["", "huggingface", " auto ", "mirror ", "OFFICIAL"] {
+            let expected = if bad.trim() == "mirror" {
+                "mirror".to_string()
+            } else {
+                "auto".to_string()
+            };
+            assert_eq!(normalise_fish_model_mirror(bad), expected);
+        }
+        let legacy = serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#)
+            .expect("legacy settings");
+        assert_eq!(legacy.fish_model_mirror, "auto");
     }
 
     #[test]

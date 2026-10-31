@@ -193,7 +193,78 @@ impl Playlist {
             crate::debug_log(&format!("playlist restore items=0 current=none mode={mode}"));
         }
         host.publish();
+        host.install_hover_watch();
         host
+    }
+
+    /// f193: wire the main window's 播放列表 hover probe.
+    ///
+    /// The UI owns the whole hover decision (dwell / grace / rectangle tests);
+    /// Rust only answers "where is the cursor": one `GetCursorPos` + one
+    /// `GetWindowRect` per 60ms UI tick, converted into WINDOW logical px -
+    /// exactly the measurement behind the player's `pointer_inside`. A hidden /
+    /// minimised window, or a pointer outside the client rect, publishes `-1`,
+    /// which fails both rectangle tests, so no timer can open or close the panel
+    /// while the window is off screen or the pointer is elsewhere.
+    ///
+    /// The failed upgrade never leaves the callbacks unwired in practice: the
+    /// host is built right after `AppWindow::new()`. Wiring twice is harmless
+    /// (`Slint` replaces the handler).
+    fn install_hover_watch(&self) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let weak = ui.as_weak();
+        // f193 QA: one receipt per inside/outside transition, with the exact
+        // logical point the UI is about to hit-test. Silent while the pointer
+        // stays on one side, so a run logs a handful of lines, not 16/s.
+        let last_inside = Cell::new(None::<bool>);
+        ui.on_pointer_probe(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let window = ui.window();
+            let on_screen = win::is_visible(&window) == Some(true)
+                && win::is_minimized(&window) != Some(true);
+            // A point OUTSIDE the client rect is published as -1 too: the UI's
+            // rectangle tests only need "not over the chrome", and a wild value
+            // (the pointer on the second monitor) must never read as a hit.
+            let size = window.size();
+            let point = if on_screen {
+                cursor_in_window(&window).filter(|(x, y)| {
+                    *x >= 0.0
+                        && *y >= 0.0
+                        && *x < f64::from(size.width)
+                        && *y < f64::from(size.height)
+                })
+            } else {
+                None
+            };
+            let (x, y) = match point {
+                Some((x, y)) => (x as f32, y as f32),
+                None => (-1.0, -1.0),
+            };
+            if last_inside.get() != Some(point.is_some()) {
+                last_inside.set(Some(point.is_some()));
+                crate::debug_log(&format!(
+                    "pointer probe main inside={} x={x:.0} y={y:.0} wide={:.0} high={:.0}",
+                    u8::from(point.is_some()),
+                    size.width,
+                    size.height,
+                ));
+            }
+            // Only transitions reach Slint: a still pointer writes nothing, so
+            // the tick never repaints the window by itself.
+            if ui.get_pointer_x() != x {
+                ui.set_pointer_x(x);
+            }
+            if ui.get_pointer_y() != y {
+                ui.set_pointer_y(y);
+            }
+        });
+        ui.on_hover_log(|line| {
+            crate::debug_log(&line);
+        });
     }
 
     /// The main window's current view (0 = 首页推荐 feed).
@@ -722,9 +793,10 @@ impl Playlist {
     }
 
     /// A player window closed on the user's terms (X / Alt+F4): that video is
-    /// done, so its queue row goes with it. A pause or an end-of-track never
-    /// reaches here; a Replace close is tagged `replace` and is skipped by the
-    /// caller, so auto-advance keeps the played item in the queue.
+    /// done, so its queue row goes with it. A pause never reaches here; an
+    /// end-of-track removes its own row in [`Playlist::tick`] (before the
+    /// next/shuffle/stop decision), and a Replace close is tagged `replace` and
+    /// skipped by the caller, so a natural advance never removes twice.
     pub(crate) fn remove_bvid_via(&self, bvid: &str, via: &str) -> bool {
         let index = self
             .queue
@@ -861,21 +933,40 @@ impl Playlist {
         if let Some((bvid, cid)) = ended {
             prefetch::remove_cached_for(&bvid, cid, "end-of-track");
         }
+        // A NATURAL end also owns its row: the finished item leaves the queue
+        // BEFORE the next/shuffle/stop decision, so 播放列表 never keeps a card
+        // the user has already watched. Only this block removes on its own;
+        // the gesture paths (row ✕, window close, another card) never come
+        // through here and keep their own behaviour.
+        let action = match mode {
+            0 => "stop",
+            2 => "shuffle",
+            _ => "next",
+        };
+        let (left, removed_at) = match current {
+            Some(index) if index < len => (self.drop_ended(index, action), Some(index)),
+            _ => {
+                crate::debug_log(&format!(
+                    "playlist end remove skipped current={current:?} action={action}"
+                ));
+                (len, None)
+            }
+        };
+        // Removing `index` shifts everything after it down by one, so the
+        // successor now sits AT `index` (the ended row's own slot); an ended
+        // last row wraps to the new first row. `index + 1` would name the row
+        // after the successor in the old list - the classic off-by-one here.
+        let successor = removed_at.and_then(|index| next_after_removal(index, left));
         match mode {
             0 => {
-                crate::debug_log("playlist end action=stop mode=0");
-                self.stopped.set(true);
-                self.playing.set(false);
-                self.publish();
+                crate::debug_log(&format!("playlist end action=stop mode=0 left={left}"));
+                self.stop_after_end();
             }
             2 => {
                 let (candidates, target) = {
                     let mut queue = self.queue.borrow_mut();
-                    // The item that just ended counts as played; then pick a
-                    // random one that has not been.
-                    if let Some(current) = queue.current {
-                        queue.played.insert(current);
-                    }
+                    // Every finished item already left the queue, so `played`
+                    // only matters for a removal this pass had to skip.
                     let candidates = queue.random_candidates();
                     let pick = if candidates.is_empty() {
                         None
@@ -886,26 +977,63 @@ impl Playlist {
                     (candidates.len(), target)
                 };
                 match target {
-                    Some(index) => {
+                    Some(index) if index < left => {
                         crate::debug_log(&format!(
-                            "playlist end action=shuffle candidates={candidates} pick={index}"
+                            "playlist end action=shuffle candidates={candidates} pick={index} left={left}"
                         ));
                         self.play_index(index);
                     }
-                    None => crate::debug_log("playlist end action=none mode=2"),
+                    _ => {
+                        crate::debug_log("playlist end action=none mode=2");
+                        self.stop_after_end();
+                    }
                 }
             }
             _ => {
-                let target = self.queue.borrow().step(true);
+                let target = successor.or_else(|| self.queue.borrow().step(true));
                 match target {
                     Some(index) => {
-                        crate::debug_log(&format!("playlist end action=next pick={index} mode=1"));
+                        crate::debug_log(&format!(
+                            "playlist end action=next pick={index} mode=1 left={left}"
+                        ));
                         self.play_index(index);
                     }
-                    None => crate::debug_log("playlist end action=none mode=1"),
+                    None => {
+                        crate::debug_log("playlist end action=none mode=1");
+                        self.stop_after_end();
+                    }
                 }
             }
         }
+    }
+
+    /// Drop the item that just finished playing, then republish and persist so
+    /// the panel loses its row immediately and the bar's vinyl (row 0) names the
+    /// row that is really next. Returns the queue length after the removal; the
+    /// caller re-locates the successor from it, never from the pre-removal index.
+    fn drop_ended(&self, index: usize, action: &str) -> usize {
+        let removed = self.queue.borrow_mut().remove(index);
+        let left = self.queue.borrow().items.len();
+        let Some(removed) = removed else {
+            return left;
+        };
+        crate::debug_log(&format!(
+            "playlist end remove idx={index} bvid={} left={left} action={action}",
+            removed.bvid
+        ));
+        self.publish();
+        self.persist();
+        left
+    }
+
+    /// Nothing follows a natural end (mode 0, or the queue ran dry): the bar
+    /// stops, `now_playing=0`, and with no row left `publish` clears the title
+    /// and cover so the panel sits in its empty state instead of on the card
+    /// that was just watched.
+    fn stop_after_end(&self) {
+        self.stopped.set(true);
+        self.playing.set(false);
+        self.publish();
     }
 
     /// xorshift64: a tiny, dependency-free shuffle pick.
@@ -928,8 +1056,9 @@ impl Playlist {
         set_active_player(player);
         // A video opened DIRECTLY (card click / detail 播放) was never in the
         // queue. Insert it as the current row now; a video opened from the
-        // queue is already there and is only re-pointed at. The row is removed
-        // by the window-close path, never by pause/end/replace.
+        // queue is already there and is only re-pointed at. The row leaves on
+        // a manual window close or when it plays to the end; a pause or a
+        // Replace close never removes it.
         let (index, inserted) = self
             .queue
             .borrow_mut()
@@ -988,6 +1117,20 @@ impl Playlist {
             "playlist focus bvid={} title={}",
             video.bvid, video.title
         ));
+    }
+}
+
+/// Where playback continues after the ended row `index` was removed from a
+/// queue that now holds `left` items: the ended row's own slot (its successor
+/// moved down into it), wrapping to the first row when the ended row was the
+/// last one. `None` when the removal emptied the queue.
+pub(crate) fn next_after_removal(index: usize, left: usize) -> Option<usize> {
+    if left == 0 {
+        None
+    } else if index < left {
+        Some(index)
+    } else {
+        Some(0)
     }
 }
 
@@ -1295,7 +1438,8 @@ pub(crate) fn close_player_window(
         }
         // A user close (X / native) means "I am done with this video": drop
         // its queue row. A Replace close is the auto-advance / another-video
-        // path and must NOT remove anything (the queue survives an end).
+        // path and must NOT remove anything there (an end-of-track already
+        // removed its own row, and a Replace close must never remove twice).
         if (tag == "button" || tag == "native") && !record.live {
             if let Some(host) = playlist() {
                 let closed_bvid = record.video.bvid.clone();
@@ -1939,5 +2083,57 @@ mod playlist_tests {
         assert_eq!(duration_seconds("1:02:03"), 3723);
         assert_eq!(duration_seconds(""), 0);
         assert_eq!(duration_seconds("bad"), 0);
+    }
+
+    /// A natural end removes its row; the successor is re-located in the
+    /// SHRUNK list, never at `index + 1` of the old one.
+    #[test]
+    pub(crate) fn next_after_removal_names_the_row_that_moved_into_the_slot() {
+        assert_eq!(next_after_removal(0, 2), Some(0));
+        assert_eq!(next_after_removal(1, 2), Some(1));
+        // The last row ended: wrap to the new first row.
+        assert_eq!(next_after_removal(2, 2), Some(0));
+        // The removal emptied the queue.
+        assert_eq!(next_after_removal(0, 0), None);
+    }
+
+    /// End-of-track on a three-item queue: the played row leaves, the queue
+    /// keeps its order and the item that used to follow it is now both row 0
+    /// and the successor playback must start.
+    #[test]
+    pub(crate) fn end_removal_keeps_the_order_and_points_at_the_successor() {
+        let mut queue = queue(&["BV1", "BV2", "BV3"]);
+        queue.current = Some(0);
+        let removed = queue.remove(0).expect("row 0 exists");
+        assert_eq!(removed.bvid, "BV1");
+        assert_eq!(queue.current, None);
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.bvid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BV2", "BV3"]
+        );
+        let successor = next_after_removal(0, queue.items.len()).expect("two rows left");
+        assert_eq!(successor, 0);
+        assert_eq!(queue.items[successor].bvid, "BV2");
+        // Playing it promotes nothing: it already is row 0.
+        assert_eq!(queue.make_current(successor), Some(0));
+        assert_eq!(queue.current, Some(0));
+        assert_eq!(queue.items[0].bvid, "BV2");
+    }
+
+    /// The single queued item ends: the queue empties and there is no successor
+    /// to start, which is what turns into the stopped empty state.
+    #[test]
+    pub(crate) fn end_removal_of_the_only_item_leaves_an_empty_queue() {
+        let mut queue = queue(&["BV1"]);
+        queue.current = Some(0);
+        assert!(queue.remove(0).is_some());
+        assert!(queue.items.is_empty());
+        assert_eq!(queue.current, None);
+        assert_eq!(next_after_removal(0, queue.items.len()), None);
+        assert_eq!(queue.step(true), None);
     }
 }

@@ -9,7 +9,7 @@
 //! `notify` is thread-safe and only queues a string plus a window message.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -107,26 +107,6 @@ pub fn notify(title: &str, body: &str) {
 }
 
 /// Whether the one-time "hidden to tray" hint has already been queued.
-static HIDDEN_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
-
-/// Queue the "hidden to the tray" hint, at most once per process.
-///
-/// The first hide explains where the window went and how to get it back;
-/// every later hide stays silent, so the balloon never becomes noise. Does
-/// nothing (and keeps the flag unset) while the tray is not running yet, so
-/// an early call cannot swallow the hint.
-pub fn notify_hidden_once() {
-    if GLOBAL.get().is_none() {
-        return;
-    }
-    if HIDDEN_NOTICE_SHOWN.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    notify(
-        "O11A1",
-        "已隐藏在系统托盘，播放继续。双击托盘图标可恢复。",
-    );
-}
 
 /// Tear the tray icon down through the global handle.
 pub fn shutdown() {
