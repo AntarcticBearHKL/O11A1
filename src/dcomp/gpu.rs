@@ -18,21 +18,24 @@
 //! * the RGBA -> BGRA swizzle is fused into the upload and never touches alpha:
 //!   the UI layer's premultiplied alpha has to survive it.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use windows::core::{Interface, IUnknown, BOOL};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11CreateDevice, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_MAP_WRITE, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+    DCompositionCreateDevice, DCompositionCreateDevice2, IDCompositionDevice, IDCompositionDevice2,
+    IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -172,7 +175,48 @@ pub(crate) struct Layer {
     texture: ID3D11Texture2D,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// f213 diagnostics. Every field is inert unless `BILI_F213_TRACE=1`: the
+    /// counters cost one relaxed atomic per present, and the probe texture is
+    /// only ever created by [`Self::probe_alpha`], which nothing calls when the
+    /// trace is off.
+    presents: AtomicU64,
+    present_ok: AtomicU64,
+    last_hr: AtomicI32,
+    waits: AtomicU64,
+    wait_ok: AtomicU64,
+    staged: AtomicU64,
+    backbuffer: AtomicU64,
+    probe: RefCell<Option<ID3D11Texture2D>>,
 }
+
+/// f213: whether the present/alpha trace is on (`BILI_F213_TRACE=1`).
+pub(crate) fn f213_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BILI_F213_TRACE").is_ok_and(|value| {
+            matches!(value.trim(), "1" | "true" | "yes" | "on")
+        })
+    })
+}
+
+/// f213: how one layer presented since the process started.
+///
+/// `staged` counts presents fed by the CPU staging copy ([`Layer::submit`]),
+/// `backbuffer` the ones drawn straight into the swapchain (the warp and the
+/// video processor). One swapchain must only ever be presented by one of them
+/// per display slot; two paths on one frame is the failure this trace exists
+/// to catch.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct F213Stats {
+    pub(crate) presents: u64,
+    pub(crate) ok: u64,
+    pub(crate) last_hr: i32,
+    pub(crate) waits: u64,
+    pub(crate) wait_ok: u64,
+    pub(crate) staged: u64,
+    pub(crate) backbuffer: u64,
+}
+
 
 /// The alpha mode decides what the compositor does with the layer's alpha.
 mod alpha {
@@ -187,6 +231,20 @@ mod alpha {
 }
 
 pub(crate) use self::alpha::{UI, VIDEO};
+
+/// f213: whether the video visual was switched to DComp's *opaque* opacity mode
+/// (the trace prints it). A layer whose swapchain is `ALPHA_MODE_IGNORE` is
+/// already opaque on screen, so this is belt and braces - but a visual left at
+/// the default mode is exactly what makes a transparent frame visible.
+static VISUAL_OPAQUE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_visual_opaque(opaque: bool) {
+    VISUAL_OPAQUE.store(opaque, Ordering::Relaxed);
+}
+
+pub(crate) fn visual_opaque() -> bool {
+    VISUAL_OPAQUE.load(Ordering::Relaxed)
+}
 
 /// Fresh `B8G8R8A8_UNORM` texture with the given usage.
 unsafe fn texture(
@@ -272,6 +330,14 @@ impl Layer {
                 texture: texture(gpu, width, height, D3D11_USAGE_DEFAULT, 0)?,
                 width,
                 height,
+                presents: AtomicU64::new(0),
+                present_ok: AtomicU64::new(0),
+                last_hr: AtomicI32::new(0),
+                waits: AtomicU64::new(0),
+                wait_ok: AtomicU64::new(0),
+                staged: AtomicU64::new(0),
+                backbuffer: AtomicU64::new(0),
+                probe: RefCell::new(None),
             };
             layer.trace_born();
             Ok(layer)
@@ -410,7 +476,12 @@ impl Layer {
     /// the copy is issued *after* the wait so it lands in the buffer the
     /// compositor is about to take.
     pub(crate) fn submit(&self) -> windows::core::Result<windows::core::HRESULT> {
-        wait(self.waiter, 200);
+        let signalled = wait(self.waiter, 200);
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        if signalled {
+            self.wait_ok.fetch_add(1, Ordering::Relaxed);
+        }
+        self.staged.fetch_add(1, Ordering::Relaxed);
         unsafe {
             let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
             self.context.CopyResource(&self.texture, &self.staging);
@@ -432,6 +503,7 @@ impl Layer {
     /// assumed: with 97 comments in the model and a 800x319 damage rect per
     /// paint, the window showed none of them.
     pub(crate) fn pulse(&self) -> windows::core::Result<windows::core::HRESULT> {
+        self.staged.fetch_add(1, Ordering::Relaxed);
         unsafe {
             let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
             self.context.CopyResource(&self.texture, &self.staging);
@@ -446,6 +518,7 @@ impl Layer {
     pub(crate) fn present_backbuffer(
         &self,
     ) -> windows::core::Result<windows::core::HRESULT> {
+        self.backbuffer.fetch_add(1, Ordering::Relaxed);
         Ok(self.present(DXGI_PRESENT_DO_NOT_WAIT))
     }
 
@@ -456,6 +529,100 @@ impl Layer {
         &self.staging
     }
 
+    /// f213: the present / wait counters of this layer.
+    pub(crate) fn f213_stats(&self) -> F213Stats {
+        F213Stats {
+            presents: self.presents.load(Ordering::Relaxed),
+            ok: self.present_ok.load(Ordering::Relaxed),
+            last_hr: self.last_hr.load(Ordering::Relaxed),
+            waits: self.waits.load(Ordering::Relaxed),
+            wait_ok: self.wait_ok.load(Ordering::Relaxed),
+            staged: self.staged.load(Ordering::Relaxed),
+            backbuffer: self.backbuffer.load(Ordering::Relaxed),
+        }
+    }
+
+    /// f213: `(BufferCount, AlphaMode)` the swapchain was actually created
+    /// with, not what was asked for - creation and `ResizeBuffers` can land on
+    /// another buffer count than requested.
+    pub(crate) fn f213_desc(&self) -> (u32, u32) {
+        match unsafe { self.swap.GetDesc1() } {
+            Ok(desc) => (desc.BufferCount, desc.AlphaMode.0 as u32),
+            Err(_) => (0, u32::MAX),
+        }
+    }
+
+    /// f213 (diagnostic only): the smallest and largest alpha in a
+    /// `columns` x `rows` grid of the backbuffer that is about to be presented.
+    pub(crate) fn probe_alpha(&self, columns: u32, rows: u32) -> Option<(u8, u8)> {
+        let columns = columns.max(1);
+        let rows = rows.max(1);
+        unsafe {
+            let back: ID3D11Texture2D = self.swap.GetBuffer(0).ok()?;
+            let mut slot = self.probe.borrow_mut();
+            if slot.is_none() {
+                let description = D3D11_TEXTURE2D_DESC {
+                    Width: self.width,
+                    Height: self.height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                };
+                let mut created: Option<ID3D11Texture2D> = None;
+                self.device
+                    .CreateTexture2D(&description, None, Some(&mut created))
+                    .ok()?;
+                *slot = created;
+            }
+            let staging = slot.as_ref()?;
+            self.context.CopyResource(staging, &back);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .ok()?;
+            let pitch = mapped.RowPitch as usize;
+            let base = mapped.pData as *const u8;
+            let mut low = 255u8;
+            let mut high = 0u8;
+            for row in 0..rows {
+                for column in 0..columns {
+                    let x = (((column * 2 + 1) * self.width) / (columns * 2)) as usize;
+                    let y = (((row * 2 + 1) * self.height) / (rows * 2)) as usize;
+                    let alpha = *base.add(y * pitch + x * 4 + 3);
+                    low = low.min(alpha);
+                    high = high.max(alpha);
+                }
+            }
+            self.context.Unmap(staging, 0);
+            Some((low, high))
+        }
+    }
+
+    /// Paint the whole backbuffer one opaque colour (`colour` is RGBA in 0..1).
+    ///
+    /// f213: nothing reaches the compositor with undefined pixels. The warp and
+    /// video-processor draws cover the full viewport themselves, so this is for
+    /// the background layer and for a slot that has no picture to draw.
+    pub(crate) fn clear_backbuffer(&self, colour: [f32; 4]) -> windows::core::Result<()> {
+        unsafe {
+            let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
+            let mut view: Option<ID3D11RenderTargetView> = None;
+            self.device.CreateRenderTargetView(&back, None, Some(&mut view))?;
+            if let Some(view) = view {
+                self.context.ClearRenderTargetView(&view, &colour);
+            }
+            Ok(())
+        }
+    }
+
     /// f202: the compositor wait `submit` performs, exposed so the enhanced path
     /// can keep the same order (CPU copy first, wait, then the GPU work that
     /// lands in the buffer about to be presented) without the two copies.
@@ -464,7 +631,12 @@ impl Layer {
     }
 
     fn present(&self, flags: DXGI_PRESENT) -> windows::core::HRESULT {
+        self.presents.fetch_add(1, Ordering::Relaxed);
         let hr = unsafe { self.swap.Present(0, flags) };
+        self.last_hr.store(hr.0, Ordering::Relaxed);
+        if hr.0 == 0 {
+            self.present_ok.fetch_add(1, Ordering::Relaxed);
+        }
         if super::f210::enabled() {
             super::f210::note_present(self.role, hr.0);
             // `GetDeviceRemovedReason` is a device-level query with no GPU work
@@ -514,7 +686,25 @@ impl Composition {
     ) -> windows::core::Result<(Self, Vec<IDCompositionVisual>)> {
         unsafe {
             let dxgi: IDXGIDevice = gpu.device.cast()?;
-            let device: IDCompositionDevice = DCompositionCreateDevice(Some(&dxgi))?;
+            // f213: a **device2** when the OS has one. Its visuals are
+            // `IDCompositionVisual2`s, which is what carries `SetOpacityMode`
+            // (the "treat this layer as opaque" switch the video visual needs).
+            // A v1 device's visuals refuse that call, which is measured, not
+            // assumed: the trace printed `dcomp video visual: opacity mode not
+            // set` on every run until this line changed. Falls back to v1 on an
+            // OS that predates it (Windows 8.1 still composites correctly - the
+            // swapchain is `ALPHA_MODE_IGNORE` either way).
+            let unknown: IUnknown = dxgi.cast()?;
+            let device: IDCompositionDevice =
+                match DCompositionCreateDevice2::<&IUnknown, IDCompositionDevice2>(&unknown) {
+                Ok(device2) => device2.cast()?,
+                Err(error) => {
+                    crate::debug_log(&format!(
+                        "dcomp device2 unavailable ({error}), using device1"
+                    ));
+                    DCompositionCreateDevice(Some(&dxgi))?
+                }
+            };
             let target = device.CreateTargetForHwnd(windows::Win32::Foundation::HWND(hwnd as *mut c_void), true)?;
             let root = device.CreateVisual()?;
             target.SetRoot(&root)?;

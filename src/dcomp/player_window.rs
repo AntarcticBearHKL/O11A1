@@ -47,9 +47,12 @@ use slint::platform::software_renderer::{PremultipliedRgbaColor, RepaintBufferTy
 use slint::platform::{PlatformError, WindowAdapter, WindowEvent};
 use slint::{LogicalPosition, PhysicalPosition, PhysicalSize, WindowSize};
 
-use windows::core::{Interface, PCWSTR};
+use windows::core::{Interface, IUnknown, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::DirectComposition::{IDCompositionRectangleClip, IDCompositionVisual};
+use windows::Win32::Graphics::DirectComposition::{
+    IDCompositionRectangleClip, IDCompositionVisual, IDCompositionVisual2,
+    DCOMPOSITION_OPACITY_MODE_LAYER,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, MonitorFromWindow, ScreenToClient, UpdateWindow,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
@@ -211,12 +214,40 @@ thread_local! {
 struct Compositor {
     gpu: Option<Gpu>,
     ui: Option<Layer>,
+    /// f213: an opaque layer of its own, at the bottom of the tree.
+    ///
+    /// The UI layer draws a *hole* where the picture goes (that is how the
+    /// video shows through), and the video layer has no content until the
+    /// decoder hands over its first frame. Between window creation and that
+    /// frame the hole was transparent, so the desktop was visible through the
+    /// player - the "加载视频时背景完全透明" report. This layer is created with
+    /// the window, painted the player's own base colour and never presented
+    /// again (nothing draws over it), so the hole is opaque from the first
+    /// composited frame and the picture is simply drawn on top of it.
+    background: Option<Layer>,
+    background_visual: Option<IDCompositionVisual>,
     composition: Option<Composition>,
     ui_visual: Option<IDCompositionVisual>,
     video_visual: Option<IDCompositionVisual>,
     clip: Option<IDCompositionRectangleClip>,
     /// Geometry last applied to the video visual (physical client px).
     geometry: Option<VideoGeometry>,
+}
+
+/// f213: the opaque colour behind the picture, `AppTheme.player-bg` in
+/// `ui/app.slint` (#101014). Written as **RGBA** - [`Layer::stage`] does the
+/// red/blue swap on the way in.
+const PLAYER_BG: [u8; 4] = [0x10, 0x10, 0x14, 0xFF];
+
+/// f213: paint `layer` the player's base colour and present it.
+fn fill_background(layer: &Layer) -> windows::core::Result<()> {
+    let mut pixels = vec![0u8; layer.width as usize * layer.height as usize * 4];
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&PLAYER_BG);
+    }
+    layer.stage(&pixels, true)?;
+    let _ = layer.submit()?;
+    Ok(())
 }
 
 impl Compositor {
@@ -469,12 +500,50 @@ impl DcompPlayerWindow {
         let ui_gpu = Gpu::new().map_err(|error| format!("ui device: {error}"))?;
         let ui_layer = Layer::new(&ui_gpu, size.width, size.height, gpu::UI)
             .map_err(|error| format!("ui layer: {error}"))?;
+        // f213: the backdrop. Its own swapchain, one opaque frame, never
+        // presented again; it exists so no frame of this window can ever be
+        // the desktop. Created *before* the composition tree so the visual can
+        // be the first child.
+        let background = Layer::new(&ui_gpu, size.width, size.height, gpu::VIDEO)
+            .map_err(|error| format!("background layer: {error}"))?;
+        fill_background(&background).map_err(|error| format!("background fill: {error}"))?;
         let (composition, mut visuals) = Composition::new(self.hwnd.get(), &ui_gpu, &[&ui_layer])
             .map_err(|error| format!("composition: {error}"))?;
         let ui_visual = visuals.pop();
+        // Directly below the UI visual. A NULL reference visual does *not* mean
+        // "the bottom" in practice (the f196 note on the video visual): it put
+        // this layer *above* everything, which hid the whole window behind one
+        // flat rectangle. Explicit reference is unambiguous.
+        let background_visual = unsafe {
+            let visual = composition
+                .device
+                .CreateVisual()
+                .map_err(|error| format!("background visual: {error}"))?;
+            let unknown: IUnknown = background
+                .swap
+                .cast()
+                .map_err(|error| format!("background content: {error}"))?;
+            visual
+                .SetContent(&unknown)
+                .map_err(|error| format!("background content: {error}"))?;
+            visual
+                .SetOffsetX2(0.0)
+                .map_err(|error| format!("background offset: {error}"))?;
+            visual
+                .SetOffsetY2(0.0)
+                .map_err(|error| format!("background offset: {error}"))?;
+            composition
+                .root
+                .AddVisual(&visual, false, ui_visual.as_ref())
+                .map_err(|error| format!("background visual: {error}"))?;
+            let _ = composition.device.Commit();
+            visual
+        };
         let mut compositor = self.compositor.borrow_mut();
         compositor.gpu = Some(ui_gpu);
         compositor.ui = Some(ui_layer);
+        compositor.background = Some(background);
+        compositor.background_visual = Some(background_visual);
         compositor.composition = Some(composition);
         compositor.ui_visual = ui_visual;
         Ok(())
@@ -517,12 +586,42 @@ impl DcompPlayerWindow {
             visual
                 .SetContent(&unknown)
                 .map_err(|error| format!("video content: {error}"))?;
+            // f213: the picture visual is opaque by contract. The swapchain is
+            // already `ALPHA_MODE_IGNORE`, so this changes nothing when the
+            // frames are drawn - it is the guarantee that a frame handed to the
+            // compositor with alpha in it (or none at all) can never blend the
+            // desktop through the band. `OPACITY_MODE_LAYER` is DComp's "treat
+            // the content as one opaque layer" mode: per-pixel alpha in the
+            // swapchain stops taking part in the composite.
+            let opaque = match visual.cast::<IDCompositionVisual2>() {
+                Ok(visual2) => match visual2.SetOpacityMode(DCOMPOSITION_OPACITY_MODE_LAYER) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        crate::debug_log(&format!("dcomp video visual: opacity mode {error}"));
+                        false
+                    }
+                },
+                Err(error) => {
+                    crate::debug_log(&format!("dcomp video visual: no visual2 {error}"));
+                    false
+                }
+            };
+            gpu::set_visual_opaque(opaque);
+            if !opaque {
+                crate::debug_log("dcomp video visual: opacity mode not set");
+            }
             composition
                 .root
                 .AddVisual(&visual, false, ui_visual.as_ref())
                 .map_err(|error| format!("video visual: {error}"))?;
             visual
         };
+        // f213: a brand-new swapchain holds undefined pixels. One opaque black
+        // frame means the layer is never *the* thing that shows the desktop,
+        // and the background layer below it stays the only thing visible until
+        // the first real picture arrives.
+        let _ = video_layer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
+        let _ = video_layer.present_backbuffer();
         // The danmaku layer (if it was built before the first frame) sits
         // between the video and the UI: re-insert it above the new video visual
         // so the two never swap places.
@@ -655,13 +754,26 @@ impl DcompPlayerWindow {
         }
 
         let mut compositor = self.compositor.borrow_mut();
-        let Compositor { gpu, ui, .. } = &mut *compositor;
+        let Compositor {
+            gpu,
+            ui,
+            background,
+            ..
+        } = &mut *compositor;
         let (Some(gpu), Some(ui)) = (gpu.as_ref(), ui.as_mut()) else {
             return false;
         };
         if ui.resize(gpu, size.width, size.height).unwrap_or(false) {
             // New buffers: the next paint must be a full one.
             self.full_paint.set(true);
+            // f213: the backdrop follows the client area, or a resize would
+            // leave the old frame's size showing beside/under the new band.
+            if let Some(background) = background.as_mut() {
+                let _ = background.resize(gpu, size.width, size.height);
+                if let Err(error) = fill_background(background) {
+                    crate::debug_log(&format!("dcomp background fill failed: {error}"));
+                }
+            }
         }
         let buffer = self.buffer.borrow();
         let bytes = unsafe {

@@ -208,6 +208,142 @@ pub(crate) struct Counters {
     pub(crate) mf_state: AtomicU64,
 }
 
+/// f213: the 4 lines a second the present trace prints (`BILI_F213_TRACE=1`).
+///
+/// One line answers the two questions the 闪烁 report has to be split on:
+/// *what* the last slot drew (warp / vp-copy / staging / nothing) and whether
+/// that produced an opaque backbuffer, and *how many* presents this swapchain
+/// took in the window (two paths presenting one swapchain is a flicker of its
+/// own, no alpha involved).
+///
+/// Inert when the flag is off: `note` is a store into a plain field and nothing
+/// samples the backbuffer.
+struct Trace213 {
+    on: bool,
+    since: std::time::Instant,
+    snapshot: super::gpu::F213Stats,
+    /// warp / vp-copy / staging / nothing, in that order.
+    slots: [u64; 4],
+    /// The pair identity of the slots in this window: how many source intervals
+    /// the window covered, and whether the drawn A slot ever flipped inside one
+    /// pair (the frame-order bug the mf warp is suspected of).
+    pairs: u64,
+    last_pair: u64,
+    /// The last slot, printed verbatim: kind, pair, phase, and whether the
+    /// engine's texture roles had rotated (the parity the warp's inputs need).
+    kind: &'static str,
+    phase: f32,
+    flipped: bool,
+    enhanced: bool,
+    /// min/max alpha of the last backbuffer a slot was about to present.
+    alpha: (u8, u8),
+    desc: (u32, u32),
+}
+
+impl Trace213 {
+    fn new() -> Self {
+        Self {
+            on: super::gpu::f213_trace(),
+            since: std::time::Instant::now(),
+            snapshot: super::gpu::F213Stats::default(),
+            slots: [0; 4],
+            pairs: 0,
+            last_pair: u64::MAX,
+            kind: "nothing",
+            phase: 0.0,
+            flipped: false,
+            enhanced: false,
+            alpha: (255, 255),
+            desc: (0, 0),
+        }
+    }
+
+    /// Record the slot that is about to be presented (`kind` is an index into
+    /// [`Self::slots`]: 0 warp, 1 vp-copy, 2 staging, 3 nothing).
+    fn note(&mut self, kind: usize, layer: &Layer, pair: u64, phase: f32, flipped: bool) {
+        if !self.on {
+            return;
+        }
+        self.slots[kind.min(3)] += 1;
+        if pair != self.last_pair {
+            if self.last_pair != u64::MAX {
+                self.pairs += 1;
+            }
+            self.last_pair = pair;
+        }
+        self.kind = match kind {
+            0 => "warp",
+            1 => "vp-copy",
+            2 => "staging",
+            _ => "nothing",
+        };
+        self.phase = phase;
+        self.flipped = flipped;
+        self.enhanced = enhance::desired() != enhance::OFF;
+        // Right place for it: the pixels measured are the ones about to be
+        // handed to the compositor.
+        if let Some(alpha) = layer.probe_alpha(4, 4) {
+            self.alpha = alpha;
+        }
+    }
+
+    /// Print one line per 250 ms, from the presenting thread.
+    fn tick(&mut self, layer: &Layer) {
+        if !self.on {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let window = now.duration_since(self.since);
+        if window < Duration::from_millis(250) {
+            return;
+        }
+        self.since = now;
+        let stats = layer.f213_stats();
+        let delta = |now: u64, before: u64| now.saturating_sub(before);
+        let presents = delta(stats.presents, self.snapshot.presents);
+        let ok = delta(stats.ok, self.snapshot.ok);
+        let waits = delta(stats.waits, self.snapshot.waits);
+        let wait_ok = delta(stats.wait_ok, self.snapshot.wait_ok);
+        let staged = delta(stats.staged, self.snapshot.staged);
+        let backbuffer = delta(stats.backbuffer, self.snapshot.backbuffer);
+        self.snapshot = stats;
+        let ms = window.as_millis().max(1);
+        let rate = |count: u64| (count as f64) * 1000.0 / (ms as f64);
+        if self.desc.0 == 0 {
+            self.desc = layer.f213_desc();
+        }
+        crate::debug_log(&format!(
+            "f213 slot ms={ms} kind={} pair={} phase={:.2} flip={} enhanced={} | (D) presents={} ok={} staged={} backbuffer={} hr=0x{:08X} | (F) alpha={}..{} buf={} alpha_mode={} visual={} | warp={} vp={} staging={} nothing={} pairs={} slot_s={:.1} layer_s={:.1} wait_ok={}/{}",
+            self.kind,
+            self.last_pair,
+            self.phase,
+            u8::from(self.flipped),
+            u8::from(self.enhanced),
+            presents,
+            ok,
+            staged,
+            backbuffer,
+            stats.last_hr as u32,
+            self.alpha.0,
+            self.alpha.1,
+            self.desc.0,
+            self.desc.1,
+            if super::gpu::visual_opaque() { "opaque" } else { "premultiplied" },
+            self.slots[0],
+            self.slots[1],
+            self.slots[2],
+            self.slots[3],
+            self.pairs,
+            rate(self.slots.iter().sum::<u64>()),
+            rate(presents),
+            wait_ok,
+            waits,
+        ));
+        self.slots = [0; 4];
+        self.pairs = 0;
+    }
+}
+
 /// The UI thread's handle to the video layer.
 pub(crate) struct VideoSink {
     shared: Arc<(Mutex<Shared>, Condvar)>,
@@ -288,6 +424,9 @@ impl VideoSink {
                 // Step-by-step trace for the first warp job (`BILI_WARP_TRACE`
                 // is always on for the first two, so a crash has a last line).
                 let mut warp_trace = true;
+                // f213: the present/alpha trace (`BILI_F213_TRACE=1`). No
+                // allocation, no GPU work while the flag is off.
+                let mut trace = Trace213::new();
                 let mut last_pair = u64::MAX;
                 let mut scratch: Vec<u8> = Vec::new();
                 // f202: the enhancement tier, built on the first frame that
@@ -304,6 +443,9 @@ impl VideoSink {
                 // Whether the pair the ticks are drawing with is the one the
                 // optical-flow engine has (so a slot does not resubmit it).
                 let mut pair_warped = false;
+                // f213: whether the engine's input textures have rotated since
+                // `views` was taken (see the swap in the tick branch).
+                let mut views_flipped = false;
                 loop {
                     // Wait for a job (or a close). The timeout is only a safety
                     // net for a lost wake-up.
@@ -351,11 +493,15 @@ impl VideoSink {
                         &thread_counters,
                     );
                 }
+                // f213: the trace prints on the presenting thread's own clock,
+                // every iteration, so a slot never waits for a 250 ms timer.
+                trace.tick(&layer);
                 let Some(job) = job else {
                     if repaint && has_frame {
                         // f202: a repaint request. Nothing new arrived, so the
                         // staging texture is the frame on screen; run the tier
                         // (or the plain copy) over it again and present.
+                        trace.note(2, &layer, 0, 0.0, false);
                         present_staged(
                             &mut enhance_state,
                             &gpu,
@@ -413,6 +559,7 @@ impl VideoSink {
 
                             // f202: present it through the tier (or the plain
                             // copy) - the same call a paused repaint uses.
+                            trace.note(2, &layer, 0, 0.0, false);
                             present_staged(
                                 &mut enhance_state,
                                 &gpu,
@@ -579,6 +726,7 @@ impl VideoSink {
                                     continue;
                                 }
                             }
+                            trace.note(0, &layer, pair, phase, false);
                             match layer.present_backbuffer() {
                                 Ok(hr) if hr.0 == 0 => {
                                     thread_counters.presented.fetch_add(1, Ordering::Relaxed);
@@ -603,7 +751,7 @@ impl VideoSink {
                                 .warp_us
                                 .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }
-                        Job::Tick { video_ms, pair: _pair } => {
+                        Job::Tick { video_ms, pair } => {
                             // f209: one display slot of an MF session. Everything
                             // a picture needs is already on the GPU when this
                             // runs; the pacer contributed only the clock.
@@ -631,6 +779,10 @@ impl VideoSink {
                                         width,
                                         height,
                                     );
+                                    // A rebuilt engine comes with fresh views
+                                    // (`take_views`) that describe the roles it
+                                    // was built with, so the parity restarts.
+                                    views_flipped = false;
                                 }
                                 let ofa_ready = matches!(warp_state, WarpState::Ready { .. });
                                 thread_counters
@@ -692,10 +844,35 @@ impl VideoSink {
                                         if !gated {
                                             crate::debug_log("dcomp mf warp gate timeout ms=50");
                                         }
-                                        // `submit_textures` swaps the textures'
-                                        // roles (`b` becomes the next pair's `a`),
-                                        // so the views swap with them.
-                                        views.swap(0, 1);
+                                        // f213: the parity of the engine's two
+                                        // input textures.
+                                        //
+                                        // `views` is `take_views()`: the SRVs of
+                                        // the two textures the session was built
+                                        // with (`views[0]` = the texture that was
+                                        // `tex_cur`, `views[1]` = `tex_next`).
+                                        // `submit_textures` copies a -> tex_cur,
+                                        // b -> tex_next, and then **swaps** the
+                                        // two roles, so after submit k the A
+                                        // picture lives in `views[(k+1) % 2]`.
+                                        // The shader needs `tex_a` = A (the flow
+                                        // field is a -> b), so the pair must be
+                                        // swapped after every submit **except the
+                                        // first one**.
+                                        //
+                                        // The old code swapped on every submit -
+                                        // off by one for the whole session. That
+                                        // handed the shader (B, A) for a field
+                                        // that means (A, B): each interval played
+                                        // its pair backwards (A+1 -> A) and jumped
+                                        // forward at the next boundary. At 120
+                                        // slots over 30 fps source that is a 30 Hz
+                                        // back-and-forth on screen - the 闪烁
+                                        // report.
+                                        if views_flipped {
+                                            views.swap(0, 1);
+                                        }
+                                        views_flipped = true;
                                         pair_warped = true;
                                     } else {
                                         let reason =
@@ -809,6 +986,15 @@ impl VideoSink {
                             } else if let Err(error) = drawn {
                                 crate::debug_log(&format!("dcomp mf draw failed: {error}"));
                             }
+                            // f213: what this slot drew, and the parity the warp's
+                            // inputs are in (see the swap in the new-pair block).
+                            trace.note(
+                                if pair_warped { 0 } else { 1 },
+                                &layer,
+                                pair,
+                                tick.phase,
+                                views_flipped,
+                            );
                             match layer.present_backbuffer() {
                                 Ok(hr) if hr.0 == 0 => {
                                     thread_counters.presented.fetch_add(1, Ordering::Relaxed);
