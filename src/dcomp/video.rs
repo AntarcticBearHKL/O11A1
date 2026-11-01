@@ -45,7 +45,7 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11RenderTargetView, ID3D11ShaderR
 
 use super::enhance::{self, Enhance, Source};
 use super::gpu::{Gpu, Layer};
-use super::nv12::{BlitPipeline, GpuPicture, Nv12Converter};
+use super::nv12::{BlitPipeline, GpuPicture, Nv12Converter, SurfaceRing, SURFACE_RING};
 use super::warp::{Params, WarpPipeline};
 
 /// The picture the decode pipeline produces (`player::FrameBuf`).
@@ -237,6 +237,13 @@ struct Trace213 {
     enhanced: bool,
     /// min/max alpha of the last backbuffer a slot was about to present.
     alpha: (u8, u8),
+    /// f218: the picture time of the source frame the slot drew (`pts`, ms) and
+    /// the mean luma of that same backbuffer. On the flat-luma ramp sample the
+    /// luma is the source frame's level, so the pair (pts, luma) says whether
+    /// the slot drew the frame it chose and whether the *sequence* advances.
+    /// Both are the extremes seen inside one printed window.
+    pts: (u64, u64),
+    luma: (f32, f32),
     desc: (u32, u32),
 }
 
@@ -254,6 +261,8 @@ impl Trace213 {
             flipped: false,
             enhanced: false,
             alpha: (255, 255),
+            pts: (u64::MAX, 0),
+            luma: (f32::MAX, f32::MIN),
             desc: (0, 0),
         }
     }
@@ -261,6 +270,20 @@ impl Trace213 {
     /// Record the slot that is about to be presented (`kind` is an index into
     /// [`Self::slots`]: 0 warp, 1 vp-copy, 2 staging, 3 nothing).
     fn note(&mut self, kind: usize, layer: &Layer, pair: u64, phase: f32, flipped: bool) {
+        self.note_frame(kind, layer, pair, phase, flipped, 0);
+    }
+
+    /// [`Self::note`] plus the picture time the slot drew (f218: the frame-order
+    /// probe).
+    fn note_frame(
+        &mut self,
+        kind: usize,
+        layer: &Layer,
+        pair: u64,
+        phase: f32,
+        flipped: bool,
+        pts: u64,
+    ) {
         if !self.on {
             return;
         }
@@ -280,10 +303,26 @@ impl Trace213 {
         self.phase = phase;
         self.flipped = flipped;
         self.enhanced = enhance::desired() != enhance::OFF;
+        self.pts.0 = self.pts.0.min(pts);
+        self.pts.1 = self.pts.1.max(pts);
         // Right place for it: the pixels measured are the ones about to be
-        // handed to the compositor.
-        if let Some(alpha) = layer.probe_alpha(4, 4) {
-            self.alpha = alpha;
+        // handed to the compositor. One readback gives both the alpha range and
+        // the luma of the frame this slot actually drew.
+        if let Some((low, high, luma)) = layer.probe_pixels(4, 4) {
+            self.alpha = (low, high);
+            self.luma.0 = self.luma.0.min(luma);
+            self.luma.1 = self.luma.1.max(luma);
+            // f218 (`BILI_F218_SLOTS=1`): one line per slot, so the frame the
+            // slot *picked* (`pts`) and the pixels it *drew* (`luma`) can be
+            // aligned one to one. The per-250 ms range above only says "the
+            // window was chaotic"; this says which slot broke.
+            if f218_slots() {
+                crate::debug_log(&format!(
+                    "f218 slot pts={pts} luma={luma:.0} kind={} pair={pair} phase={phase:.2} warped={}",
+                    self.kind,
+                    u8::from(kind == 0)
+                ));
+            }
         }
     }
 
@@ -313,12 +352,16 @@ impl Trace213 {
             self.desc = layer.f213_desc();
         }
         crate::debug_log(&format!(
-            "f213 slot ms={ms} kind={} pair={} phase={:.2} flip={} enhanced={} | (D) presents={} ok={} staged={} backbuffer={} hr=0x{:08X} | (F) alpha={}..{} buf={} alpha_mode={} visual={} | warp={} vp={} staging={} nothing={} pairs={} slot_s={:.1} layer_s={:.1} wait_ok={}/{}",
+            "f213 slot ms={ms} kind={} pair={} phase={:.2} flip={} enhanced={} pts={}..{} luma={:.0}..{:.0} | (D) presents={} ok={} staged={} backbuffer={} hr=0x{:08X} | (F) alpha={}..{} buf={} alpha_mode={} visual={} | warp={} vp={} staging={} nothing={} pairs={} slot_s={:.1} layer_s={:.1} wait_ok={}/{}",
             self.kind,
             self.last_pair,
             self.phase,
             u8::from(self.flipped),
             u8::from(self.enhanced),
+            if self.pts.0 == u64::MAX { 0 } else { self.pts.0 },
+            self.pts.1,
+            if self.luma.0 == f32::MAX { 0.0 } else { self.luma.0 },
+            if self.luma.1 == f32::MIN { 0.0 } else { self.luma.1 },
             presents,
             ok,
             staged,
@@ -341,7 +384,19 @@ impl Trace213 {
         ));
         self.slots = [0; 4];
         self.pairs = 0;
+        self.pts = (u64::MAX, 0);
+        self.luma = (f32::MAX, f32::MIN);
     }
+}
+
+/// f218: whether the per-slot frame trace is armed (`BILI_F218_SLOTS=1`).
+/// QA only: the readback it prints is already paid for by `BILI_F213_TRACE`.
+fn f218_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BILI_F218_SLOTS")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    })
 }
 
 /// The UI thread's handle to the video layer.
@@ -988,12 +1043,16 @@ impl VideoSink {
                             }
                             // f213: what this slot drew, and the parity the warp's
                             // inputs are in (see the swap in the new-pair block).
-                            trace.note(
+                            // f218: `tick.a.pts_ms` is the source frame this slot
+                            // was supposed to draw; the printed `pts`/`luma` pair
+                            // says whether the pixels agree with that choice.
+                            trace.note_frame(
                                 if pair_warped { 0 } else { 1 },
                                 &layer,
                                 pair,
                                 tick.phase,
                                 views_flipped,
+                                tick.a.pts_ms,
                             );
                             match layer.present_backbuffer() {
                                 Ok(hr) if hr.0 == 0 => {
@@ -1682,6 +1741,29 @@ impl MfEngine {
             .current
             .as_ref()
             .map_or(true, |current| current.a.pts_ms != a.pts_ms);
+        // f218/f219: once per session, the surface the *slot* holds. Since f218
+        // this is the sink's ring copy (array=1, subresource=0), not the
+        // decoder's pool - the pool's own shape (`array=12`) is logged once by
+        // `mediadec::mf` as `mf surface pool`. The line is kept because it is
+        // the one place that proves the picture handed to the compositor is a
+        // texture nobody else writes.
+        if new_pair && f218_slots() {
+            static SURFACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SURFACE.swap(true, Ordering::Relaxed) {
+                let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+                unsafe { a.texture.GetDesc(&mut desc) };
+                crate::debug_log(&format!(
+                    "f218 surface size={}x{} array={} mips={} fmt={} subresource={} pts={}",
+                    desc.Width,
+                    desc.Height,
+                    desc.ArraySize,
+                    desc.MipLevels,
+                    desc.Format.0,
+                    a.subresource,
+                    a.pts_ms
+                ));
+            }
+        }
         playback.retire(a.pts_ms);
         let tick = MfTick {
             a,
@@ -1753,6 +1835,9 @@ struct MfPlayback {
     /// Decoded pictures, oldest first. Never more than a handful: the decoder
     /// rotates through ~15 surfaces and holding them stalls it.
     frames: std::collections::VecDeque<GpuPicture>,
+    /// f218: sink-owned copies of every frame read (see [`SurfaceRing`]); the
+    /// queue holds *these*, never the decoder's own array slices.
+    surfaces: SurfaceRing,
     converter: Option<Nv12Converter>,
     start_ms: u64,
     frame_ms: f64,
@@ -1787,6 +1872,7 @@ impl MfPlayback {
         Ok(Self {
             decoder,
             frames: std::collections::VecDeque::new(),
+            surfaces: SurfaceRing::new(&gpu.device, &gpu.context),
             converter: None,
             start_ms,
             frame_ms,
@@ -1801,8 +1887,11 @@ impl MfPlayback {
     }
 
     fn seek(&mut self, start_ms: u64) -> Result<(), String> {
-        self.decoder.seek(Duration::from_millis(start_ms))?;
+        // f219: release the queued pictures *before* the reader is flushed. Each
+        // one now also reserves a decoder slice (via its `IMFSample`), and a
+        // decoder waiting for a surface must get them back before it can seek.
         self.frames.clear();
+        self.decoder.seek(Duration::from_millis(start_ms))?;
         self.start_ms = start_ms;
         self.eos = false;
         self.primed = false;
@@ -1856,7 +1945,40 @@ impl MfPlayback {
             match read {
                 Ok(Some(frame)) => {
                     counters.mf_decoded.fetch_add(1, Ordering::Relaxed);
-                    self.frames.push_back(GpuPicture::from_mf(frame));
+                    // f218: copy the picture out of the decoder's pool *now*,
+                    // before the next read can recycle that slice (see
+                    // [`SurfaceRing`]). A failed copy is not fatal: the frame is
+                    // still usable for as long as the pool does not rotate, so
+                    // the session degrades to the pre-f218 behaviour instead of
+                    // falling back to ffmpeg.
+                    let picture = GpuPicture::from_mf(frame);
+                    match self.surfaces.stash(&picture) {
+                        Ok(copy) => self.frames.push_back(copy),
+                        Err(error) => {
+                            if self.failures == 0 {
+                                crate::debug_log(&format!(
+                                    "f218 surface copy failed: {error} (decoder slice, best effort)"
+                                ));
+                            }
+                            self.frames.push_back(picture);
+                        }
+                    }
+                    // f218/f219: the queue is bounded by the surface ring. A
+                    // picture that has fallen off the front is never chosen
+                    // again, and its ring slot must be free before this copy
+                    // count wraps - so keeping at most `SURFACE_RING - 1`
+                    // pictures is what makes "the copy is stable until it is
+                    // drawn" true even when a seek's primed burst reads hundreds
+                    // of frames in one call (the ones behind the target are
+                    // useless anyway). f219: each queued picture also reserves
+                    // one decoder slice (`IMFSample`), so this same bound is what
+                    // keeps the decoder from being starved: three in the queue
+                    // plus the one just read is four, against a pool of ~12.
+                    while self.frames.len() > SURFACE_RING - 1 {
+                        self.frames.pop_front();
+                        self.dropped = self.dropped.saturating_add(1);
+                        counters.mf_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Ok(None) => self.eos = true,
                 Err(error) => {

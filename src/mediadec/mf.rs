@@ -35,9 +35,18 @@
 //!
 //! # Samples are a pool
 //!
-//! MF hands out textures from the decoder's own array; the returned
-//! `MfFrame.texture` is AddRef'ed, but holding many frames stalls the decoder.
-//! Consume and drop, as the probe does.
+//! MF hands out textures from the decoder's own array. `MfFrame.texture` is
+//! AddRef'ed, but that reference alone does **not** reserve the surface: the
+//! `IMFSample` returned by `ReadSample` is what keeps the decoder from handing
+//! the same array slice to its next picture. f219 therefore keeps the sample in
+//! `MfFrame` (see `MfFrame::sample`) - a frame whose sample is already released
+//! is a *stale* view of the pool, not a picture, and a sink that copies it later
+//! can copy whatever the decoder wrote there in the meantime.
+//!
+//! Holding samples is still a pool: each live `MfFrame` costs the decoder one
+//! slice, so hold few (the sink keeps at most `SURFACE_RING` of them) and drop
+//! them as soon as the picture is no longer drawn. Holding the whole pool stalls
+//! the decoder outright.
 //!
 //! The array is the DXVA picture pool: an 852x480 stream comes back as a
 //! 864x480 NV12 texture with `ArraySize` around 15, and `subresource` names the
@@ -122,11 +131,49 @@ pub(crate) fn startup() -> Result<(), String> {
         .clone()
 }
 
+/// f219: an `IMFSample` carried from the decode thread to the sink thread.
+///
+/// The `windows` bindings mark every D3D11 interface `Send` (they are agile) but
+/// not `IMFSample`, even though Media Foundation samples are free-threaded too.
+/// The sink has to keep the sample alive after the read returns - see
+/// [`MfFrame::sample`] - so it has to cross threads, and the only operation
+/// performed on it there is a `Release` when the picture is dropped (which is
+/// how `IMFTrackedSample` hands the surface back to the decoder's allocator,
+/// from whatever thread is done with it). That is what the assertion below
+/// stands for; nothing reads or writes sample state from two threads at once.
+#[derive(Clone, Debug)]
+pub(crate) struct HeldSample(IMFSample);
+
+unsafe impl Send for HeldSample {}
+
+impl HeldSample {
+    pub(crate) fn new(sample: IMFSample) -> Self {
+        Self(sample)
+    }
+}
+
 /// A decoded picture that is still on the GPU.
 ///
 /// `subresource` is the array slice MF put the picture in: hardware decoders
 /// keep a texture array and rotate through its slices, so the sink has to
 /// sample `texture` with this subresource rather than slice 0.
+///
+/// # Why the sample is carried (f219)
+///
+/// The slice belongs to the decoder until the `IMFSample` that produced it is
+/// released; the decoder's next `ProcessOutput` writes its next picture into
+/// whatever slice the pool hands back. A consumer that keeps only `texture` +
+/// `subresource` (as f209-f218 did) therefore holds a *pointer*, not a picture:
+/// as soon as this function's caller stops looking - in practice before the
+/// sink's `CopySubresourceRegion` has even been executed by the GPU - the slice
+/// can be refilled with a frame 12-16 positions away (the measured pool size),
+/// which is exactly the last 0.7 % of one-frame jumps left after f218.
+///
+/// `sample` keeps the reservation alive for as long as the picture is held. It
+/// is declared **last** so a drop releases the texture handle first and the
+/// sample (which owns the surface) second, and it is an `Option` so a probe or a
+/// test can build a picture without one.
+#[derive(Debug)]
 pub(crate) struct MfFrame {
     pub texture: ID3D11Texture2D,
     pub subresource: u32,
@@ -139,6 +186,9 @@ pub(crate) struct MfFrame {
     pub texture_width: u32,
     pub texture_height: u32,
     pub pts: Duration,
+    /// The sample that reserves `texture` / `subresource` in the decoder's
+    /// pool. Dropping it returns the slice to the decoder (see above).
+    pub sample: Option<HeldSample>,
 }
 
 /// What the negotiated stream actually is. Reported by the probe and the log so
@@ -323,6 +373,7 @@ impl MfVideoDecoder {
             texture_width: raw.texture_width,
             texture_height: raw.texture_height,
             pts: Duration::from_nanos(raw.pts.max(0) as u64 * 100),
+            sample: raw.sample,
         }))
     }
 
@@ -401,6 +452,9 @@ struct RawFrame {
     texture_height: u32,
     /// 100 ns, MF's sample time.
     pts: i64,
+    /// f219: keeps the array slice out of the decoder's pool (see
+    /// [`MfFrame::sample`]). Declared last so it is released after the texture.
+    sample: Option<HeldSample>,
 }
 
 fn worker_main(
@@ -813,12 +867,16 @@ fn read_one(
         let (texture_width, texture_height) = check_texture(info, &texture)?;
         let pts = unsafe { sample.GetSampleTime() }.unwrap_or(timestamp);
         frames.fetch_add(1, Ordering::Relaxed);
+        // f219: the sample goes *with* the picture. Dropping it here (as f209 -
+        // f218 did) returns the slice to the decoder's pool before the sink has
+        // copied it, and the decoder's next picture lands in that slice.
         return Ok(Some(RawFrame {
             texture,
             subresource,
             texture_width,
             texture_height,
             pts,
+            sample: Some(HeldSample::new(sample)),
         }));
     }
     Err("MF 解码器: 连续收到流事件但没有画面".to_string())
@@ -837,6 +895,16 @@ fn check_texture(
         return Err(format!(
             "MF 解码器: 解码纹理格式是 DXGI_FORMAT {}，不是 NV12/P010",
             desc.Format.0
+        ));
+    }
+    // f219: how big the pool really is. `ArraySize` is the number of slices the
+    // decoder rotates through, i.e. how many samples a consumer may hold before
+    // it starts starving the decoder; the sink keeps at most `SURFACE_RING`.
+    static POOL_LOGGED: AtomicU64 = AtomicU64::new(0);
+    if POOL_LOGGED.swap(1, Ordering::Relaxed) == 0 {
+        crate::debug_log(&format!(
+            "mf surface pool size={}x{} array={} fmt={} (holding samples reserves slices)",
+            desc.Width, desc.Height, desc.ArraySize, desc.Format.0
         ));
     }
     if let Ok(mut slot) = info.lock() {

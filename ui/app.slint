@@ -591,10 +591,16 @@ export global AppTheme {
     // light is a white translucent surface, which is what makes the pill and
     // its popovers read as chrome on a light wallpaper instead of as a dark tint
     // on one. f215: the 右栏 strip samples the wallpaper like every other
-    // surface, so its film is one step lighter (88 % / 90 %) than the popovers
-    // that float over the picture (those keep the denser `player-menu-tint`).
-    out property <color> player-panel-tint: dark ? #1e1e1ee0 : #ffffffe6;
-    out property <color> player-menu-tint: dark ? #1e1e1ef2 : #ffffffee;
+    // surface, so its film is one step lighter than the popovers that float
+    // over the picture.
+    // f218: both films now sit on the main window's `card` alphas (70 % dark /
+    // 81 % light) instead of 88 %/95 %. At the old values the sample was painted
+    // but invisible: the player's panels read as flat plates next to the main
+    // window's cards, which is the beta.7 report. The film covers the *picture*
+    // completely (the sample is opaque), so legibility still depends only on
+    // `wallpaper x tint`, the pair the f215 contrast pass measured.
+    out property <color> player-panel-tint: dark ? #1e1e1eb3 : #ffffffcf;
+    out property <color> player-menu-tint: dark ? #1e1e1eb8 : #ffffffd9;
 }
 
 
@@ -2312,8 +2318,9 @@ component ToastView inherits GlassPanel {
     height: 36px;
     radius: 18px;
     // f215: a toast is a surface: the wallpaper sample + the chrome film, not an
-    // opaque plate. The 18px radius, hairline and shadow are the ones it had.
-    tint: AppTheme.player-menu;
+    // opaque plate. f218: it rides the same (now lighter) popover film as the
+    // pill tooltips. The 18px radius, hairline and shadow are the ones it had.
+    tint: AppTheme.player-menu-tint;
     edge: AppTheme.player-menu-border;
     shadow: true;
     shadow-color: AppTheme.player-shadow;
@@ -5971,10 +5978,13 @@ export component PlayerWindow inherits Window {
                     y: -28px;
                     width: pointer_label.preferred-width + 14px;
                     height: 20px;
-                    border-radius: 5px;
-                    background: AppTheme.player-menu;
-                    border-width: 1px;
-                    border-color: AppTheme.player-menu-border;
+                    radius: 5px;
+                    // f218: the readout used to override `background:` with the
+                    // nearly opaque `player-menu`, which painted OVER the
+                    // wallpaper sample the panel had just drawn. Its own tint is
+                    // the only surface it needs.
+                    tint: AppTheme.player-menu-tint;
+                    edge: AppTheme.player-menu-border;
                     drop-shadow-color: AppTheme.ds-color(AppTheme.player-shadow);
                     drop-shadow-blur: AppTheme.ds-blur(10px);
                     drop-shadow-offset-y: 3px;
@@ -6548,7 +6558,7 @@ export component PlayerWindow inherits Window {
             // that cell and clamped to the pill's own 8px margin; y -30px sits
             // clear of the 22px seek band. The plate is the popovers' own
             // surface (menu fill, 1px hairline, soft shadow).
-            interp_tip_plate := Rectangle {
+            interp_tip_plate := GlassPanel {
                 property <bool> shown: interp_icon.hot
                     && root.chrome_shown && root.scrub_level == 0;
                 visible: self.shown;
@@ -6558,10 +6568,12 @@ export component PlayerWindow inherits Window {
                     - self.width / 2, 8px,
                     max(8px, pill.width - 8px - self.width));
                 y: -30px;
-                border-radius: 6px;
-                background: AppTheme.player-menu;
-                border-width: 1px;
-                border-color: AppTheme.player-menu-border;
+                radius: 6px;
+                // f218: was a plain Rectangle over `player-menu` (a flat plate
+                // with no sample); the pill's tooltips belong on the same
+                // wallpaper as the pill itself.
+                tint: AppTheme.player-menu-tint;
+                edge: AppTheme.player-menu-border;
                 drop-shadow-color: AppTheme.ds-color(AppTheme.player-shadow);
                 drop-shadow-blur: AppTheme.ds-blur(10px);
                 drop-shadow-offset-y: 3px;
@@ -7287,7 +7299,7 @@ export component PlayerWindow inherits Window {
         // 64x24 的时间胶囊——不出现空图框，也不报错。
         //
         // 它不是一个 TouchArea：绝不抢指针，所以悬停状态始终由轨道自己持有。
-        preview_card := Rectangle {
+        preview_card := GlassPanel {
             visible: root.preview_on;
             width: root.preview_card_w;
             height: root.preview_card_h;
@@ -7295,10 +7307,12 @@ export component PlayerWindow inherits Window {
                 max(6px, root.width - 6px - self.width));
             y: clamp(root.preview_anchor_y - self.height - 6px, 6px,
                 max(6px, root.height - 6px - self.height));
-            border-radius: 8px;
-            background: AppTheme.player-menu;
-            border-width: 1px;
-            border-color: AppTheme.player-menu-border;
+            radius: 8px;
+            // f218: the storyboard card is a surface like every other one; it
+            // used a flat `player-menu` fill and so was the one piece of player
+            // chrome that never sampled the wallpaper.
+            tint: AppTheme.player-menu-tint;
+            edge: AppTheme.player-menu-border;
             drop-shadow-color: AppTheme.ds-color(AppTheme.player-shadow);
             drop-shadow-blur: AppTheme.ds-blur(10px);
             drop-shadow-offset-y: 3px;
@@ -9695,15 +9709,16 @@ export component PlayerWindow inherits Window {
                                     // reason, in the same plate language as the
                                     // pill tooltips, drawn over the chip while the
                                     // pointer rests on the row.
-                                    if row.locked && q_row.has-hover : Rectangle {
+                                    if row.locked && q_row.has_hover : GlassPanel {
                                         x: parent.width - 10px - 96px;
                                         y: 10px;
                                         width: 96px;
                                         height: 24px;
-                                        border-radius: 6px;
-                                        background: AppTheme.player-menu;
-                                        border-width: 1px;
-                                        border-color: AppTheme.player-menu-border;
+                                        radius: 6px;
+                                        // f218: same wallpaper sample as the
+                                        // pill tooltips (was a flat plate).
+                                        tint: AppTheme.player-menu-tint;
+                                        edge: AppTheme.player-menu-border;
                                         drop-shadow-color: AppTheme.ds-color(AppTheme.player-shadow);
                                         drop-shadow-blur: AppTheme.ds-blur(8px);
                                         drop-shadow-offset-y: 2px;

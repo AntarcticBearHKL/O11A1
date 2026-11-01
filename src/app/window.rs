@@ -894,6 +894,12 @@ pub(crate) fn set_backdrop(ui: &AppWindow, dark: bool) {
 }
 
 /// The same for a player window.
+///
+/// f218: every `AppTheme` property a `GlassPanel` reads is published here, and
+/// the values are logged in one line (`theme win=player ...`). The player is a
+/// separate window with its own `AppTheme` global, so a property that is only
+/// written on the main window leaves the player's panels flat - which is
+/// exactly the beta.7 report ("主窗口是好的，播放器里没变").
 pub(crate) fn set_player_backdrop(player: &PlayerWindow, dark: bool) {
     let dark_wallpaper = backdrop::image(true);
     let light_wallpaper = backdrop::image(false);
@@ -904,17 +910,49 @@ pub(crate) fn set_player_backdrop(player: &PlayerWindow, dark: bool) {
     };
     player.set_wallpaper(dark_wallpaper);
     player.set_wallpaper_light(light_wallpaper);
-    player.set_wallpaper(wallpaper);
+    player.set_wallpaper(wallpaper.clone());
     player.set_wallpaper_valid(true);
-    player.global::<AppTheme>().set_glass_blur(backdrop::blurred(dark));
-    player
-        .global::<AppTheme>()
-        .set_backdrop_blur(backdrop::blur_px() as i32);
+    let theme = player.global::<AppTheme>();
+    let blur = backdrop::blurred(dark);
+    theme.set_glass_blur(blur.clone());
+    theme.set_backdrop_blur(backdrop::blur_px() as i32);
+    // f218: the card skin is a *published* switch, not a Slint default: the main
+    // window writes it (`BILI_CARD_FLAT` / QA), so the player has to mirror it or
+    // its panels would disagree with the window behind them.
+    theme.set_cards_flat(cards_flat_requested());
     let (wall_x, wall_y) = publish_wallpaper(player.global::<AppTheme>(), player.window());
     crate::debug_log(&format!(
         "wallpaper publish win=player x={wall_x:.1} y={wall_y:.1} tile={:.0}",
         backdrop::tile_px()
     ));
+    // One line that can be read back as the player window's whole theme state:
+    // which image the panels sample, where in the wallpaper they sample it, and
+    // every tint that decides whether the sample is visible at all.
+    crate::debug_log(&format!(
+        "theme win=player dark={} glass_blur={}x{} wallpaper={}x{} wall=({wall_x:.1},{wall_y:.1}) \
+         tile={:.0} backdrop_blur={} cards_flat={} glass_tint={:?} bar_fill={:?} \
+         panel_tint={:?} menu_tint={:?}",
+        u8::from(dark),
+        blur.size().width,
+        blur.size().height,
+        wallpaper.size().width,
+        wallpaper.size().height,
+        backdrop::tile_px(),
+        theme.get_backdrop_blur(),
+        u8::from(theme.get_cards_flat()),
+        theme.get_glass_tint(),
+        theme.get_bar_fill(),
+        theme.get_player_panel_tint(),
+        theme.get_player_menu_tint(),
+    ));
+}
+
+/// f218: whether this process asks for the flat card skin (`BILI_CARD_FLAT`).
+/// The main window and every player window read the same source, so a QA run
+/// cannot end up with a sampled home page and a flat player.
+fn cards_flat_requested() -> bool {
+    std::env::var("BILI_CARD_FLAT")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
 }
 
 /// The same for the mini player.

@@ -230,14 +230,118 @@ struct Compositor {
     ui_visual: Option<IDCompositionVisual>,
     video_visual: Option<IDCompositionVisual>,
     clip: Option<IDCompositionRectangleClip>,
+    /// f218: rounded-corner clips for the other three layers. DWM does not
+    /// round a `WS_EX_NOREDIRECTIONBITMAP` composition window (the main window
+    /// gets its corners from `DWMWCP_ROUND`), so the composite itself has to be
+    /// clipped: background, video and UI each get the same radius, and the
+    /// danmaku layer gets it on its own picture-sized visual.
+    clip_ui: Option<IDCompositionRectangleClip>,
+    clip_background: Option<IDCompositionRectangleClip>,
+    clip_danmaku: Option<IDCompositionRectangleClip>,
+    /// f218: the (width, height, radius bits) last applied to the danmaku clip,
+    /// so the per-paint path only touches COM when the picture rect changed.
+    clip_danmaku_key: Option<(u32, u32, u32)>,
     /// Geometry last applied to the video visual (physical client px).
     geometry: Option<VideoGeometry>,
+    /// f218: the corner radius last applied to the video clip. A fullscreen
+    /// toggle can keep the same geometry while the radius changes to zero.
+    corner: f32,
 }
 
 /// f213: the opaque colour behind the picture, `AppTheme.player-bg` in
 /// `ui/app.slint` (#101014). Written as **RGBA** - [`Layer::stage`] does the
 /// red/blue swap on the way in.
 const PLAYER_BG: [u8; 4] = [0x10, 0x10, 0x14, 0xFF];
+
+/// f218: the player window's corner radius, in logical px (DIP).
+///
+/// The main window is rounded by DWM (`DWMWA_WINDOW_CORNER_PREFERENCE =
+/// DWMWCP_ROUND`, see `win.rs`). A `WS_EX_NOREDIRECTIONBITMAP` window has no
+/// redirection surface, so DWM does not round it at all - the player came back
+/// square in beta.7. The composite is therefore clipped here, on every layer
+/// that can reach a corner, with the same 12 DIP the main window's chrome reads
+/// as, scaled by the window's DPI.
+const CORNER_DIP: f32 = 12.0;
+
+/// Give `visual` a rounded clip of `width` x `height` (its own content space).
+///
+/// The clip object is created once per layer and then only updated: a resize
+/// re-sets the bounds and the radius, which is a handful of COM sets on the UI
+/// thread, not a new object. `radius` is clamped to half the shorter side so a
+/// tiny window rounds to a pill instead of failing the clip.
+fn set_round_clip(
+    device: &windows::Win32::Graphics::DirectComposition::IDCompositionDevice,
+    slot: &mut Option<IDCompositionRectangleClip>,
+    visual: &IDCompositionVisual,
+    width: f32,
+    height: f32,
+    radius: f32,
+) {
+    unsafe {
+        if slot.is_none() {
+            let Ok(clip) = device.CreateRectangleClip() else {
+                return;
+            };
+            if visual.SetClip(&clip).is_err() {
+                return;
+            }
+            *slot = Some(clip);
+        }
+        let Some(clip) = slot.as_ref() else {
+            return;
+        };
+        let radius = radius.max(0.0).min(width.min(height) * 0.5);
+        let _ = clip.SetLeft2(0.0);
+        let _ = clip.SetTop2(0.0);
+        let _ = clip.SetRight2(width.max(0.0));
+        let _ = clip.SetBottom2(height.max(0.0));
+        let _ = clip.SetTopLeftRadiusX2(radius);
+        let _ = clip.SetTopLeftRadiusY2(radius);
+        let _ = clip.SetTopRightRadiusX2(radius);
+        let _ = clip.SetTopRightRadiusY2(radius);
+        let _ = clip.SetBottomLeftRadiusX2(radius);
+        let _ = clip.SetBottomLeftRadiusY2(radius);
+        let _ = clip.SetBottomRightRadiusX2(radius);
+        let _ = clip.SetBottomRightRadiusY2(radius);
+    }
+}
+
+/// f218: the radius for this window right now, in physical px.
+///
+/// A fullscreen picture is the whole screen: rounding there would show the
+/// desktop through four corner bites, and DWM stops rounding a maximized
+/// window for the same reason, so the radius drops to zero in fullscreen.
+fn corner_radius(window: &DcompPlayerWindow) -> f32 {
+    corner_radius_px(window.fullscreen.get(), window.scale.get())
+}
+
+/// [`corner_radius`] without a window, so the DPI rule is testable: the radius
+/// is `CORNER_DIP` logical px (the main window's visual radius) times the
+/// window's factor, and zero while fullscreen.
+fn corner_radius_px(fullscreen: bool, scale: f32) -> f32 {
+    if fullscreen {
+        0.0
+    } else {
+        CORNER_DIP * scale.max(0.1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{corner_radius_px, CORNER_DIP};
+
+    #[test]
+    fn corner_radius_scales_with_dpi_and_drops_in_fullscreen() {
+        assert_eq!(corner_radius_px(false, 1.0), CORNER_DIP);
+        assert_eq!(corner_radius_px(false, 1.5), CORNER_DIP * 1.5);
+        assert_eq!(corner_radius_px(false, 2.0), CORNER_DIP * 2.0);
+        // A nonsense factor can never produce a zero/negative radius.
+        assert_eq!(corner_radius_px(false, 0.0), CORNER_DIP * 0.1);
+        // Fullscreen is square, whatever the DPI.
+        assert_eq!(corner_radius_px(true, 1.0), 0.0);
+        assert_eq!(corner_radius_px(true, 2.0), 0.0);
+    }
+}
 
 /// f213: paint `layer` the player's base colour and present it.
 fn fill_background(layer: &Layer) -> windows::core::Result<()> {
@@ -251,11 +355,12 @@ fn fill_background(layer: &Layer) -> windows::core::Result<()> {
 }
 
 impl Compositor {
-    fn apply_geometry(&mut self, geometry: VideoGeometry) {
-        if self.geometry == Some(geometry) {
+    fn apply_geometry(&mut self, geometry: VideoGeometry, corner: f32) {
+        if self.geometry == Some(geometry) && (self.corner - corner).abs() < 0.01 {
             return;
         }
         self.geometry = Some(geometry);
+        self.corner = corner;
         let (Some(visual), Some(device)) = (&self.video_visual, self.composition.as_ref()) else {
             return;
         };
@@ -290,6 +395,19 @@ impl Compositor {
                 let _ = clip.SetTop2((by - geometry.y) / sy);
                 let _ = clip.SetRight2((bx + bw - geometry.x) / sx);
                 let _ = clip.SetBottom2((by + bh - geometry.y) / sy);
+                // f218: the same corner radius as the window, expressed in the
+                // swapchain's pixel space so the transform turns it back into
+                // `corner` physical px on screen.
+                let rx = (corner / sx).max(0.0);
+                let ry = (corner / sy).max(0.0);
+                let _ = clip.SetTopLeftRadiusX2(rx);
+                let _ = clip.SetTopLeftRadiusY2(ry);
+                let _ = clip.SetTopRightRadiusX2(rx);
+                let _ = clip.SetTopRightRadiusY2(ry);
+                let _ = clip.SetBottomLeftRadiusX2(rx);
+                let _ = clip.SetBottomLeftRadiusY2(ry);
+                let _ = clip.SetBottomRightRadiusX2(rx);
+                let _ = clip.SetBottomRightRadiusY2(ry);
             }
             let _ = device.device.Commit();
         }
@@ -499,6 +617,9 @@ impl DcompPlayerWindow {
         crate::debug_log(&format!(
             "dcomp player window hwnd={hwnd} size={INITIAL_WIDTH}x{INITIAL_HEIGHT} scale={scale:.2}"
         ));
+        // f218: the corners exist from the first composited frame (the window is
+        // shown right after this returns), never a square flash then a radius.
+        window.apply_corners();
         Ok(window)
     }
 
@@ -561,6 +682,52 @@ impl DcompPlayerWindow {
         compositor.composition = Some(composition);
         compositor.ui_visual = ui_visual;
         Ok(())
+    }
+
+    /// Set the rounded-corner clip on the UI, background and (if it exists)
+    /// danmaku layers. Called whenever the client size or the DPI changes, and
+    /// on a fullscreen toggle; the video visual's clip is rounded in
+    /// [`Compositor::apply_geometry`], where its content space is known.
+    fn apply_corners(&self) {
+        let size = self.size.get();
+        if size.width < 2 || size.height < 2 {
+            return;
+        }
+        let radius = corner_radius(self);
+        let width = size.width as f32;
+        let height = size.height as f32;
+        // Read the picture rect first: it lives behind the same `RefCell`.
+        let picture = self.compositor.borrow().geometry.map(|g| g.visible());
+        let mut compositor = self.compositor.borrow_mut();
+        let Compositor {
+            composition,
+            background_visual,
+            ui_visual,
+            clip_background,
+            clip_ui,
+            clip_danmaku,
+            ..
+        } = &mut *compositor;
+        let Some(composition) = composition.as_ref() else {
+            return;
+        };
+        if let Some(visual) = background_visual.as_ref() {
+            set_round_clip(&composition.device, clip_background, visual, width, height, radius);
+        }
+        if let Some(visual) = ui_visual.as_ref() {
+            set_round_clip(&composition.device, clip_ui, visual, width, height, radius);
+        }
+        // The danmaku visual only exists once the layer was built; its clip is
+        // (re)applied by `present_danmaku`, which knows the picture rect.
+        if let Some(danmaku) = self.danmaku.surface_ref() {
+            let (_, _, w, h) = picture.unwrap_or((0.0, 0.0, width, height));
+            set_round_clip(&composition.device, clip_danmaku, &danmaku, w, h, radius);
+        }
+        let _ = unsafe { composition.device.Commit() };
+        crate::debug_log(&format!(
+            "dcomp player corners size={width:.0}x{height:.0} radius={radius:.1} fullscreen={}",
+            u8::from(self.fullscreen.get())
+        ));
     }
 
     /// Build the video layer at `frame`'s size, put it under the UI visual and
@@ -885,6 +1052,8 @@ impl DcompPlayerWindow {
             gpu,
             composition,
             ui_visual,
+            clip_danmaku,
+            clip_danmaku_key,
             ..
         } = &mut *compositor;
         let (Some(gpu), Some(composition)) = (gpu.as_ref(), composition.as_ref()) else {
@@ -892,6 +1061,25 @@ impl DcompPlayerWindow {
         };
         self.danmaku
             .present(gpu, composition, ui_visual.as_ref(), rect);
+        // f218: the comment layer lives over the picture, so its own visual has
+        // to be rounded too - otherwise a comment near the window's corner is
+        // drawn outside the clip the window's edges follow. Only when the rect
+        // or the radius changed: this runs on every UI paint.
+        let radius = corner_radius(self);
+        let key = (rect.2, rect.3, radius.to_bits());
+        if clip_danmaku_key.as_ref() != Some(&key) {
+            if let Some(visual) = self.danmaku.surface_ref() {
+                set_round_clip(
+                    &composition.device,
+                    clip_danmaku,
+                    &visual,
+                    rect.2 as f32,
+                    rect.3 as f32,
+                    radius,
+                );
+                *clip_danmaku_key = Some(key);
+            }
+        }
     }
 
     /// Start the UI clock (idempotent).
@@ -931,7 +1119,9 @@ impl DcompPlayerWindow {
         let band = super::video::clamp_band(layout.band(client), layout.scale, client);
         let geometry = VideoGeometry::fit(band, layout.scale, layout.frame, layout.fit);
         let before = self.compositor.borrow().geometry;
-        self.compositor.borrow_mut().apply_geometry(geometry);
+        self.compositor
+            .borrow_mut()
+            .apply_geometry(geometry, corner_radius(self));
         if before == Some(geometry) {
             return;
         }
@@ -1038,6 +1228,9 @@ impl DcompPlayerWindow {
             }
         }
         crate::debug_log(&format!("dcomp player fullscreen on={on}"));
+        // f218: a fullscreen picture keeps square corners (as DWM does for a
+        // maximized window); leaving fullscreen restores them.
+        self.apply_corners();
     }
 }
 
@@ -1403,6 +1596,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if let Some(layout) = window.layout.get() {
                             window.sync_layout(layout);
                         }
+                        // f218: the composite's rounded clip follows the client
+                        // size, so a resize can never leave a square corner (or a
+                        // radius cut into the middle of the window).
+                        window.apply_corners();
                     }
                 }
             }
@@ -1437,6 +1634,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(layout) = window.layout.get() {
                     window.sync_layout(layout);
                 }
+                // f218: the radius is in DIP - at 150 % the same window needs
+                // 18 physical px, not 12.
+                window.apply_corners();
             }
             LRESULT(0)
         }

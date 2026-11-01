@@ -177,7 +177,7 @@ pub(crate) struct Layer {
     pub(crate) height: u32,
     /// f213 diagnostics. Every field is inert unless `BILI_F213_TRACE=1`: the
     /// counters cost one relaxed atomic per present, and the probe texture is
-    /// only ever created by [`Self::probe_alpha`], which nothing calls when the
+    /// only ever created by [`Self::probe_pixels`], which nothing calls when the
     /// trace is off.
     presents: AtomicU64,
     present_ok: AtomicU64,
@@ -552,9 +552,11 @@ impl Layer {
         }
     }
 
-    /// f213 (diagnostic only): the smallest and largest alpha in a
-    /// `columns` x `rows` grid of the backbuffer that is about to be presented.
-    pub(crate) fn probe_alpha(&self, columns: u32, rows: u32) -> Option<(u8, u8)> {
+    /// f218 QA: alpha range *and* mean luma from ONE readback. The trace uses
+    /// the luma to prove *what* the slot drew: on the flat-luma ramp sample
+    /// (one level per source frame) that number IS the source frame's level, so
+    /// it is compared against the frame's own `pts` on the same line.
+    pub(crate) fn probe_pixels(&self, columns: u32, rows: u32) -> Option<(u8, u8, f32)> {
         let columns = columns.max(1);
         let rows = rows.max(1);
         unsafe {
@@ -592,17 +594,20 @@ impl Layer {
             let base = mapped.pData as *const u8;
             let mut low = 255u8;
             let mut high = 0u8;
+            let mut luma = 0.0f64;
             for row in 0..rows {
                 for column in 0..columns {
                     let x = (((column * 2 + 1) * self.width) / (columns * 2)) as usize;
                     let y = (((row * 2 + 1) * self.height) / (rows * 2)) as usize;
-                    let alpha = *base.add(y * pitch + x * 4 + 3);
-                    low = low.min(alpha);
-                    high = high.max(alpha);
+                    let pixel = base.add(y * pitch + x * 4);
+                    let (b, g, r) = (*pixel, *pixel.add(1), *pixel.add(2));
+                    low = low.min(*pixel.add(3));
+                    high = high.max(*pixel.add(3));
+                    luma += 0.114 * f64::from(b) + 0.587 * f64::from(g) + 0.299 * f64::from(r);
                 }
             }
             self.context.Unmap(staging, 0);
-            Some((low, high))
+            Some((low, high, (luma / f64::from(columns * rows)) as f32))
         }
     }
 

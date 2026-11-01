@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 
+use crate::mediadec::mf::HeldSample;
 use windows::core::{Interface, BOOL};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -59,6 +60,135 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 
+/// f218: a sink-owned copy of the decoder's surface, so a picture the sink
+/// still holds can never be overwritten underneath it.
+///
+/// # Why this exists
+///
+/// `mediadec::mf` returns one array slice of the decoder's texture array. Until
+/// f219 it also dropped the `IMFSample` that reserved it (the sink only needs
+/// the texture, and holding samples stalls the decoder), so releasing the sample
+/// handed the slice straight back to the decoder's pool and the decoder wrote
+/// the next picture into it. The sink decodes a couple of frames ahead of what
+/// it draws (`pump` reads up to four frames before `choose` picks one), so by
+/// the time a picture was converted its slice could already hold a *different*
+/// frame: the picture jumped by up to a pool length (measured: `array=12`,
+/// ~0.4 s at 30 fps) every slot - the reported 闪烁. f218 copied every frame
+/// into this small ring of sink-owned NV12 textures **immediately after it was
+/// read**, which removed almost all of it, but not the last 0.7 %: the copy was
+/// only *enqueued* after the sample had already been released, so the decoder
+/// was free to refill the slice before the GPU ran the copy.
+///
+/// f219 fixes the reservation itself (`MfFrame::sample` / `GpuPicture::sample`),
+/// so the source slice of a picture that is still queued stays the frame it was
+/// decoded from. The ring copy is kept on top of it: it is what makes the
+/// GPU-side read independent of the decoder's scheduling, and a ring slot is
+/// never reused while a queued picture can still be chosen (the queue is bounded
+/// by `SURFACE_RING - 1`).
+///
+/// Cost: one `CopySubresourceRegion` per *source* frame (30/s at 1080p, ~3 MB),
+/// on the GPU, and only NV12 bytes are moved - no CPU pixel is touched.
+pub(crate) struct SurfaceRing {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    textures: Vec<ID3D11Texture2D>,
+    /// Size/format the ring was built for; a stream change rebuilds it.
+    key: Option<(u32, u32, i32, u32)>,
+    next: usize,
+    copies: u64,
+}
+
+/// How many surface copies the ring keeps. The decode queue is bounded by
+/// `SURFACE_RING - 1` in `MfPlayback::pump`, so a frame's copy is never reused
+/// while it can still be chosen; four is the smallest power of two that covers
+/// three queued pictures plus the one being read. The same bound is what keeps
+/// the f219 sample reservation small: at most four decoder slices can be held at
+/// once (`pump` trims to three, the fourth is the read in flight), out of the
+/// `array=12`-ish pool a 1080p DXVA decoder owns.
+pub(crate) const SURFACE_RING: usize = 4;
+
+impl SurfaceRing {
+    pub(crate) fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Self {
+        Self {
+            device: device.clone(),
+            context: context.clone(),
+            textures: Vec::new(),
+            key: None,
+            next: 0,
+            copies: 0,
+        }
+    }
+
+    /// Copy `picture` (a decoder array slice) into the ring and return a
+    /// [`GpuPicture`] that points at the copy.
+    ///
+    /// Enqueued on the sink's own context right after the frame was read. The
+    /// returned picture keeps the source's `IMFSample` too (f219): a
+    /// `CopySubresourceRegion` is only *recorded* here, so the decoder must not
+    /// refill the source slice until this picture has left the queue. Both
+    /// reservations - the ring slot and the decoder slice - are released when the
+    /// copy is dropped, in that order.
+    pub(crate) fn stash(&mut self, picture: &GpuPicture) -> Result<GpuPicture, String> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { picture.texture.GetDesc(&mut desc) };
+        let key = (desc.Width, desc.Height, desc.Format.0, desc.BindFlags);
+        if self.key != Some(key) || self.textures.is_empty() {
+            self.textures.clear();
+            for _ in 0..SURFACE_RING {
+                let description = D3D11_TEXTURE2D_DESC {
+                    Width: desc.Width,
+                    Height: desc.Height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: desc.Format,
+                    SampleDesc: desc.SampleDesc,
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: desc.BindFlags,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut texture: Option<ID3D11Texture2D> = None;
+                unsafe { self.device.CreateTexture2D(&description, None, Some(&mut texture)) }
+                    .map_err(|error| format!("f218 surface copy: {error}"))?;
+                self.textures
+                    .push(texture.ok_or_else(|| "f218 surface copy: 空纹理".to_string())?);
+            }
+            self.key = Some(key);
+            self.next = 0;
+            crate::debug_log(&format!(
+                "f218 surface ring size={}x{} fmt={} slots={SURFACE_RING}",
+                desc.Width, desc.Height, desc.Format.0
+            ));
+        }
+        let slot = self.next % SURFACE_RING;
+        self.next = self.next.wrapping_add(1);
+        let texture = self.textures[slot].clone();
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &texture,
+                0,
+                0,
+                0,
+                0,
+                &picture.texture,
+                picture.subresource,
+                None,
+            );
+        }
+        self.copies = self.copies.saturating_add(1);
+        if self.copies % 300 == 1 {
+            crate::debug_log(&format!(
+                "f218 surface copies={} slot={slot} src_sub={}",
+                self.copies, picture.subresource
+            ));
+        }
+        let mut copy = picture.clone_picture();
+        copy.texture = texture;
+        copy.subresource = 0;
+        Ok(copy)
+    }
+}
+
 /// One decoded picture that never left the GPU.
 ///
 /// `Send` is asserted for the hand-off between the MF reader (where the frame is
@@ -79,6 +209,14 @@ pub(crate) struct GpuPicture {
     pub tex_height: u32,
     /// Presentation time, ms since the stream's start.
     pub pts_ms: u64,
+    /// f219: the decoder sample that reserves the array slice this picture was
+    /// read (or copied) from.
+    ///
+    /// Held for as long as this picture is alive, so that slice cannot be
+    /// refilled with a later frame while the ring copy or the video processor
+    /// still reads it. Declared after `texture` so dropping a picture releases
+    /// the texture handle first and the surface reservation last.
+    pub sample: Option<HeldSample>,
 }
 
 unsafe impl Send for GpuPicture {}
@@ -93,6 +231,7 @@ impl GpuPicture {
             tex_width: frame.texture_width.max(1),
             tex_height: frame.texture_height.max(1),
             pts_ms: frame.pts.as_millis().min(u64::MAX as u128) as u64,
+            sample: frame.sample,
         }
     }
 
@@ -105,6 +244,7 @@ impl GpuPicture {
             tex_width: self.tex_width,
             tex_height: self.tex_height,
             pts_ms: self.pts_ms,
+            sample: self.sample.clone(),
         }
     }
 }
