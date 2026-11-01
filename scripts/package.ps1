@@ -16,7 +16,10 @@ param(
     [switch]$SkipBuild,
     [switch]$Zip,
     [switch]$DynamicCrt,
-    [switch]$WithCuda
+    [switch]$WithCuda,
+    # Skip the "a copy is running" guard entirely (used when only the repo-root
+    # exe is open and the distribution image is untouched).
+    [switch]$AllowRunning
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,7 +47,17 @@ if (-not $SkipBuild) {
 
 $exe = Join-Path $distTarget "release\o11a1.exe"
 if (-not (Test-Path $exe)) { Fail "missing $exe" }
-if (Get-Process o11a1 -ErrorAction SilentlyContinue) { Fail "o11a1.exe is running; close it first (the file is locked)" }
+# Staging only writes `dist\O11A1`, so a copy running from the repository root
+# (or from `target\release`) does not lock anything this script touches. The
+# guard is for the case that matters: the distribution image itself is in use.
+if (-not $AllowRunning -and (Get-Process o11a1 -ErrorAction SilentlyContinue)) {
+    $inUse = Join-Path $out "O11A1.exe"
+    $locked = Get-Process o11a1 -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -eq [IO.Path]::GetFullPath($inUse)) } catch { $false }
+    }
+    if ($locked) { Fail "the distribution copy $inUse is running; close it first" }
+    Write-Host "   (an o11a1 copy is running outside $out; staging is safe)" -ForegroundColor Yellow
+}
 
 # ---------------------------------------------------------------- layout
 Step "staging $out"
