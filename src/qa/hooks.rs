@@ -6360,23 +6360,28 @@ fn write_evidence_image(
     ));
 }
 
-/// f159: the card surface (flat tint vs frosted wallpaper).
+/// f159: the card surface (flat tint vs wallpaper sample).
 ///
-/// Shipped default: FLAT. The f159 A/B on femtovg-wgpu measured the frosted card
+/// The f159 default was FLAT: its A/B on femtovg-wgpu measured the frosted card
 /// at morph p95 12.72 / 18.85 ms against 9.77 / 9.69 ms flat (two runs, both
-/// orders), i.e. +3 to +9 ms on the one animation this app runs at 120Hz - far
-/// outside the 1.5 ms budget - while the feed scroll p95 stayed at ~8.8 ms for
-/// both. The glass card is therefore opt-in for QA:
+/// orders) - far outside the 1.5 ms budget - and the frosted card there was a
+/// per-card `cover` resample of the whole tile.
 ///
-///   BILI_CARD_FLAT=0   frosted cards (the A/B's `glass` variant)
-///   unset / 1          the flat card (shipped)
+/// f215 replaced that image with a 1:1 crop of the SAME texture the window
+/// paints (one upload, UV offset per surface), and re-measured both variants on
+/// this binary (`scripts/qa-f215-perf.ps1`, `BILI_F215_PERF`): the morph p95
+/// moved by +0.09 ms (1280x800) / +0.37 ms (1920x1080), so the sampled card is
+/// the shipped default now.
+///
+///   BILI_CARD_FLAT=1   the flat plate (the A/B's `flat` variant)
+///   unset / 0          the sampled card (shipped)
 pub(crate) fn f159_apply_card_flat(ui: &AppWindow) {
     let (flat, source) = match env::var("BILI_CARD_FLAT") {
         Some(value) => {
-            let off = matches!(value.as_str(), "0" | "false" | "off" | "no");
-            (!off, "env")
+            let on = matches!(value.as_str(), "1" | "true" | "on" | "yes");
+            (on, "env")
         }
-        None => (true, "default"),
+        None => (false, "default"),
     };
     ui.global::<AppTheme>().set_cards_flat(flat);
     f159_log(format!("cards_flat={} source={source}", u8::from(flat)));

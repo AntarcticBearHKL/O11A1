@@ -2023,13 +2023,42 @@ impl VideoGeometry {
     }
 }
 
+/// The picture slot as insets from the client's four edges, in logical px.
+///
+/// f214: this replaces "publish the band, hope the window did not move between
+/// the layout pass and the publish". The band is *derived* from the live client
+/// rect on the compositor side, so a `WM_SIZE` is applied in the message handler
+/// itself — no 33 ms tick in between, and no stale band to clamp. The insets are
+/// the only thing a resize does not change; they move when a panel opens or the
+/// window enters fullscreen, and both publish immediately.
+pub(crate) fn band_from_insets(
+    insets: (f32, f32, f32, f32),
+    scale: f32,
+    client: (u32, u32),
+) -> (f32, f32, f32, f32) {
+    let scale = if scale.is_finite() && scale > 0.05 {
+        scale
+    } else {
+        1.0
+    };
+    let (l, t, r, b) = insets;
+    let cw = client.0 as f32 / scale;
+    let ch = client.1 as f32 / scale;
+    if cw <= 1.0 || ch <= 1.0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let x = l.clamp(0.0, cw);
+    let y = t.clamp(0.0, ch);
+    (x, y, (cw - x - r.max(0.0)).max(0.0), (ch - y - b.max(0.0)).max(0.0))
+}
+
 /// Clamp a logical band to the window's client area.
 ///
-/// Slint publishes the band from its own layout, which is one event behind a
-/// resize: `WM_SIZE` updates the client rect before the next tick re-lays the
-/// band out. Clamping here (a) keeps a stale band from ever placing the picture
-/// outside the window and (b) turns a not-yet-laid-out (0×0) band into the full
-/// client area instead of an empty visual.
+/// The DComp layer builds its band from [`band_from_insets`] (so there is no
+/// stale band to correct), and this runs on the result as the last comment on
+/// the invariant the layer owes the window: whatever the insets say, the picture
+/// slot never leaves the client rect and a degenerate one becomes the whole
+/// client instead of an empty visual.
 pub(crate) fn clamp_band(
     band: (f32, f32, f32, f32),
     scale: f32,
@@ -2165,5 +2194,56 @@ mod tests {
             clamp_band((0.0, 0.0, 1280.0, 800.0), 1.5, (960, 540)),
             (0.0, 0.0, 640.0, 360.0)
         );
+    }
+
+    /// f214: the band follows the client, the insets are the only state a
+    /// resize does not touch — and the picture keeps the source aspect at every
+    /// size (`overflow` stays zero, the container is never crossed).
+    #[test]
+    fn insets_track_the_client_on_every_resize() {
+        let none = (0.0, 0.0, 0.0, 0.0);
+        assert_eq!(
+            band_from_insets(none, 1.0, (800, 600)),
+            (0.0, 0.0, 800.0, 600.0)
+        );
+        assert_eq!(
+            band_from_insets(none, 1.0, (1920, 1080)),
+            (0.0, 0.0, 1920.0, 1080.0)
+        );
+        // Panel open: 360 logical on the right, at 100 % and at 150 %.
+        let right = (0.0, 0.0, 360.0, 0.0);
+        assert_eq!(
+            band_from_insets(right, 1.0, (1920, 1080)),
+            (0.0, 0.0, 1560.0, 1080.0)
+        );
+        // 1920 px at 150 % is 1280 logical; the strip is logical too.
+        assert_eq!(
+            band_from_insets(right, 1.5, (1920, 1080)),
+            (0.0, 0.0, 920.0, 720.0)
+        );
+        // A panel wider than the window collapses to zero, never negative.
+        assert_eq!(
+            band_from_insets((0.0, 0.0, 400.0, 0.0), 1.0, (360, 200)),
+            (0.0, 0.0, 0.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn insets_letterbox_at_three_window_sizes() {
+        // 16:9 source in 800x600 / 1280x720 / 1920x1080 clients, panel closed.
+        for (client, expect) in [
+            ((800u32, 600u32), (800.0f32, 450.0f32)),
+            ((1280, 720), (1280.0, 720.0)),
+            ((1920, 1080), (1920.0, 1080.0)),
+        ] {
+            let band = band_from_insets((0.0, 0.0, 0.0, 0.0), 1.0, client);
+            let geometry = VideoGeometry::fit(band, 1.0, (1920, 1080), 0);
+            assert!((geometry.width - expect.0).abs() <= 1.0, "{client:?}");
+            assert!((geometry.height - expect.1).abs() <= 1.0, "{client:?}");
+            assert_eq!(geometry.overflow(client), 0.0, "{client:?}");
+            // Centred: the bars are split evenly.
+            assert!((geometry.x - (client.0 as f32 - geometry.width) / 2.0).abs() < 0.01);
+            assert!((geometry.y - (client.1 as f32 - geometry.height) / 2.0).abs() < 0.01);
+        }
     }
 }

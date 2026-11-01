@@ -966,17 +966,32 @@ pub(crate) fn apply_panel_geometry(
         ));
         return;
     };
-    // Fullscreen: the strips float over the picture, the window is fullscreen
-    // already and must not be resized. Remember the ints for the way out.
+    // Fullscreen: the window is already the monitor and must not be resized.
+    // f214: the strip is *reserved* out of the picture in this mode too (Slint's
+    // `reserve_r` no longer drops to 0 in fullscreen), so the strip hangs off
+    // the window's right edge and the video band narrows by exactly its width.
+    // The log line is what the acceptance reads: `panel_x + strip == win_w`,
+    // i.e. the strip ends on the window edge and never crosses it.
     if state.overlay {
         state.left = left;
         state.right = right;
         state.bottom = bottom;
         state.applied = None;
+        let strip = if right != 0 {
+            panel_phys(PANEL_RIGHT_LOGICAL, scale)
+        } else {
+            0
+        };
+        let panel_x = live.w.saturating_sub(strip);
         crate::debug_log(&format!(
             "panel left={left} right={right} bottom={bottom} overlay=true win={}x{} \
-             base={}x{} fullscreen-skip",
-            live.w, live.h, state.base_w, state.base_h
+             base={}x{} strip={strip} px panel_x={panel_x} right_edge={} inside={} fullscreen-skip",
+            live.w,
+            live.h,
+            state.base_w,
+            state.base_h,
+            panel_x + strip,
+            u8::from(panel_x + strip <= live.w)
         ));
         return;
     }
@@ -1190,6 +1205,40 @@ fn publish_fav_picker(
     }
 }
 
+/// f214 (C): one line per fullscreen toggle, read back from the **live** window.
+///
+/// In fullscreen the strip is reserved out of the picture and hangs off the
+/// window's right edge, so `panel_x + strip == window width` must hold exactly.
+/// The number is Slint's, not re-derived here: the strip width is the same
+/// `right_panel_w` the UI lays the strip out with, and `live.w` is what the OS
+/// gave this window.
+fn log_panel_strip(geom: &Rc<RefCell<PanelGeom>>, window: &slint::Window, fullscreen: bool) {
+    let Some(live) = player_window_rect(window) else {
+        return;
+    };
+    let scale = window.scale_factor().max(0.2);
+    let (right, overlay) = {
+        let state = geom.borrow();
+        (state.right, state.overlay)
+    };
+    let strip = if right != 0 {
+        panel_phys(PANEL_RIGHT_LOGICAL, scale)
+    } else {
+        0
+    };
+    let panel_x = live.w.saturating_sub(strip);
+    crate::debug_log(&format!(
+        "panel f214 fullscreen={} overlay={} win={}x{} strip={strip} panel_x={panel_x} \
+         right_edge={} inside={}",
+        u8::from(fullscreen),
+        u8::from(overlay),
+        live.w,
+        live.h,
+        panel_x + strip,
+        u8::from(panel_x + strip <= live.w)
+    ));
+}
+
 /// f202: publish 画质增强 — the tier in effect, which tiers this machine can
 /// run, and the one line that explains the greyed ones.
 ///
@@ -1197,25 +1246,21 @@ fn publish_fav_picker(
 /// winit path there is no video layer to draw into, so 1–3 are greyed with that
 /// reason rather than silently doing nothing.
 ///
-/// f204: the same publish also fills the 画面直出 row: `player_dcomp` is the
-/// stored preference the row edits, `dcomp_active` is the path this process
-/// actually runs on (`platform::enabled()` was resolved at start-up). The two
-/// differ exactly when the user flipped the switch and has not restarted yet,
-/// which is what the row's "重启后生效" wording is derived from.
-fn publish_enhance(window: &PlayerWindow, player_dcomp: bool) {
+/// f214: the 画面直出 row is gone — the composite path is the only path, so
+/// there is nothing left to switch, persist, or wait a restart for. The hint
+/// still names the winit escape valve when it is in use (`BILI_PLAYER_DCOMP=0`).
+fn publish_enhance(window: &PlayerWindow) {
     let dcomp = crate::dcomp::platform::enabled();
     let availability = crate::dcomp::enhance::availability();
     let shader_ok = dcomp && availability.shaders;
     let mut parts: Vec<String> = Vec::new();
     if !dcomp {
-        parts.push("未开启画面直出：锐化 / Anime4K / FSR（1–3 档）不可用".to_string());
+        parts.push("未开启画面直出（BILI_PLAYER_DCOMP=0）：锐化 / Anime4K / FSR（1–3 档）不可用".to_string());
     } else if !availability.shaders {
         parts.push(format!("锐化 / Anime4K / FSR：{}", availability.shader_reason));
     }
     window.set_enhance_shader_ok(shader_ok);
     window.set_enhance_hint(parts.join("；").into());
-    window.set_player_dcomp(player_dcomp);
-    window.set_dcomp_active(dcomp);
     // A stored tier this machine cannot run must not look selected. Falling
     // back here (once, before the first frame) is what keeps a settings.json
     // copied from another machine from reporting a filter that is not running.
@@ -1226,11 +1271,57 @@ fn publish_enhance(window: &PlayerWindow, player_dcomp: bool) {
         window.set_enhance_mode(crate::dcomp::enhance::OFF as i32);
     }
     crate::debug_log(&format!(
-        "enhance publish mode={} dcomp={dcomp} player_dcomp={player_dcomp} shaders={} hint={}",
+        "enhance publish mode={} dcomp={dcomp} shaders={} hint={}",
         crate::dcomp::enhance::desired(),
         availability.shaders,
         parts.join("；")
     ));
+}
+
+/// f214: hand the composite video layer its slot.
+///
+/// The slot is published as insets from the client's edges (see
+/// [`crate::dcomp::VideoLayout`]), never as a pre-computed band: the layer
+/// derives the band from the live client rect, which is what makes a window
+/// resize apply inside `WM_SIZE` instead of one tick later. Called from the
+/// 33 ms content tick, from the always-on 100 ms layout lane (so a paused player
+/// or one with 弹幕 off still tracks a panel change), and right after a
+/// panel/fullscreen change.
+///
+/// The transparent hole the picture shows through must have the decoded frame's
+/// aspect, not a fixed 16:9 (4:3 and 21:9 sources otherwise leak the desktop
+/// through the bars), which is why the aspect is published here too.
+pub(crate) fn publish_video_layout(window: &PlayerWindow, control: &Arc<player::PlaybackControl>) {
+    let (fw, fh) = (control.frame_width(), control.frame_height());
+    let aspect = if fw > 0 && fh > 0 {
+        fw as f32 / fh as f32
+    } else {
+        16.0 / 9.0
+    };
+    if (window.get_video_aspect() - aspect).abs() > 0.001 {
+        window.set_video_aspect(aspect);
+    }
+    let Some(hwnd) = win::hwnd_of(window.window()) else {
+        return;
+    };
+    crate::dcomp::sync_layout(
+        hwnd,
+        crate::dcomp::VideoLayout {
+            insets: (
+                window.get_band_inset_l(),
+                window.get_band_inset_t(),
+                window.get_band_inset_r(),
+                window.get_band_inset_b(),
+            ),
+            scale: window.window().scale_factor(),
+            fit: window.get_fit_mode().clamp(0, 2) as u8,
+            frame: if fw > 0 && fh > 0 {
+                (fw, fh)
+            } else {
+                (960, 540)
+            },
+        },
+    );
 }
 
 pub(crate) fn open_player_inner(
@@ -2118,6 +2209,7 @@ pub(crate) fn open_player_inner(
     {
         let geom = panel_geom.clone();
         let window = weak.clone();
+        let control = control.clone();
         player.on_panel_changed(move || {
             if let Some(window) = window.upgrade() {
                 apply_panel_geometry(
@@ -2128,6 +2220,23 @@ pub(crate) fn open_player_inner(
                     window.get_bottom_panel(),
                     false,
                 );
+                // f214: the strip changed the picture's available width. In
+                // fullscreen nothing resizes the window, so this publish (not a
+                // `WM_SIZE`) is what narrows the video band — and the layer
+                // derives the band from it immediately, not on the next tick.
+                publish_video_layout(&window, &control);
+            }
+        });
+    }
+    // f214: the always-on layout lane (100 ms). The 33 ms content tick stops
+    // with 弹幕 off or while paused; this one does not, so a resize or a panel
+    // change is never left unapplied behind an idle picture.
+    {
+        let window = weak.clone();
+        let control = control.clone();
+        player.on_layout_tick(move || {
+            if let Some(window) = window.upgrade() {
+                publish_video_layout(&window, &control);
             }
         });
     }
@@ -2294,42 +2403,11 @@ pub(crate) fn open_player_inner(
                 window.get_bottom_panel(),
                 false,
             );
-            // f194: the DComp video layer is placed from the same properties the
-            // UI lays the band out with. Publishing it here (not only with a
-            // frame) keeps the picture in the right slot while paused, when a
-            // panel that changes the band opens without a frame arriving.
-            if let Some(hwnd) = win::hwnd_of(window.window()) {
-                let (fw, fh) = (control.frame_width(), control.frame_height());
-                // The transparent hole the DComp picture shows through must
-                // have the decoded frame's aspect, not a fixed 16:9 (4:3 and
-                // 21:9 sources otherwise leak the desktop through the bars).
-                let aspect = if fw > 0 && fh > 0 {
-                    fw as f32 / fh as f32
-                } else {
-                    16.0 / 9.0
-                };
-                if (window.get_video_aspect() - aspect).abs() > 0.001 {
-                    window.set_video_aspect(aspect);
-                }
-                crate::dcomp::sync_layout(
-                    hwnd,
-                    crate::dcomp::VideoLayout {
-                        band: (
-                            window.get_surface_x(),
-                            window.get_surface_y(),
-                            window.get_surface_w(),
-                            window.get_surface_h(),
-                        ),
-                        scale: window.window().scale_factor(),
-                        fit: window.get_fit_mode().clamp(0, 2) as u8,
-                        frame: if fw > 0 && fh > 0 {
-                            (fw, fh)
-                        } else {
-                            (960, 540)
-                        },
-                    },
-                );
-            }
+            // 弹幕/内容 tick: the layout lane also runs on its own 100 ms timer
+            // (paused or 弹幕 off used to leave the slot stale), but keeping it
+            // here means a panel change during playback is applied on the same
+            // frame as the rest of the UI.
+            publish_video_layout(&window, &control);
             // 网络分析: the profiler is sampled every tick but only formatted
             // at 4 Hz; one sparkline sample per second. Both snapshots are taken
             // inside the 4 Hz block below: `prefetch_stats` locks the proxy and
@@ -2840,26 +2918,22 @@ pub(crate) fn open_player_inner(
     // menu writes and logs each tier's GPU cost, presents/s and drops.
     crate::qa::maybe_start_sr_test(player.as_weak(), control.clone());
     // f204: open the 画质增强 menu (and optionally one tier) for a capture of
-    // the 画面直出 row; no-op without `BILI_F204_MENU`.
+    // the tier list; no-op without `BILI_F204_MENU`.
     crate::qa::maybe_open_enhance_menu(player.as_weak());
     // f202: 画质增强. The pick goes to a process-wide atomic the video thread
     // reads on its next frame, is mirrored into the row (`enhance_mode`) and is
     // persisted, so a restart keeps the tier. The availability/hint publish at
     // open because nothing about it can change inside one session.
     //
-    // f204: the 画面直出 row lives in the same section. It writes
-    // `player_dcomp` and nothing else: `platform::enabled()` already resolved
-    // this process's window class, so the row only shows "重启后生效" until the
-    // next start. Never restart the app from here — that is the user's call.
+    // f214: the 画面直出 row (and its `set_player_dcomp` callback / stored
+    // setting) is gone. The composite path is the only path; there is nothing
+    // to persist and nothing that needs a restart, so the menu has no switch in
+    // it at all.
     {
         let window = weak.clone();
         let store = settings_store.clone();
-        let stored_dcomp = settings_store
-            .lock()
-            .map(|prefs| prefs.player_dcomp)
-            .unwrap_or(false);
         if let Some(window) = window.upgrade() {
-            publish_enhance(&window, stored_dcomp);
+            publish_enhance(&window);
         }
         player.on_set_enhance(move |mode| {
             let mode = mode.clamp(0, 4) as u32;
@@ -2872,15 +2946,6 @@ pub(crate) fn open_player_inner(
                     crate::dcomp::repaint(hwnd);
                 }
             }
-        });
-        let store = settings_store.clone();
-        player.on_set_player_dcomp(move |on| {
-            update_settings(&store, |prefs| prefs.player_dcomp = on);
-            crate::debug_log(&format!(
-                "f204 dcomp setting={} active={} (restart required)",
-                if on { "on" } else { "off" },
-                crate::dcomp::platform::enabled()
-            ));
         });
     }
     {
@@ -3023,22 +3088,43 @@ pub(crate) fn open_player_inner(
     {
         let geom = panel_geom.clone();
         let window = weak.clone();
+        let control = control.clone();
         player.on_toggle_fullscreen(move || {
             if let Some(window) = window.upgrade() {
                 let next = !window.window().is_fullscreen();
                 if next {
                     // Capture the base size / picture position before the
-                    // window covers the monitor; panels float over the picture
-                    // while fullscreen and the window is never resized.
+                    // window covers the monitor; the panel strip keeps its
+                    // width inside the screen (it is reserved out of the
+                    // picture, not added to it) and the window is never
+                    // resized while fullscreen.
                     enter_panel_overlay(&geom, window.window());
                 }
                 window.window().set_fullscreen(next);
                 window.set_fullscreen(next);
                 window.set_panels_overlay(next);
                 window.set_fullscreen_text(if next { "退出全屏" } else { "全屏" }.into());
+                // f214: the panel strip is inside the window in both modes, and
+                // the picture gives up its width, so the band has to be
+                // republished in the same event as the flag - not on the next
+                // tick, when the screen would show the old band for a frame.
+                publish_video_layout(&window, &control);
+                // One observed line per toggle, after the OS has applied the
+                // window size: `panel_x + strip == win_w`, the invariant C is
+                // judged on.
+                {
+                    let geom = geom.clone();
+                    let weak_window = window.as_weak();
+                    slint::Timer::single_shot(Duration::from_millis(600), move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            log_panel_strip(&geom, window.window(), window.get_fullscreen());
+                        }
+                    });
+                }
                 if !next {
-                    // Winit restores the pre-fullscreen rect asynchronously;
-                    // grow back by the strips that are open now afterwards.
+                    // The window restores its pre-fullscreen rect
+                    // asynchronously; grow back by the strips that are open now
+                    // afterwards.
                     schedule_overlay_exit(geom.clone(), window.as_weak(), 0);
                 }
             }
@@ -5176,6 +5262,60 @@ pub(crate) fn open_player_inner(
                 }
             });
         }
+    }
+    // Diagnostic hook (`BILI_F214_DPI=<dpi>,<delay_ms>`): the DPI-change path,
+    // driven through the same `WM_DPICHANGED` the OS sends when a window crosses
+    // to a monitor with a different scale. It is posted **from inside the
+    // process** because a cross-process `PostMessage` of this message is refused
+    // (measured: `PostMessage` returns FALSE, so a script cannot fake it). The
+    // message carries a null suggested rect, so the window keeps its size and
+    // only the factor changes — which is exactly what the video layer's geometry
+    // has to survive (`overflow=0`, the picture still 16:9 inside the band).
+    if let Ok(raw) = std::env::var("BILI_F214_DPI") {
+        let mut parts = raw.split(',').map(str::trim);
+        let dpi = parts
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(144)
+            .clamp(72, 480);
+        let delay = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(2_500)
+            .clamp(500, 60_000);
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(player) = weak.upgrade() else {
+                    return;
+                };
+                let Some(hwnd) = win::hwnd_of(player.window()) else {
+                    return;
+                };
+                #[link(name = "user32")]
+                extern "system" {
+                    fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+                }
+                const WM_DPICHANGED: u32 = 0x02E0;
+                // `SendMessageW`, not `PostMessageW`: the posting API refuses
+                // this message (returns FALSE — measured both cross-process and
+                // in-process), while the synchronous send reaches the window
+                // procedure.
+                let rc = unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_DPICHANGED,
+                        ((dpi as usize) << 16) | (dpi as usize & 0xFFFF),
+                        0,
+                    )
+                };
+                let scale = player.window().scale_factor();
+                crate::debug_log(&format!(
+                    "f214 dpi test dpi={dpi} delay_ms={delay} rc={rc} scale_after={scale:.2}"
+                ));
+            });
+        });
     }
     // Diagnostic hook (mirrors BILI_RESIZE_TEST): toggle fullscreen on and back
     // off through the same UI callback the button uses, so the decode target's

@@ -334,13 +334,27 @@ pub(crate) struct DcompPlayerWindow {
     paints: Cell<u64>,
 }
 
-/// What the player publishes about the picture slot, logical px.
+/// What the player publishes about the picture slot.
+///
+/// f214: the slot is published as **insets from the client's edges** (logical
+/// px), not as a band: the band itself is derived from the live client rect, so
+/// `WM_SIZE` is honoured inside the message handler instead of one publish
+/// later. The insets only move when a panel opens/closes or the window enters
+/// fullscreen.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VideoLayout {
-    pub(crate) band: (f32, f32, f32, f32),
+    /// `(left, top, right, bottom)` logical px taken out of the client area.
+    pub(crate) insets: (f32, f32, f32, f32),
     pub(crate) scale: f32,
     pub(crate) fit: u8,
     pub(crate) frame: (u32, u32),
+}
+
+impl VideoLayout {
+    /// The band this layout occupies in a client rect of `client` physical px.
+    fn band(&self, client: (u32, u32)) -> (f32, f32, f32, f32) {
+        super::video::band_from_insets(self.insets, self.scale, client)
+    }
 }
 
 impl DcompPlayerWindow {
@@ -900,14 +914,21 @@ impl DcompPlayerWindow {
 
     /// Apply a published picture slot to the video visual.
     ///
-    /// The band arrives in logical px from Slint. It is clamped to the current
-    /// client rect first (a resize/panel change publishes the band one tick
-    /// later than `WM_SIZE`), then turned into physical pixels exactly once by
-    /// [`VideoGeometry::fit`].
+    /// The insets arrive in logical px from Slint; the band they describe is
+    /// computed against the **current** client rect, so this is exact whenever
+    /// it runs — including the `WM_SIZE`/`WM_DPICHANGED` call, where Slint has
+    /// not re-laid anything out yet. Nothing here waits for the UI tick.
     fn sync_layout(&self, layout: VideoLayout) {
+        // The adapter owns the scale (it is what `WM_DPICHANGED` updates), so a
+        // cached layout published before a DPI change is still applied at the
+        // new factor instead of at the one it was published with.
+        let layout = VideoLayout {
+            scale: self.scale.get(),
+            ..layout
+        };
         self.layout.set(Some(layout));
         let client = (self.size.get().width, self.size.get().height);
-        let band = super::video::clamp_band(layout.band, layout.scale, client);
+        let band = super::video::clamp_band(layout.band(client), layout.scale, client);
         let geometry = VideoGeometry::fit(band, layout.scale, layout.frame, layout.fit);
         let before = self.compositor.borrow().geometry;
         self.compositor.borrow_mut().apply_geometry(geometry);
@@ -1372,10 +1393,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         window
                             .window
                             .dispatch_event(WindowEvent::Resized { size: size.to_logical(window.scale.get()) });
-                        // The band in Slint is re-laid out on the next tick, but
-                        // the video layer must not spend that tick in the old
-                        // slot: recompute against the new client rect now (the
-                        // clamp keeps a stale band inside it).
+                        // f214: the band is derived from THIS client rect plus
+                        // the published insets, so the picture is scaled in the
+                        // message handler itself — dragging the window edge,
+                        // maximising or entering fullscreen never leaves the
+                        // video at the old size waiting for the next UI tick.
+                        // (The UI layer's own swapchain follows in `paint`, which
+                        // the adapter's 4 ms timer runs.)
                         if let Some(layout) = window.layout.get() {
                             window.sync_layout(layout);
                         }
@@ -1660,9 +1684,13 @@ pub(crate) fn sync_layout(hwnd: isize, layout: VideoLayout) -> bool {
             .ok()
             .and_then(|map| map.get(&hwnd).and_then(|weak| weak.upgrade()))
     }) {
-        Some(window) if window.video.borrow().is_some() => {
+        Some(window) => {
+            let has_layer = window.video.borrow().is_some();
+            // f214: cache the slot even before the first frame built the video
+            // layer, so the `WM_SIZE` that arrives first can place the picture
+            // the moment the layer exists instead of waiting for a publish.
             window.sync_layout(layout);
-            true
+            has_layer
         }
         _ => false,
     }

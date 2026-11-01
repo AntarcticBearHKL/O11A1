@@ -24,12 +24,12 @@
 //!
 //! # The fallback
 //!
-//! f204: the branch is a user setting (`settings.json` → `player_dcomp`,
-//! switchable from the player's 画质增强 menu); f212 made **on** the shipped
-//! default. `BILI_PLAYER_DCOMP` still wins over it, and `=0` (or
-//! `false`/`no`/`off`) turns it off for one run: the flag is still set,
-//! `create_window_adapter` sees it, declines, and the player is built by winit
-//! exactly as before. Nothing else in the process changes.
+//! f214: the branch is **always on** — `settings.json` → `player_dcomp` is no
+//! longer read (the field only survives so old files still parse). The one way
+//! out is the environment: `BILI_PLAYER_DCOMP=0` (or `false`/`no`/`off`) turns
+//! the path off for one run. The flag is still set, `create_window_adapter`
+//! sees it, declines, and the player is built by winit exactly as before.
+//! Nothing else in the process changes.
 
 pub(crate) mod danmaku;
 /// f202: 画质增强 — CAS / Anime4K / FSR in the sink's own passes.

@@ -1995,6 +1995,9 @@ pub(crate) fn main() -> Result<()> {
     ));
     if let Ok(guard) = settings_store.lock() {
         publish_settings(&ui, &guard);
+        // The search page reopens on the tab last picked (设置 → 搜索 is the
+        // same field; the UI's own list is the label source).
+        ui.set_search_tab(settings::normalise_search_tab(guard.search_tab));
     }
     // 防干扰 readback: what the toolbar and the search panel actually render
     // from after this start-up, so a restart can be proven from the log alone.
@@ -2124,19 +2127,9 @@ pub(crate) fn main() -> Result<()> {
                     return;
                 }
                 // 用户 tab: the row is a UP主, so a click opens the UP page.
-                if open_search_user(
-                    weak.clone(),
-                    session_slot.clone(),
-                    search_state.clone(),
-                    up_page.clone(),
-                    up_seq.clone(),
-                    up_store.clone(),
-                    index,
-                    "card",
-                ) {
-                    return;
-                }
-                if !open_search_index(
+                // Every other tab is resolved by `open_search_hit` (视频 →
+                // detail, 番剧/影视 → season, 直播 → live player).
+                if open_search_hit(
                     weak.clone(),
                     session_slot.clone(),
                     search_state.clone(),
@@ -2144,13 +2137,19 @@ pub(crate) fn main() -> Result<()> {
                     detail_state.clone(),
                     detail_seq.clone(),
                     related_bvids.clone(),
+                    up_page.clone(),
+                    up_seq.clone(),
+                    up_store.clone(),
+                    &player_state,
+                    &settings_store,
                     index,
                     "card",
                 ) {
-                    crate::debug_log(&format!(
-                        "card open miss view=1 index={index} mode={mode}"
-                    ));
+                    return;
                 }
+                crate::debug_log(&format!(
+                    "card open miss view=1 index={index} mode={mode}"
+                ));
                 return;
             }
             match mode {
@@ -2379,6 +2378,9 @@ pub(crate) fn main() -> Result<()> {
         let search_bvids = search_bvids.clone();
         let hot_keywords = hot_keywords.clone();
         ui.on_do_search(move |keyword| {
+            // The remembered tab (设置 / 上次选择) is where a new search lands:
+            // 番剧 is not reset to 视频 just because the keyword changed.
+            let tab = current_search_tab(&weak);
             begin_search(
                 weak.clone(),
                 session_slot.clone(),
@@ -2387,6 +2389,7 @@ pub(crate) fn main() -> Result<()> {
                 search_bvids.clone(),
                 hot_keywords.clone(),
                 keyword.to_string(),
+                tab,
             );
         });
     }
@@ -2406,29 +2409,24 @@ pub(crate) fn main() -> Result<()> {
     ui.on_mono_ms(mono_ms_i32);
     ui.on_morph_frame(f152_note_morph);
 
-    // Search tab switch (视频 / 用户): reset to page 1 and re-query.
+    // Search tab switch (视频 / 番剧 / 影视 / 直播 / 用户): keep the keyword, drop
+    // the old rows for the skeleton, remember the choice and re-query.
     {
         let weak = weak.clone();
         let session_slot = session_slot.clone();
         let search_state = search_state.clone();
         let search_seq = search_seq.clone();
         let search_bvids = search_bvids.clone();
+        let settings_store = settings_store.clone();
         ui.on_search_tab_changed(move |tab| {
-            if let Ok(mut state) = search_state.lock() {
-                state.tab = tab;
-                state.page = 1;
-                state.num_pages = 1;
-            }
-            if let Some(ui) = weak.upgrade() {
-                ui.set_search_tab(tab);
-                set_client_page(1, 0);
-            }
-            run_search(
+            search_switch_tab(
                 weak.clone(),
                 session_slot.clone(),
                 search_state.clone(),
                 search_seq.clone(),
                 search_bvids.clone(),
+                settings_store.clone(),
+                tab,
             );
         });
     }
@@ -2468,20 +2466,10 @@ pub(crate) fn main() -> Result<()> {
         let up_page = up_page.clone();
         let up_seq = up_seq.clone();
         let up_store = up_store.clone();
+        let player_state = player_state.clone();
+        let settings_store = settings_store.clone();
         ui.on_open_search_item(move |index| {
-            if open_search_user(
-                weak.clone(),
-                session_slot.clone(),
-                search_state.clone(),
-                up_page.clone(),
-                up_seq.clone(),
-                up_store.clone(),
-                index,
-                "activate",
-            ) {
-                return;
-            }
-            if !open_search_index(
+            if !open_search_hit(
                 weak.clone(),
                 session_slot.clone(),
                 search_state.clone(),
@@ -2489,6 +2477,11 @@ pub(crate) fn main() -> Result<()> {
                 detail_state.clone(),
                 detail_seq.clone(),
                 related_bvids.clone(),
+                up_page.clone(),
+                up_seq.clone(),
+                up_store.clone(),
+                &player_state,
+                &settings_store,
                 index,
                 "activate",
             ) {
@@ -4007,6 +4000,7 @@ pub(crate) fn main() -> Result<()> {
         let suggest_seq = suggest_seq.clone();
         ui.on_suggest_selected(move |text| {
             suggest_seq.fetch_add(1, Ordering::SeqCst);
+            let tab = current_search_tab(&weak);
             begin_search(
                 weak.clone(),
                 session_slot.clone(),
@@ -4015,6 +4009,7 @@ pub(crate) fn main() -> Result<()> {
                 search_bvids.clone(),
                 hot_keywords.clone(),
                 text.to_string(),
+                tab,
             );
         });
     }
@@ -4043,6 +4038,7 @@ pub(crate) fn main() -> Result<()> {
                 .ok()
                 .and_then(|guard| guard.get(index.max(0) as usize).cloned());
             if let Some(keyword) = keyword {
+                let tab = current_search_tab(&weak);
                 begin_search(
                     weak.clone(),
                     session_slot.clone(),
@@ -4051,6 +4047,7 @@ pub(crate) fn main() -> Result<()> {
                     search_bvids.clone(),
                     hot_keywords.clone(),
                     keyword,
+                    tab,
                 );
             }
         });
@@ -5346,6 +5343,14 @@ pub(crate) fn main() -> Result<()> {
     // f159 QA chain (`BILI_F159_TEST`): the 5+5 bar, the breathing skeleton, the
     // white chips and the card glass/flat A/B. Inert unless the env var is set.
     start_f159_test_hook(weak.clone());
+    // f217 QA chain (`BILI_F217_TEST`): the five search tabs against the real
+    // endpoints, the season / live click-through and the empty / failure states.
+    start_f217_test_hook(
+        weak.clone(),
+        session_slot.clone(),
+        search_state.clone(),
+        search_bvids.clone(),
+    );
 
     // ---- 养鱼 (fish dashboard, view_mode 20) ----
     // The engine is opened ONCE here; a failure (unwritable fish.db) leaves the

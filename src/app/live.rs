@@ -33,9 +33,25 @@ pub(crate) fn live_card_from(room: &bilibili::LiveRoom) -> LiveCard {
         title: room.title.clone().into(),
         uname: room.uname.clone().into(),
         area: area.into(),
-        cover: Image::default(),
+        // f216: a republish must not blank a cover that was already decoded.
+        // `cached_cover` reads the UI-held copy first, then the shared decode
+        // cache, so re-entering 直播 paints what is already known instead of a
+        // grid of empty cards.
+        cover: cached_cover(&room.cover),
         online: live_online_text(room.online).into(),
         live: room.live_status == 1,
+    }
+}
+
+/// The session + main window of the last real 直播 load, so a **cached**
+/// republish (re-entering the page, re-picking 推荐) can still fetch the covers
+/// the decode cache no longer holds. Set by the two network loaders, which are
+/// the only paths that receive a session.
+static LIVE_HOME: Mutex<Option<(SessionSlot, Weak<AppWindow>)>> = Mutex::new(None);
+
+fn live_remember_home(weak: &Weak<AppWindow>, session_slot: &SessionSlot) {
+    if let Ok(mut guard) = LIVE_HOME.lock() {
+        *guard = Some((session_slot.clone(), weak.clone()));
     }
 }
 
@@ -65,6 +81,24 @@ pub(crate) fn live_publish_index_cached(
             count: module.rooms.len().min(i32::MAX as usize) as i32,
         });
     }
+    // Rows this publish could not paint from the UI-held copies or the decode
+    // cache: streamed right after the model is live (below), never left blank.
+    let pending: Vec<(usize, String, String)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.cover.size().width == 0)
+        .filter_map(|(index, _)| {
+            let room = rooms.get(index)?;
+            (!room.cover.is_empty()).then(|| {
+                (
+                    index,
+                    room.cover.clone(),
+                    room.room_id.to_string(),
+                )
+            })
+        })
+        .take(bilibili::THUMB_MAX_PER_VIEW)
+        .collect();
     let ids: Vec<String> = rooms.iter().map(|room| room.room_id.to_string()).collect();
     if let Ok(mut guard) = host.ids.lock() {
         *guard = ids.clone();
@@ -100,10 +134,77 @@ pub(crate) fn live_publish_index_cached(
     ui.set_live_page(1);
     ui.set_live_shown(card_count.min(i32::MAX as usize) as i32);
     crate::debug_log(&format!(
-        "live publish index modules={} cards={card_count} areas={}",
+        "live publish index modules={} cards={card_count} areas={} warm={} pending={}",
         module_count,
-        areas.len()
+        areas.len(),
+        card_count.saturating_sub(pending.len()),
+        pending.len(),
     ));
+    live_stream_covers(ui.as_weak(), host.clone(), pending);
+}
+
+/// Stream `pending` (row index, cover URL, room id) covers into the live grid.
+/// Runs off the UI thread; every patch is checked against the room id still at
+/// that row, so a republish that happened meanwhile is never painted over.
+fn live_stream_covers(
+    weak: Weak<AppWindow>,
+    host: Arc<LiveHost>,
+    pending: Vec<(usize, String, String)>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let Some((session_slot, _)) = LIVE_HOME.lock().ok().and_then(|guard| guard.clone()) else {
+        return;
+    };
+    let Some(session) = active_session(&session_slot) else {
+        return;
+    };
+    let my = host.seq.load(Ordering::SeqCst);
+    crate::netpool::submit(crate::netpool::Prio::Low, Box::new(move || {
+        let Some(runtime) = bilibili::shared_runtime() else {
+            return;
+        };
+        let pics: Vec<String> = pending.iter().map(|(_, url, _)| url.clone()).collect();
+        let urls = pics.clone();
+        let keys: Vec<String> = pending.iter().map(|(_, _, id)| id.clone()).collect();
+        let indices: Vec<usize> = pending.iter().map(|(index, _, _)| *index).collect();
+        runtime.block_on(async {
+            stream_thumbs(&session, pics, |_| {}, |slot, pixels| {
+                let Some(pixels) = pixels else {
+                    return;
+                };
+                let index = indices.get(slot).copied().unwrap_or(usize::MAX);
+                let key = keys.get(slot).cloned().unwrap_or_default();
+                let url = urls.get(slot).cloned().unwrap_or_default();
+                let weak = weak.clone();
+                let host = host.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    let current = host
+                        .covers
+                        .lock()
+                        .ok()
+                        .and_then(|covers| covers.get(index).cloned())
+                        .map(|room_id| room_id == key)
+                        .unwrap_or(false);
+                    if host.seq.load(Ordering::SeqCst) != my || !current {
+                        COVER_DROPPED_GUARD.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    let image = to_thumb(&Some(pixels));
+                    remember_cover(&url, &image);
+                    patch_model_thumb(ui.get_live_cards(), index, image, |row, image| {
+                        row.cover = image
+                    });
+                    COVER_PATCHED.fetch_add(1, Ordering::Relaxed);
+                });
+            })
+            .await;
+        });
+    }));
 }
 
 /// Publish one area page (`append` keeps the rows on screen). Runs on the UI
@@ -170,15 +271,17 @@ pub(crate) fn live_publish_area(
     ));
 }
 
-/// The homepage aggregate: fetch, publish, then stream the first screen of
-/// covers. `force` bypasses nothing (there is no cache below the page state) —
-/// it only changes the status copy, so a retry reads as a fresh load.
+/// The homepage aggregate: fetch, publish (painting whatever is already
+/// decoded), then stream the covers that are still missing. `force` bypasses
+/// nothing (there is no cache below the page state) — it only changes the
+/// status copy, so a retry reads as a fresh load.
 pub(crate) fn live_load_index(
     weak: Weak<AppWindow>,
     session_slot: SessionSlot,
     host: Arc<LiveHost>,
     force: bool,
 ) {
+    live_remember_home(&weak, &session_slot);
     let Some(session) = active_session(&session_slot) else {
         return;
     };
@@ -221,21 +324,9 @@ pub(crate) fn live_load_index(
             };
             let modules = index.modules.clone();
             let areas = index.areas.clone();
-            // Covers: at most the first 60 rooms of the aggregate (the module
-            // rows the first screen can reach), streamed in with the guard that
-            // drops a patch from a superseded load.
-            let pics: Vec<String> = modules
-                .iter()
-                .flat_map(|module| module.rooms.iter())
-                .take(60)
-                .map(|room| room.cover.clone())
-                .collect();
-            let keys: Vec<String> = modules
-                .iter()
-                .flat_map(|module| module.rooms.iter())
-                .take(60)
-                .map(|room| room.room_id.to_string())
-                .collect();
+            // The publish itself paints every cover the UI/cache already holds
+            // and streams the misses (`live_stream_covers`), so this path and a
+            // cached republish share one cover implementation.
             let weak_a = weak.clone();
             let host_a = host.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -246,27 +337,6 @@ pub(crate) fn live_load_index(
                     live_publish_index_cached(&ui, &host_a, &modules, &areas);
                 }
             });
-            let covers = host.covers.clone();
-            let seq = host.seq.clone();
-            let my_seq = my;
-            stream_cover_list(
-                &weak,
-                &session,
-                pics,
-                keys,
-                0,
-                move |_index, key| {
-                    if seq.load(Ordering::SeqCst) == my_seq {
-                        ThumbGuard::Ids(covers.clone(), key)
-                    } else {
-                        ThumbGuard::Seq(seq.clone(), u64::MAX)
-                    }
-                },
-                |ui| ui.get_live_cards(),
-                |row, image| row.cover = image,
-                "live index".to_string(),
-            )
-            .await;
         });
     }));
 }
@@ -282,6 +352,7 @@ pub(crate) fn live_load_area(
     page: i64,
     append: bool,
 ) {
+    live_remember_home(&weak, &session_slot);
     let Some(session) = active_session(&session_slot) else {
         return;
     };

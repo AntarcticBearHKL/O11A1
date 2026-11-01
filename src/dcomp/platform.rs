@@ -73,36 +73,34 @@ pub(crate) fn with_buffer_scope<T>(adapter: Rc<dyn WindowAdapter>, body: impl Fn
 }
 
 ///
-/// f204: the answer comes from three levels, in this order:
-///
-/// 1. `BILI_PLAYER_DCOMP` — `1`/`true`/`yes`/`on` forces the path on,
-///    `0`/`false`/`no`/`off` forces it off. The QA scripts flip the path per run
-///    this way, so a user setting can never make a scripted run measure the
-///    wrong window.
-/// 2. `settings.json` → `player_dcomp` (设置里 can turn it off; **on** is the
-///    shipped default since f212).
-/// 3. [`crate::settings::read_player_dcomp`]'s answer, which is that default.
+/// f214: the path is **not a preference any more** — it is always on, and the
+/// only way it is turned off is the escape valve `BILI_PLAYER_DCOMP=0` (the QA
+/// scripts' A/B, and the one command a user can run to get the old window back
+/// if the compositor path ever misbehaves on their machine). In particular this
+/// no longer reads `settings.json` → `player_dcomp`: that field could only be
+/// applied by the *next* process (the window class is chosen at start-up), so
+/// the switch meant "restart to find out", and a write that did not land looked
+/// exactly like one that did. See [`crate::settings::Settings::player_dcomp`].
 ///
 /// Evaluated once per process: the player window class is chosen when the
-/// platform is installed, so a change needs a restart. That is why the menu
-/// writes the setting and says "重启后生效" instead of switching live.
+/// platform is installed. The answer is logged once ([`resolve`]) with the
+/// reason, so a run can be read back without guessing.
 pub(crate) fn enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        // The environment wins over the stored preference.
-        if let Ok(value) = std::env::var("BILI_PLAYER_DCOMP") {
-            match value.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => return true,
-                "0" | "false" | "no" | "off" => return false,
-                // Empty or unrecognised: fall through to the setting rather
-                // than silently forcing a path the user did not ask for.
-                _ => {}
-            }
-        }
-        // Read the one field directly: `settings::load()` must not run here
-        // (it normalises the whole file and may write it back). A missing or
-        // broken file reads as the shipped default (on).
-        crate::settings::read_player_dcomp()
+    resolve().0
+}
+
+/// [`enabled`] plus the reason it answered that way, for the startup log.
+fn resolve() -> (bool, &'static str) {
+    static ANSWER: std::sync::OnceLock<(bool, &'static str)> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| match std::env::var("BILI_PLAYER_DCOMP") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => (false, "BILI_PLAYER_DCOMP"),
+            "1" | "true" | "yes" | "on" => (true, "BILI_PLAYER_DCOMP"),
+            // An empty/unrecognised value is not a request to change anything:
+            // the path stays on, and the odd value is worth a log line.
+            _ => (true, "default"),
+        },
+        Err(_) => (true, "default"),
     })
 }
 
@@ -248,9 +246,10 @@ pub(crate) fn install_platform() -> Result<(), String> {
         return Ok(());
     }
     let winit = winit_backend().map_err(|error| error.to_string())?;
+    let (path, reason) = resolve();
     crate::debug_log(&format!(
-        "dcomp platform installed player_path={}",
-        if enabled() { "dcomp" } else { "winit" }
+        "dcomp platform installed player_path={} reason={reason}",
+        if path { "dcomp" } else { "winit" }
     ));
     slint::platform::set_platform(Box::new(HybridPlatform { winit }))
         .map_err(|error| error.to_string())

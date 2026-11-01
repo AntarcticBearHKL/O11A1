@@ -214,14 +214,16 @@ export global AppTheme {
     // wider than the 5x4 grid) so it reads as more wallpaper, never as desktop.
     out property <color> wall-base: dark ? #07070b : #fafafc;
 
-    // Surfaces. `card` / `card-hover` are slightly translucent (81% / 85%
-    // alpha): the window glass underneath stays faintly visible through every
-    // video card, the way the top bar and page pill read. The tint is opaque
-    // enough that text and covers keep their contrast.
+    // Surfaces. `card` / `card-hover` stay slightly translucent: the window
+    // glass stays faintly visible through every video card, the way the top bar
+    // and page pill read. f215 lowered their alpha one step (81 %/85 % ->
+    // 70 %/81 %): nested plates now sit over a glass pane that carries the
+    // wallpaper sample, and a nearly opaque `card` read as the "one grey box on
+    // a coloured panel" split the pass removed.
     out property <color> bg: dark ? #121212 : #f5f5f7;
-    out property <color> card: dark ? #1e1e1ecf : #ffffffd9;
-    out property <color> card-alt: dark ? #242424 : #f6f7f9;
-    out property <color> card-hover: dark ? #2a2a2acf : #e7e7ecd9;
+    out property <color> card: dark ? #1e1e1eb3 : #ffffffcf;
+    out property <color> card-alt: dark ? #242424bd : #f6f7f9;
+    out property <color> card-hover: dark ? #2a2a2ab3 : #e7e7eccf;
     out property <color> thumb: dark ? #2a2a2a : #e0e0e3;
     out property <color> divider: dark ? #2c2c2c : #e0e0e3;
     out property <color> divider-alt: dark ? #2c2c2c : #d8d8dc;
@@ -239,14 +241,14 @@ export global AppTheme {
     // Windows close-button red (used only as the close button's hover fill).
     out property <color> win-close: #e81123;
 
-    // Floating top-bar glass. The bar is a small panel (a card), not a window
-    // layer, so it is allowed its own fill: dark uses the #1e1e1e surface
-    // family at 72% - a clear step above the 55% window glass - with a 1px
-    // #ffffff14-family hairline that gives the edge definition a translucent
-    // fill alone cannot. Light mirrors it (white fill, dark hairline).
-    // The bar is a SURFACE, not a film: >= 92 % alpha so card art and
-    // titles can never read through it.
-    out property <color> bar-fill: dark ? #1e1e1ef7 : #fffffff7;
+    // Floating top-bar glass. The bar paints the wallpaper sample (f215) under
+    // this film, so the film is a step lighter than it was in f151: at 97 % the
+    // sampled gradient was invisible and the bar read as a solid slab. 76 % dark
+    // / 80 % light still puts card art and titles far from legible through it
+    // (the sample is a diffuse mesh, not a picture), while the bar now visibly
+    // belongs to the same wallpaper as the page behind it. Dark keeps the
+    // #1e1e1e family, light the white one, and the 1px hairline is unchanged.
+    out property <color> bar-fill: dark ? #1e1e1ec2 : #ffffffcc;
     out property <color> bar-border: dark ? #ffffff14 : #00000014;
     // Hover wash for the bar's own controls (hairline button, win buttons).
     out property <color> bar-hover: dark ? #ffffff14 : #00000010;
@@ -284,11 +286,15 @@ export global AppTheme {
     out property <color> skeleton-hi: dark ? #303033 : #eff0f3;
     out property <color> skeleton-lo: dark ? #232326 : #dcdde2;
 
-    // Text
+    // Text. `text-dim` / `text-soft` are one step brighter/darker than the
+    // pre-f215 values: card-sized surfaces now carry the wallpaper's brighter
+    // patches (f215), and the 10-12px meta/owner line has to keep >= 4.5:1 on
+    // the BRIGHTEST patch a sampled card can land on (> 4.5:1 is checked by
+    // `scripts/qa-f215-contrast.py`, which recovers that patch from a capture).
     out property <color> text: dark ? #e8e8e8 : #1a1a1a;
-    out property <color> text-dim: dark ? #9a9a9a : #5f5f66;
+    out property <color> text-dim: dark ? #aaaaaa : #5a5a62;
     out property <color> text-faint: dark ? #808080 : #6b6b72;
-    out property <color> text-soft: dark ? #a8a8a8 : #555555;
+    out property <color> text-soft: dark ? #acacac : #555555;
     out property <color> text-body: dark ? #c8c8c8 : #333333;
 
     // Accent
@@ -493,18 +499,24 @@ export global AppTheme {
     in-out property <bool> qa-no-shadow: false;
     in-out property <bool> qa-no-danmaku: false;
     in-out property <bool> qa-no-clip: false;
+    // f215 QA: hold 播放列表 open for a capture. Its close path is the real
+    // cursor's hover state machine (300 ms away), which a headless script cannot
+    // satisfy; with this set the away-close is skipped, nothing else changes.
+    in-out property <bool> qa_hold_playlist: false;
     /// f194: the window is drawn by the software renderer (the DComp player
     /// layer). Cost-saving switches that only apply there hang off this.
     in-out property <bool> soft-ui: false;
-    // f159: the card surfaces (VideoCardView, and the masonry / poster / 动态
-    // cards that wear the same skin) paint the frosted wallpaper again when this
-    // is false - the f149 `flat: true` trade was measured on the OpenGL renderer,
-    // and the f159 A/B re-ran it on femtovg-wgpu.
+    // f215: the card surfaces (VideoCardView, and the masonry / poster / 动态 /
+    // 直播 / 养鱼 / 消息 cards that wear the same skin) paint the wallpaper
+    // sample again. The f149/f159 trade that made them flat was priced on the
+    // old `cover` image (a per-card resample of the whole tile); f215 replaced
+    // that with a 1:1 crop of the SAME texture the window paints, which is what
+    // the f215 A/B re-measured (scroll p95 and morph p95 both inside budget).
     //
-    // Shipped default is TRUE (the flat card) because the re-measurement kept
-    // flat: see `main.rs::f159_apply_card_flat`. The QA switch
-    // `BILI_CARD_FLAT=0` turns the frosted card back on for a side-by-side run.
-    in-out property <bool> cards_flat: true;
+    // Shipped default is now FALSE (the sampled card). `BILI_CARD_FLAT=1` still
+    // turns the flat plate back on, so one binary can produce both sides of the
+    // A/B (`scripts/qa-f215-perf.ps1`).
+    in-out property <bool> cards_flat: false;
     // Live home-tree counters (no paint work): every GlassPanel, how many of
     // them paint the wallpaper image, and how many carry a drop-shadow. Logged
     // by the f154 run; the f149 glass counters use the same mechanism.
@@ -567,19 +579,21 @@ export global AppTheme {
     // clone), never a per-panel copy. An empty image is the pre-Rust state;
     // the tint below still carries the panel, so nothing flashes.
     in-out property <image> glass-blur;
-    // The panel tint: `card` at ~61 % (dark) / ~64 % (light) alpha. Low enough
-    // that the diffused gradient reads through, high enough that body text
-    // keeps >= 7:1 against the darkest/lightest panel area (see the f133
-    // report). Panels over the feed use the hover pair as well.
-    out property <color> glass-tint: dark ? #1e1e1e9b : #ffffffa3;
-    out property <color> glass-tint-hover: dark ? #2a2a2a9b : #e7e7eca3;
+    // The panel tint: a film over the surface's own wallpaper patch (f215). The
+    // alpha is the contrast knob the f215 pass re-measured: 66 % dark / 56 %
+    // light leaves the sampled gradient clearly readable while `text` stays
+    // >= 12:1 and `text-dim` >= 4.6:1 over the BRIGHTEST patch of either
+    // wallpaper (the check below is in `scripts/qa-f215-contrast.py`).
+    out property <color> glass-tint: dark ? #1e1e1eb3 : #ffffff8f;
+    out property <color> glass-tint-hover: dark ? #2a2a2ab3 : #e7e7ec8f;
     // f151: the player chrome follows the theme, so its panels use the same
     // `bar-fill` / `card` family as the home bar. Dark keeps the old slate,
-    // light is a white translucent surface (85 % white over the light blurred
-    // backdrop), which is what makes the pill and its popovers read as chrome
-    // on a light wallpaper instead of as a dark tint. The ink tokens above flip
-    // with it; the accent stays ink, never the surface.
-    out property <color> player-panel-tint: dark ? #1e1e1ef2 : #ffffffee;
+    // light is a white translucent surface, which is what makes the pill and
+    // its popovers read as chrome on a light wallpaper instead of as a dark tint
+    // on one. f215: the 右栏 strip samples the wallpaper like every other
+    // surface, so its film is one step lighter (88 % / 90 %) than the popovers
+    // that float over the picture (those keep the denser `player-menu-tint`).
+    out property <color> player-panel-tint: dark ? #1e1e1ee0 : #ffffffe6;
     out property <color> player-menu-tint: dark ? #1e1e1ef2 : #ffffffee;
 }
 
@@ -588,15 +602,16 @@ export global AppTheme {
 // GlassPanel: the ONE frosted surface every panel-like element uses.
 //
 // Paint order, back to front:
-//   1. the shared PRE-BLURRED backdrop (`AppTheme.glass-blur`), `cover`;
+//   1. the shared PRE-BLURRED backdrop (`AppTheme.glass-blur`), sampled at this
+//      surface's own position in the virtual wallpaper (f215: 1:1, not
+//      `cover`), so every surface in a window is a window onto the same sheet;
 //   2. a translucent `card` tint, so text contrast holds;
 //   3. the 1px `bar-border` hairline on the same radius;
 //   4. the shadow the surface already had (`shadow:` + its three knobs).
 //
 // Everything above is a static image plus alpha: no capture, no render target,
-// no timer, nothing per frame. Because the window behind a panel is itself the
-// generated gradient, the blurred copy is what "the panel blurs what is behind
-// it" looks like - the blur was computed once, in Rust, at startup.
+// no timer, nothing per frame. The blur was computed once, in Rust, at startup,
+// and every panel reads the same texture object.
 //
 // Children declared on an instance are painted above the three layers, so this
 // is a drop-in replacement for a `Rectangle` with `background: AppTheme.card`
@@ -606,17 +621,17 @@ component GlassPanel inherits Rectangle {
     // The surface's corner radius (0 = square, e.g. a full-height side strip).
     in property <length> radius: 18px;
     // f149: a card-sized surface. `flat: true` drops the wallpaper image and
-    // paints only the translucent tint + hairline, which is all a 200-600px
-    // card needs; the image stays on the large surfaces (bar, panels,
-    // popovers, playlist, fish tank) where it is actually readable.
+    // paints only the translucent tint + hairline. Since f215 the shipped
+    // default is the SAMPLED plate (`AppTheme.cards_flat = false`); `flat` is
+    // kept as the A/B baseline (`BILI_CARD_FLAT=1`) the scroll/morph table
+    // compares against.
     in property <bool> flat: false;
-    // Paint the WHOLE wallpaper into this surface (`fill`) instead of the
-    // centred `cover` crop. A 64px popover covers only a 64px patch of the
-    // 1024px tile, which reads as one flat tone; `fill` keeps the same colour
-    // range the main window's large panels show, so the player chrome is made
-    // of the same wallpaper, not of a separate grey card. Off by default, so
-    // every existing panel keeps its exact look.
-    in property <bool> fill-image: false;
+    // f215: where this surface sits inside the repeating virtual wallpaper.
+    // `Math.mod` wraps into (-tile, 0], so the tile covers the panel from its
+    // top-left corner. Read-only derivations of `absolute-position`; they cost
+    // one layout pass per window, not a per-frame computation.
+    property <length> wall-shift-x: Math.mod(AppTheme.wall-x - root.absolute-position.x, AppTheme.wallpaper-tile) - AppTheme.wallpaper-tile;
+    property <length> wall-shift-y: Math.mod(AppTheme.wall-y - root.absolute-position.y, AppTheme.wallpaper-tile) - AppTheme.wallpaper-tile;
     // The translucent tint above the blurred image.
     in property <color> tint: AppTheme.glass-tint;
     // The 1px edge. `edge-width: 0px` drops it where a surface had none.
@@ -630,6 +645,10 @@ component GlassPanel inherits Rectangle {
     // f199: the host is allowed to drop this panel's rounded clip while a list
     // scrolls (see `AppTheme.scroll-lite`). Only the card-sized plates set it,
     // so the bar, the page pill and the popovers keep their exact corners.
+    // f215: this only drops the CORNER SHAPE. The wallpaper sample stays
+    // painted during the whole scroll - its quads are tile-sized and clipped by
+    // the image group's own square scissor, so nothing spills and nothing
+    // degrades to a flat tint.
     in property <bool> unclipped: false;
 
     background: #00000000;
@@ -638,6 +657,11 @@ component GlassPanel inherits Rectangle {
     // offscreen layer (a rounded clip cannot be a scissor). `BILI_QA_NO_CLIP`
     // takes it away for the A/B; a normal run keeps it - except on a card that
     // is scrolling, where `unclipped` drops it for the duration of the move.
+    // f215 measured the alternative (clip always on, radius 0 while scrolling,
+    // i.e. one scissor per card instead of the rounded layer): the sample
+    // variant was unchanged but the FLAT variant lost 2.5 ms/frame at 1920,
+    // because a scissor per card is not free either. Keeping the layer off is
+    // therefore still the cheaper scroll path.
     clip: !root.unclipped && !AppTheme.qa-no-clip;
     // f154: the shadow of a panel whose SIZE changes is re-blurred every frame
     // (`BoxShadowCache` is keyed by size), so `BILI_QA_NO_SHADOW` and
@@ -651,12 +675,40 @@ component GlassPanel inherits Rectangle {
     drop-shadow-offset-y: root.shadow && !AppTheme.qa-no-glass
         ? AppTheme.ds-blur(root.shadow-y)
         : 0px;
-    // 1. the diffused gradient (the shared image, not a copy)
-    if !root.flat && !AppTheme.qa-no-glass : Image {
+    // 1. the diffused gradient, sampled at THIS surface's place in the virtual
+    // wallpaper. One texture (`AppTheme.glass-blur`, the same image the window
+    // paints) drawn at 1:1 inside a SQUARE scissor: no per-panel image, no
+    // resampling, no render target. A card-sized plate uses ONE quad; the other
+    // three exist only where the panel reaches past the first tile's remainder
+    // (a full-width bar at some window offsets) and are invisible otherwise.
+    //
+    // f215 measured the alternative (`source-clip-*` on a panel-sized quad, no
+    // scissor): each panel then carries its own source rect, so the draws stop
+    // batching and the 1280 feed cost +2.6 ms/frame instead of +0.4. The
+    // oversized quad + scissor keeps one identical paint for every panel.
+    if !root.flat && !AppTheme.qa-no-glass : Rectangle {
         width: 100%;
         height: 100%;
-        source: AppTheme.glass-blur;
-        image-fit: root.fill-image ? fill : cover;
+        background: #00000000;
+        clip: true;
+
+        for cell[i] in [0, 1, 2, 3] : Image {
+            x: (i == 0 || i == 2) ? root.wall-shift-x : root.wall-shift-x + AppTheme.wallpaper-tile;
+            y: i < 2 ? root.wall-shift-y : root.wall-shift-y + AppTheme.wallpaper-tile;
+            width: AppTheme.wallpaper-tile;
+            height: AppTheme.wallpaper-tile;
+            source: AppTheme.glass-blur;
+            image-fit: fill;
+            // The second column/row only exists when this panel reaches past the
+            // first tile's RIGHT/BOTTOM edge (`shift + tile`): a full-width bar,
+            // or a card in the last grid column at some window offsets.
+            visible: (i == 0 || i == 2
+                ? true
+                : root.width > AppTheme.wallpaper-tile + root.wall-shift-x)
+                && (i < 2
+                    ? true
+                    : root.height > AppTheme.wallpaper-tile + root.wall-shift-y);
+        }
     }
 
     // f149 QA counters (no paint work): one per live panel, one per panel that
@@ -2242,7 +2294,7 @@ component ToastIcon inherits Rectangle {
     }
 }
 
-component ToastView inherits Rectangle {
+component ToastView inherits GlassPanel {
     in property <string> message: "";
     in property <int> kind: 0;
     in property <float> progress: 1.0;
@@ -2258,20 +2310,24 @@ component ToastView inherits Rectangle {
     y: self.slot_y + self.rise;
     width: 100%;
     height: 36px;
-    border-radius: 18px;
-    background: AppTheme.player-menu;
-    border-width: 1px;
-    border-color: AppTheme.player-menu-border;
-    drop-shadow-color: AppTheme.ds-color(AppTheme.player-shadow);
-    drop-shadow-blur: AppTheme.ds-blur(12px);
-    drop-shadow-offset-y: 3px;
+    radius: 18px;
+    // f215: a toast is a surface: the wallpaper sample + the chrome film, not an
+    // opaque plate. The 18px radius, hairline and shadow are the ones it had.
+    tint: AppTheme.player-menu;
+    edge: AppTheme.player-menu-border;
+    shadow: true;
+    shadow-color: AppTheme.player-shadow;
+    shadow-blur: 12px;
+    shadow-y: 3px;
     // 180ms in, 200ms out. The same animation carries a slot push-down when a
     // newer toast arrives above an older one.
     animate y { duration: root.shown ? 180ms : 200ms; easing: ease-out; }
 
     // Info uses the accent, success a lifted `player-on` (the raw green is too
-    // dark on `player-menu`), error the theme danger.
-    property <color> tint: root.kind == 1
+    // dark on `player-menu`), error the theme danger. `ink` (not `tint`, which is
+    // the panel's own wallpaper film since f215) colours the icon and the
+    // progress hairline only.
+    property <color> ink: root.kind == 1
         ? AppTheme.player-on.mix(AppTheme.player-fg-strong, 0.55)
         : (root.kind == 2 ? AppTheme.danger : AppTheme.accent);
 
@@ -2302,13 +2358,13 @@ component ToastView inherits Rectangle {
         width: 24px;
         height: 24px;
         border-radius: 12px;
-        background: root.tint.transparentize(0.82);
+        background: root.ink.transparentize(0.82);
 
         ToastIcon {
             x: 4px;
             y: 4px;
             kind: root.kind;
-            tint: root.tint;
+            tint: root.ink;
         }
     }
 
@@ -2331,7 +2387,7 @@ component ToastView inherits Rectangle {
         width: max(0px, (parent.width - 2px) * clamp(root.progress, 0, 1));
         height: 3px;
         border-radius: 1.5px;
-        background: root.tint;
+        background: root.ink;
         opacity: 0.9;
     }
 }
@@ -3213,6 +3269,16 @@ export component PlayerWindow inherits Window {
     out property <length> surface_y: 0px;
     out property <length> surface_w: root.video_w;
     out property <length> surface_h: root.band_h;
+    // f214: the same slot described as insets from the client's four edges. The
+    // composite video layer places its picture from the LIVE client rect plus
+    // these insets (never from `surface_*`, which is one layout pass behind a
+    // resize), so a window drag — `WM_SIZE` arriving before Slint has re-laid
+    // the band out — already scales the picture correctly. Only a panel opening
+    // or fullscreen changes them, and that is published immediately.
+    out property <length> band_inset_l: root.reserve_l;
+    out property <length> band_inset_t: 0px;
+    out property <length> band_inset_r: root.reserve_r;
+    out property <length> band_inset_b: root.reserve_b;
     // The decoded picture's aspect (width / height), published by Rust when a
     // session picks its frame size. The transparent hole the composition layer
     // shows through must have the *source* aspect: a fixed 16:9 hole over a 4:3
@@ -3493,11 +3559,12 @@ export component PlayerWindow inherits Window {
     in property <length> bottom_panel_h: 200px;
     in-out property <int> right_tab: 0;
     callback right_tab_changed(int);
-    // Fullscreen has no room to grow the window, so the SAME three ints switch
-    // to overlay mode there: no strip reserves space, the panels float over the
-    // picture anchored to the same edges. The default binding follows the
-    // player's own `fullscreen` flag (written from Rust by on_toggle_fullscreen),
-    // so the mode flips by itself; the wiring agent may still set it explicitly.
+    // Fullscreen has no room to grow the window, so the SAME three ints do not
+    // resize it there — Rust skips the window resize (see `PanelGeom::overlay`)
+    // and only the strip's width is reserved, taken from the picture. So the
+    // panel opens *inward* from the window's right edge instead of hanging over
+    // the frame (f214: the reserved layout is the only layout; this flag now
+    // means "do not touch the window size", not "float over the picture").
     in property <bool> panels_overlay: root.fullscreen;
     callback panel_changed();
 
@@ -3889,8 +3956,9 @@ export component PlayerWindow inherits Window {
 
     // ---- panel geometry (both layout modes) ----
     // `right_w` is the right strip's real size and never depends on the mode;
-    // `reserve_r` is what the layout takes OUT of the window and is zero in
-    // overlay mode, where the picture keeps the whole window. `pill_y` is the
+    // `reserve_r` is what the layout takes OUT of the window, and it is the
+    // strip's width in **both** modes (f214: fullscreen no longer floats the
+    // panels over the picture — see the note at `reserve_r`). `pill_y` is the
     // VOD pill's top edge in window coordinates: 100px up from the bottom edge,
     // independent of any panel, so the f165 86px pill (10 | 22 | 8 | 36 | 10)
     // keeps the top edge it always had and gains the 6px as bottom inset.
@@ -3905,7 +3973,15 @@ export component PlayerWindow inherits Window {
     // Inert: the bottom strip is gone, the band always uses the full height.
     property <length> bottom_h: 0px;
     property <length> reserve_l: 0px;
-    property <length> reserve_r: root.panels_overlay ? 0px : root.right_w;
+    // f214: the strip reserves its width in BOTH modes. Before this it was
+    // `panels_overlay ? 0px : right_w`, i.e. in fullscreen the picture kept the
+    // whole window and the panel *floated* over its right edge: the strip sat
+    // at `width - 360` but the picture behind it was still laid out 360px
+    // wider, so the panel covered the frame and the comment band instead of
+    // opening into space of its own. "边栏向内展开" is exactly the reserved
+    // layout: the picture gives up 360px on the right, the strip takes it, and
+    // the window is NOT resized (fullscreen already owns the screen).
+    property <length> reserve_r: root.right_w;
     property <length> reserve_b: 0px;
     property <length> video_w: max(0px, root.width - root.reserve_l - root.reserve_r);
     property <length> band_h: max(0px, root.height - root.reserve_b);
@@ -4322,36 +4398,6 @@ export component PlayerWindow inherits Window {
 
     callback set_enhance(int);
 
-    // ---- f204: 画面直出 (DComp picture path) ----
-    // `player_dcomp` is the stored preference (what the next start will use),
-    // `dcomp_active` is the path THIS process runs on — `platform::enabled()`
-    // is a OnceLock, resolved when the platform was installed. They differ
-    // exactly when the switch was flipped after launch, which is when the row
-    // says "重启后生效". Writing the setting is all this row does: it never
-    // restarts the app, and it never changes the current window.
-    in-out property <bool> player_dcomp: false;
-    in property <bool> dcomp_active: false;
-    callback set_player_dcomp(bool);
-
-    pure function dcomp-label() -> string {
-        if (root.player_dcomp != root.dcomp_active) {
-            return root.player_dcomp ? "画面直出：已开启，重启后生效" : "画面直出：已关闭，重启后生效";
-        }
-        // f211: the zero-copy decoder (Media Foundation → NV12 texture, the
-        // 120 fps path) draws into this picture layer, so the row says what it
-        // buys. f212: this is the shipped default, so the on-state says so and
-        // the off-state no longer implies the user has to turn anything on.
-        return root.player_dcomp
-            ? "画面直出：已开启（默认）· 零拷贝 120 帧"
-            : "画面直出：已关闭（可开启零拷贝 120 帧）";
-    }
-
-    // The bracket on the right always names what a click will do, so it stays
-    // usable while the change is still pending a restart.
-    pure function dcomp-action() -> string {
-        return root.player_dcomp ? "关闭" : "开启";
-    }
-
     // ---- 画质 menu helpers ----
     // The 画质 row's value: the current stream's short name as published by
     // Rust, and "自动" until the first stream list arrives. The old default
@@ -4420,6 +4466,13 @@ export component PlayerWindow inherits Window {
     // chrome is on screen: with the pill hidden nothing reads these values, and
     // a property write would dirty the UI layer for no visible pixel.
     callback progress_tick();
+    // f214: the composite picture layer's slot. Fires slowly (100 ms) and
+    // unconditionally — the 33 ms `danmaku_tick` that used to be the only
+    // publisher of the band stops when 弹幕 is off or the video is paused, which
+    // left a resize (and a panel opening) unapplied for as long as playback was
+    // idle. Resizing itself does not wait for this: `WM_SIZE` re-derives the
+    // band from the live client rect and the insets below.
+    callback layout_tick();
     callback seek(float);
     callback volume_changed(float);
     callback toggle_mute();
@@ -4487,6 +4540,18 @@ export component PlayerWindow inherits Window {
         interval: 33ms;
         running: root.danmaku_running;
         triggered => { root.danmaku_tick(); }
+    }
+
+    // f214: the composite layer's layout lane. 10 Hz, always running: the band
+    // is the client rect minus the panel insets, so the only thing this tick
+    // catches is an inset change that no `WM_SIZE` announces (a panel opening or
+    // closing while fullscreen, a fit-mode pick) — and it must catch it while
+    // paused or with 弹幕 off, which is when the 33 ms content tick is silent.
+    // 10 Hz on a window that already paints through its own 4 ms timer is free.
+    Timer {
+        interval: 100ms;
+        running: true;
+        triggered => { root.layout_tick(); }
     }
 
     // The danmaku motion lane. Split from the 33 ms tick above on purpose: that
@@ -5022,15 +5087,14 @@ export component PlayerWindow inherits Window {
 
     // ===================== 画面区 (video area) =====================
     // The picture and every piece of chrome live here, in one strip whose
-    // geometry depends on the panel mode:
-    //   reserved (windowed): x = left strip, width = window - both strips, so
-    //     the picture keeps its exact size while Rust grows the window by the
-    //     panel size in the same event as the integer change.
-    //   overlay (fullscreen): x = 0, width = window, so the picture stays
-    //     full-bleed and the panels float above it.
-    // The band's height is the strip minus the bottom strip (reserved mode);
-    // in overlay mode the bottom panel floats and the band keeps the full
-    // height.
+    // geometry is the window minus the panel insets:
+    //   windowed: x = left inset, width = window - both strips, so the picture
+    //     keeps its exact size while Rust grows the window by the panel size in
+    //     the same event as the integer change.
+    //   fullscreen (f214): the window does NOT grow (it is already the screen),
+    //     so the strip keeps `width = window - 360` and the panel opens inward
+    //     from the right edge over that space instead of over the picture.
+    // The band's height is the full window height: the bottom panel is gone.
     Rectangle {
         x: root.reserve_l;
         y: 0;
@@ -5570,7 +5634,12 @@ export component PlayerWindow inherits Window {
             // 设置 panel's 其他 section. A TouchArea, not a Rectangle, so the
             // whole 68x26 cluster is one hit target.
             top_controls := TouchArea {
-                x: parent.width - 80px - (root.panels_overlay ? root.right_w : 0px);
+                // f214: the cluster lives inside the picture strip, and the
+                // strip now gives up the panel's width in fullscreen too, so
+                // there is no separate `right_w` offset to subtract any more
+                // (the old offset would have moved it 360px left of the panel
+                // it was already clear of).
+                x: parent.width - 80px;
                 y: 12px;
                 width: 68px;
                 height: 26px;
@@ -6538,7 +6607,8 @@ export component PlayerWindow inherits Window {
                 radius: 12px;
                 tint: AppTheme.player-menu-tint;
                 edge: AppTheme.player-menu-border;
-                fill-image: true;
+                // f215: the sample is the panel's own patch of the wallpaper,
+                // so the popover needs no `cover` crop and no extra switch.
                 shadow: true;
                 shadow-color: AppTheme.player-shadow;
                 shadow-blur: 14px;
@@ -6678,7 +6748,8 @@ export component PlayerWindow inherits Window {
                 radius: 10px;
                 tint: AppTheme.player-menu-tint;
                 edge: AppTheme.player-menu-border;
-                fill-image: true;
+                // f215: the sample is the panel's own patch of the wallpaper,
+                // so the popover needs no `cover` crop and no extra switch.
                 shadow: true;
                 shadow-color: #00000073;
                 shadow-blur: 14px;
@@ -7031,7 +7102,8 @@ export component PlayerWindow inherits Window {
                 radius: 10px;
                 tint: AppTheme.player-menu-tint;
                 edge: AppTheme.player-menu-border;
-                fill-image: true;
+                // f215: the sample is the panel's own patch of the wallpaper,
+                // so the popover needs no `cover` crop and no extra switch.
                 shadow: true;
                 shadow-color: #00000073;
                 shadow-blur: 14px;
@@ -7368,10 +7440,11 @@ export component PlayerWindow inherits Window {
     // ===================== 右栏: 信息 / 评论 / 性能 / 设置 =====================
     // One strip, four contents behind a 40px tab row: 0 信息 (视频信息 + 互动,
     // the old left strip), 1 评论, 2 性能, 3 设置. `right_panel` is only
-    // "is it open"; `right_tab` picks the body. Reserved mode: the strip
-    // occupies the new space Rust added on the right edge, so the picture keeps
-    // its size. Overlay mode (fullscreen): it hangs on the picture's right edge
-    // and paints above it. The body slides 18px out of the edge and fades in
+    // "is it open"; `right_tab` picks the body. Windowed: the strip occupies the
+    // new space Rust added on the right edge, so the picture keeps its size.
+    // Fullscreen (f214): the window cannot grow, so the strip takes its 360px
+    // out of the picture instead and opens inward from the right edge — it never
+    // sits outside the window. The body slides 18px out of the edge and fades in
     // place (160ms) when the panel opens.
     Rectangle {
         x: root.width - root.right_w;
@@ -7392,9 +7465,8 @@ export component PlayerWindow inherits Window {
             radius: 0px;
             tint: AppTheme.player-panel-tint;
             edge: AppTheme.player-menu-border;
-            // The whole wallpaper, not a 360px crop of its centre: the strip is
-            // then literally a window onto the same layer as the home window.
-            fill-image: true;
+            // f215: the strip samples its own 360px column of the wallpaper, so
+            // it is literally a window onto the same layer as the home window.
         }
 
         right_strip_area := PanelHit { width: 100%; height: 100%; dismiss => { root.close-right(); } pass-scroll: true; }
@@ -9138,7 +9210,7 @@ export component PlayerWindow inherits Window {
                             }
                             Rectangle {
                                 property <length> sub_h: root.enhance_menu_open
-                                    ? (4 * 34px + 6px + 26px + (root.enhance_hint == "" ? 0px : 21px))
+                                    ? (4 * 34px + 6px + (root.enhance_hint == "" ? 0px : 21px))
                                     : 0px;
                                 height: self.sub_h;
                                 clip: !AppTheme.qa-no-clip;
@@ -9196,63 +9268,17 @@ export component PlayerWindow inherits Window {
                                     }
                                 }
 
-                                // f204: 画面直出 — the only switch that makes
-                                // tiers 1-3 usable, so it sits directly under
-                                // them instead of in the 设置 panel: the reason
-                                // the rows above are grey is answered here.
-                                // The right-hand bracket names the action
-                                // (开启/关闭); the label reports the state, and
-                                // after a flip it says the change is waiting for
-                                // a restart — this row never restarts anything.
-                                Rectangle {
-                                    x: 3px;
-                                    y: 3px + 4 * 34px;
-                                    width: max(0px, parent.width - 6px);
-                                    height: 26px;
-                                    border-radius: 5px;
-                                    background: d_item.has-hover
-                                        ? AppTheme.player-menu-hover
-                                        : #00000000;
-                                    animate background { duration: 120ms; easing: ease-out; }
-
-                                    Text {
-                                        x: 10px;
-                                        width: max(0px, parent.width - 20px - 52px);
-                                        height: parent.height;
-                                        text: root.dcomp-label();
-                                        color: root.player_dcomp == root.dcomp_active
-                                            ? AppTheme.player-text-dim
-                                            : AppTheme.player-fg-strong;
-                                        font-size: 11px;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
-
-                                    Text {
-                                        x: parent.width - 52px;
-                                        width: 42px;
-                                        height: parent.height;
-                                        text: "[" + root.dcomp-action() + "]";
-                                        color: AppTheme.player-text;
-                                        font-size: 11px;
-                                        horizontal-alignment: right;
-                                        vertical-alignment: center;
-                                    }
-
-                                    d_item := PanelHit {
-                                        pass-scroll: true;
-                                        clicked => {
-                                            root.player_dcomp = !root.player_dcomp;
-                                            root.set_player_dcomp(root.player_dcomp);
-                                        }
-                                        dismiss => { root.close-right(); }
-                                    }
-                                }
+                                // f214: 画面直出 is not a switch any more — the
+                                // composite picture path is the only path, so
+                                // the row that used to say "重启后生效" is gone
+                                // and the hint below (greyed tiers, when the
+                                // shader compiler is unavailable) is the only
+                                // thing that can appear under the list.
 
                                 // The one line that explains every greyed row.
                                 if root.enhance_hint != "" : Text {
                                     x: 10px;
-                                    y: 3px + 4 * 34px + 26px;
+                                    y: 3px + 4 * 34px;
                                     width: max(0px, parent.width - 20px);
                                     height: 18px;
                                     text: root.enhance_hint;
@@ -11841,6 +11867,19 @@ component LiveRoomCard inherits Rectangle {
     background: #00000000;
     border-radius: 8px;
 
+    // f215: the live card is a surface like every other card - the wallpaper
+    // sample under the tint, so the 直播 grid no longer reads as a bare page
+    // with covers dropped on it. The cover sits above it at 1px inset.
+    GlassPanel {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        radius: 8px;
+        flat: AppTheme.cards_flat;
+        tint: root.hot ? AppTheme.glass-tint-hover : AppTheme.glass-tint;
+    }
+
     Rectangle {
         x: 0;
         y: 0;
@@ -12175,15 +12214,21 @@ component FishRecipeCard inherits Rectangle {
     width: 172px;
     height: 96px;
     border-radius: 12px;
-    border-width: 1px;
-    border-color: root.active
-        ? AppTheme.accent
-        : (hit.has-hover ? AppTheme.accent.transparentize(0.4) : AppTheme.bar-border);
-    background: root.active
-        ? AppTheme.accent.transparentize(0.9)
-        : (hit.has-hover ? AppTheme.card-alt : AppTheme.card);
-    animate border-color { duration: 120ms; easing: ease-out; }
-    animate background { duration: 120ms; easing: ease-out; }
+    background: #00000000;
+    // f215: the 食谱 card is a surface like the fish card beside it: wallpaper
+    // sample + tint (the accent is ink, never the plate).
+    GlassPanel {
+        width: 100%;
+        height: 100%;
+        radius: 12px;
+        flat: AppTheme.cards_flat;
+        tint: root.active
+            ? AppTheme.accent.transparentize(0.86)
+            : (hit.has-hover ? AppTheme.glass-tint-hover : AppTheme.glass-tint);
+        edge: root.active
+            ? AppTheme.accent
+            : (hit.has-hover ? AppTheme.accent.transparentize(0.4) : AppTheme.bar-border);
+    }
 
     Text {
         x: 12px;
@@ -12269,13 +12314,13 @@ component FishCard inherits Rectangle {
         clicked => { root.open(root.item.bvid); }
     }
 
-    // Flat translucent plate, no wallpaper, no shadow (the project's rule for
-    // card-sized surfaces); the 18px radius is the site-wide one.
+    // The card surface the whole app shares: the wallpaper sampled at THIS
+    // card's position (f215), tinted, with the 18px site radius. No shadow.
     plate := GlassPanel {
         width: 100%;
         height: 100%;
         radius: 18px;
-        flat: true;
+        flat: AppTheme.cards_flat;
         // f199: same scroll-time downgrade as the feed card (see
         // `AppTheme.scroll-lite`): the fish page renders EVERY card in a plain
         // VerticalLayout, so the per-card clip layer is the tank's frame cost.
@@ -13000,6 +13045,114 @@ component SearchGrid inherits Rectangle {
     }
 }
 
+// Row-virtualised 番剧/影视 search results: the 番剧 page's poster card, one row
+// per `cols` seasons. Same band geometry and wheel-only scrolling as SearchGrid.
+component SearchPosterGrid inherits Rectangle {
+    in property <[PgcCard]> items;
+    callback activate(int);
+    in property <int> cols: 6;
+    in property <int> page-offset: 0;
+    in property <int> page-size: 24;
+    in property <length> available-width: 400px;
+    property <length> gap: 12px;
+    property <length> card-w: max(86px, (available-width - gap * (cols - 1)) / cols);
+    property <length> card-h: card-w * 1.5 + 46px;
+    property <int> shown-count: max(0, min(page-size, items.length - page-offset));
+    property <int> row-count: (shown-count + cols - 1) / cols;
+
+    out property <length> scroll-y: vlist.content-y;
+
+    background: #00000000;
+
+    vlist := ListView {
+        width: 100%;
+        height: 100%;
+        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        mouse-drag-pan-enabled: false;
+
+        for r in row-count : Rectangle {
+            width: 100%;
+            height: root.card-h + root.gap + (r == row-count - 1 ? AppTheme.bar-clearance : 0px);
+            background: #00000000;
+
+            for c in cols : Rectangle {
+                x: c * (root.card-w + root.gap);
+                y: 0;
+                width: root.card-w;
+                height: root.card-h;
+                background: #00000000;
+                property <int> idx: root.page-offset + r * cols + c;
+
+                if idx < items.length && (idx - root.page-offset) < root.page-size : PgcPosterCard {
+                    width: parent.width;
+                    height: parent.height;
+                    card-width: root.card-w;
+                    thumb: items[idx].thumb;
+                    title: items[idx].title;
+                    meta: items[idx].meta;
+                    badge: items[idx].badge;
+                    follows: items[idx].follows;
+                    rank: items[idx].rank;
+                    progress: items[idx].progress;
+                    activate => { root.activate(idx); }
+                }
+            }
+        }
+    }
+}
+
+// Row-virtualised 直播 search results: the 直播 page's room card (LIVE pill,
+// 人气 line, 主播 · 分区), one row per `cols` rooms.
+component SearchLiveGrid inherits Rectangle {
+    in property <[LiveCard]> items;
+    callback activate(int);
+    in property <int> cols: 3;
+    in property <int> page-offset: 0;
+    in property <int> page-size: 24;
+    in property <length> available-width: 400px;
+    property <length> gap: 12px;
+    property <length> card-w: max(120px, (available-width - gap * (cols - 1)) / cols);
+    property <length> card-h: card-w * 0.5625 + 42px;
+    property <int> shown-count: max(0, min(page-size, items.length - page-offset));
+    property <int> row-count: (shown-count + cols - 1) / cols;
+
+    out property <length> scroll-y: vlist.content-y;
+
+    background: #00000000;
+
+    vlist := ListView {
+        width: 100%;
+        height: 100%;
+        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        mouse-drag-pan-enabled: false;
+
+        for r in row-count : Rectangle {
+            width: 100%;
+            height: root.card-h + root.gap + (r == row-count - 1 ? AppTheme.bar-clearance : 0px);
+            background: #00000000;
+
+            for c in cols : Rectangle {
+                x: c * (root.card-w + root.gap);
+                y: 0;
+                width: root.card-w;
+                height: root.card-h;
+                background: #00000000;
+                property <int> idx: root.page-offset + r * cols + c;
+
+                if idx < items.length && (idx - root.page-offset) < root.page-size : LiveRoomCard {
+                    width: parent.width;
+                    height: parent.height;
+                    card-width: root.card-w;
+                    item: items[idx];
+                    activate => { root.activate(idx); }
+                }
+            }
+        }
+    }
+}
+
 // Row-virtualised favourite-folder contents (see CardGrid / FeedGrid).
 component FolderGrid inherits Rectangle {
     in property <[FolderItemRow]> items;
@@ -13534,13 +13687,13 @@ component MsgListRow inherits Rectangle {
     clip: !AppTheme.qa-no-clip;
     background: #00000000;
 
-    // A message row: flat tint, hover lifts the tone. Only a session actually
-    // opens on click.
+    // A message row: the wallpaper sample + tint; hover lifts the tone. Only a
+    // session actually opens on click.
     GlassPanel {
         width: 100%;
         height: 100%;
         radius: 8px;
-        flat: true;
+        flat: AppTheme.cards_flat;
         tint: row_hit.has-hover ? AppTheme.glass-tint-hover : AppTheme.glass-tint;
     }
 
@@ -16381,7 +16534,7 @@ export component AppWindow inherits Window {
             root.pv_block = false;
             root.pv_dwell_ms = 0;
         }
-        if (!disc && !panel && root.playlist_open) {
+        if (!disc && !panel && root.playlist_open && !AppTheme.qa_hold_playlist) {
             root.pv_away_ms += 60;
             if (root.pv_away_ms >= 300) {
                 let away = root.pv_away_ms;
@@ -16829,6 +16982,19 @@ export component AppWindow inherits Window {
     in-out property <int> search_tab: 0;
     in property <bool> search_loading: false;
     in property <[SearchRow]> search_items;
+    // 番剧 / 影视 and 直播 results have their own card shapes, so each tab fills
+    // its own model; Rust empties the other two on every load (one publish).
+    in property <[PgcCard]> search_media_items;
+    in property <[LiveCard]> search_live_items;
+    // The five search tabs, in tab order. A Rust-side value only ever selects
+    // an index; this list is the label source (same order as `SearchKind`).
+    in property <[string]> search_tabs: ["视频", "番剧", "影视", "直播", "用户"];
+    // How many cards the SELECTED tab holds. The three result models are
+    // published together, so the empty-state message has to look at the one
+    // that is on screen.
+    property <int> search_active_count: root.search_tab <= 0 || root.search_tab == 4
+        ? root.search_items.length
+        : (root.search_tab <= 2 ? root.search_media_items.length : root.search_live_items.length);
     in property <string> search_page_text: "";
     in property <string> search_status: "";
     in property <bool> search_has_prev: false;
@@ -18574,47 +18740,47 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     height: 30px;
 
-                    Rectangle {
-                        width: 80px;
+                    // 视频 / 番剧 / 影视 / 直播 / 用户: one chip per index of
+                    // `search_tabs`, the same pill the page used for its two.
+                    for label[index] in root.search_tabs : Rectangle {
+                        width: 72px;
                         height: 30px;
                         border-radius: 6px;
                         border-width: 1px;
-                        border-color: root.search_tab == 0 ? #00000000 : AppTheme.chip-edge;
-                        background: root.search_tab == 0 ? AppTheme.accent : AppTheme.chip-bg;
-                        Text {
-                            text: "视频";
-                            color: root.search_tab == 0 ? AppTheme.accent-fg : AppTheme.pill-fg;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                        TouchArea { clicked => { root.search_tab_changed(0); } }
-                    }
+                        border-color: root.search_tab == index ? #00000000 : AppTheme.chip-edge;
+                        background: root.search_tab == index
+                            ? AppTheme.accent
+                            : (tab_hit.has-hover ? AppTheme.chip-hover : AppTheme.chip-bg);
 
-                    Rectangle {
-                        width: 80px;
-                        height: 30px;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: root.search_tab == 1 ? #00000000 : AppTheme.chip-edge;
-                        background: root.search_tab == 1 ? AppTheme.accent : AppTheme.chip-bg;
-                        Text {
-                            text: "用户";
-                            color: root.search_tab == 1 ? AppTheme.accent-fg : AppTheme.pill-fg;
-                            font-size: 13px;
+                        tab_text := Text {
+                            width: 100%;
+                            height: 100%;
+                            text: label;
+                            color: root.search_tab == index ? AppTheme.accent-fg : AppTheme.pill-fg;
+                            font-size: 12px;
                             horizontal-alignment: center;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
-                        TouchArea { clicked => { root.search_tab_changed(1); } }
+
+                        tab_hit := TouchArea {
+                            accessible-role: button;
+                            accessible-label: label;
+                            clicked => { root.search_tab_changed(index); }
+                        }
                     }
 
                     Rectangle { horizontal-stretch: 1; background: #00000000; }
 
                     Text {
-                        text: root.search_status;
+                        // Empty / failed copy is printed in the middle of the
+                        // results area (below), so the corner line stays for
+                        // "没有更多了" and the like.
+                        text: root.search_active_count == 0 ? "" : root.search_status;
                         color: AppTheme.text-dim;
                         font-size: 12px;
                         vertical-alignment: center;
+                        overflow: elide;
                     }
                 }
 
@@ -18624,29 +18790,94 @@ export component AppWindow inherits Window {
                     font-size: 13px;
                 }
 
-                ScrollView {
-                    // One page of `list_page_size` cards. The grid owns its
-                    // scrolling (row-virtualised, wheel only, no scrollbar) and
-                    // keeps the 84px page-bar clearance on its last row.
-                    search_grid := SearchGrid {
-                        changed scroll-y => { root.qa_hot_scroll = self.scroll-y; }
-                        init => { root.qa_hot_scroll = self.scroll-y; }
-                        items: root.search_items;
-                        cols: root.video-cols;
-                        available-width: root.grid-avail;
-                        page-offset: root.list_offset;
-                        page-size: root.list_page_size;
-                        people: root.search_tab == 1;
-                        now-ts: root.now_ts;
-                        activate(idx) => { root.open_search_item(idx); }
-                        card_open(idx, mode) => { root.card_open(idx, mode); }
-                        owner(idx, mid) => {
-                            // The UP name is the card's own link, exactly like
-                            // the home feed's. An empty mid (a user row) keeps
-                            // the current behaviour.
-                            if (mid != "" && mid != "0") {
-                                root.open_up_mid(mid);
+                // 视频 / 用户: the existing 16:9 cards.
+                search_body := Rectangle {
+                    vertical-stretch: 1;
+                    background: #00000000;
+
+                    if root.search_tab == 0 || root.search_tab == 4 : ScrollView {
+                        width: 100%;
+                        height: 100%;
+                        // One page of `list_page_size` cards. The grid owns its
+                        // scrolling (row-virtualised, wheel only, no scrollbar) and
+                        // keeps the 84px page-bar clearance on its last row.
+                        search_grid := SearchGrid {
+                            changed scroll-y => { root.qa_hot_scroll = self.scroll-y; }
+                            init => { root.qa_hot_scroll = self.scroll-y; }
+                            items: root.search_items;
+                            cols: root.video-cols;
+                            available-width: root.grid-avail;
+                            page-offset: root.list_offset;
+                            page-size: root.list_page_size;
+                            people: root.search_tab == 4;
+                            now-ts: root.now_ts;
+                            activate(idx) => { root.open_search_item(idx); }
+                            card_open(idx, mode) => { root.card_open(idx, mode); }
+                            owner(idx, mid) => {
+                                // The UP name is the card's own link, exactly like
+                                // the home feed's. An empty mid (a user row) keeps
+                                // the current behaviour.
+                                if (mid != "" && mid != "0") {
+                                    root.open_up_mid(mid);
+                                }
                             }
+                        }
+                    }
+
+                    // 番剧 / 影视: 2:3 posters, the 番剧 page's own card.
+                    if root.search_tab == 1 || root.search_tab == 2 : ScrollView {
+                        width: 100%;
+                        height: 100%;
+                        search_media_grid := SearchPosterGrid {
+                            changed scroll-y => { root.qa_hot_scroll = self.scroll-y; }
+                            init => { root.qa_hot_scroll = self.scroll-y; }
+                            items: root.search_media_items;
+                            cols: root.pgc_cols(root.grid-avail);
+                            available-width: root.grid-avail;
+                            page-offset: root.list_offset;
+                            page-size: root.list_page_size;
+                            activate(idx) => { root.open_search_item(idx); }
+                        }
+                    }
+
+                    // 直播: 16:9 room cards with the 直播中 pill and 人气 line, the
+                    // 直播 page's own card.
+                    if root.search_tab == 3 : ScrollView {
+                        width: 100%;
+                        height: 100%;
+                        search_live_grid := SearchLiveGrid {
+                            changed scroll-y => { root.qa_hot_scroll = self.scroll-y; }
+                            init => { root.qa_hot_scroll = self.scroll-y; }
+                            items: root.search_live_items;
+                            cols: root.width >= 900px ? 4 : 3;
+                            available-width: root.grid-avail;
+                            page-offset: root.list_offset;
+                            page-size: root.list_page_size;
+                            activate(idx) => { root.open_search_item(idx); }
+                        }
+                    }
+
+                    // Empty / failed: the corner line is hidden in this state,
+                    // so the results area itself says it where the user is
+                    // looking. Only when the tab really has no cards - the
+                    // skeleton rows a switch publishes are cards, so they never
+                    // hide the message before a load even starts.
+                    if root.search_active_count == 0 && root.search_status != "" : Rectangle {
+                        width: 100%;
+                        height: 100%;
+                        background: #00000000;
+
+                        Text {
+                            x: 24px;
+                            y: 0;
+                            width: max(0px, parent.width - 48px);
+                            height: 100%;
+                            text: root.search_status;
+                            color: AppTheme.text-soft;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
                         }
                     }
                 }
@@ -19480,10 +19711,18 @@ export component AppWindow inherits Window {
                         width: 104px;
                         height: root.pgc_sorts.length * 30px + 8px;
                         border-radius: 10px;
-                        background: AppTheme.card;
-                        border-width: 1px;
-                        border-color: AppTheme.border-popup;
+                        background: #00000000;
                         clip: true;
+
+                        // f215: the 排序 popup is a surface, so it samples the
+                        // wallpaper under its own patch (no opaque card here).
+                        GlassPanel {
+                            width: 100%;
+                            height: 100%;
+                            radius: 10px;
+                            tint: AppTheme.bar-fill;
+                            edge: AppTheme.border-popup;
+                        }
 
                         for label[i] in root.pgc_sorts : Rectangle {
                             x: 4px;
@@ -22512,7 +22751,7 @@ export component AppWindow inherits Window {
                                 width: 100%;
                                 height: fish_page.card_h;
                                 radius: 18px;
-                                flat: true;
+                                flat: AppTheme.cards_flat;
                                 edge: AppTheme.bar-border;
 
                                 // The mascot lives here now: it only shows when
@@ -23940,7 +24179,7 @@ export component AppWindow inherits Window {
                         for row[index] in root.relation_items : GlassPanel {
                             height: 64px;
                             radius: 8px;
-                            flat: true;
+                            flat: AppTheme.cards_flat;
 
                             TouchArea { clicked => { root.open_relation_user(row.mid); } }
 

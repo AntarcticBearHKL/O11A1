@@ -17,7 +17,7 @@
 use crate::*;
 
 /// `(samples, p50, p95, p99, max)` of a pooled gap set, in milliseconds.
-fn percentiles(mut samples: Vec<f64>) -> (usize, f64, f64, f64, f64) {
+pub(crate) fn percentiles(mut samples: Vec<f64>) -> (usize, f64, f64, f64, f64) {
     if samples.is_empty() {
         return (0, 0.0, 0.0, 0.0, 0.0);
     }
@@ -40,7 +40,7 @@ fn f199_log(line: impl AsRef<str>) {
 }
 
 /// The product switch the two passes flip (`AppTheme.scroll-degrade`).
-fn f199_degrade(weak: &Weak<AppWindow>, on: bool) {
+pub(crate) fn f199_degrade(weak: &Weak<AppWindow>, on: bool) {
     let _ = f145_on_ui(weak, move |ui| {
         let theme = ui.global::<AppTheme>();
         theme.set_scroll_degrade(on);
@@ -66,7 +66,7 @@ fn f199_rewind(weak: &Weak<AppWindow>, x: f32, y: f32) {
 /// Three reps of three seconds of real wheel input; returns the pooled gaps.
 /// Each rep is also logged on its own, so a spike can be attributed to the
 /// first (cold) scroll of a page rather than to the steady state.
-fn f199_scroll(weak: &Weak<AppWindow>, label: &str, x: f32, y: f32, reps: usize, ms: u64) -> Vec<f64> {
+pub(crate) fn f199_scroll(weak: &Weak<AppWindow>, label: &str, x: f32, y: f32, reps: usize, ms: u64) -> Vec<f64> {
     let mut pooled: Vec<f64> = Vec::new();
     // One throwaway scroll before the measured reps. The FIRST pass over a page
     // pays the cold costs that are not scrolling (glyph atlas entries for titles
@@ -133,6 +133,10 @@ fn f199_one(weak: &Weak<AppWindow>, page: &str, degrade: bool, x: f32, y: f32) -
 ///   * `history` — 历史 with the 清空 button armed (the confirm state), then the
 ///     显示条数 picker after a real switch to 50 (the trimmed list).
 pub(crate) fn maybe_start_f199_shot(weak: Weak<AppWindow>) {
+    // f215 owns its own screenshots through the same call site.
+    if crate::qa::f215::maybe_start_shot(weak.clone()) {
+        return;
+    }
     let Some(kind) = env::var("BILI_F199_SHOT") else {
         return;
     };
@@ -273,6 +277,10 @@ pub(crate) fn maybe_start_f199_shot(weak: Weak<AppWindow>) {
 
 /// One env-driven run (`BILI_F199_TEST=1`), see the module comment.
 pub(crate) fn maybe_start_f199_test(weak: Weak<AppWindow>) {
+    // f215 owns its own perf table through the same call site.
+    if crate::qa::f215::maybe_start_perf(weak.clone()) {
+        return;
+    }
     if !env::flag("BILI_F199_TEST") {
         return;
     }

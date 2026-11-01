@@ -99,14 +99,17 @@ pub struct Settings {
     /// 启动时把它当作关闭（见 `player_host::publish_enhance`）。
     #[serde(default)]
     pub player_enhance: u32,
-    /// 画面直出（DComp 播放路径）开关，默认 `true`（f212）。
-    /// `true` 时播放器窗口走 `src/dcomp` 的合成树，画质增强的 1–3 档才有意义，
-    /// f209 的零拷贝解码（[`Self::player_mf_decode`]）也才有可写的设备：这一
-    /// 项是 120 帧 + 零上传那条路径的总开关。
-    /// 只在启动时求值一次（`dcomp::platform::enabled` 的 `OnceLock`），所以菜单
-    /// 里打开/关闭只写文件，重启后才生效。`BILI_PLAYER_DCOMP` 环境变量优先于
-    /// 本字段（QA 脚本按次切换路径，不碰用户的 `settings.json`）；`=0` 是逃生阀，
-    /// 一键回到改动前的 winit 窗口 + ffmpeg 管道。
+    /// **已废弃，仅为兼容旧 `settings.json`（f214）。**
+    ///
+    /// 画面直出（DComp 播放路径）现在是**唯一**路径，不再由这个字段决定：
+    /// [`crate::dcomp::platform::enabled`] 恒为 `true`，只有环境变量
+    /// `BILI_PLAYER_DCOMP=0` 能退回 winit + ffmpeg。这个字段还留着，是因为旧
+    /// 版本写过的文件里仍带着它（读的时候要能解析，写的时候要保持原样），但
+    /// **没有任何代码读它**：它当初只能在下一个进程生效（窗口类在启动时选定），
+    /// 于是"开/关"实际是"重启才知道"，而一次没落盘的写入和一次成功的写入看起来
+    /// 完全一样。f214 去掉了这个开关，也去掉了这条歧义。
+    ///
+    /// 零拷贝解码（[`Self::player_mf_decode`]）同样不再需要它为前置条件。
     #[serde(default = "default_player_dcomp")]
     pub player_dcomp: bool,
     /// 零拷贝解码（Media Foundation 硬件解码 → NV12 纹理直接上屏），f209。
@@ -114,12 +117,12 @@ pub struct Settings {
     /// 打不开（没有硬件解码器 / 没有 DComp 视频层）时自动回退 ffmpeg 管道，
     /// 日志写 `decode fallback reason=…`。`BILI_DECODE=ffmpeg` 按次关闭。
     ///
-    /// f211：这条路径**只在画面直出（[`Self::player_dcomp`]）开启时有意义** ——
-    /// 解码器写进 DComp 视频层的设备，winit 画面路径没有那个层，也没有可写的
-    /// 设备。画面直出关闭时它不会尝试（日志 `decode fallback
-    /// reason=no_dcomp_platform`，一次），播放行为与改动前完全一致；开启后
-    /// 只要解码器能打开，seek / 换档 / 起播都走零拷贝，120 帧插帧也才有 GPU
-    /// 光流可做。
+    /// f211：这条路径写进的是 DComp 视频层的设备 —— 只有画面直出这条播放路径
+    /// 有那个层。f214 之后画面直出恒为开（`BILI_PLAYER_DCOMP=0` 是唯一的例外），
+    /// 所以这个开关现在是"零拷贝开/关"本身，不再是"在有画面的前提下开/关"：
+    /// 逃生阀生效时它不会尝试（日志 `decode fallback reason=no_dcomp_platform`，
+    /// 一次），播放行为与改动前完全一致；开着时只要解码器能打开，seek / 换档 /
+    /// 起播都走零拷贝，120 帧插帧也才有 GPU 光流可做。
     #[serde(default = "default_player_mf_decode")]
     pub player_mf_decode: bool,
     #[serde(default = "default_player_speed")]
@@ -345,6 +348,10 @@ pub struct Settings {
     /// 见 [`normalise_pgc_sorts`]。
     #[serde(default)]
     pub pgc_sorts: BTreeMap<String, String>,
+    /// 搜索页上次选中的类型：0 视频 / 1 番剧 / 2 影视 / 3 直播 / 4 用户
+    /// （见 [`normalise_search_tab`]）。重启后搜索页回到这个 tab。
+    #[serde(default)]
+    pub search_tab: i32,
 }
 
 /// Number of remappable player actions.
@@ -411,8 +418,18 @@ pub fn normalise_pgc_sorts(stored: BTreeMap<String, String>) -> BTreeMap<String,
         })
         .collect()
 }
-/// 关闭主窗口后的行为（见 [`Settings::close_action`]）：1 = 隐藏到系统托盘,
-/// 2 = 直接退出程序.
+/// Snap a stored 搜索 tab to the five the UI has: 0 视频 / 1 番剧 / 2 影视 /
+/// 3 直播 / 4 用户. Anything else (a hand-edited file, a version that had fewer
+/// tabs) opens the search page on 视频 rather than on a tab that does not exist.
+pub fn normalise_search_tab(value: i32) -> i32 {
+    if (0..=4).contains(&value) {
+        value
+    } else {
+        0
+    }
+}
+
+/// 关闭主窗口后的行为（见 [`Settings::close_action`]）：1 = 隐藏到系统托盘,/// 2 = 直接退出程序.
 ///
 /// `0`（旧的「最小化到任务栏」）已经下线：最小化之后窗口仍然占着任务栏按钮，
 /// 在主窗口的 ✕ 上看起来和「没关掉」一模一样，正是用户报的那个问题。
@@ -538,11 +555,10 @@ fn default_player_mf_decode() -> bool {
     true
 }
 
-/// 画面直出默认 **开启**（f212）。
+/// 兼容旧文件用：`player_dcomp` 缺失时的反序列化默认值。
 ///
-/// f204 引入时它是 opt-in，理由只有一条：新路径要用户显式同意才切换。f212
-/// 的两个入口问题修掉之后，没有理由让出厂配置停在 winit + ffmpeg（1080p 上
-/// 视频 60 帧、每帧一次上屏），零拷贝路径 120 帧、零上传、seek p50 39 ms。
+/// f214 之后这个字段不再被读取（见 [`Settings::player_dcomp`]）；保留默认值只
+/// 是为了让旧 `settings.json` 继续解析成功，并在重写文件时保持同样的形状。
 fn default_player_dcomp() -> bool {
     true
 }
@@ -1202,36 +1218,13 @@ impl Default for Settings {
             fish_model_mirror: default_fish_model_mirror(),
             fish_vision_detail: default_fish_vision_detail(),
             pgc_sorts: BTreeMap::new(),
+            search_tab: 0,
         }
     }
 }
 
 pub fn settings_path() -> PathBuf {
     crate::paths::root().join("settings.json")
-}
-
-/// `player_dcomp` alone, straight from `settings.json`.
-///
-/// [`crate::dcomp::platform::enabled`] is evaluated once, during platform
-/// installation, **before** the settings store is built. Calling [`load`] there
-/// would pull the whole normalisation pass (and its best-effort write-back) into
-/// start-up, and would couple the two modules' initialisation; this reads the
-/// one field with a tolerant parse instead. A missing file, an unreadable file
-/// or a missing key all mean the shipped default of [`default_player_dcomp`]
-/// (`true` since f212); only an explicit `false` — or `BILI_PLAYER_DCOMP=0`,
-/// which the caller checks first — turns the path off.
-pub fn read_player_dcomp() -> bool {
-    /// Only the field we need: `serde` ignores the rest of the document.
-    #[derive(Deserialize)]
-    struct StoredPath {
-        #[serde(default = "default_player_dcomp")]
-        player_dcomp: bool,
-    }
-    std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|data| serde_json::from_str::<StoredPath>(&data).ok())
-        .map(|stored| stored.player_dcomp)
-        .unwrap_or_else(default_player_dcomp)
 }
 
 /// Load preferences, clamping corrupted values and falling back to defaults.
@@ -1331,6 +1324,7 @@ pub fn load() -> Settings {
         fish_model_mirror: normalise_fish_model_mirror(&settings.fish_model_mirror),
         fish_vision_detail: normalise_fish_vision_detail(&settings.fish_vision_detail),
         pgc_sorts: normalise_pgc_sorts(settings.pgc_sorts),
+        search_tab: normalise_search_tab(settings.search_tab),
     };
     if loaded.theme != stored_theme {
         let _ = save(&loaded);
@@ -1642,8 +1636,26 @@ mod tests {
     }
 
     #[test]
-    fn close_action_accepts_every_offered_value() {
-        for value in CLOSE_ACTIONS {
+    fn search_tab_survives_a_round_trip_and_rejects_corrupt_values() {
+        for value in 0..=4 {
+            assert_eq!(normalise_search_tab(value), value);
+        }
+        for value in [-3, 5, 7, i32::MAX] {
+            assert_eq!(normalise_search_tab(value), 0);
+        }
+        let mut settings = Settings::default();
+        assert_eq!(settings.search_tab, 0, "default tab is 视频");
+        settings.search_tab = 3;
+        let json = serde_json::to_string(&settings).expect("serialise");
+        let back: Settings = serde_json::from_str(&json).expect("parse back");
+        assert_eq!(back.search_tab, 3);
+        // A file written before this field existed keeps the default.
+        let old: Settings = serde_json::from_str("{}").expect("old file");
+        assert_eq!(old.search_tab, 0);
+    }
+
+    #[test]
+    fn close_action_accepts_every_offered_value() {        for value in CLOSE_ACTIONS {
             assert_eq!(normalise_close_action(value), value);
         }
     }

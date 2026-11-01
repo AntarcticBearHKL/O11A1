@@ -631,11 +631,39 @@ pub(crate) fn patch_model_thumb<T: Clone + 'static>(
     }
 }
 
+/// Cover patches actually written into a row model.
+pub(crate) static COVER_PATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// Patches applied with no pixels: the row is written with the empty image.
+pub(crate) static COVER_EMPTY_PATCH: AtomicU64 = AtomicU64::new(0);
+
+/// Decoded covers thrown away because their row's identity no longer matched
+/// (a superseded batch). A non-zero count with zero covers means the guards,
+/// not the network, are dropping the page.
+pub(crate) static COVER_DROPPED_GUARD: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn cover_dropped_guards() -> u64 {
+    COVER_DROPPED_GUARD.load(Ordering::Relaxed)
+}
+
+pub(crate) fn cover_empty_patches() -> u64 {
+    COVER_EMPTY_PATCH.load(Ordering::Relaxed)
+}
+
+pub(crate) fn cover_patched() -> u64 {
+    COVER_PATCHED.load(Ordering::Relaxed)
+}
+
 /// Post one incremental cover patch for a `T`-row list.
+///
+/// `url` is the cover's own URL: the image built here is remembered by the UI
+/// (`remember_cover`), so rebuilding the row later — a republish, a tab switch,
+/// a re-entry — paints it again without depending on the LRU or the network.
 pub(crate) fn post_thumb_patch<T: Clone + 'static>(
     weak: &Weak<AppWindow>,
     index: usize,
     pixels: Option<(Vec<u8>, u32, u32)>,
+    url: String,
     guard: ThumbGuard,
     get_model: fn(&AppWindow) -> ModelRc<T>,
     set_thumb: fn(&mut T, Image),
@@ -646,7 +674,16 @@ pub(crate) fn post_thumb_patch<T: Clone + 'static>(
         if let Some(ui) = weak.upgrade() {
             let applied = guard.allows(index);
             if applied {
-                patch_model_thumb(get_model(&ui), index, to_thumb(&pixels), set_thumb);
+                if pixels.is_none() {
+                    COVER_EMPTY_PATCH.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    COVER_PATCHED.fetch_add(1, Ordering::Relaxed);
+                }
+                let image = to_thumb(&pixels);
+                remember_cover(&url, &image);
+                patch_model_thumb(get_model(&ui), index, image, set_thumb);
+            } else {
+                COVER_DROPPED_GUARD.fetch_add(1, Ordering::Relaxed);
             }
             skeleton_settle(&ui, 1);
             sync.settle(applied);
@@ -758,7 +795,7 @@ pub(crate) async fn cover_fetch(
     // Listed by the stall trace as `covers=`/`last=cover:decode`; the guard
     // also releases the count when the future is cancelled mid-fetch.
     crate::player::tag_here("cover:decode");
-    let _decoding = CoverDecodeGuard::new();
+    let _decoding = CoverDecodeGuard::new(url, path);
     let pixels = match session.fetch_thumb(url).await {
         Ok(pixels) => Arc::new(pixels),
         Err(err) => {
@@ -1637,6 +1674,7 @@ pub(crate) async fn stream_cover_list<T: Clone + 'static, G>(
     G: FnMut(usize, String) -> ThumbGuard,
 {
     let total = pics.len();
+    let urls = pics.clone();
     let sync = ThumbSync::new(label.clone(), total);
     let started = Instant::now();
     let fallbacks_before = bilibili::thumb_fallbacks();
@@ -1645,10 +1683,12 @@ pub(crate) async fn stream_cover_list<T: Clone + 'static, G>(
         delivered += 1;
         let row = index_offset + index;
         let key = keys.get(index).cloned().unwrap_or_default();
+        let url = urls.get(index).cloned().unwrap_or_default();
         post_thumb_patch(
             weak,
             row,
             pixels,
+            url,
             guard_of(row, key),
             get_model,
             set_thumb,
@@ -2277,16 +2317,82 @@ pub(crate) fn open_detail(
     }));
 }
 
+/// Covers the UI already materialised into a Slint image, kept on the UI thread.
+///
+/// f216: the 播放列表 panel, the vinyl and the 养鱼 cards rebuild their rows from
+/// a URL and used to ask the *decode cache* for the pixels. That cache is a
+/// 32 MB / 128-entry LRU — smaller than one 首页 batch (83 covers, ~43 MB) — so
+/// an entry can be evicted while its row is still on screen: the next republish
+/// then drew an empty card and nothing ever fetched it again. These held images
+/// belong to the UI and are not evicted by the cache.
+pub(crate) const HELD_COVER_MAX: usize = 256;
+
+struct HeldCovers {
+    /// Insertion order, front = oldest.
+    order: VecDeque<String>,
+    images: HashMap<String, Image>,
+}
+
+thread_local! {
+    static HELD_COVERS: RefCell<HeldCovers> = RefCell::new(HeldCovers {
+        order: VecDeque::new(),
+        images: HashMap::new(),
+    });
+}
+
+/// Keep `image` for `url` (UI thread). Bounded by [`HELD_COVER_MAX`]: the
+/// oldest held cover is dropped, which at worst falls back to the LRU.
+pub(crate) fn remember_cover(url: &str, image: &Image) {
+    if url.is_empty() || image.size().width == 0 {
+        return;
+    }
+    HELD_COVERS.with(|cell| {
+        let mut held = cell.borrow_mut();
+        if held.images.contains_key(url) {
+            return;
+        }
+        while held.order.len() >= HELD_COVER_MAX {
+            let Some(oldest) = held.order.pop_front() else {
+                break;
+            };
+            held.images.remove(&oldest);
+        }
+        held.order.push_back(url.to_string());
+        held.images.insert(url.to_string(), image.clone());
+    });
+}
+
+/// The image the UI already holds for `url`, if any (UI thread).
+pub(crate) fn held_cover(url: &str) -> Option<Image> {
+    if url.is_empty() {
+        return None;
+    }
+    HELD_COVERS.with(|cell| cell.borrow().images.get(url).cloned())
+}
+
 /// A cover for `url` when it is already decoded; a tinted block otherwise.
+///
+/// The UI-held copy is consulted first, then the decode cache; a cache hit is
+/// remembered here, so the row it was painted into can be rebuilt later without
+/// depending on an LRU slot surviving.
 pub(crate) fn cached_cover(url: &str) -> Image {
     if url.is_empty() {
         return Image::default();
     }
+    if let Some(image) = held_cover(url) {
+        return image;
+    }
     match cover_cache().lock() {
-        Ok(mut cache) => cache
-            .get(url)
-            .map(|pixels| to_thumb_shared(&pixels))
-            .unwrap_or_default(),
+        Ok(mut cache) => {
+            let image = cache
+                .get(url)
+                .map(|pixels| to_thumb_shared(&pixels))
+                .unwrap_or_default();
+            if image.size().width > 0 {
+                remember_cover(url, &image);
+            }
+            image
+        }
         Err(_) => Image::default(),
     }
 }
@@ -2527,5 +2633,35 @@ mod cover_warm_tests {
         cache.put("huge", Arc::new((vec![0u8; COVER_CACHE_BYTES + 1], 1, 1)));
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);
+    }
+
+    /// f216: the image a UI row was built from must not depend on the LRU slot
+    /// still being there. `cached_cover` materialises an image and remembers it,
+    /// so a republish after an eviction (or a cache clear) still paints it.
+    #[test]
+    pub(crate) fn cached_cover_survives_the_decode_cache() {
+        let url = "https://example.invalid/f216-held.webp";
+        cover_cache_clear();
+        let pixels: CoverPixels = (vec![7u8; 4 * 4 * 4], 4, 4);
+        cover_cache().lock().unwrap().put(url, Arc::new(pixels));
+        let first = cached_cover(url);
+        assert_eq!(first.size().width, 4);
+        // The decode cache forgets the URL; the UI copy is what the row reads.
+        cover_cache_clear();
+        let second = cached_cover(url);
+        assert_eq!(second.size().width, 4);
+        assert!(held_cover(url).is_some());
+        // A URL the UI never materialised is not held.
+        assert!(held_cover("https://example.invalid/f216-never.webp").is_none());
+    }
+
+    /// An empty decode is never remembered: a blank row must stay a blank row.
+    #[test]
+    pub(crate) fn blank_covers_are_not_held() {
+        let url = "https://example.invalid/f216-blank.webp";
+        remember_cover(url, &Image::default());
+        assert!(held_cover(url).is_none());
+        remember_cover("", &Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::new(2, 2)));
+        assert!(held_cover("").is_none());
     }
 }

@@ -2412,6 +2412,40 @@ pub(crate) fn active_session(session_slot: &SessionSlot) -> Option<Arc<bilibili:
         .and_then(|guard| guard.as_ref().cloned())
 }
 
+/// The anonymous session a search falls back to when nobody is logged in.
+///
+/// Searching every tab works without an account (the login only decides which
+/// 清晰度 a 番剧 may play), and the search page can be reached before signing in,
+/// so the first unlogged query builds a session and every later one reuses it.
+/// `None` means the handshake itself failed — the caller reports a network
+/// error rather than the silent "nothing happened" this used to be.
+static ANONYMOUS_SESSION: Mutex<Option<Arc<bilibili::Session>>> = Mutex::new(None);
+
+pub(crate) async fn anonymous_session() -> Option<Arc<bilibili::Session>> {
+    if let Ok(guard) = ANONYMOUS_SESSION.lock() {
+        if let Some(session) = guard.as_ref() {
+            return Some(session.clone());
+        }
+    }
+    let session = Arc::new(bilibili::Session::new().await.ok()?);
+    if let Ok(mut guard) = ANONYMOUS_SESSION.lock() {
+        *guard = Some(session.clone());
+    }
+    crate::debug_log("search session anonymous (未登录)");
+    Some(session)
+}
+
+/// Drop all three result models (they are published together from Rust, so a
+/// tab switch or a failed load must clear them together).
+pub(crate) fn clear_search_models(ui: &AppWindow) {
+    let rows: Vec<SearchRow> = Vec::new();
+    let posters: Vec<PgcCard> = Vec::new();
+    let rooms: Vec<LiveCard> = Vec::new();
+    ui.set_search_items(ModelRc::from(std::rc::Rc::new(VecModel::from(rows))));
+    ui.set_search_media_items(ModelRc::from(std::rc::Rc::new(VecModel::from(posters))));
+    ui.set_search_live_items(ModelRc::from(std::rc::Rc::new(VecModel::from(rooms))));
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum VipAction {
     Experience,
@@ -2762,18 +2796,77 @@ pub(crate) enum CoverPath {
     Warm,
 }
 
+/// One in-flight cover decode: who asked, for what, and since when.
+///
+/// f216: the counter alone could only say "N decodes in flight", never *which*
+/// one leaked. Every lease is registered here by identity and removed on drop,
+/// so a stuck decode names its own URL, path and age instead of leaving a bare
+/// non-zero number behind.
+pub(crate) struct CoverDecodeLease {
+    pub(crate) url: String,
+    pub(crate) path: &'static str,
+    pub(crate) started: Instant,
+}
+
+static COVER_DECODES_LIVE: OnceLock<Mutex<HashMap<u64, CoverDecodeLease>>> = OnceLock::new();
+
+static COVER_DECODES_NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn cover_decodes_live() -> &'static Mutex<HashMap<u64, CoverDecodeLease>> {
+    COVER_DECODES_LIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// In-flight cover decodes, oldest first, as `(id, url, path, ms)`.
+pub(crate) fn cover_decode_leases() -> Vec<(u64, String, &'static str, u128)> {
+    let Ok(guard) = cover_decodes_live().lock() else {
+        return Vec::new();
+    };
+    let mut leases: Vec<(u64, String, &'static str, u128)> = guard
+        .iter()
+        .map(|(id, lease)| {
+            (
+                *id,
+                lease.url.clone(),
+                lease.path,
+                lease.started.elapsed().as_millis(),
+            )
+        })
+        .collect();
+    leases.sort_by_key(|(_, _, _, ms)| std::cmp::Reverse(*ms));
+    leases
+}
+
 /// Holds the in-flight cover counter for as long as it lives.
-pub(crate) struct CoverDecodeGuard;
+pub(crate) struct CoverDecodeGuard {
+    id: u64,
+}
 
 impl CoverDecodeGuard {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(url: &str, path: CoverPath) -> Self {
         crate::player::note_cover_decode(true);
-        Self
+        let id = COVER_DECODES_NEXT.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut guard) = cover_decodes_live().lock() {
+            guard.insert(
+                id,
+                CoverDecodeLease {
+                    url: url.to_string(),
+                    path: match path {
+                        CoverPath::Display => "display",
+                        CoverPath::Warm => "warm",
+                    },
+                    started: Instant::now(),
+                },
+            );
+        }
+        Self { id }
     }
 }
 
 impl Drop for CoverDecodeGuard {
     fn drop(&mut self) {
+        if let Ok(mut guard) = cover_decodes_live().lock() {
+            guard.remove(&self.id);
+        }
         crate::player::note_cover_decode(false);
     }
 }
@@ -3169,6 +3262,7 @@ pub(crate) async fn stream_feed_covers(
     let indices: Vec<usize> = pending.iter().map(|cover| cover.index).collect();
     let bvids: Vec<String> = pending.iter().map(|cover| cover.bvid.clone()).collect();
     let pics: Vec<String> = pending.iter().map(|cover| cover.pic.clone()).collect();
+    let urls = pics.clone();
     let indices_issue = indices.clone();
     let count_first_screen = move |slot: usize| {
         if indices_issue.get(slot).copied().unwrap_or(usize::MAX) < first_screen {
@@ -3180,6 +3274,7 @@ pub(crate) async fn stream_feed_covers(
         delivered += 1;
         let index = indices.get(slot).copied().unwrap_or(slot);
         let bvid = bvids.get(slot).cloned().unwrap_or_default();
+        let url = urls.get(slot).cloned().unwrap_or_default();
         let guard = ThumbGuard::GenFeed(generation_b.clone(), my, feed_store_b.clone(), bvid);
         let weak_c = weak_b.clone();
         let sync_c = sync.clone();
@@ -3187,9 +3282,13 @@ pub(crate) async fn stream_feed_covers(
             if let Some(ui) = weak_c.upgrade() {
                 let applied = guard.allows(index);
                 if applied {
-                    patch_model_thumb(ui.get_feed_items(), index, to_thumb(&pixels), |row, image| {
+                    let image = to_thumb(&pixels);
+                    remember_cover(&url, &image);
+                    patch_model_thumb(ui.get_feed_items(), index, image, |row, image| {
                         row.thumb = image
                     });
+                } else {
+                    COVER_DROPPED_GUARD.fetch_add(1, Ordering::Relaxed);
                 }
                 skeleton_settle(&ui, 1);
                 sync_c.settle(applied);
@@ -3415,16 +3514,16 @@ pub(crate) fn run_search(
     if keyword.trim().is_empty() {
         return;
     }
-    let Some(session) = active_session(&session_slot) else {
-        return;
-    };
+    let kind = bilibili::SearchKind::from_tab(tab);
     // One API page per screen: fetch with the live client page size so the
     // loaded page fills exactly one screen.
     let ps = current_page_size(&weak);
     let seq = search_seq.fetch_add(1, Ordering::SeqCst) + 1;
     SEARCH_SEQ_MIRROR.store(seq, Ordering::SeqCst);
     crate::debug_log(&format!(
-        "search run seq={seq} keyword={keyword:?} tab={tab} page={page} players={}",
+        "search run seq={seq} keyword={keyword:?} tab={tab} kind={} type={} page={page} ps={ps} players={}",
+        kind.label(),
+        kind.search_type(),
         PLAYER_OPEN_COUNT.load(Ordering::SeqCst)
     ));
     if let Some(ui) = weak.upgrade() {
@@ -3437,98 +3536,72 @@ pub(crate) fn run_search(
             return;
         };
         runtime.block_on(async move {
-            let outcome = if tab == 0 {
-                session
-                    .search_video(&keyword, page, "totalrank", ps)
-                    .await
-                    .map(|result| SearchOutcome {
-                        page: result.page,
-                        num_pages: result.num_pages,
-                        num_results: result.num_results,
-                        rows: result
-                            .items
-                            .iter()
-                            .map(|item| {
-                                let meta = format!(
-                                    "{} · {}播放 · {}",
-                                    item.author,
-                                    format_view(item.play),
-                                    item.duration
+            // 未登录: an anonymous session still searches every tab (the sign-in
+            // only decides which 清晰度 a 番剧 may play, not whether it can be
+            // found). The session is built once and shared by later searches.
+            let session = match active_session(&session_slot) {
+                Some(session) => session,
+                None => match anonymous_session().await {
+                    Some(session) => session,
+                    None => {
+                        let state_empty = search_state.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if search_seq.load(Ordering::SeqCst) != seq {
+                                return;
+                            }
+                            if let Ok(mut state) = state_empty.lock() {
+                                state.clear_targets();
+                            }
+                            if let Some(ui) = weak.upgrade() {
+                                clear_search_models(&ui);
+                                publish_refresh(&ui, false, 1.0);
+                                // 未登录 is not a failure: say so instead of
+                                // reporting a network error the user cannot fix.
+                                ui.set_search_status(
+                                    "无法连接 B站，检查网络后重试".into(),
                                 );
-                                (
-                                    item.pic.clone(),
-                                    SearchRowData {
-                                        pixels: None,
-                                        title: item.title.clone(),
-                                        meta,
-                                        sub: item.description.clone(),
-                                        badge: item.duration.clone(),
-                                        owner: item.author.clone(),
-                                        owner_mid: item.mid,
-                                        view_count: item.play,
-                                        pub_ts: item.pub_ts,
-                                    },
-                                )
-                            })
-                            .collect(),
-                        bvids: result.items.iter().map(|item| item.bvid.clone()).collect(),
-                        mids: result.items.iter().map(|item| item.mid).collect(),
-                    })
-                    .map_err(|err| format!("{err}"))
-            } else {
-                session
-                    .search_user(&keyword, page, ps)
-                    .await
-                    .map(|result| SearchOutcome {
-                        page: result.page,
-                        num_pages: result.num_pages,
-                        num_results: result.num_results,
-                        rows: result
-                            .items
-                            .iter()
-                            .map(|item| {
-                                let meta =
-                                    format!("粉丝 {} · 投稿 {}", format_view(item.fans), item.videos);
-                                (
-                                    item.upic.clone(),
-                                    SearchRowData {
-                                        pixels: None,
-                                        title: item.uname.clone(),
-                                        meta,
-                                        sub: item.usign.clone(),
-                                        badge: String::new(),
-                                        owner: String::new(),
-                                        owner_mid: item.mid,
-                                        view_count: 0,
-                                        pub_ts: 0,
-                                    },
-                                )
-                            })
-                            .collect(),
-                        bvids: Vec::new(),
-                        mids: result.items.iter().map(|item| item.mid).collect(),
-                    })
-                    .map_err(|err| format!("{err}"))
+                                ui.set_search_page_text(String::new().into());
+                                ui.set_search_current_page(1);
+                                ui.set_search_has_prev(false);
+                                ui.set_search_has_next(false);
+                                ui.set_search_total_pages(1);
+                                set_client_page(1, 0);
+                                publish_list_offset(&ui);
+                                update_page_bar(&ui);
+                            }
+                        });
+                        return;
+                    }
+                },
             };
+            let started = Instant::now();
+            let outcome = session
+                .search_hits(kind, &keyword, page, "totalrank", ps)
+                .await
+                .map(|result| search_outcome(kind, result))
+                .map_err(|err| format!("{err}"));
 
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(message) => {
+                    crate::debug_log(&format!(
+                        "search fail kind={} type={} page={page} ms={} err={message}",
+                        kind.label(),
+                        kind.search_type(),
+                        started.elapsed().as_millis()
+                    ));
                     let state_empty = search_state.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if search_seq.load(Ordering::SeqCst) != seq {
                             return;
                         }
                         if let Ok(mut state) = state_empty.lock() {
-                            state.mids.clear();
+                            state.clear_targets();
                         }
                         if let Some(ui) = weak.upgrade() {
-                            let empty: Vec<SearchRow> = Vec::new();
-                            ui.set_search_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
-                                empty,
-                            ))));
+                            clear_search_models(&ui);
                             publish_refresh(&ui, false, 1.0);
-                            ui.set_search_status(format!("搜索失败：{message}").into());
+                            ui.set_search_status(search_error_text(&message).into());
                             ui.set_search_page_text(String::new().into());
                             ui.set_search_current_page(1);
                             ui.set_search_has_prev(false);
@@ -3543,16 +3616,35 @@ pub(crate) fn run_search(
                 }
             };
 
-            let pics: Vec<String> = outcome.rows.iter().map(|(url, _)| url.clone()).collect();
+            crate::debug_log(&format!(
+                "search ok kind={} type={} keyword={keyword:?} page={page} items={} num_pages={} num_results={} ms={}",
+                kind.label(),
+                kind.search_type(),
+                outcome.loaded(),
+                outcome.num_pages,
+                outcome.num_results,
+                started.elapsed().as_millis()
+            ));
+
+            let pics = outcome.pics();
             let covers = pics.len().min(bilibili::THUMB_MAX_PER_VIEW);
             let rows: Vec<SearchRowData> = outcome.rows.into_iter().map(|(_, row)| row).collect();
+            let posters: Vec<MediaRowData> =
+                outcome.posters.into_iter().map(|(_, card)| card).collect();
+            let rooms: Vec<LiveRowData> = outcome.rooms.into_iter().map(|(_, card)| card).collect();
             let bvids = outcome.bvids;
             let mids = outcome.mids;
+            let season_ids = outcome.season_ids;
+            let live_rooms = outcome.live_rooms;
             let page = outcome.page;
             let num_pages = outcome.num_pages;
             let num_results = outcome.num_results;
+            let empty_text = kind.empty_text();
+            // The tab's own paging truth: 番剧/影视/直播 stop where the API
+            // says there is no next page, not where a derived count guesses.
+            let has_more = outcome.has_more;
 
-            let loaded = rows.len();
+            let loaded = rows.len() + posters.len() + rooms.len();
             let weak_a = weak.clone();
             let search_seq_a = search_seq.clone();
             let search_bvids_a = search_bvids.clone();
@@ -3567,6 +3659,8 @@ pub(crate) fn run_search(
                     }
                     if let Ok(mut state) = search_state_a.lock() {
                         state.mids = mids;
+                        state.season_ids = season_ids;
+                        state.rooms = live_rooms;
                     }
                     let items: Vec<SearchRow> = rows
                         .iter()
@@ -3582,22 +3676,73 @@ pub(crate) fn run_search(
                             pub_ts: saturating_i32(row.pub_ts),
                         })
                         .collect();
+                    let media: Vec<PgcCard> = posters
+                        .iter()
+                        .map(|card| PgcCard {
+                            thumb: Image::default(),
+                            title: card.title.clone().into(),
+                            meta: card.meta.clone().into(),
+                            badge: card.badge.clone().into(),
+                            follows: card.follows.clone().into(),
+                            rank: 0,
+                            progress: Default::default(),
+                        })
+                        .collect();
+                    let live: Vec<LiveCard> = rooms
+                        .iter()
+                        .map(|card| LiveCard {
+                            room_id: card.room_id,
+                            title: card.title.clone().into(),
+                            uname: card.uname.clone().into(),
+                            area: card.area.clone().into(),
+                            cover: Image::default(),
+                            online: card.online.clone().into(),
+                            live: card.live,
+                        })
+                        .collect();
                     // One API page per screen: the client page restarts at 0
-                    // and the bar counts pages of the live page size.
-                    let total = search_total(num_results, num_pages, list_page_size(&ui));
+                    // and the bar counts pages of the live page size. 番剧 /
+                    // 影视 / 直播 stop at the API's own page count.
+                    let total = search_total_for(kind, num_results, num_pages, list_page_size(&ui));
                     if let Ok(mut state) = search_state_a.lock() {
                         state.num_pages = num_pages.max(1);
                     }
                     set_client_page(1, 0);
                     ui.set_search_items(ModelRc::from(std::rc::Rc::new(VecModel::from(items))));
+                    ui.set_search_media_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
+                        media,
+                    ))));
+                    ui.set_search_live_items(ModelRc::from(std::rc::Rc::new(VecModel::from(
+                        live,
+                    ))));
                     publish_refresh(&ui, false, 1.0);
-                    ui.set_search_status(String::new().into());
+                    // Empty and last-page states are per tab: 「没有找到相关番剧」
+                    // must not be printed on the 直播 tab, and a shallow tab
+                    // that ran out of pages says so instead of showing a dead
+                    // next arrow.
+                    let status = if loaded == 0 {
+                        empty_text.to_string()
+                    } else if kind.shallow_paging() && page >= total {
+                        "没有更多了".to_string()
+                    } else {
+                        String::new()
+                    };
+                    ui.set_search_status(status.clone().into());
+                    crate::debug_log(&format!(
+                        "search status kind={} text={status:?} loaded={loaded} page={} total={total}",
+                        kind.label(),
+                        page.max(1)
+                    ));
                     ui.set_search_page_text(
-                        format!("第 {}/{} 页", page.max(1), total).into(),
+                        if loaded == 0 {
+                            String::new().into()
+                        } else {
+                            format!("第 {}/{} 页", page.max(1), total).into()
+                        },
                     );
                     ui.set_search_current_page(page.max(1) as i32);
                     ui.set_search_has_prev(page > 1);
-                    ui.set_search_has_next(page < total);
+                    ui.set_search_has_next(loaded > 0 && has_more);
                     ui.set_search_total_pages(total as i32);
                     publish_list_offset(&ui);
                     skeleton_arm(&ui, covers as u64);
@@ -3608,18 +3753,50 @@ pub(crate) fn run_search(
             let mut pics = pics;
             pics.truncate(covers);
             let seq_guard = search_seq.clone();
-            stream_cover_list(
-                &weak,
-                &session,
-                pics,
-                Vec::new(),
-                0,
-                move |_index, _key| ThumbGuard::Seq(seq_guard.clone(), seq),
-                |ui| ui.get_search_items(),
-                |row, image| row.thumb = image,
-                format!("search tab={tab} page={page}"),
-            )
-            .await;
+            match kind {
+                bilibili::SearchKind::Video | bilibili::SearchKind::User => {
+                    stream_cover_list(
+                        &weak,
+                        &session,
+                        pics,
+                        Vec::new(),
+                        0,
+                        move |_index, _key| ThumbGuard::Seq(seq_guard.clone(), seq),
+                        |ui| ui.get_search_items(),
+                        |row, image| row.thumb = image,
+                        format!("search tab={tab} page={page}"),
+                    )
+                    .await;
+                }
+                bilibili::SearchKind::Bangumi | bilibili::SearchKind::Film => {
+                    stream_cover_list(
+                        &weak,
+                        &session,
+                        pics,
+                        Vec::new(),
+                        0,
+                        move |_index, _key| ThumbGuard::Seq(seq_guard.clone(), seq),
+                        |ui| ui.get_search_media_items(),
+                        |row, image| row.thumb = image,
+                        format!("search media tab={tab} page={page}"),
+                    )
+                    .await;
+                }
+                bilibili::SearchKind::Live => {
+                    stream_cover_list(
+                        &weak,
+                        &session,
+                        pics,
+                        Vec::new(),
+                        0,
+                        move |_index, _key| ThumbGuard::Seq(seq_guard.clone(), seq),
+                        |ui| ui.get_search_live_items(),
+                        |row, image| row.cover = image,
+                        format!("search live tab={tab} page={page}"),
+                    )
+                    .await;
+                }
+            }
             // One card-health line after the patches have landed: covers are
             // the same shared cache + decode path as the feed, and the home
             // card fields (UP / heat / date) must be populated for every row.
@@ -3632,22 +3809,52 @@ pub(crate) fn run_search(
                         return;
                     }
                     if let Some(ui) = weak_cards.upgrade() {
-                        let rows = ui.get_search_items();
-                        let total = rows.row_count();
-                        let mut covers = 0usize;
-                        let mut owners = 0usize;
-                        let mut dates = 0usize;
-                        for index in 0..total {
-                            let Some(row) = rows.row_data(index) else {
-                                continue;
-                            };
-                            covers += usize::from(row.thumb.size().width > 0);
-                            owners += usize::from(!row.owner.is_empty());
-                            dates += usize::from(row.pub_ts > 0);
+                        match kind {
+                            bilibili::SearchKind::Video | bilibili::SearchKind::User => {
+                                let rows = ui.get_search_items();
+                                let total = rows.row_count();
+                                let mut covers = 0usize;
+                                let mut owners = 0usize;
+                                let mut dates = 0usize;
+                                for index in 0..total {
+                                    let Some(row) = rows.row_data(index) else {
+                                        continue;
+                                    };
+                                    covers += usize::from(row.thumb.size().width > 0);
+                                    owners += usize::from(!row.owner.is_empty());
+                                    dates += usize::from(row.pub_ts > 0);
+                                }
+                                crate::debug_log(&format!(
+                                    "search cards {label} covers={covers}/{total} owners={owners}/{total} dates={dates}/{total}"
+                                ));
+                            }
+                            bilibili::SearchKind::Bangumi | bilibili::SearchKind::Film => {
+                                let cards = ui.get_search_media_items();
+                                let total = cards.row_count();
+                                let mut covers = 0usize;
+                                for index in 0..total {
+                                    if let Some(card) = cards.row_data(index) {
+                                        covers += usize::from(card.thumb.size().width > 0);
+                                    }
+                                }
+                                crate::debug_log(&format!(
+                                    "search posters {label} covers={covers}/{total}"
+                                ));
+                            }
+                            bilibili::SearchKind::Live => {
+                                let cards = ui.get_search_live_items();
+                                let total = cards.row_count();
+                                let mut covers = 0usize;
+                                for index in 0..total {
+                                    if let Some(card) = cards.row_data(index) {
+                                        covers += usize::from(card.cover.size().width > 0);
+                                    }
+                                }
+                                crate::debug_log(&format!(
+                                    "search rooms {label} covers={covers}/{total}"
+                                ));
+                            }
                         }
-                        crate::debug_log(&format!(
-                            "search cards {label} covers={covers}/{total} owners={owners}/{total} dates={dates}/{total}"
-                        ));
                     }
                 });
             });
@@ -4385,5 +4592,43 @@ mod danmaku_lane_tests {
         let after = model.row_data(0).unwrap().x;
         assert!(after != before, "the comment moved");
         assert_eq!(after, lane_x(&lane, 0));
+    }
+}
+
+/// f216: the in-flight decode counter now carries an identity per decode, so a
+/// leak names its holder instead of leaving a bare non-zero number. The lease
+/// must disappear the moment its guard is dropped — including on an early
+/// return, which is exactly where a bare `fetch_add`/`fetch_sub` pair used to
+/// be able to skip the decrement.
+#[cfg(test)]
+mod cover_decode_lease_tests {
+    use super::*;
+
+    #[test]
+    pub(crate) fn a_decode_lease_is_registered_and_released() {
+        let before = cover_decode_leases().len();
+        {
+            let _guard = CoverDecodeGuard::new(
+                "https://example.invalid/f216-lease.webp",
+                CoverPath::Display,
+            );
+            let live = cover_decode_leases();
+            assert_eq!(live.len(), before + 1);
+            let mine = live
+                .iter()
+                .find(|(_, url, _, _)| url == "https://example.invalid/f216-lease.webp")
+                .expect("the lease is registered under its own URL");
+            assert_eq!(mine.2, "display");
+        }
+        assert_eq!(cover_decode_leases().len(), before);
+    }
+
+    #[test]
+    pub(crate) fn every_lease_names_its_path() {
+        let _warm = CoverDecodeGuard::new("https://example.invalid/f216-warm.webp", CoverPath::Warm);
+        let live = cover_decode_leases();
+        assert!(live
+            .iter()
+            .any(|(_, url, path, _)| url.ends_with("f216-warm.webp") && *path == "warm"));
     }
 }

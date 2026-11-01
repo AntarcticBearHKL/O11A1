@@ -299,17 +299,12 @@ impl Playlist {
 
     /// A cover for `url` if it is already decoded; `Image::default()` (none)
     /// otherwise. Never fetches - `spawn_cover` does that off-thread.
+    ///
+    /// f216: goes through `cached_cover`, which keeps a UI-held copy. Reading
+    /// the LRU directly made a republish blank the panel as soon as the entry
+    /// had been evicted (the cache holds less than one 首页 batch).
     pub(crate) fn cover_image(&self, url: &str) -> Image {
-        if url.is_empty() {
-            return Image::default();
-        }
-        match cover_cache().lock() {
-            Ok(mut cache) => cache
-                .get(url)
-                .map(|pixels| to_thumb_shared(&pixels))
-                .unwrap_or_default(),
-            Err(_) => Image::default(),
-        }
+        cached_cover(url)
     }
 
     /// Publish rows, the bar's now-playing block and the mode.

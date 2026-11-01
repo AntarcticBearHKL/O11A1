@@ -214,9 +214,8 @@ pub(crate) fn maybe_open_enhance_menu(player: slint::Weak<crate::PlayerWindow>) 
                     window.invoke_set_enhance(tier as i32);
                 }
                 crate::debug_log(&format!(
-                    "f204 menu open tab=3 tier={tier:?} dcomp_setting={} dcomp_active={}",
-                    window.get_player_dcomp(),
-                    window.get_dcomp_active()
+                    "f204 menu open tab=3 tier={tier:?} dcomp_active={}",
+                    crate::dcomp::platform::enabled()
                 ));
             });
         });

@@ -15858,11 +15858,13 @@ impl FrameMailbox {
             (VIDEO_W as u32, VIDEO_H as u32)
         };
         crate::dcomp::VideoLayout {
-            band: (
-                window.get_surface_x(),
-                window.get_surface_y(),
-                window.get_surface_w(),
-                window.get_surface_h(),
+            // f214: insets, not a band: the composite layer derives the band
+            // from the live client rect so a resize applies in `WM_SIZE`.
+            insets: (
+                window.get_band_inset_l(),
+                window.get_band_inset_t(),
+                window.get_band_inset_r(),
+                window.get_band_inset_b(),
             ),
             scale: window.window().scale_factor(),
             fit: window.get_fit_mode().clamp(0, 2) as u8,

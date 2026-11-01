@@ -2165,6 +2165,7 @@ pub(crate) fn fav_spawn_covers(
         let began = Instant::now();
         let total = pending.len();
         let pics: Vec<String> = pending.iter().map(|cover| cover.pic.clone()).collect();
+        let urls = pics.clone();
         let indices: Vec<usize> = pending.iter().map(|cover| cover.index).collect();
         let bvids: Vec<String> = pending.iter().map(|cover| cover.bvid.clone()).collect();
         let mut delivered = 0usize;
@@ -2176,6 +2177,7 @@ pub(crate) fn fav_spawn_covers(
                 };
                 let index = indices.get(slot).copied().unwrap_or(usize::MAX);
                 let bvid = bvids.get(slot).cloned().unwrap_or_default();
+                let url = urls.get(slot).cloned().unwrap_or_default();
                 let guard = ThumbGuard::Fav(generation.clone(), my, store.clone(), bvid);
                 let weak = weak.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -2183,7 +2185,11 @@ pub(crate) fn fav_spawn_covers(
                         if guard.allows(index) {
                             // Decode on the UI thread: `Image` is not `Send`.
                             let aspect = fav_aspect(&pixels);
-                            patch_masonry_row(ui.get_masonry(), index, to_thumb(&Some(pixels)), aspect);
+                            let image = to_thumb(&Some(pixels));
+                            remember_cover(&url, &image);
+                            patch_masonry_row(ui.get_masonry(), index, image, aspect);
+                        } else {
+                            COVER_DROPPED_GUARD.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 });
