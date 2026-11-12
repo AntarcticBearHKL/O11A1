@@ -39,9 +39,9 @@ use crate::overlay::{
     dm_menu_rect, dm_menu_row, dm_report_rect, dm_report_row, AudioRowUi, CommentUi,
     DanmakuMenuUi, ImageData, InfoUi, Overlay, PageUi, QualityRowUi, Rect, SettingsMenu,
     SidebarTab, StoryboardCellUi, ToastUi, UiModel, UndoToastUi, DM_MENU_BLOCK, DM_MENU_COPY,
-    DM_MENU_LIKE, DM_MENU_REPORT, DM_MENU_LABELS, DM_REPORT_LABELS, SETTINGS_ROWS, TB_ASPECT,
-    TB_DANMAKU, TB_DANMAKU_SETTINGS, TB_FULLSCREEN, TB_MINI, TB_PLAYLIST, TB_SETTINGS, TB_SHOT,
-    TB_SIDEBAR, TB_SPEED, TB_VOLUME,
+    DM_MENU_LIKE, DM_MENU_REPORT, DM_MENU_LABELS, DM_REPORT_LABELS, SETTINGS_ROWS,
+    TB_COMMENTS, TB_DANMAKU, TB_ENHANCE, TB_INFO, TB_INTERP, TB_PERF, TB_SERIES,
+    TB_SETTINGS, TB_VOLUME,
 };
 use crate::source::{MediaSource, TrackRequest};
 use crate::state::{PlayerState, SaveDebouncer, SAVE_DEBOUNCE};
@@ -350,6 +350,8 @@ struct Engine {
     /// a clean release keeps the old play/pause click.
     window_drag_arm: Option<(i32, i32)>,
     popup_drag: Option<u8>,
+    /// 增强 tier list opened from the toolbar.
+    enhance_open: bool,
     mini: bool,
     mini_saved: Option<MiniSaved>,
     mini_hint_until: Option<Instant>,
@@ -360,6 +362,8 @@ struct Engine {
     last_mouse_activity: Instant,
     pointer: Option<(f32, f32)>,
     sidebar_open: bool,
+    /// Windowed mode already grew the outer window by the strip width.
+    sidebar_extra: bool,
     sidebar_tab: SidebarTab,
     sidebar_scroll: f32,
     danmaku_popup: bool,
@@ -804,6 +808,7 @@ impl Engine {
             dragging: false,
             window_drag_arm: None,
             popup_drag: None,
+            enhance_open: false,
             mini: false,
             mini_saved: None,
             mini_hint_until: None,
@@ -812,6 +817,7 @@ impl Engine {
             last_mouse_activity: Instant::now(),
             pointer: None,
             sidebar_open: false,
+            sidebar_extra: false,
             sidebar_tab: SidebarTab::Info,
             sidebar_scroll: 0.0,
             danmaku_popup: false,
@@ -2456,13 +2462,14 @@ impl Engine {
             self.position_ms = self.position_now();
             self.shared.position_ms.store(self.position_ms, Ordering::SeqCst);
 
-            if self.chrome_shown
+            if self.fullscreen
+                && self.chrome_shown
                 && !self.dragging
                 && self.popup_drag.is_none()
                 && !self.sidebar_open
                 && !self.danmaku_popup
                 && self.dm_menu.is_none()
-                && self.last_mouse_activity.elapsed() >= Duration::from_secs(3)
+                && self.last_mouse_activity.elapsed() >= Duration::from_millis(2500)
             {
                 self.chrome_shown = false;
                 log::line(&format!(
@@ -3185,7 +3192,7 @@ impl Engine {
                 if !self.hover_pinned && self.hover_preview.take().is_some() {
                     self.ui_dirty = true;
                 }
-                if !self.sidebar_open && !self.danmaku_popup && self.dm_menu.is_none() {
+                if !self.danmaku_popup && self.dm_menu.is_none() {
                     self.chrome_shown = false;
                     self.ui_dirty = true;
                 }
@@ -3344,6 +3351,32 @@ impl Engine {
             }
             return;
         }
+        if self.enhance_open {
+            for (index, row) in layout.enhance_rows.iter().enumerate() {
+                if row.contains(px, py) {
+                    let mode = EnhanceMode::from_u8(index as u8);
+                    self.set_enhance(mode);
+                    let mut stored = o11a1::settings::load();
+                    stored.player_enhance = mode.as_u8() as u32;
+                    if let Err(error) = o11a1::settings::save(&stored) {
+                        log::line(&format!("enhance save failed: {error:#}"));
+                    }
+                    self.enhance_open = false;
+                    self.ui_dirty = true;
+                    return;
+                }
+            }
+            if layout.enhance_menu.contains(px, py) {
+                return;
+            }
+            if layout.toolbar_buttons[TB_ENHANCE].contains(px, py) {
+                self.enhance_open = false;
+                self.ui_dirty = true;
+                return;
+            }
+            self.enhance_open = false;
+            self.ui_dirty = true;
+        }
         if self.sidebar_open {
             if layout.sidebar_close.contains(px, py) {
                 self.set_sidebar(false, self.sidebar_tab);
@@ -3378,6 +3411,10 @@ impl Engine {
             }
             if layout.play.contains(px, py) {
                 self.toggle_play();
+                return;
+            }
+            if layout.loop_btn.contains(px, py) {
+                self.toggle_loop();
                 return;
             }
             for (index, rect) in layout.toolbar_buttons.iter().enumerate() {
@@ -3448,27 +3485,73 @@ impl Engine {
     }
 
     fn toolbar_action(&mut self, index: usize) {
+        if index != TB_ENHANCE {
+            self.enhance_open = false;
+        }
         match index {
             TB_VOLUME => self.toggle_mute(),
-            TB_DANMAKU => self.toggle_danmaku(),
-            TB_DANMAKU_SETTINGS => {
+            TB_DANMAKU => {
                 self.danmaku_popup = !self.danmaku_popup;
+                self.settings_menu = None;
                 self.ui_dirty = true;
-                log::line(&format!("danmaku popup={}", u8::from(self.danmaku_popup)));
+                log::line(&format!(
+                    "danmaku popup={}",
+                    u8::from(self.danmaku_popup)
+                ));
             }
-            TB_SPEED => self.cycle_speed(1),
-            TB_ASPECT => self.cycle_aspect(),
-            TB_SHOT => self.screenshot(),
-            TB_MINI => self.toggle_mini(),
-            TB_FULLSCREEN => self.toggle_fullscreen(),
-            TB_PLAYLIST => self.open_sidebar_tab(SidebarTab::Episodes),
-            TB_SIDEBAR => self.set_sidebar(!self.sidebar_open, self.sidebar_tab),
+            TB_INTERP => {
+                let next = if self.interp == InterpMode::Off {
+                    InterpMode::Cpu
+                } else {
+                    InterpMode::Off
+                };
+                self.interp = next;
+                self.shared.interp.store(next.as_u8(), Ordering::SeqCst);
+                self.ui_dirty = true;
+                let mut stored = o11a1::settings::load();
+                stored.interp_mode = next.as_u8();
+                if let Err(error) = o11a1::settings::save(&stored) {
+                    log::line(&format!("interp save failed: {error:#}"));
+                }
+                log::line(&format!("interp mode={} label={}", next.as_u8(), next.label()));
+            }
+            TB_ENHANCE => {
+                self.enhance_open = !self.enhance_open;
+                self.danmaku_popup = false;
+                self.settings_menu = None;
+                self.ui_dirty = true;
+                log::line(&format!("enhance menu={}", u8::from(self.enhance_open)));
+            }
+            TB_INFO => self.open_sidebar_tab(SidebarTab::Info),
+            TB_COMMENTS => self.open_sidebar_tab(SidebarTab::Comments),
+            TB_SERIES => self.open_sidebar_tab(SidebarTab::Episodes),
+            TB_PERF => self.open_sidebar_tab(SidebarTab::Performance),
             TB_SETTINGS => self.open_sidebar_tab(SidebarTab::Settings),
             _ => {}
         }
     }
 
+    fn toggle_loop(&mut self) {
+        self.loop_one = !self.loop_one;
+        self.ui_dirty = true;
+        let mut stored = o11a1::settings::load();
+        stored.loop_one = self.loop_one;
+        if let Err(error) = o11a1::settings::save(&stored) {
+            log::line(&format!("loop_one save failed: {error:#}"));
+        }
+        log::line(&format!("loop_one={}", u8::from(self.loop_one)));
+    }
+
     fn set_sidebar(&mut self, open: bool, tab: SidebarTab) {
+        if open != self.sidebar_open && !self.fullscreen && !window::is_maximized(self.hwnd) {
+            let delta = if open {
+                (360.0 * self.scale).round() as i32
+            } else {
+                -(360.0 * self.scale).round() as i32
+            };
+            window::grow_width(self.hwnd, delta);
+            self.sidebar_extra = open;
+        }
         self.restore_live_danmaku();
         self.close_dm_menu();
         self.sidebar_open = open;
@@ -3495,6 +3578,10 @@ impl Engine {
         }
         self.restore_live_danmaku();
         self.close_dm_menu();
+        if !self.sidebar_open && !self.fullscreen && !window::is_maximized(self.hwnd) {
+            window::grow_width(self.hwnd, (360.0 * self.scale).round() as i32);
+            self.sidebar_extra = true;
+        }
         self.sidebar_open = true;
         self.sidebar_tab = tab;
         self.sidebar_scroll = 0.0;
@@ -4496,6 +4583,10 @@ impl Engine {
             self.ui_dirty = true;
             return true;
         }
+        if layout.popup_toggle.contains(x, y) {
+            self.toggle_danmaku();
+            return true;
+        }
         if layout.popup_close.contains(x, y) {
             self.danmaku_popup = false;
             self.dm_input_focus = false;
@@ -4684,6 +4775,15 @@ impl Engine {
             return;
         }
         window::toggle_fullscreen(self.hwnd, &mut self.fullscreen, &mut self.saved_window);
+        if !self.fullscreen && self.sidebar_open != self.sidebar_extra {
+            let delta = if self.sidebar_open {
+                (360.0 * self.scale).round() as i32
+            } else {
+                -(360.0 * self.scale).round() as i32
+            };
+            window::grow_width(self.hwnd, delta);
+            self.sidebar_extra = self.sidebar_open;
+        }
         if let Err(error) = window::set_topmost(self.hwnd, self.ontop) {
             log::line(&format!("fullscreen topmost failed: {error:#}"));
         }
@@ -4736,6 +4836,10 @@ impl Engine {
         if mini {
             if self.fullscreen {
                 self.toggle_fullscreen();
+            }
+            if self.sidebar_extra {
+                window::grow_width(self.hwnd, -(360.0 * self.scale).round() as i32);
+                self.sidebar_extra = false;
             }
             let window = window::outer_rect(self.hwnd);
             let client = window::client_size(self.hwnd);
@@ -4817,10 +4921,20 @@ impl Engine {
         self.set_mini(desired);
     }
 
+    fn video_area(&self) -> (u32, u32) {
+        let width = if self.sidebar_open {
+            (self.client.0 as f32 - 360.0 * self.scale).max(320.0) as u32
+        } else {
+            self.client.0
+        };
+        (width, self.client.1)
+    }
+
     fn update_video_rect(&mut self) {
+        let (area_w, area_h) = self.video_area();
         let (x, y, scale_x, scale_y) = crate::gpu::video_transform(
-            self.client.0 as f32,
-            self.client.1 as f32,
+            area_w as f32,
+            area_h as f32,
             self.source.width,
             self.source.height,
             self.aspect,
@@ -4836,7 +4950,7 @@ impl Engine {
 
     fn refresh_danmaku_geometry(&mut self) {
         let band = danmaku_band(
-            self.client,
+            self.video_area(),
             &self.overlay.layout,
             &self.source,
             self.mini,
@@ -5142,6 +5256,7 @@ impl Engine {
         let model = UiModel {
             title: self.source.title.clone(),
             playing: self.playing,
+            loop_one: self.loop_one,
             position_ms: self.drag_preview.unwrap_or(self.position_ms),
             duration_ms: self.duration_ms,
             volume: self.volume,
@@ -5216,6 +5331,8 @@ impl Engine {
             storyboard_cell,
             light_sidebar: self.light_sidebar,
             buffering,
+            video_w: self.video_area().0 as f32,
+            enhance_open: self.enhance_open,
             splash: self.loading || !self.had_first_frame,
             error: self.error.clone(),
             danmaku_opacity: self.danmaku_opacity,

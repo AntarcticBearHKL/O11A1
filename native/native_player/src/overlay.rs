@@ -78,10 +78,10 @@ pub enum SidebarTab {
     Info = 0,
     Episodes = 1,
     Comments = 2,
-    /// 弹幕历史: date list + historical comments in the live layer.
-    History = 3,
-    Performance = 4,
-    Settings = 5,
+    Performance = 3,
+    Settings = 4,
+    /// Legacy danmaku-history body; no longer a tab in the Rust strip.
+    History = 5,
 }
 
 impl SidebarTab {
@@ -90,9 +90,9 @@ impl SidebarTab {
             Self::Info => "信息",
             Self::Episodes => "选集",
             Self::Comments => "评论",
-            Self::History => "历史",
             Self::Performance => "性能",
             Self::Settings => "设置",
+            Self::History => "历史",
         }
     }
 
@@ -100,9 +100,8 @@ impl SidebarTab {
         match index {
             1 => Self::Episodes,
             2 => Self::Comments,
-            3 => Self::History,
-            4 => Self::Performance,
-            5 => Self::Settings,
+            3 => Self::Performance,
+            4 => Self::Settings,
             _ => Self::Info,
         }
     }
@@ -290,22 +289,30 @@ pub struct Layout {
     pub top_min: Rect,
     pub top_max: Rect,
     pub top_close: Rect,
-    /// Right strip (300 logical px) when open.
+    /// Right strip (360 logical px) when open.
     pub sidebar: Rect,
-    pub sidebar_tabs: [Rect; 6],
+    pub sidebar_tabs: [Rect; 5],
     pub sidebar_close: Rect,
     pub sidebar_content: Rect,
     /// 历史 tab: 实时弹幕 row and date rows start below it.
     pub history_live: Rect,
-    /// Compact centered toolbar. `panel` is kept as the toolbar alias.
+    /// Rust floating pill: seek band over a 36px control row.
     pub panel: Rect,
-    /// Thin progress line above the toolbar.
+    /// 22px seek band inside the pill.
     pub track: Rect,
     pub play: Rect,
-    pub toolbar_buttons: [Rect; 11],
+    pub loop_btn: Rect,
+    pub time: Rect,
+    pub toolbar_buttons: [Rect; 9],
+    pub divider1: Rect,
+    pub divider2: Rect,
+    /// 增强 tier list opened from the toolbar cell.
+    pub enhance_menu: Rect,
+    pub enhance_rows: [Rect; 3],
     /// 弹幕 settings popover.
     pub popup: Rect,
     pub popup_close: Rect,
+    pub popup_toggle: Rect,
     pub popup_opacity: Rect,
     pub popup_font: [Rect; 3],
     pub popup_speed: Rect,
@@ -329,26 +336,22 @@ pub struct Layout {
 
 pub const TB_VOLUME: usize = 0;
 pub const TB_DANMAKU: usize = 1;
-pub const TB_DANMAKU_SETTINGS: usize = 2;
-pub const TB_SPEED: usize = 3;
-pub const TB_ASPECT: usize = 4;
-pub const TB_SHOT: usize = 5;
-pub const TB_MINI: usize = 6;
-pub const TB_FULLSCREEN: usize = 7;
-pub const TB_PLAYLIST: usize = 8;
-pub const TB_SIDEBAR: usize = 9;
-pub const TB_SETTINGS: usize = 10;
+pub const TB_INTERP: usize = 2;
+pub const TB_ENHANCE: usize = 3;
+pub const TB_INFO: usize = 4;
+pub const TB_COMMENTS: usize = 5;
+pub const TB_SERIES: usize = 6;
+pub const TB_PERF: usize = 7;
+pub const TB_SETTINGS: usize = 8;
 
 impl Layout {
     pub fn new(width: f32, height: f32, scale: f32, sidebar_open: bool, fullscreen: bool) -> Self {
         let s = scale.max(0.75);
         let top_h = if fullscreen { 0.0 } else { 44.0 * s };
-        let side_w = if sidebar_open { 300.0 * s } else { 0.0 };
-        // The picture stays full-window. 非全屏 the strip is docked on the
-        // right and the chrome (toolbar, popups, window buttons) centres in the
-        // uncovered area; 全屏 it expands inward over the picture but still
-        // keeps the chrome out from under it.
-        let video_w = width;
+        let side_w = if sidebar_open { 360.0 * s } else { 0.0 };
+        // The picture stays full-window. The right strip reserves its width in
+        // both modes (Rust f214): non-fullscreen from the window edge,
+        // fullscreen inward from it.
         let ui_w = if sidebar_open {
             (width - side_w).max(320.0 * s)
         } else {
@@ -357,41 +360,106 @@ impl Layout {
         let top_bar = Rect {
             left: 0.0,
             top: 0.0,
-            right: video_w,
+            right: ui_w,
             bottom: top_h,
         };
-        let toolbar_w = (640.0 * s).min((ui_w - 28.0 * s).max(420.0 * s));
-        let toolbar_h = 54.0 * s;
-        let toolbar_bottom = height - 16.0 * s;
+        // Rust floating pill: 10 | 22 seek | 8 | 36 controls | 10 = 86 tall.
+        let bar_cell = 36.0 * s;
+        let bar_gap = 8.0 * s;
+        let bar_group_gap = 12.0 * s;
+        let bar_pad_x = 12.0 * s;
+        let bar_pad_y = 10.0 * s;
+        let bar_seek_h = 22.0 * s;
+        let bar_time_w = 88.0 * s;
+        let bar_sep_w = s;
+        let bar_sep_pad = 10.0 * s;
+        let bar_sep = bar_sep_pad * 2.0 + bar_sep_w;
+        let bar_content_w = bar_cell * 11.0
+            + bar_time_w
+            + bar_gap * 8.0
+            + bar_group_gap
+            + bar_sep * 2.0;
+        let bar_w = (bar_pad_x * 2.0 + bar_content_w).min((ui_w - 8.0 * s).max(320.0 * s));
+        let bar_h = bar_pad_y * 2.0 + bar_cell + bar_seek_h + bar_gap;
+        let bar_top = (height - 100.0 * s).max(0.0);
         let toolbar = Rect {
-            left: (ui_w - toolbar_w) * 0.5,
-            top: toolbar_bottom - toolbar_h,
-            right: (ui_w + toolbar_w) * 0.5,
-            bottom: toolbar_bottom,
+            left: (ui_w - bar_w) * 0.5,
+            top: bar_top,
+            right: (ui_w + bar_w) * 0.5,
+            bottom: bar_top + bar_h,
         };
         let track = Rect {
-            left: toolbar.left + 14.0 * s,
-            top: toolbar.top - 11.0 * s,
-            right: toolbar.right - 14.0 * s,
-            bottom: toolbar.top - 8.0 * s,
+            left: toolbar.left + bar_pad_x,
+            top: toolbar.top + bar_pad_y,
+            right: toolbar.right - bar_pad_x,
+            bottom: toolbar.top + bar_pad_y + bar_seek_h,
         };
+        let row_top = track.bottom + bar_gap;
         let play = Rect {
-            left: toolbar.left + 14.0 * s,
-            top: toolbar.top + 11.0 * s,
-            right: toolbar.left + 46.0 * s,
-            bottom: toolbar.top + 43.0 * s,
+            left: toolbar.left + bar_pad_x,
+            top: row_top,
+            right: toolbar.left + bar_pad_x + bar_cell,
+            bottom: row_top + bar_cell,
         };
-        let mut toolbar_buttons = [Rect::default(); 11];
-        let button = 30.0 * s;
-        let gap = 4.0 * s;
-        let start = toolbar.left + 150.0 * s;
+        let loop_btn = Rect {
+            left: play.right + bar_gap,
+            top: row_top,
+            right: play.right + bar_gap + bar_cell,
+            bottom: row_top + bar_cell,
+        };
+        let time = Rect {
+            left: loop_btn.right + bar_gap,
+            top: row_top,
+            right: loop_btn.right + bar_gap + bar_time_w,
+            bottom: row_top + bar_cell,
+        };
+        let mut toolbar_buttons = [Rect::default(); 9];
+        let mut x = time.right + bar_group_gap;
         for (index, rect) in toolbar_buttons.iter_mut().enumerate() {
-            let left = start + index as f32 * (button + gap);
             *rect = Rect {
-                left,
-                top: toolbar.top + 12.0 * s,
-                right: left + button,
-                bottom: toolbar.top + 42.0 * s,
+                left: x,
+                top: row_top,
+                right: x + bar_cell,
+                bottom: row_top + bar_cell,
+            };
+            let gap = match index {
+                3 | 6 => bar_sep,
+                _ => bar_gap,
+            };
+            x += bar_cell + gap;
+        }
+        let divider1 = Rect {
+            left: toolbar_buttons[TB_ENHANCE].right + bar_sep_pad,
+            top: row_top + (bar_cell - 14.0 * s) * 0.5,
+            right: toolbar_buttons[TB_ENHANCE].right + bar_sep_pad + bar_sep_w,
+            bottom: row_top + (bar_cell + 14.0 * s) * 0.5,
+        };
+        let divider2 = Rect {
+            left: toolbar_buttons[TB_SERIES].right + bar_sep_pad,
+            top: divider1.top,
+            right: toolbar_buttons[TB_SERIES].right + bar_sep_pad + bar_sep_w,
+            bottom: divider1.bottom,
+        };
+        let menu_w = 116.0 * s;
+        let menu_row_h = 34.0 * s;
+        let menu_h = menu_row_h * 3.0 + 12.0 * s;
+        let anchor = toolbar_buttons[TB_ENHANCE];
+        let menu_left = ((anchor.left + anchor.right) * 0.5 - menu_w * 0.5)
+            .clamp(8.0 * s, (ui_w - menu_w - 8.0 * s).max(8.0 * s));
+        let menu_bottom = toolbar.top - 12.0 * s;
+        let enhance_menu = Rect {
+            left: menu_left,
+            top: menu_bottom - menu_h,
+            right: menu_left + menu_w,
+            bottom: menu_bottom,
+        };
+        let mut enhance_rows = [Rect::default(); 3];
+        for (index, rect) in enhance_rows.iter_mut().enumerate() {
+            *rect = Rect {
+                left: enhance_menu.left + 6.0 * s,
+                top: enhance_menu.top + 6.0 * s + index as f32 * menu_row_h,
+                right: enhance_menu.right - 6.0 * s,
+                bottom: enhance_menu.top + 6.0 * s + (index + 1) as f32 * menu_row_h,
             };
         }
         let sidebar = Rect {
@@ -400,22 +468,28 @@ impl Layout {
             right: width,
             bottom: height,
         };
-        let tab_left = sidebar.left + 8.0 * s;
-        let tab_right = sidebar.right - 42.0 * s;
-        let tab_w = (tab_right - tab_left).max(1.0) / 6.0;
-        let mut sidebar_tabs = [Rect::default(); 6];
+        let tab_left = sidebar.left + 10.0 * s;
+        let tab_top = sidebar.top;
+        let tab_w = 60.0 * s;
+        let mut sidebar_tabs = [Rect::default(); 5];
         for (index, rect) in sidebar_tabs.iter_mut().enumerate() {
             let left = tab_left + index as f32 * tab_w;
             *rect = Rect {
                 left,
-                top: sidebar.top + 8.0 * s,
+                top: tab_top,
                 right: left + tab_w,
-                bottom: sidebar.top + 42.0 * s,
+                bottom: tab_top + 40.0 * s,
             };
         }
+        let sidebar_close = Rect {
+            left: sidebar.right - 38.0 * s,
+            top: sidebar.top + 7.0 * s,
+            right: sidebar.right - 12.0 * s,
+            bottom: sidebar.top + 33.0 * s,
+        };
         let sidebar_content = Rect {
             left: sidebar.left + 14.0 * s,
-            top: sidebar.top + 50.0 * s,
+            top: sidebar.top + 40.0 * s,
             right: sidebar.right - 14.0 * s,
             bottom: sidebar.bottom - 12.0 * s,
         };
@@ -445,6 +519,12 @@ impl Layout {
             top: popup.top + 8.0 * s,
             right: popup.right - 10.0 * s,
             bottom: popup.top + 34.0 * s,
+        };
+        let popup_toggle = Rect {
+            left: popup.right - 140.0 * s,
+            top: popup.top + 10.0 * s,
+            right: popup.right - 48.0 * s,
+            bottom: popup.top + 32.0 * s,
         };
         let mut popup_font = [Rect::default(); 3];
         for (index, rect) in popup_font.iter_mut().enumerate() {
@@ -477,7 +557,7 @@ impl Layout {
             };
         }
         let mut info_actions = [Rect::default(); 3];
-        let action_top = sidebar_content.top + 150.0 * s;
+        let action_top = sidebar_content.top + 152.0 * s;
         let action_w = (sidebar_content.width() - 12.0 * s) / 3.0;
         for (index, rect) in info_actions.iter_mut().enumerate() {
             let left = sidebar_content.left + index as f32 * (action_w + 6.0 * s);
@@ -485,7 +565,7 @@ impl Layout {
                 left,
                 top: action_top,
                 right: left + action_w,
-                bottom: action_top + 32.0 * s,
+                bottom: action_top + 36.0 * s,
             };
         }
         let sort_top = sidebar_content.top + 40.0 * s;
@@ -557,20 +637,22 @@ impl Layout {
             },
             sidebar,
             sidebar_tabs,
-            sidebar_close: Rect {
-                left: sidebar.right - 38.0 * s,
-                top: sidebar.top + 10.0 * s,
-                right: sidebar.right - 10.0 * s,
-                bottom: sidebar.top + 38.0 * s,
-            },
+            sidebar_close,
             sidebar_content,
             history_live,
             panel: toolbar,
             track,
             play,
+            loop_btn,
+            time,
             toolbar_buttons,
+            divider1,
+            divider2,
+            enhance_menu,
+            enhance_rows,
             popup,
             popup_close,
+            popup_toggle,
             popup_opacity: row(40.0, 8.0),
             popup_font,
             popup_speed: row(120.0, 8.0),
@@ -676,6 +758,7 @@ impl Layout {
 pub struct UiModel {
     pub title: String,
     pub playing: bool,
+    pub loop_one: bool,
     pub position_ms: u64,
     pub duration_ms: u64,
     pub volume: u8,
@@ -752,6 +835,10 @@ pub struct UiModel {
     pub storyboard_cell: Option<StoryboardCellUi>,
     pub light_sidebar: bool,
     pub buffering: bool,
+    /// Width of the picture area (window minus the open right strip).
+    pub video_w: f32,
+    /// The 增强 tier list is open above the toolbar.
+    pub enhance_open: bool,
     /// The video layer has no picture yet; paint the loading backdrop.
     pub splash: bool,
     pub error: Option<String>,
@@ -801,6 +888,7 @@ pub struct Overlay {
     chrome_soft: ID2D1SolidColorBrush,
     sidebar_line: ID2D1SolidColorBrush,
     hover: ID2D1SolidColorBrush,
+    cell_selected: ID2D1SolidColorBrush,
     accent_blue: ID2D1SolidColorBrush,
     toast_bg: ID2D1SolidColorBrush,
     // Theme-aware sidebar brushes. The toolbar/top strip stay dark in both
@@ -882,6 +970,7 @@ impl Overlay {
             let chrome_soft = solid(&render_target, color(20, 22, 28, 0.72))?;
             let sidebar_line = solid(&render_target, color(255, 255, 255, 0.08))?;
             let hover = solid(&render_target, color(255, 255, 255, 0.12))?;
+            let cell_selected = solid(&render_target, color(220, 233, 248, 1.0))?;
             let accent_blue = solid(&render_target, color(64, 156, 255, 1.0))?;
             let toast_bg = solid(&render_target, color(28, 30, 38, 0.96))?;
             let sidebar_text = solid(&render_target, color(242, 245, 250, 1.0))?;
@@ -961,6 +1050,7 @@ impl Overlay {
                 chrome_soft,
                 sidebar_line,
                 hover,
+                cell_selected,
                 accent_blue,
                 toast_bg,
                 sidebar_text,
@@ -1123,6 +1213,11 @@ impl Overlay {
             let _ = self.hover.SetColor(&chrome[11]);
             // Old progress/play accent is blue in both themes.
             let _ = self.accent.SetColor(&color(47, 155, 255, 1.0));
+            let _ = self.cell_selected.SetColor(if light {
+                &color(220, 233, 248, 1.0)
+            } else {
+                &color(47, 74, 104, 1.0)
+            });
         }
     }
 
@@ -1161,7 +1256,7 @@ impl Overlay {
             // shows the desktop through it.
             if model.aspect == AspectMode::Fit {
                 let (vx, vy, video_width, video_height) = crate::gpu::video_bounds(
-                    layout.width,
+                    model.video_w,
                     layout.height,
                     model.source_size.0,
                     model.source_size.1,
@@ -1804,7 +1899,7 @@ impl Overlay {
             // Fit letterbox. Fill/Stretch crop or fill underneath the chrome.
             if model.aspect == AspectMode::Fit {
                 let (vx, vy, video_width, video_height) = crate::gpu::video_bounds(
-                    layout.width,
+                    model.video_w,
                     layout.height,
                     model.source_size.0,
                     model.source_size.1,
@@ -1862,6 +1957,9 @@ impl Overlay {
             }
             if model.chrome_shown {
                 self.draw_toolbar(model, &layout);
+                if model.enhance_open {
+                    self.draw_enhance_menu(model, &layout);
+                }
                 if model.danmaku_popup {
                     self.draw_danmaku_popup(model, &layout);
                 }
@@ -2106,17 +2204,6 @@ impl Overlay {
         for (index, rect) in layout.sidebar_tabs.iter().enumerate() {
             let tab = SidebarTab::from_index(index);
             let active = model.sidebar_tab == tab;
-            if active {
-                self.fill(
-                    Rect {
-                        left: rect.left + 6.0 * s,
-                        top: rect.top + 4.0 * s,
-                        right: rect.right - 6.0 * s,
-                        bottom: rect.bottom - 2.0 * s,
-                    },
-                    &self.sidebar_chip,
-                );
-            }
             self.text_centered(
                 tab.label(),
                 *rect,
@@ -2124,11 +2211,12 @@ impl Overlay {
                 if active { &self.sidebar_text } else { &self.sidebar_text_dim },
             );
             if active {
+                let center = (rect.left + rect.right) * 0.5;
                 self.fill(
                     Rect {
-                        left: rect.left + 14.0 * s,
+                        left: center - 11.0 * s,
                         top: rect.bottom - 2.0 * s,
-                        right: rect.right - 14.0 * s,
+                        right: center + 11.0 * s,
                         bottom: rect.bottom,
                     },
                     &self.accent,
@@ -2143,9 +2231,9 @@ impl Overlay {
         self.fill(
             Rect {
                 left: layout.sidebar.left,
-                top: layout.sidebar_content.top - 4.0 * s,
+                top: layout.sidebar.top + 40.0 * s - s,
                 right: layout.sidebar.right,
-                bottom: layout.sidebar_content.top - 3.0 * s,
+                bottom: layout.sidebar.top + 40.0 * s,
             },
             &self.sidebar_panel_line,
         );
@@ -2166,7 +2254,7 @@ impl Overlay {
             let cover = Rect {
                 left: content.left,
                 top: content.top,
-                right: content.left + 88.0 * s,
+                right: content.left + 96.0 * s,
                 bottom: content.top + 54.0 * s,
             };
             if let Some(image) = &info.cover {
@@ -2183,7 +2271,7 @@ impl Overlay {
                 content.top,
                 (content.right - text_left).max(60.0),
                 40.0 * s,
-                &self.wrap_body,
+                &self.title_format,
                 &self.sidebar_text,
             );
             let owner = if info.owner.is_empty() {
@@ -2196,7 +2284,7 @@ impl Overlay {
                 text_left,
                 content.top + 42.0 * s,
                 content.right - text_left,
-                &self.small_format,
+                &self.body_format,
                 &self.accent,
             );
             let date = format_date(info.pubdate);
@@ -2917,39 +3005,7 @@ impl Overlay {
 
     unsafe fn draw_toolbar(&mut self, model: &UiModel, layout: &Layout) {
         let s = layout.scale;
-        // Progress hairline above the pill.
-        self.fill(layout.track, &self.track);
-        let fraction = if model.duration_ms > 0 {
-            (model.drag_preview.unwrap_or(model.position_ms) as f32 / model.duration_ms as f32)
-                .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let filled_right = layout.track.left + layout.track.width() * fraction;
-        self.fill(
-            Rect {
-                left: layout.track.left,
-                top: layout.track.top,
-                right: filled_right,
-                bottom: layout.track.bottom,
-            },
-            &self.accent,
-        );
-        let pointer_on_track = model
-            .pointer
-            .map(|(x, y)| layout.progress_hit(x, y))
-            .unwrap_or(false);
-        if pointer_on_track || model.drag_preview.is_some() {
-            self.d2d.FillEllipse(
-                &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
-                    point: Vector2::new(filled_right, layout.track.top + 1.5 * s),
-                    radiusX: 5.0 * s,
-                    radiusY: 5.0 * s,
-                },
-                &self.text,
-            );
-        }
-
+        // Rust pill plate.
         let pill = D2D1_ROUNDED_RECT {
             rect: to_d2d(layout.panel),
             radiusX: 12.0 * s,
@@ -2959,26 +3015,76 @@ impl Overlay {
         self.d2d
             .DrawRoundedRectangle(&pill, &self.panel_border, 1.0 * s, None);
 
-        // Play / pause.
+        // Seek band: 4px track, accent fill, 8px knob.
+        let line_top = layout.track.top + (layout.track.height() - 4.0 * s) * 0.5;
+        let track = Rect {
+            left: layout.track.left,
+            top: line_top,
+            right: layout.track.right,
+            bottom: line_top + 4.0 * s,
+        };
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(track),
+            radiusX: 2.0 * s,
+            radiusY: 2.0 * s,
+        };
+        self.d2d.FillRoundedRectangle(&rounded, &self.track);
+        let fraction = if model.duration_ms > 0 {
+            (model.drag_preview.unwrap_or(model.position_ms) as f32 / model.duration_ms as f32)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let filled_right = layout.track.left + layout.track.width() * fraction;
+        let filled = Rect {
+            left: track.left,
+            top: track.top,
+            right: filled_right.max(track.left + 2.0 * s),
+            bottom: track.bottom,
+        };
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(filled),
+            radiusX: 2.0 * s,
+            radiusY: 2.0 * s,
+        };
+        self.d2d.FillRoundedRectangle(&rounded, &self.accent_blue);
+        let pointer_on_track = model
+            .pointer
+            .map(|(x, y)| layout.progress_hit(x, y))
+            .unwrap_or(false);
+        if pointer_on_track || model.drag_preview.is_some() {
+            let knob = if model.drag_preview.is_some() { 10.0 * s } else { 8.0 * s };
+            self.d2d.FillEllipse(
+                &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
+                    point: Vector2::new(
+                        filled_right.clamp(layout.track.left, layout.track.right),
+                        layout.track.top + layout.track.height() * 0.5,
+                    ),
+                    radiusX: knob * 0.5,
+                    radiusY: knob * 0.5,
+                },
+                &self.text,
+            );
+        }
+
+        // Play / pause: 36px accent cell, rounded 10.
+        let play = D2D1_ROUNDED_RECT {
+            rect: to_d2d(layout.play),
+            radiusX: 10.0 * s,
+            radiusY: 10.0 * s,
+        };
+        self.d2d.FillRoundedRectangle(&play, &self.accent_blue);
         let center = Vector2::new(
             (layout.play.left + layout.play.right) * 0.5,
             (layout.play.top + layout.play.bottom) * 0.5,
-        );
-        self.d2d.FillEllipse(
-            &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
-                point: center,
-                radiusX: 16.0 * s,
-                radiusY: 16.0 * s,
-            },
-            &self.accent_blue,
         );
         if model.playing {
             for sign in [-1.0f32, 1.0] {
                 self.fill(
                     Rect {
-                        left: center.X + sign * 4.0 * s - 2.0 * s,
+                        left: center.X + sign * 4.0 * s - 1.2 * s,
                         top: center.Y - 6.0 * s,
-                        right: center.X + sign * 4.0 * s + 2.0 * s,
+                        right: center.X + sign * 4.0 * s + 1.2 * s,
                         bottom: center.Y + 6.0 * s,
                     },
                     &self.top_text,
@@ -3004,6 +3110,28 @@ impl Overlay {
             }
             self.render_target.SetTransform(&Matrix3x2::identity());
         }
+
+        // Loop toggle.
+        let loop_hot = model
+            .pointer
+            .map(|(x, y)| layout.loop_btn.contains(x, y))
+            .unwrap_or(false);
+        if loop_hot {
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: to_d2d(layout.loop_btn),
+                radiusX: 10.0 * s,
+                radiusY: 10.0 * s,
+            };
+            self.d2d.FillRoundedRectangle(&rounded, &self.hover);
+        }
+        self.icon_loop(
+            (layout.loop_btn.left + layout.loop_btn.right) * 0.5,
+            (layout.loop_btn.top + layout.loop_btn.bottom) * 0.5,
+            s,
+            model.loop_one,
+        );
+
+        // Clock: 88px fixed column.
         let time = format!(
             "{} / {}",
             format_time(model.drag_preview.unwrap_or(model.position_ms)),
@@ -3011,16 +3139,18 @@ impl Overlay {
         );
         self.text(
             &time,
-            layout.play.right + 8.0 * s,
-            center.Y - 8.0 * s,
-            96.0 * s,
-            &self.small_format,
+            layout.time.left,
+            layout.time.top + (layout.time.height() - 16.0 * s) * 0.5,
+            layout.time.width(),
+            &self.body_format,
             &self.text,
         );
 
-        // Storyboard / time bubble above the progress line. The image comes
-        // from the background videoshot worker; a failed fetch leaves the
-        // time-only bubble (no error dialog, exactly like the old player).
+        // Divider rules between the three groups.
+        self.fill(layout.divider1, &self.panel_border);
+        self.fill(layout.divider2, &self.panel_border);
+
+        // Storyboard / time bubble above the seek band.
         if let Some(preview_ms) = model.drag_preview.or(model.hover_preview) {
             let fraction = if model.duration_ms > 0 {
                 (preview_ms as f32 / model.duration_ms as f32).clamp(0.0, 1.0)
@@ -3032,9 +3162,9 @@ impl Overlay {
             let bubble = Rect {
                 left: (anchor_x - bubble_w * 0.5)
                     .clamp(layout.track.left, layout.track.right - bubble_w),
-                top: layout.track.top - 28.0 * s,
+                top: layout.panel.top - 30.0 * s,
                 right: 0.0,
-                bottom: layout.track.top - 8.0 * s,
+                bottom: layout.panel.top - 10.0 * s,
             };
             let bubble = Rect {
                 right: bubble.left + bubble_w,
@@ -3083,13 +3213,25 @@ impl Overlay {
                 .pointer
                 .map(|(x, y)| rect.contains(x, y))
                 .unwrap_or(false);
-            if hot {
-                let rounded = D2D1_ROUNDED_RECT {
-                    rect: to_d2d(*rect),
-                    radiusX: 7.0 * s,
-                    radiusY: 7.0 * s,
-                };
+            let active = match index {
+                TB_INFO => model.sidebar_open && model.sidebar_tab == SidebarTab::Info,
+                TB_COMMENTS => model.sidebar_open && model.sidebar_tab == SidebarTab::Comments,
+                TB_SERIES => model.sidebar_open && model.sidebar_tab == SidebarTab::Episodes,
+                TB_PERF => model.sidebar_open && model.sidebar_tab == SidebarTab::Performance,
+                TB_SETTINGS => model.sidebar_open && model.sidebar_tab == SidebarTab::Settings,
+                _ => false,
+            };
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: to_d2d(*rect),
+                radiusX: 10.0 * s,
+                radiusY: 10.0 * s,
+            };
+            if active {
+                self.d2d.FillRoundedRectangle(&rounded, &self.cell_selected);
+            } else if hot {
                 self.d2d.FillRoundedRectangle(&rounded, &self.hover);
+            } else {
+                self.d2d.FillRoundedRectangle(&rounded, &self.chip);
             }
             let cx = (rect.left + rect.right) * 0.5;
             let cy = (rect.top + rect.bottom) * 0.5;
@@ -3100,30 +3242,59 @@ impl Overlay {
                     cy,
                     s,
                     if model.danmaku_visible { &self.text } else { &self.text_faint },
+                    model.danmaku_visible,
                 ),
-                TB_DANMAKU_SETTINGS => self.icon_gear(cx, cy, s, &self.text_dim),
-                TB_SPEED => self.text_centered(
-                    &format!("{:.2}×", model.speed),
-                    *rect,
-                    &self.hint_format,
-                    &self.text_dim,
-                ),
-                TB_ASPECT => {
-                    self.icon_aspect(cx, cy, s);
-                }
-                TB_SHOT => self.icon_camera(cx, cy, s),
-                TB_MINI => self.icon_mini(cx, cy, s),
-                TB_FULLSCREEN => self.icon_fullscreen(cx, cy, s),
-                TB_PLAYLIST => self.icon_playlist(cx, cy, s),
-                TB_SIDEBAR => self.icon_sidebar(
-                    cx,
-                    cy,
-                    s,
-                    if model.sidebar_open { &self.accent } else { &self.text_dim },
-                ),
-                TB_SETTINGS => self.icon_gear(cx, cy, s, &self.text_dim),
+                TB_INTERP => self.icon_interp(cx, cy, s, model.interp != InterpMode::Off),
+                TB_ENHANCE => self.icon_enhance(cx, cy, s, model.enhance != EnhanceMode::Off),
+                TB_INFO => self.icon_info(cx, cy, s),
+                TB_COMMENTS => self.icon_comments(cx, cy, s, &self.text),
+                TB_SERIES => self.icon_series(cx, cy, s, &self.text),
+                TB_PERF => self.icon_perf(cx, cy, s, &self.text),
+                TB_SETTINGS => self.icon_gear(cx, cy, s, &self.text),
                 _ => {}
             }
+        }
+    }
+
+    unsafe fn draw_enhance_menu(&self, model: &UiModel, layout: &Layout) {
+        let s = layout.scale;
+        let rect = layout.enhance_menu;
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(rect),
+            radiusX: 10.0 * s,
+            radiusY: 10.0 * s,
+        };
+        self.d2d.FillRoundedRectangle(&rounded, &self.toast_bg);
+        self.d2d
+            .DrawRoundedRectangle(&rounded, &self.panel_border, 1.0 * s, None);
+        let labels = ["关闭", "通用", "番剧"];
+        for (index, row) in layout.enhance_rows.iter().enumerate() {
+            let active = model.enhance.as_u8() as usize == index;
+            let hot = model
+                .pointer
+                .map(|(x, y)| row.contains(x, y))
+                .unwrap_or(false);
+            if active {
+                let rounded = D2D1_ROUNDED_RECT {
+                    rect: to_d2d(*row),
+                    radiusX: 7.0 * s,
+                    radiusY: 7.0 * s,
+                };
+                self.d2d.FillRoundedRectangle(&rounded, &self.cell_selected);
+            } else if hot {
+                let rounded = D2D1_ROUNDED_RECT {
+                    rect: to_d2d(*row),
+                    radiusX: 7.0 * s,
+                    radiusY: 7.0 * s,
+                };
+                self.d2d.FillRoundedRectangle(&rounded, &self.hover);
+            }
+            self.text_centered(
+                labels[index],
+                *row,
+                &self.body_format,
+                if active { &self.text } else { &self.text_dim },
+            );
         }
     }
 
@@ -3264,6 +3435,45 @@ impl Overlay {
         let cy = (close.top + close.bottom) * 0.5;
         self.line(cx - 4.0 * s, cy - 4.0 * s, cx + 4.0 * s, cy + 4.0 * s, 1.3 * s, &self.text_dim);
         self.line(cx - 4.0 * s, cy + 4.0 * s, cx + 4.0 * s, cy - 4.0 * s, 1.3 * s, &self.text_dim);
+
+        // 弹幕开/关 switch, like the Rust popover header.
+        let toggle = layout.popup_toggle;
+        self.text(
+            if model.danmaku_visible { "弹幕开" } else { "弹幕关" },
+            toggle.left,
+            toggle.top + 2.0 * s,
+            54.0 * s,
+            &self.small_format,
+            &self.text_dim,
+        );
+        let switch = Rect {
+            left: toggle.right - 34.0 * s,
+            top: toggle.top,
+            right: toggle.right,
+            bottom: toggle.top + 20.0 * s,
+        };
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(switch),
+            radiusX: 10.0 * s,
+            radiusY: 10.0 * s,
+        };
+        self.d2d.FillRoundedRectangle(
+            &rounded,
+            if model.danmaku_visible { &self.accent_blue } else { &self.track },
+        );
+        let knob_x = if model.danmaku_visible {
+            switch.right - 18.0 * s
+        } else {
+            switch.left + 2.0 * s
+        };
+        self.d2d.FillEllipse(
+            &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
+                point: Vector2::new(knob_x + 8.0 * s, switch.top + 10.0 * s),
+                radiusX: 8.0 * s,
+                radiusY: 8.0 * s,
+            },
+            &self.top_text,
+        );
 
         self.popup_slider(
             "透明度",
@@ -3493,7 +3703,7 @@ impl Overlay {
     }
 
     unsafe fn icon_volume(&self, cx: f32, cy: f32, s: f32, muted: bool) {
-        let brush = if muted { &self.text_faint } else { &self.text_dim };
+        let brush = if muted { &self.text_faint } else { &self.text };
         self.fill(
             Rect {
                 left: cx - 8.0 * s,
@@ -3515,28 +3725,171 @@ impl Overlay {
         }
     }
 
-    unsafe fn icon_danmaku(&self, cx: f32, cy: f32, s: f32, brush: &ID2D1SolidColorBrush) {
+    unsafe fn icon_loop(&self, cx: f32, cy: f32, s: f32, on: bool) {
+        let b = if on { &self.accent } else { &self.text_dim };
+        // Rounded repeat: top and bottom half-arcs plus two arrowheads.
+        let r = 5.6 * s;
+        let steps = 10;
+        let mut prev_top = (cx - r, cy - 0.5 * s);
+        let mut prev_bottom = (cx + r, cy + 0.5 * s);
+        for index in 1..=steps {
+            let t = index as f32 / steps as f32;
+            let top_angle = std::f32::consts::PI + t * std::f32::consts::PI;
+            let bottom_angle = t * std::f32::consts::PI;
+            let top = (
+                cx + r * top_angle.cos(),
+                cy - 0.5 * s + r * top_angle.sin(),
+            );
+            let bottom = (
+                cx + r * bottom_angle.cos(),
+                cy + 0.5 * s + r * bottom_angle.sin(),
+            );
+            self.line(prev_top.0, prev_top.1, top.0, top.1, 1.5 * s, b);
+            self.line(prev_bottom.0, prev_bottom.1, bottom.0, bottom.1, 1.5 * s, b);
+            prev_top = top;
+            prev_bottom = bottom;
+        }
+        // Arrowheads: right end of the top arc, left end of the bottom arc.
+        self.line(cx + r, cy - 0.5 * s, cx + r - 3.0 * s, cy - 3.5 * s, 1.5 * s, b);
+        self.line(cx + r, cy - 0.5 * s, cx + r + 1.5 * s, cy - 3.0 * s, 1.5 * s, b);
+        self.line(cx - r, cy + 0.5 * s, cx - r + 3.0 * s, cy + 3.5 * s, 1.5 * s, b);
+        self.line(cx - r, cy + 0.5 * s, cx - r - 1.5 * s, cy + 3.0 * s, 1.5 * s, b);
+    }
+
+    unsafe fn icon_interp(&self, cx: f32, cy: f32, s: f32, on: bool) {
+        let b = if on { &self.accent } else { &self.text_dim };
         self.stroke_rect(
             Rect {
-                left: cx - 10.0 * s,
-                top: cy - 7.0 * s,
-                right: cx + 10.0 * s,
-                bottom: cy + 5.0 * s,
+                left: cx - 8.0 * s,
+                top: cy - 6.0 * s,
+                right: cx + 2.0 * s,
+                bottom: cy + 6.0 * s,
             },
-            1.3 * s,
-            brush,
+            1.4 * s,
+            b,
+        );
+        self.stroke_rect(
+            Rect {
+                left: cx - 3.0 * s,
+                top: cy - 3.0 * s,
+                right: cx + 8.0 * s,
+                bottom: cy + 8.0 * s,
+            },
+            1.4 * s,
+            b,
+        );
+    }
+
+    unsafe fn icon_enhance(&self, cx: f32, cy: f32, s: f32, on: bool) {
+        let b = if on { &self.accent } else { &self.text_dim };
+        // Four-point sparkle plus a small companion star.
+        self.line(cx + 2.0 * s, cy - 7.0 * s, cx + 3.0 * s, cy - 3.0 * s, 1.3 * s, b);
+        self.line(cx + 3.0 * s, cy - 3.0 * s, cx + 7.0 * s, cy - 2.0 * s, 1.3 * s, b);
+        self.line(cx + 7.0 * s, cy - 2.0 * s, cx + 3.0 * s, cy - 1.0 * s, 1.3 * s, b);
+        self.line(cx + 3.0 * s, cy - 1.0 * s, cx + 2.0 * s, cy + 3.0 * s, 1.3 * s, b);
+        self.line(cx + 2.0 * s, cy + 3.0 * s, cx + 1.0 * s, cy - 1.0 * s, 1.3 * s, b);
+        self.line(cx + 1.0 * s, cy - 1.0 * s, cx - 3.0 * s, cy - 2.0 * s, 1.3 * s, b);
+        self.line(cx - 3.0 * s, cy - 2.0 * s, cx + 1.0 * s, cy - 3.0 * s, 1.3 * s, b);
+        self.line(cx + 1.0 * s, cy - 3.0 * s, cx + 2.0 * s, cy - 7.0 * s, 1.3 * s, b);
+        self.line(cx - 6.0 * s, cy + 4.0 * s, cx - 5.0 * s, cy + 6.0 * s, 1.2 * s, b);
+        self.line(cx - 5.0 * s, cy + 6.0 * s, cx - 3.0 * s, cy + 7.0 * s, 1.2 * s, b);
+        self.line(cx - 3.0 * s, cy + 7.0 * s, cx - 5.0 * s, cy + 8.0 * s, 1.2 * s, b);
+        self.line(cx - 5.0 * s, cy + 8.0 * s, cx - 6.0 * s, cy + 6.0 * s, 1.2 * s, b);
+        self.line(cx - 6.0 * s, cy + 6.0 * s, cx - 6.0 * s, cy + 4.0 * s, 1.2 * s, b);
+    }
+
+    unsafe fn icon_info(&self, cx: f32, cy: f32, s: f32) {
+        let b = &self.text;
+        unsafe {
+            let _ = self.render_target.DrawEllipse(
+                &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
+                    point: Vector2::new(cx, cy),
+                    radiusX: 6.1 * s,
+                    radiusY: 6.1 * s,
+                },
+                b,
+                1.4 * s,
+                None,
+            );
+        }
+        self.fill(
+            Rect {
+                left: cx - 1.1 * s,
+                top: cy - 3.6 * s,
+                right: cx + 1.1 * s,
+                bottom: cy - 1.4 * s,
+            },
+            b,
         );
         self.fill(
             Rect {
-                left: cx - 10.0 * s,
-                top: cy + 3.0 * s,
-                right: cx - 5.0 * s,
-                bottom: cy + 8.0 * s,
+                left: cx - 1.1 * s,
+                top: cy - 0.1 * s,
+                right: cx + 1.1 * s,
+                bottom: cy + 4.1 * s,
             },
-            brush,
+            b,
         );
-        self.line(cx - 6.0 * s, cy - 2.0 * s, cx + 6.0 * s, cy - 2.0 * s, 1.2 * s, brush);
-        self.line(cx - 6.0 * s, cy + 1.0 * s, cx + 3.0 * s, cy + 1.0 * s, 1.2 * s, brush);
+    }
+
+    unsafe fn icon_comments(&self, cx: f32, cy: f32, s: f32, b: &ID2D1SolidColorBrush) {
+        let bubble = Rect {
+            left: cx - 7.5 * s,
+            top: cy - 6.5 * s,
+            right: cx + 7.5 * s,
+            bottom: cy + 4.0 * s,
+        };
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(bubble),
+            radiusX: 3.0 * s,
+            radiusY: 3.0 * s,
+        };
+        self.d2d.DrawRoundedRectangle(&rounded, b, 1.3 * s, None);
+        self.fill(
+            Rect {
+                left: cx - 4.0 * s,
+                top: bubble.bottom - 0.5 * s,
+                right: cx - 0.5 * s,
+                bottom: bubble.bottom + 3.5 * s,
+            },
+            b,
+        );
+        self.line(cx - 4.0 * s, cy - 2.0 * s, cx + 4.0 * s, cy - 2.0 * s, 1.1 * s, b);
+        self.line(cx - 4.0 * s, cy + 0.8 * s, cx + 1.5 * s, cy + 0.8 * s, 1.1 * s, b);
+    }
+
+    unsafe fn icon_series(&self, cx: f32, cy: f32, s: f32, b: &ID2D1SolidColorBrush) {
+        for row in 0..3 {
+            let top = cy - 6.0 * s + row as f32 * 4.3 * s;
+            self.stroke_rect(
+                Rect {
+                    left: cx - 6.5 * s,
+                    top,
+                    right: cx - 4.0 * s,
+                    bottom: top + 2.5 * s,
+                },
+                1.2 * s,
+                b,
+            );
+            self.line(cx - 2.5 * s, top + 1.2 * s, cx + 6.0 * s, top + 1.2 * s, 1.2 * s, b);
+        }
+    }
+
+    unsafe fn icon_perf(&self, cx: f32, cy: f32, s: f32, b: &ID2D1SolidColorBrush) {
+        self.line(cx - 7.0 * s, cy + 7.0 * s, cx + 7.0 * s, cy + 7.0 * s, 1.3 * s, b);
+        for (x, top) in [(-5.0f32, 2.0f32), (0.0, -1.0), (5.0, -5.0)] {
+            self.line(cx + x * s, cy + 7.0 * s, cx + x * s, cy + top * s, 1.5 * s, b);
+        }
+    }
+
+    unsafe fn icon_danmaku(&self, cx: f32, cy: f32, s: f32, brush: &ID2D1SolidColorBrush, visible: bool) {
+        // Rust's 弹幕 mark: three travelling dashes.
+        self.line(cx - 6.0 * s, cy - 3.6 * s, cx + 2.6 * s, cy - 3.6 * s, 1.5 * s, brush);
+        self.line(cx - 2.6 * s, cy, cx + 6.0 * s, cy, 1.5 * s, brush);
+        self.line(cx - 5.6 * s, cy + 3.6 * s, cx + 1.4 * s, cy + 3.6 * s, 1.5 * s, brush);
+        if !visible {
+            self.line(cx - 6.0 * s, cy + 6.0 * s, cx + 6.0 * s, cy - 6.0 * s, 1.3 * s, &self.text_faint);
+        }
     }
 
     unsafe fn icon_gear(&self, cx: f32, cy: f32, s: f32, brush: &ID2D1SolidColorBrush) {
@@ -4241,12 +4594,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidebar_tab_indices_include_history() {
+    fn sidebar_tab_indices_follow_the_rust_strip() {
         assert_eq!(SidebarTab::from_index(0), SidebarTab::Info);
-        assert_eq!(SidebarTab::from_index(3), SidebarTab::History);
-        assert_eq!(SidebarTab::from_index(4), SidebarTab::Performance);
-        assert_eq!(SidebarTab::from_index(5), SidebarTab::Settings);
-        assert_eq!(SidebarTab::History.label(), "历史");
+        assert_eq!(SidebarTab::from_index(1), SidebarTab::Episodes);
+        assert_eq!(SidebarTab::from_index(2), SidebarTab::Comments);
+        assert_eq!(SidebarTab::from_index(3), SidebarTab::Performance);
+        assert_eq!(SidebarTab::from_index(4), SidebarTab::Settings);
+        assert_eq!(SidebarTab::Settings.label(), "设置");
     }
 
     #[test]
@@ -4300,15 +4654,31 @@ mod tests {
     }
 
     #[test]
-    fn layout_has_six_tabs_and_an_undo_button_above_the_toolbar() {
-        let layout = Layout::new(1280.0, 720.0, 1.0, true, false);
-        assert_eq!(layout.sidebar_tabs.len(), 6);
-        assert!(layout.history_live.top > layout.sidebar_content.top);
+    fn layout_has_five_tabs_and_the_rust_toolbar_grid() {
+        let layout = Layout::new(1000.0, 600.0, 1.0, true, false);
+        assert_eq!(layout.sidebar_tabs.len(), 5);
+        // Windowed strip: full height and 360 logical px, Rust f214.
+        assert_eq!(layout.sidebar.right - layout.sidebar.left, 360.0);
+        assert_eq!(layout.sidebar.top, 0.0);
+        assert_eq!(layout.sidebar.bottom, 600.0);
+        // Pill: 10 | 22 seek | 8 | 36 | 10 = 86 tall, 626 wide at 100%.
+        assert!((layout.panel.height() - 86.0).abs() < 0.01);
+        assert!((layout.panel.width() - 626.0).abs() < 0.01);
+        assert!((layout.play.width() - 36.0).abs() < 0.01);
+        assert!((layout.loop_btn.width() - 36.0).abs() < 0.01);
+        assert_eq!(layout.toolbar_buttons.len(), 9);
+        // f235 cell order: volume, danmaku, interp, enhance | info, comments,
+        // series | performance, settings.
+        for pair in layout.toolbar_buttons.windows(2) {
+            assert!(pair[0].right <= pair[1].left + 0.01);
+        }
+        assert!(layout.divider1.right <= layout.toolbar_buttons[TB_INFO].left);
+        assert!(layout.divider2.right <= layout.toolbar_buttons[TB_PERF].left);
+        assert!(layout.track.bottom < layout.play.top);
+        assert!(layout.enhance_menu.bottom <= layout.panel.top);
         assert!(layout.undo_toast.bottom <= layout.panel.top);
         assert!(layout.undo_button.right <= layout.undo_toast.right);
         assert!(layout.undo_button.left >= layout.undo_toast.left);
-        // The 历史 tab's live row is above its first date row.
-        assert!(layout.history_row(0, 0.0).top > layout.history_live.bottom);
     }
 }
 

@@ -651,6 +651,48 @@ pub fn is_maximized(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd).as_bool() }
 }
 
+/// Grow/shrink the window width from its left edge, keeping it on the work
+/// area. The player strip uses this so windowed mode opens outward instead of
+/// eating the picture.
+pub fn grow_width(hwnd: HWND, delta: i32) {
+    if delta == 0 {
+        return;
+    }
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return;
+    }
+    let mut width = (rect.right - rect.left + delta).max(720);
+    let mut x = rect.left;
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info).as_bool() } {
+        let work = info.rcWork;
+        let max_w = (work.right - work.left).max(720);
+        width = width.min(max_w);
+        if x + width > work.right {
+            x = (work.right - width).max(work.left);
+        }
+        if x < work.left {
+            x = work.left;
+        }
+    }
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            x,
+            rect.top,
+            width,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
+}
+
 /// Retitle the window once the deferred source reports its real title.
 pub fn set_title(hwnd: HWND, title: &str) {
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
