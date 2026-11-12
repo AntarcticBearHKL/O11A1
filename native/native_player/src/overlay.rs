@@ -751,6 +751,8 @@ pub struct UiModel {
     pub storyboard_cell: Option<StoryboardCellUi>,
     pub light_sidebar: bool,
     pub buffering: bool,
+    /// The video layer has no picture yet; paint the loading backdrop.
+    pub splash: bool,
     pub error: Option<String>,
     pub danmaku_opacity: u32,
     pub danmaku_font: u32,
@@ -1783,6 +1785,21 @@ impl Overlay {
                 a: 0.0,
             }));
 
+            // The loading screen must be fully opaque: the video swapchain has
+            // not presented a frame yet, so a transparent UI layer would let
+            // the desktop show through.
+            if model.splash {
+                self.fill(
+                    Rect {
+                        left: 0.0,
+                        top: 0.0,
+                        right: layout.width,
+                        bottom: layout.height,
+                    },
+                    &self.black,
+                );
+            }
+
             // Fit letterbox. Fill/Stretch crop or fill underneath the chrome.
             if model.aspect == AspectMode::Fit {
                 let (vx, vy, video_width, video_height) = crate::gpu::video_bounds(
@@ -1982,7 +1999,11 @@ impl Overlay {
                     );
                 }
                 self.text(
-                    "正在缓冲…",
+                    if model.status.is_empty() {
+                        "正在缓冲…"
+                    } else {
+                        model.status.as_str()
+                    },
                     card.left + 52.0 * s,
                     card.top + 22.0 * s,
                     card.width() - 64.0 * s,

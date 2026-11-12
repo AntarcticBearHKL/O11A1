@@ -176,8 +176,11 @@ pub fn run(
     session: Option<Arc<o11a1::bilibili::Session>>,
     state: PlayerState,
     ready: Sender<Result<(), String>>,
+    source_rx: Receiver<std::result::Result<crate::DeferredOpen, String>>,
+    source_tx: Sender<std::result::Result<crate::DeferredOpen, String>>,
 ) {
     let result = Engine::new(
+        config,
         source,
         shared.clone(),
         commands,
@@ -187,8 +190,8 @@ pub fn run(
         detail_rx,
         session,
         state,
-        config.start_ms,
-        config.host.clone(),
+        source_rx,
+        source_tx,
     );
     let mut engine = match result {
         Ok(engine) => {
@@ -211,6 +214,15 @@ pub fn run(
 
 struct Engine {
     source: MediaSource,
+    /// The open request, kept so a failed initial resolve can be retried.
+    open_config: PlayerConfig,
+    /// `true` while the window shows the loading card and no source exists.
+    loading: bool,
+    /// A resolve worker is in flight and its result is expected on `source_rx`.
+    source_pending: bool,
+    source_rx: Receiver<std::result::Result<crate::DeferredOpen, String>>,
+    source_tx: Sender<std::result::Result<crate::DeferredOpen, String>>,
+    requested_start_ms: u64,
     session: Option<Arc<o11a1::bilibili::Session>>,
     shared: Arc<SharedState>,
     commands: Receiver<Command>,
@@ -511,6 +523,7 @@ enum QaKind {
 
 impl Engine {
     fn new(
+        config: PlayerConfig,
         source: MediaSource,
         shared: Arc<SharedState>,
         commands: Receiver<Command>,
@@ -520,14 +533,19 @@ impl Engine {
         detail_rx: Receiver<DetailEvent>,
         session: Option<Arc<o11a1::bilibili::Session>>,
         mut state: PlayerState,
-        requested_start_ms: u64,
-        host: Option<crate::PlayerHost>,
+        source_rx: Receiver<std::result::Result<crate::DeferredOpen, String>>,
+        source_tx: Sender<std::result::Result<crate::DeferredOpen, String>>,
     ) -> Result<Self> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             let _ = timeBeginPeriod(1);
         }
+        // The placeholder source has no URL: the window opens on the loading
+        // card while a worker resolves the real media.
+        let loading = source.is_placeholder();
+        let requested_start_ms = config.start_ms;
+        let host = config.host.clone();
         let title = format!("O11A1 · {}", source.title);
         let external = host.is_some();
         let (hwnd, events) = match &host {
@@ -676,6 +694,12 @@ impl Engine {
 
         let mut engine = Self {
             source,
+            open_config: config,
+            loading,
+            source_pending: loading,
+            source_rx,
+            source_tx,
+            requested_start_ms,
             session,
             shared,
             commands,
@@ -771,7 +795,11 @@ impl Engine {
             last_blend_us: 0,
             ui_dirty: true,
             last_ui_draw: Instant::now(),
-            status: "正在加载…".to_string(),
+            status: if loading {
+                "正在打开视频…".to_string()
+            } else {
+                "正在加载…".to_string()
+            },
             drag_preview: None,
             dragging: false,
             window_drag_arm: None,
@@ -884,7 +912,11 @@ impl Engine {
             "danmaku cadence hz={} independent=1",
             crate::interp::display_refresh_hz().clamp(30, 120)
         ));
-        engine.open_sessions(start_ms, false)?;
+        if loading {
+            log::line("player window ready; waiting for the resolved source");
+        } else {
+            engine.open_sessions(start_ms, false)?;
+        }
         let start_mini = std::env::var("BILI_PLAYER_MINI")
             .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
             .unwrap_or(false);
@@ -2309,6 +2341,25 @@ impl Engine {
             if self.quit {
                 break;
             }
+            if self.source_pending {
+                match self.source_rx.try_recv() {
+                    Ok(Ok(open)) => {
+                        self.source_pending = false;
+                        self.apply_deferred_source(open);
+                    }
+                    Ok(Err(message)) => {
+                        self.source_pending = false;
+                        self.loading = false;
+                        self.report_error(format!("打开视频失败：{message}"));
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        self.source_pending = false;
+                        self.loading = false;
+                        self.report_error("打开视频失败：解析线程已退出");
+                    }
+                }
+            }
             loop {
                 match self.danmaku_rx.try_recv() {
                     Ok(items) => self.install_danmaku(items),
@@ -2497,6 +2548,9 @@ impl Engine {
     }
 
     fn wanted_status(&self) -> String {
+        if self.loading {
+            return "正在打开视频…".to_string();
+        }
         if self.ended {
             return "播放结束".to_string();
         }
@@ -3738,6 +3792,143 @@ impl Engine {
         self.show_toast("已切换分P", false);
     }
 
+    /// Install the source that the worker resolved while the window was
+    /// already showing its loading card: swap in the real video surface and
+    /// start the decode/audio sessions.
+    fn apply_deferred_source(&mut self, open: crate::DeferredOpen) {
+        let crate::DeferredOpen {
+            mut source,
+            session,
+            detail,
+        } = open;
+        if source.title.trim().is_empty() {
+            source.title = self.source.title.clone();
+        }
+        let title = source.title.clone();
+        let size_changed =
+            source.width != self.source.width || source.height != self.source.height;
+        let new_surface = if size_changed {
+            match VideoSurface::new(&self.gpu, source.width, source.height) {
+                Ok(surface) => Some(surface),
+                Err(error) => {
+                    log::line(&format!("initial source surface failed: {error:#}"));
+                    self.loading = false;
+                    self.report_error(format!("创建视频层失败：{error:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let new_pipeline = if size_changed {
+            match EnhancePipeline::new(
+                &self.gpu.device,
+                &self.gpu.context,
+                source.width,
+                source.height,
+            ) {
+                Ok(pipeline) => Some(pipeline),
+                Err(error) => {
+                    log::line(&format!(
+                        "enhance fallback on initial source reason={error:#}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(surface) = new_surface {
+            if let Err(error) = self.composition.set_video_content(&surface.swap) {
+                log::line(&format!("initial source composition failed: {error:#}"));
+                self.loading = false;
+                self.report_error(format!("视频层绑定失败：{error:#}"));
+                return;
+            }
+            self.video = surface;
+            self.enhance_pipeline = new_pipeline;
+            if self.enhance != EnhanceMode::Off && self.enhance_pipeline.is_none() {
+                self.enhance = EnhanceMode::Off;
+                self.shared.enhance.store(0, Ordering::SeqCst);
+            }
+            self.cur = None;
+            self.prev = None;
+            self.blend_buffer.clear();
+            self.last_source_present = None;
+        }
+        self.loading = false;
+        self.source = source;
+        self.session = session;
+        if let Some((tx, rx)) = detail {
+            self.detail_tx = tx;
+            self.detail_rx = rx;
+            let _ = self.detail_tx.send(DetailRequest::Info);
+            log::line("detail info requested after source resolve");
+        }
+        window::set_title(self.hwnd, &format!("O11A1 · {title}"));
+        if let Some(info) = self.info.as_mut() {
+            info.title = title;
+            info.current_page = 0;
+        }
+        self.pages.clear();
+        self.current_page = 0;
+        self.comments.clear();
+        self.comments_total = 0;
+        self.comments_end = false;
+        self.comments_cursor.clear();
+        self.restart_heartbeat_for_source();
+        self.reset_storyboard();
+        self.settings_menu = None;
+        self.duration_ms = self.source.duration_ms;
+        let start = clamp_seek(self.requested_start_ms, self.duration_ms);
+        self.position_ms = start;
+        self.base_ms = start;
+        self.paused_at = start;
+        self.seek_target = start;
+        self.anchor = None;
+        self.playing = false;
+        self.requested_play = true;
+        self.starting = true;
+        self.first_frame_at = None;
+        self.had_first_frame = false;
+        self.seek_in_flight = false;
+        self.ended = false;
+        self.audio_master = false;
+        self.last_frame_ts = start;
+        self.generation = self.generation.saturating_add(1);
+        self.session_started = Instant::now();
+        let display_hz = interp::display_refresh_hz();
+        self.interp_out_hz = interp::interp_plan(display_hz, self.source.fps);
+        let out_hz = self.interp_out_hz.unwrap_or_else(|| {
+            if self.source.fps.is_finite() && self.source.fps > 1.0 {
+                self.source.fps.round().clamp(1.0, 240.0) as u32
+            } else {
+                60
+            }
+        });
+        self.out_period = Duration::from_secs_f64(1.0 / out_hz.max(1) as f64);
+        self.danmaku.set_items(Vec::new());
+        if let Err(error) = self.danmaku_layer.clear() {
+            log::line(&format!("danmaku clear on initial source failed: {error:#}"));
+        }
+        self.refresh_danmaku_geometry();
+        self.ui_dirty = true;
+        log::line(&format!(
+            "source attached title={:?} duration_ms={} start_ms={start} qn={} codec={} {}x{}",
+            self.source.title,
+            self.duration_ms,
+            self.source.qn,
+            self.source.codec,
+            self.source.width,
+            self.source.height
+        ));
+        if let Err(error) = self.open_sessions(start, false) {
+            self.report_error(format!("打开播放会话失败：{error:#}"));
+            return;
+        }
+        self.sync_shared();
+    }
+
     fn settings_action(&mut self, index: usize) {
         if (index == 0 || index == 1) && !self.source.has_track_menu() {
             self.show_toast("当前来源是直链，没有可切换的画质/音轨", true);
@@ -4118,6 +4309,12 @@ impl Engine {
     }
 
     fn retry(&mut self) {
+        // The initial resolve itself failed: there is no stream to reconnect,
+        // so run the window's source lookup again.
+        if self.source.video_url.is_empty() {
+            self.restart_source_resolution();
+            return;
+        }
         let target = if self.ended {
             0
         } else {
@@ -4137,6 +4334,30 @@ impl Engine {
         }
         log::line("retry sessions reopened");
         self.show_toast("正在重新连接…", false);
+    }
+
+    /// Re-run `source::resolve` for a window whose first lookup failed. The
+    /// result arrives on the same channel the initial open used.
+    fn restart_source_resolution(&mut self) {
+        if self.source_pending {
+            return;
+        }
+        log::line("source resolve retry requested");
+        self.error = None;
+        self.stalled = false;
+        self.loading = true;
+        self.source_pending = true;
+        self.ui_dirty = true;
+        let config = self.open_config.clone();
+        let tx = self.source_tx.clone();
+        let danmaku_tx = self.danmaku_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("player-source-resolve".into())
+            .spawn(move || {
+                let result = crate::resolve_deferred(config, danmaku_tx);
+                let _ = tx.send(result);
+            });
+        self.show_toast("正在重新打开视频…", false);
     }
 
     // ------------------------------------------------------------- 睡眠定时
@@ -4192,6 +4413,11 @@ impl Engine {
     }
 
     fn check_sessions(&mut self) {
+        if self.loading {
+            // No decoder/audio exists until the source resolves; the loading
+            // card covers this window.
+            return;
+        }
         if self.error.is_some() {
             return;
         }
@@ -4894,7 +5120,8 @@ impl Engine {
             return Ok(());
         }
         let buffering = self.error.is_none()
-            && (self.stalled
+            && (self.loading
+                || self.stalled
                 || (self.starting && self.cur.is_some())
                 || self.wanted_status() == "正在缓冲…");
         let storyboard_cell = match (
@@ -4989,6 +5216,7 @@ impl Engine {
             storyboard_cell,
             light_sidebar: self.light_sidebar,
             buffering,
+            splash: self.loading || !self.had_first_frame,
             error: self.error.clone(),
             danmaku_opacity: self.danmaku_opacity,
             danmaku_font: self.danmaku_font,

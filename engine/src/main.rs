@@ -115,7 +115,15 @@ impl App {
     }
 
     async fn player_snapshot(&self, id: &str) -> Value {
-        let guard = self.players.lock().await;
+        let mut guard = self.players.lock().await;
+        if guard.get(id).map(|player| !player.is_open()).unwrap_or(false) {
+            if let Some(mut player) = guard.remove(id) {
+                player.close();
+            }
+            drop(guard);
+            self.emit("player.closed", json!({ "id": id }));
+            return json!({ "id": id, "open": false });
+        }
         match guard.get(id) {
             Some(player) => player_json(id, player),
             None => json!({ "id": id, "open": false }),
@@ -123,7 +131,21 @@ impl App {
     }
 
     async fn player_snapshots(&self) -> Vec<Value> {
-        let guard = self.players.lock().await;
+        let mut guard = self.players.lock().await;
+        // A native window closes itself: the engine is never told. Release
+        // those slots here so the three-window ceiling keeps counting open
+        // windows only.
+        let closed: Vec<String> = guard
+            .iter()
+            .filter(|(_, player)| !player.is_open())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in closed {
+            if let Some(mut player) = guard.remove(&id) {
+                player.close();
+            }
+            self.emit("player.closed", json!({ "id": id }));
+        }
         guard
             .iter()
             .map(|(id, player)| player_json(id, player))
@@ -1349,7 +1371,10 @@ async fn fish_engine(app: &Arc<App>) -> Rpc<Arc<FishEngine>> {
 async fn open_player(app: &Arc<App>, params: Value) -> Rpc<Value> {
     let id = player_id(&params);
     {
-        let guard = app.players.lock().await;
+        let mut guard = app.players.lock().await;
+        // Closed native windows only flip `closed`; drop them before the
+        // ceiling check so reopening keeps working after three closes.
+        guard.retain(|_, player| player.is_open());
         if !guard.contains_key(&id) && guard.len() >= 3 {
             return Err("最多同时打开 3 个播放器窗口".to_string());
         }

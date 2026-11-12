@@ -38,7 +38,7 @@ mod state;
 mod storyboard;
 mod window;
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -106,9 +106,61 @@ pub struct Player {
     thread: Option<JoinHandle<()>>,
 }
 
+/// Everything that only becomes known after the network lookup: the real
+/// source, the login session and the right-strip worker's channels.
+pub(crate) struct DeferredOpen {
+    pub source: source::MediaSource,
+    pub session: Option<Arc<o11a1::bilibili::Session>>,
+    pub detail: Option<(Sender<detail::DetailRequest>, Receiver<detail::DetailEvent>)>,
+}
+
+/// Resolve the media source for a window that is already showing its loading
+/// overlay. Runs on a plain thread: `source::resolve` uses its own runtime.
+pub(crate) fn resolve_deferred(
+    config: PlayerConfig,
+    danmaku_tx: Sender<Vec<danmaku::DanmakuItem>>,
+) -> std::result::Result<DeferredOpen, String> {
+    let resolved = source::resolve(&config).map_err(|error| format!("{error:#}"))?;
+    let duration_ms = resolved.source.duration_ms;
+    let bvid = resolved.source.bvid.clone();
+    let cid = resolved.source.cid;
+    let session = resolved.session.map(Arc::new);
+
+    if let (Some(session), Some(cid)) = (session.clone(), cid) {
+        let sender = danmaku_tx.clone();
+        match std::thread::Builder::new()
+            .name("player-danmaku-fetch".into())
+            .spawn(move || {
+                let items = danmaku::fetch_with_session(session, cid, duration_ms);
+                danmaku::send_result(&sender, items);
+            }) {
+            Ok(_) => {}
+            Err(error) => {
+                log::line(&format!("danmaku fetch thread failed: {error}"));
+                let _ = danmaku_tx.send(Vec::new());
+            }
+        }
+    } else {
+        let _ = danmaku_tx.send(Vec::new());
+    }
+
+    let detail = match (session.clone(), bvid) {
+        (Some(session), Some(bvid)) => Some(detail::spawn(session, bvid, cid.unwrap_or(0))),
+        _ => None,
+    };
+
+    Ok(DeferredOpen {
+        source: resolved.source,
+        session,
+        detail,
+    })
+}
+
 impl Player {
-    /// Resolve the source and create the window. Blocks until the composition
-    /// tree is up (or reports why it could not be built).
+    /// Show the window first, then resolve the media source on a worker
+    /// thread. Blocks only until the composition tree and loading overlay are
+    /// up, so a slow `video_view`/`playurl` round-trip no longer delays the
+    /// window appearing.
     pub fn open(config: PlayerConfig) -> Result<Self> {
         let state = PlayerState::load();
         log::line(&format!(
@@ -139,104 +191,77 @@ impl Player {
         if config.audio_index.is_none() {
             config.audio_index = state.audio_index;
         }
-        let resolved = source::resolve(&config).context("resolve media source")?;
-        let source = resolved.source;
-        let session = resolved.session.map(Arc::new);
-        log::line(&format!(
-            "open title={:?} duration_ms={} start_ms={} qn={} codec={}",
-            source.title,
-            source.duration_ms,
-            clamp_start(config.start_ms, source.duration_ms),
-            source.qn,
-            source.codec
-        ));
         let (command_tx, command_rx) = mpsc::channel();
         let (danmaku_tx, danmaku_rx) = mpsc::channel();
         let engine_danmaku_tx = danmaku_tx.clone();
-        let bvid = source.bvid.clone();
-        let cid = source.cid;
-        if let (Some(session), Some(cid)) = (session.clone(), cid) {
-            let duration_ms = source.duration_ms;
-            log::line(&format!(
-                "danmaku fetch queued bvid={} cid={cid} duration_ms={duration_ms}",
-                source.bvid.as_deref().unwrap_or("-")
-            ));
-            let sender = danmaku_tx.clone();
-            match std::thread::Builder::new()
-                .name("player-danmaku-fetch".into())
-                .spawn(move || {
-                    let items = danmaku::fetch_with_session(session, cid, duration_ms);
-                    danmaku::send_result(&sender, items);
-                }) {
-                Ok(_) => {}
-                Err(error) => {
-                    log::line(&format!("danmaku fetch thread failed: {error}"));
-                    let _ = danmaku_tx.send(Vec::new());
-                }
-            }
-        } else {
-            let _ = danmaku_tx.send(Vec::new());
-        }
-        drop(danmaku_tx);
-        // The right-strip worker shares the same session as the player. Without
-        // a Bilibili source (direct URL) it still gets channels so the engine
-        // never has to branch on Option.
-        let engine_session = session.clone();
-        let (detail_tx, detail_rx) = match (session, bvid) {
-            (Some(session), Some(bvid)) => {
-                detail::spawn(session, bvid, cid.unwrap_or(0))
-            }
-            _ => {
-                let (tx, rx) = mpsc::channel();
-                drop(rx);
-                (tx, mpsc::channel().1)
-            }
-        };
+        // Replaced with the right-strip worker's channels when the source
+        // arrives; until then `Info` requests simply fail and are ignored.
+        let (detail_tx, _detail_rx_unused) = mpsc::channel::<detail::DetailRequest>();
+        let (_detail_tx_unused, detail_rx) = mpsc::channel::<detail::DetailEvent>();
         let shared = Arc::new(SharedState::default());
-        shared
-            .duration_ms
-            .store(source.duration_ms, std::sync::atomic::Ordering::SeqCst);
         shared
             .position_ms
             .store(config.start_ms, std::sync::atomic::Ordering::SeqCst);
+        let placeholder_title = if config.title.trim().is_empty() {
+            "正在打开视频…".to_string()
+        } else {
+            config.title.clone()
+        };
+        let placeholder =
+            source::MediaSource::placeholder(placeholder_title, config.bvid.clone(), config.cid);
+        let (source_tx, source_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_shared = shared.clone();
         let thread_config = config.clone();
         let thread_state = state.clone();
+        let thread_source_tx = source_tx.clone();
         let thread = std::thread::Builder::new()
             .name("native-player".into())
             .spawn(move || {
                 engine::run(
                     thread_config,
-                    source,
+                    placeholder,
                     thread_shared,
                     command_rx,
                     danmaku_rx,
                     engine_danmaku_tx,
                     detail_tx,
                     detail_rx,
-                    engine_session,
+                    None,
                     thread_state,
                     ready_tx,
+                    source_rx,
+                    thread_source_tx,
                 );
             })
             .context("spawn player thread")?;
         match ready_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(())) => Ok(Self {
-                commands: command_tx,
-                shared,
-                thread: Some(thread),
-            }),
+            Ok(Ok(())) => {}
             Ok(Err(reason)) => {
                 let _ = thread.join();
-                Err(anyhow!("player setup failed: {reason}"))
+                return Err(anyhow!("player setup failed: {reason}"));
             }
             Err(error) => {
                 let _ = command_tx.send(Command::Close);
                 let _ = thread.join();
-                Err(anyhow!("player setup timed out: {error}"))
+                return Err(anyhow!("player setup timed out: {error}"));
             }
         }
+        // The window is on screen now (loading card + spinner); the network
+        // lookup runs separately and the engine applies the result when it
+        // arrives.
+        std::thread::Builder::new()
+            .name("player-source-resolve".into())
+            .spawn(move || {
+                let result = resolve_deferred(config, danmaku_tx);
+                let _ = source_tx.send(result);
+            })
+            .context("spawn source resolver")?;
+        Ok(Self {
+            commands: command_tx,
+            shared,
+            thread: Some(thread),
+        })
     }
 
     fn send(&self, command: Command) {
@@ -546,10 +571,6 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.close();
     }
-}
-
-fn clamp_start(start_ms: u64, duration_ms: u64) -> u64 {
-    format::clamp_seek(start_ms, duration_ms)
 }
 
 #[cfg(test)]

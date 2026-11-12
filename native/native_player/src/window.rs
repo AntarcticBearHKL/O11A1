@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetWindowLongPtrW, GetWindowRect, IsZoomed, LoadCursorW, PeekMessageW,
     PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWLP_USERDATA,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, GWLP_USERDATA,
     GWL_EXSTYLE, GWL_STYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT,
     HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MSG,
     PM_REMOVE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOMOVE, SWP_NOSIZE,
@@ -354,6 +354,28 @@ pub fn create(
             Arc::as_ptr(&events) as *const WindowEvents as isize,
         );
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // The engine is a background process, so `SetForegroundWindow` is
+        // usually denied and a plain HWND_TOP insert leaves the player behind
+        // the Electron window that launched it. The topmost → not-topmost bump
+        // raises it above the foreground window without stealing focus.
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
         let _ = UpdateWindow(hwnd);
         let _ = SetForegroundWindow(hwnd);
         Ok((hwnd, events))
@@ -627,6 +649,12 @@ pub fn close_window(hwnd: HWND) {
 
 pub fn is_maximized(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd).as_bool() }
+}
+
+/// Retitle the window once the deferred source reports its real title.
+pub fn set_title(hwnd: HWND, title: &str) {
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = unsafe { SetWindowTextW(hwnd, PCWSTR(wide.as_ptr())) };
 }
 
 /// Toggle between the decorated window and borderless monitor-filling mode.

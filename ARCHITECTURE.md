@@ -77,6 +77,26 @@ engine 打开一个 `native_player` 独立窗口：
   移动整个窗口；未移动直接松开仍切换播放/暂停。
 - 多个播放器窗口按 46px 级联摆放；视频、弹幕和控制条都在同一个原生窗口内，
   不存在 Electron 与原生窗口互相遮挡的问题。
+- 窗口创建后做一次 topmost → not-topmost 的 z-order bump，保证从 Electron 点击卡片
+  打开时，播放器直接出现在主窗口上方（后台进程无法可靠调用 `SetForegroundWindow`）。
+
+### 打开时序（点击即出窗口）
+
+```text
+点击卡片
+  → engine player.open
+  → native_player 创建窗口 + 覆盖层（约 0.05–0.5 s）
+  → 覆盖层画黑色加载底 + 8 点 spinner + 正在打开视频…
+  → 后台线程 source::resolve（video_view + playurl）
+  → Command 通道送回 DeferredOpen
+  → 换入真实视频层、启动解码/音频、拉取弹幕与详情
+  → 第一帧呈现前保持加载层，第一帧后自动消失
+```
+
+- `Player::open` 只等待窗口和覆盖层就绪，不再等待网络。
+- 解析失败时窗口保留，覆盖层显示错误卡片；“重试”重新跑解析线程。
+- 关闭原生窗口后，引擎在 150 ms 的状态轮询里发现 `Player::is_open() == false`
+  并移除该播放器，三个窗口的额度随之释放。
 
 ### 全屏
 

@@ -80,6 +80,41 @@ impl MediaSource {
     pub fn has_track_menu(&self) -> bool {
         !self.video_tracks.is_empty()
     }
+
+    /// The stand-in source the window opens with while `resolve` runs on a
+    /// worker thread. It has no URL, so the engine skips the decoder and paints
+    /// the loading card until [`crate::DeferredOpen`] replaces it.
+    pub(crate) fn placeholder(title: String, bvid: Option<String>, cid: Option<u64>) -> Self {
+        Self {
+            title,
+            bvid,
+            cid,
+            video_url: String::new(),
+            audio_url: None,
+            headers: Vec::new(),
+            duration_ms: 0,
+            source_width: 1280,
+            source_height: 720,
+            width: 1280,
+            height: 720,
+            fps: 30.0,
+            qn: 0,
+            codecid: 0,
+            audio_index: 0,
+            qn_label: String::new(),
+            audio_label: String::new(),
+            codec: String::new(),
+            video_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            quality_tiers: Vec::new(),
+            remote: true,
+        }
+    }
+
+    /// True for the stand-in used before the real source is resolved.
+    pub(crate) fn is_placeholder(&self) -> bool {
+        self.video_url.is_empty()
+    }
 }
 
 /// The resolved media plus the session that resolved it. `Player::open` hands
