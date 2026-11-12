@@ -30,17 +30,12 @@ export function ErrorBox({ error, onRetry }: { error: string; onRetry?: () => vo
   );
 }
 
-export function PageHead({ title, sub, children }: { title: string; sub?: string; children?: React.ReactNode }) {
-  return (
-    <div className="page-head">
-      <div>
-        <h1 className="page-title">{title}</h1>
-        {sub ? <div className="page-sub">{sub}</div> : null}
-      </div>
-      <div className="spacer" />
-      {children}
-    </div>
-  );
+export function PageHead({ children }: { title?: string; sub?: string; children?: React.ReactNode }) {
+  // The old native shell identifies the page by the active bottom tab only:
+  // no per-page title strip. Keep the functional row (tabs / chips / actions)
+  // when a page actually needs one.
+  if (!children) return null;
+  return <div className="page-tools">{children}</div>;
 }
 
 export function SkeletonGrid({ count = 8 }: { count?: number }) {

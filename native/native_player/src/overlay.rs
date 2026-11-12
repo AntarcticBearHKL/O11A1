@@ -344,12 +344,13 @@ impl Layout {
         let s = scale.max(0.75);
         let top_h = if fullscreen { 0.0 } else { 44.0 * s };
         let side_w = if sidebar_open { 300.0 * s } else { 0.0 };
-        // The picture always fills the window; the right strip floats above
-        // it instead of shrinking the video. The toolbar/popups stay in the
-        // uncovered area so they do not sit under the floating strip.
+        // The picture stays full-window. 非全屏 the strip is docked on the
+        // right and the chrome (toolbar, popups, window buttons) centres in the
+        // uncovered area; 全屏 it expands inward over the picture but still
+        // keeps the chrome out from under it.
         let video_w = width;
-        let ui_w = if sidebar_open && !fullscreen {
-            (width - side_w - 28.0 * s).max(420.0 * s)
+        let ui_w = if sidebar_open {
+            (width - side_w).max(320.0 * s)
         } else {
             width
         };
@@ -394,10 +395,10 @@ impl Layout {
             };
         }
         let sidebar = Rect {
-            left: width - side_w - 14.0 * s,
-            top: if fullscreen { 14.0 * s } else { 48.0 * s },
-            right: width - 14.0 * s,
-            bottom: height - 100.0 * s,
+            left: width - side_w,
+            top: 0.0,
+            right: width,
+            bottom: height,
         };
         let tab_left = sidebar.left + 8.0 * s;
         let tab_right = sidebar.right - 42.0 * s;
@@ -407,14 +408,14 @@ impl Layout {
             let left = tab_left + index as f32 * tab_w;
             *rect = Rect {
                 left,
-                top: sidebar.top + 6.0 * s,
+                top: sidebar.top + 8.0 * s,
                 right: left + tab_w,
-                bottom: sidebar.top + 40.0 * s,
+                bottom: sidebar.top + 42.0 * s,
             };
         }
         let sidebar_content = Rect {
             left: sidebar.left + 14.0 * s,
-            top: sidebar.top + 48.0 * s,
+            top: sidebar.top + 50.0 * s,
             right: sidebar.right - 14.0 * s,
             bottom: sidebar.bottom - 12.0 * s,
         };
@@ -517,12 +518,12 @@ impl Layout {
             right: (width + 96.0 * s) * 0.5,
             bottom: error_top + error_h - 16.0 * s,
         };
-        let undo_w = (330.0 * s).min((video_w - 24.0 * s).max(220.0 * s));
+        let undo_w = (330.0 * s).min((ui_w - 24.0 * s).max(220.0 * s));
         let undo_bottom = (toolbar.top - 16.0 * s).max(64.0 * s);
         let undo_toast = Rect {
-            left: (video_w - undo_w) * 0.5,
+            left: (ui_w - undo_w) * 0.5,
             top: undo_bottom - 40.0 * s,
-            right: (video_w + undo_w) * 0.5,
+            right: (ui_w + undo_w) * 0.5,
             bottom: undo_bottom,
         };
         let undo_button = Rect {
@@ -537,30 +538,30 @@ impl Layout {
             height,
             top_bar,
             top_min: Rect {
-                left: video_w - 138.0 * s,
+                left: ui_w - 138.0 * s,
                 top: 0.0,
-                right: video_w - 92.0 * s,
+                right: ui_w - 92.0 * s,
                 bottom: top_h,
             },
             top_max: Rect {
-                left: video_w - 92.0 * s,
+                left: ui_w - 92.0 * s,
                 top: 0.0,
-                right: video_w - 46.0 * s,
+                right: ui_w - 46.0 * s,
                 bottom: top_h,
             },
             top_close: Rect {
-                left: video_w - 46.0 * s,
+                left: ui_w - 46.0 * s,
                 top: 0.0,
-                right: video_w,
+                right: ui_w,
                 bottom: top_h,
             },
             sidebar,
             sidebar_tabs,
             sidebar_close: Rect {
                 left: sidebar.right - 38.0 * s,
-                top: sidebar.top + 8.0 * s,
+                top: sidebar.top + 10.0 * s,
                 right: sidebar.right - 10.0 * s,
-                bottom: sidebar.top + 36.0 * s,
+                bottom: sidebar.top + 38.0 * s,
             },
             sidebar_content,
             history_live,
@@ -2090,14 +2091,18 @@ impl Overlay {
 
     unsafe fn draw_sidebar(&mut self, model: &UiModel, layout: &Layout) {
         let s = layout.scale;
-        let rounded = D2D1_ROUNDED_RECT {
-            rect: to_d2d(layout.sidebar),
-            radiusX: 14.0 * s,
-            radiusY: 14.0 * s,
-        };
-        self.d2d.FillRoundedRectangle(&rounded, &self.sidebar_panel_bg);
-        self.d2d
-            .DrawRoundedRectangle(&rounded, &self.sidebar_panel_line, s, None);
+        // Window-height strip: 非全屏 it is docked to the right edge, 全屏 it
+        // overlays the picture. No floating rounded card.
+        self.fill(layout.sidebar, &self.sidebar_panel_bg);
+        self.fill(
+            Rect {
+                left: layout.sidebar.left,
+                top: 0.0,
+                right: layout.sidebar.left + s,
+                bottom: layout.sidebar.bottom,
+            },
+            &self.sidebar_panel_line,
+        );
         for (index, rect) in layout.sidebar_tabs.iter().enumerate() {
             let tab = SidebarTab::from_index(index);
             let active = model.sidebar_tab == tab;

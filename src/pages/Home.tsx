@@ -2,8 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { call } from '../api';
 import { useApp } from '../context';
 import type { FeedVideo } from '../types';
-import { ErrorBox, PageHead, SkeletonGrid, VideoGrid } from '../components/Common';
-import { IconRefresh } from '../components/Icons';
+import { ErrorBox, SkeletonGrid, VideoGrid } from '../components/Common';
 
 export default function Home() {
   const { launch, toast } = useApp();
@@ -72,11 +71,6 @@ export default function Home() {
 
   return (
     <>
-      <PageHead title="推荐" sub="真实的首页推荐流 · 单击卡片直接播放">
-        <button className="btn sm" onClick={() => load(fresh, true)} disabled={loading}>
-          <IconRefresh size={14} /> {loading ? '获取中…' : '换一换'}
-        </button>
-      </PageHead>
       {error && !items.length ? <ErrorBox error={error} onRetry={() => load(fresh, true)} /> : null}
       {loading && !items.length ? <SkeletonGrid count={8} /> : null}
       {items.length ? <VideoGrid items={items} onPlay={play} /> : null}

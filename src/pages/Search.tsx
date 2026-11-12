@@ -3,12 +3,11 @@ import { call, cover, formatCount } from '../api';
 import { useApp } from '../context';
 import type { SearchHitPage } from '../types';
 import { Empty, ErrorBox, Tabs, VideoGrid } from '../components/Common';
-import { IconSearch } from '../components/Icons';
 
 const TABS = ['视频', '番剧', '影视', '直播', '用户'];
 
 export default function Search() {
-  const { route, navigate, settings, toast, launch, openSearch } = useApp();
+  const { route, navigate, settings, toast, launch } = useApp();
   const keyword = route.query.get('q') || '';
   const [tab, setTab] = useState(0);
   const [page, setPage] = useState(1);
@@ -72,19 +71,6 @@ export default function Search() {
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <button className="search-title" onClick={openSearch} title="点击底栏搜索框修改关键词">
-            {keyword ? `搜索：${keyword}` : '搜索'}
-          </button>
-          <div className="page-sub">
-            {data ? `共 ${formatCount(data.num_results)} 个结果` : '使用底栏搜索框输入关键词 · Enter 搜索'}
-          </div>
-        </div>
-        <div className="spacer" />
-        <button className="btn sm" onClick={openSearch}><IconSearch size={14} /> 修改搜索</button>
-      </div>
-
       {!keyword ? (
         <div className="card panel" style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
@@ -115,10 +101,13 @@ export default function Search() {
 
       {keyword ? (
         <>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+          <div className="page-tools">
             <Tabs tabs={TABS} active={tab} onChange={(next) => { setTab(next); setPage(1); }} />
             {loading ? <span className="spinner" /> : null}
-            {data ? <span style={{ color: 'var(--text-faint)', fontSize: 11.5 }}>第 {data.page} / {Math.max(1, data.num_pages)} 页</span> : null}
+            <span className="page-count">
+              {keyword}
+              {data ? ` · ${formatCount(data.num_results)} 个结果 · 第 ${data.page} / ${Math.max(1, data.num_pages)} 页` : ''}
+            </span>
           </div>
           {error ? <ErrorBox error={error} onRetry={() => load(page, false)} /> : null}
           {!error && data && data.items.length === 0 && !loading ? <Empty title="没有找到相关结果" hint="换个关键词试试" /> : null}

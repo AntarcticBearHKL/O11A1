@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { call } from '../api';
 import { useApp } from '../context';
 import type { CardPage, VideoCard } from '../types';
-import { Empty, ErrorBox, PageHead, SkeletonGrid, VideoGrid } from '../components/Common';
+import { Empty, ErrorBox, SkeletonGrid, VideoGrid } from '../components/Common';
 
 const REGIONS: Array<[number, string]> = [
   [1, '动画'], [13, '番剧'], [167, '国创'], [3, '音乐'], [129, '舞蹈'],
@@ -50,19 +50,18 @@ export default function Regions() {
 
   return (
     <>
-      <PageHead title="分区" sub={REGIONS[selected][1]}>
-        <div className="chips">
-          <button className={`chip small ${mode === 0 ? 'active' : ''}`} onClick={() => setMode(0)}>最新发布</button>
-          <button className={`chip small ${mode === 1 ? 'active' : ''}`} onClick={() => setMode(1)}>排行榜</button>
+      <div className="region-rail">
+        <div className="region-scroll">
+          {REGIONS.map(([rid, name], index) => (
+            <button key={rid} className={`chip ${index === selected ? 'active' : ''}`} onClick={() => setSelected(index)}>
+              {name}
+            </button>
+          ))}
         </div>
-      </PageHead>
-
-      <div className="region-grid" style={{ marginBottom: 18 }}>
-        {REGIONS.map(([rid, name], index) => (
-          <button key={rid} className="region-tile" style={{ ...(index === selected ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : {}) }} onClick={() => setSelected(index)}>
-            {name}
-          </button>
-        ))}
+        <div className="region-modes">
+          <button className={`chip ${mode === 0 ? 'active' : ''}`} onClick={() => setMode(0)}>最新发布</button>
+          <button className={`chip ${mode === 1 ? 'active' : ''}`} onClick={() => setMode(1)}>排行榜</button>
+        </div>
       </div>
 
       {loading ? <SkeletonGrid count={8} /> : error ? <ErrorBox error={error} onRetry={() => load(1, false)} /> : items.length ? (

@@ -559,7 +559,7 @@ export default function App() {
           </div>
         </main>
 
-        <nav className="bottom">
+        <nav className={`bottom ${searchOpen ? 'searching' : ''}`}>
           {navLeft.map((item) => (
             <button
               key={item.key}
@@ -648,16 +648,22 @@ export default function App() {
               <div className="queue-rows">
                 {playlist.slice(playlistStart, playlistStart + rows).map((entry: any, index: number) => {
                   const actual = playlistStart + index;
+                  const active = playlistCurrent === actual;
                   return (
                     <div
                       key={`${entry.bvid}-${entry.cid}-${actual}`}
-                      className={`queue-row ${playlistCurrent === actual ? 'active' : ''}`}
+                      className={`queue-row ${active ? 'active' : ''}`}
                       onClick={() => playQueueIndex(actual)}
                     >
-                      <span className="queue-index">{actual + 1}</span>
+                      <div className="queue-cover">
+                        {entry.cover
+                          ? <img src={cover(entry.cover)} referrerPolicy="no-referrer" alt="" />
+                          : <span className="queue-cover-fallback" />}
+                        {active ? <span className="queue-playing"><i /><i /><i /></span> : null}
+                      </div>
                       <div className="queue-meta">
-                        <div className="queue-title">{entry.title}</div>
-                        <div className="queue-sub">{[entry.owner, entry.duration].filter(Boolean).join(' · ')}</div>
+                        <div className="queue-title">{entry.title || '未命名视频'}</div>
+                        <div className="queue-sub">{[entry.owner, entry.duration].filter(Boolean).join(' · ') || ' '}</div>
                       </div>
                       <button
                         className="queue-remove"
@@ -669,8 +675,20 @@ export default function App() {
                 })}
               </div>
               <div className="queue-foot">
-                <button className={`queue-toggle ${settings.playlist_autoplay ? 'on' : ''}`} onClick={() => saveSettings({ playlist_autoplay: !settings.playlist_autoplay })}>自动连播</button>
-                <button className={`queue-toggle ${settings.playlist_random ? 'on' : ''}`} onClick={() => saveSettings({ playlist_random: !settings.playlist_random })}>随机播放</button>
+                <button
+                  className={`queue-switch ${settings.playlist_autoplay ? 'on' : ''}`}
+                  onClick={() => saveSettings({ playlist_autoplay: !settings.playlist_autoplay })}
+                >
+                  <span>自动播放</span>
+                  <i className="queue-switch-track"><i /></i>
+                </button>
+                <button
+                  className={`queue-switch ${settings.playlist_random ? 'on' : ''}`}
+                  onClick={() => saveSettings({ playlist_random: !settings.playlist_random })}
+                >
+                  <span>随机播放</span>
+                  <i className="queue-switch-track"><i /></i>
+                </button>
                 <span className="queue-foot-spacer" />
                 <button className="queue-step" title="上一首" onClick={() => stepQueue(-1)}>‹</button>
                 <button className="queue-step" title="下一首" onClick={() => stepQueue(1)}>›</button>
