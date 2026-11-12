@@ -1,0 +1,14 @@
+node_modules/
+dist/
+engine-target/
+release/
+runtime/ffmpeg/
+runtime/o11a1-engine.exe
+runtime/assets/
+*.log
+.test-home/
+shots/
+shot*.png
+engine-build*.txt
+engine-*.txt
+test-*.txt

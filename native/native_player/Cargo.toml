@@ -1,0 +1,45 @@
+[package]
+name = "native_player"
+version = "0.1.0"
+edition = "2021"
+description = "O11A1 native video player — Win32 + DirectComposition + D3D11 + Direct2D, no Slint"
+
+[dependencies]
+# The network/session layer only: bilibili playurl, accounts and paths. The
+# player window itself never touches Slint (see README).
+o11a1 = { package = "o11a1-core", path = "../core" }
+anyhow = "1"
+# The QA screenshot hook writes a PNG; the external verification uses
+# CopyFromScreen, but `BILI_PLAYER_QA=shot` needs its own save.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# 弹幕 block rules: already in the workspace lock via the root crate.
+regex = "1"
+tokio = { version = "1", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-numerics = "0.3"

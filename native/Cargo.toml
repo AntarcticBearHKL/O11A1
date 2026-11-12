@@ -1,0 +1,6 @@
+[workspace]
+members = ["core", "native_player"]
+resolver = "2"
+
+[profile.release]
+incremental = true

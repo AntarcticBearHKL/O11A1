@@ -1,0 +1,34 @@
+import React from 'react';
+
+type P = { size?: number; className?: string };
+const s = (size = 16) => ({ width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const });
+
+export const IconSearch = ({ size, className }: P) => <svg {...s(size)} className={className}><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg>;
+export const IconGear = ({ size, className }: P) => <svg {...s(size)} className={className}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8.96 4.6 1.7 1.7 0 0 0 10 3.05V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.04 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z" /></svg>;
+export const IconBack = ({ size, className }: P) => <svg {...s(size)} className={className}><path d="M15 18l-6-6 6-6" /></svg>;
+export const IconRefresh = ({ size, className }: P) => <svg {...s(size)} className={className}><path d="M20 11a8 8 0 1 0-2.34 5.66" /><path d="M20 4v7h-7" /></svg>;
+export const IconPlay = ({ size = 20, className }: P) => <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}><path d="M8 5.5v13a1 1 0 0 0 1.5.87l10-6.5a1 1 0 0 0 0-1.74l-10-6.5A1 1 0 0 0 8 5.5z" /></svg>;
+export const IconPause = ({ size = 20, className }: P) => <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}><rect x="6" y="4" width="4.2" height="16" rx="1" /><rect x="13.8" y="4" width="4.2" height="16" rx="1" /></svg>;
+export const IconNext = ({ size = 18, className }: P) => <svg {...s(size)} className={className}><path d="M5 5l9 7-9 7z" fill="currentColor" stroke="none" /><path d="M18 5v14" /></svg>;
+export const IconPrev = ({ size = 18, className }: P) => <svg {...s(size)} className={className}><path d="M19 5l-9 7 9 7z" fill="currentColor" stroke="none" /><path d="M6 5v14" /></svg>;
+export const IconVolume = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><path d="M4 9v6h4l5 4V5L8 9H4z" /><path d="M17 8.5a5 5 0 0 1 0 7" /></svg>;
+export const IconMute = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><path d="M4 9v6h4l5 4V5L8 9H4z" /><path d="M17 9l4 6M21 9l-4 6" /></svg>;
+export const IconFull = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" /></svg>;
+export const IconExitFull = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /></svg>;
+export const IconDanmaku = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><rect x="3" y="5" width="18" height="12" rx="2.5" /><path d="M7 9h6M7 13h10" /></svg>;
+export const IconSettings = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><path d="M4 7h10M18 7h2M4 17h2M10 17h10M4 12h16" /><circle cx="16" cy="7" r="2" fill="currentColor" stroke="none" /><circle cx="8" cy="17" r="2" fill="currentColor" stroke="none" /></svg>;
+export const IconList = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><path d="M8 6h12M8 12h12M8 18h12" /><circle cx="4" cy="6" r="1" fill="currentColor" /><circle cx="4" cy="12" r="1" fill="currentColor" /><circle cx="4" cy="18" r="1" fill="currentColor" /></svg>;
+export const IconPanel = ({ size = 17, className }: P) => <svg {...s(size)} className={className}><rect x="3" y="4" width="18" height="16" rx="2.5" /><path d="M15 4v16" /></svg>;
+export const IconMin = ({ size = 14, className }: P) => <svg {...s(size)} className={className}><path d="M5 12h14" /></svg>;
+export const IconMax = ({ size = 13, className }: P) => <svg {...s(size)} className={className}><rect x="5" y="5" width="14" height="14" rx="1" /></svg>;
+export const IconRestore = ({ size = 13, className }: P) => <svg {...s(size)} className={className}><rect x="5" y="8" width="11" height="11" rx="1" /><path d="M9 8V5h10v10h-3" /></svg>;
+export const IconClose = ({ size = 14, className }: P) => <svg {...s(size)} className={className}><path d="M5 5l14 14M19 5L5 19" /></svg>;
+export const IconHeart = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><path d="M20.8 5.6a5 5 0 0 0-7.1 0L12 7.3l-1.7-1.7a5 5 0 1 0-7.1 7.1L12 21l8.8-8.3a5 5 0 0 0 0-7.1z" /></svg>;
+export const IconCoin = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><circle cx="12" cy="12" r="8" /><path d="M12 8v8M9.5 10.5h5M9.5 13.5h5" /></svg>;
+export const IconStar = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><path d="M12 3.6l2.6 5.4 5.9.8-4.3 4.2 1 5.9L12 17l-5.2 2.9 1-5.9L3.5 9.8l5.9-.8z" /></svg>;
+export const IconDownload = ({ size = 16, className }: P) => <svg {...s(size)} className={className}><path d="M12 4v11M7 11l5 5 5-5M5 20h14" /></svg>;
+export const IconLink = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1" /><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" /></svg>;
+export const IconClock = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" /></svg>;
+export const IconUp = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><path d="M12 19V5M6 11l6-6 6 6" /></svg>;
+export const IconDown = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><path d="M12 5v14M6 13l6 6 6-6" /></svg>;
+export const IconTrash = ({ size = 15, className }: P) => <svg {...s(size)} className={className}><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" /></svg>;

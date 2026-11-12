@@ -1,0 +1,25 @@
+[package]
+name = "o11a1-engine"
+version = "0.1.0"
+edition = "2021"
+description = "O11A1 Electron sidecar: Bilibili data RPC + native video player"
+
+[[bin]]
+name = "o11a1-engine"
+path = "src/main.rs"
+
+[dependencies]
+o11a1 = { package = "o11a1-core", path = "../native/core" }
+native_player = { path = "../native/native_player" }
+anyhow = "1"
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[workspace]

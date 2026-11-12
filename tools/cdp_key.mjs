@@ -1,0 +1,14 @@
+import WebSocket from 'ws';
+const port = process.env.CDP_PORT || 9222;
+const key = process.argv[2] || 'F12';
+const code = process.argv[3] || 'F12';
+const targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+const page = targets.find((t) => t.type === 'page' && !t.url.includes('#/player'));
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+await new Promise((r) => ws.once('open', r));
+ws.send(JSON.stringify({ id: 1, method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key, code, windowsVirtualKeyCode: 123 } }));
+await new Promise((r) => setTimeout(r, 150));
+ws.send(JSON.stringify({ id: 2, method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key, code, windowsVirtualKeyCode: 123 } }));
+await new Promise((r) => setTimeout(r, 300));
+console.log('sent');
+ws.close();

@@ -1,0 +1,2621 @@
+//! Non-secret UI preferences persisted in `settings.json` beside `token.json`.
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// One queued video in the app-wide 播放列表 (see `PlaybackQueue` in `main.rs`).
+///
+/// Deliberately flat and fully `serde`-defaulted: a hand-edited or older
+/// `settings.json` may hold any subset of these fields, and every one of them
+/// must survive a round trip without failing the whole file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueEntry {
+    #[serde(default)]
+    pub bvid: String,
+    #[serde(default)]
+    pub cid: u64,
+    #[serde(default)]
+    pub aid: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub duration: String,
+    /// Cover URL, exactly as the feed/card handed it out (empty = no cover).
+    #[serde(default)]
+    pub cover: String,
+}
+
+/// Danmaku, playback and window-appearance preferences.
+///
+/// `danmaku_font`: 0 = 小, 1 = 标准, 2 = 大. `danmaku_speed`: scroll-speed
+/// percent (50..=200). `danmaku_area`: the top percentage of the video that
+/// danmaku may occupy (25 / 50 / 75 / 100). `player_speed`: playback speed times
+/// 1000 (1000 = 1.0x). `glass_transparency`: the main window's frosted-glass
+/// tint, percent (0 = fully opaque tint, 100 = no tint; default 45).
+/// `backdrop_blur`: the wallpaper's diffusion radius in image pixels
+/// (`0..=160`, default 60; see `backdrop::set_blur`). `glass_blur` is the
+/// retired capture-engine slot, kept only so old files still round-trip.
+/// `page_size`: cards per page in the
+/// no-scroll lists, one of [`PAGE_SIZES`]. `close_action`: what ✕ / Alt+F4 /
+/// the taskbar's 关闭 does, one of [`CLOSE_ACTIONS`]. `history_limit`: how many
+/// watch-history rows the 历史 page keeps loaded, one of [`HISTORY_LIMITS`]. `feed_prefetch_batches`:
+/// how many recommendation batches the home feed keeps preloaded
+/// (`0..=FEED_PREFETCH_MAX`). `cdn_select` / `prefetch_proxy`: player-side
+/// opt-outs that are persisted here and read by a later pass. `seek_points`:
+/// how many evenly spaced positions of the stream the prefetch proxy warms in
+/// the background, so dragging the seek bar near one of them resumes from
+/// memory (`4..=SEEK_POINTS_MAX`; see [`normalise_seek_points`]).
+/// `prefetch_connections`: how many parallel upstream fetchers the proxy opens
+/// while the startup gate fills the cache (`4..=PREFETCH_CONNECTIONS_MAX`,
+/// default 16; see [`normalise_prefetch_connections`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default = "default_opacity")]
+    pub danmaku_opacity: u32,
+    #[serde(default = "default_font")]
+    pub danmaku_font: u32,
+    #[serde(default = "default_danmaku_speed")]
+    pub danmaku_speed: u32,
+    #[serde(default = "default_danmaku_area")]
+    pub danmaku_area: u32,
+    #[serde(default)]
+    pub block_scroll: bool,
+    #[serde(default)]
+    pub block_top: bool,
+    #[serde(default)]
+    pub block_bottom: bool,
+    #[serde(default)]
+    pub blocked_senders: Vec<String>,
+    /// Danmaku whose text contains any of these (case-insensitive substring) is
+    /// not rendered. Edited from the 设置 panel; applied in the player filter.
+    #[serde(default)]
+    pub blocked_keywords: Vec<String>,
+    /// Danmaku whose text matches any of these regex patterns is not rendered.
+    /// Invalid patterns are ignored at compile time.
+    #[serde(default)]
+    pub blocked_regex: Vec<String>,
+    /// Starting playback quality (`qn`), i.e. 设置 → 播放 → 默认画质: one of
+    /// `0` (自动 = `min(highest playable, 1080P)`), 1080P, 720P or 480P. The
+    /// track selector then takes the sharpest stream (highest bitrate, or the
+    /// preferred codec) at that quality. A stored value outside that set is
+    /// normalised to 自动, so a stale 4K pick can never be every video's default
+    /// (4K/8K are only opened from the 画质 menu).
+    #[serde(default = "default_player_quality")]
+    pub player_quality: i64,
+    /// Decode at the source's own resolution instead of the picture the window
+    /// actually shows. `false` (default) asks the decoder for the window-sized
+    /// picture — a 1080p source in a 1216×684 window decodes 1216×684, which is
+    /// a third of the pipe bytes and the same picture on screen. `true` is the
+    /// "原始分辨率" switch: the old behaviour, at the old cost.
+    #[serde(default)]
+    pub player_native_size: bool,
+    /// 画质增强档位：`0` = 关闭, `1` = 通用（AMD CAS 锐化）, `2` = 番剧（Anime4K CNN）。
+    /// （顺序即菜单顺序，见 `dcomp::enhance::MODES`）。只在画面直出（DComp）
+    /// 路径上有意义：档位不可用时菜单置灰，存储值若正落在不可用的档位，播放器
+    /// 启动时把它当作关闭（见 `player_host::publish_enhance`）。
+    ///
+    /// f231: the FSR tier was removed (it was the same 5-tap sharpener as 通用 at
+    /// a higher cost), so a stored `3` loads as `1`; `4` was RTX VSR, removed in
+    /// f207, and still loads as 关闭. See [`normalise_player_enhance`].
+    #[serde(default)]
+    pub player_enhance: u32,
+    /// **已废弃，仅为兼容旧 `settings.json`（f214）。**
+    ///
+    /// 画面直出（DComp 播放路径）现在是**唯一**路径，不再由这个字段决定：
+    /// [`crate::dcomp::platform::enabled`] 恒为 `true`，只有环境变量
+    /// `BILI_PLAYER_DCOMP=0` 能退回 winit + ffmpeg。这个字段还留着，是因为旧
+    /// 版本写过的文件里仍带着它（读的时候要能解析，写的时候要保持原样），但
+    /// **没有任何代码读它**：它当初只能在下一个进程生效（窗口类在启动时选定），
+    /// 于是"开/关"实际是"重启才知道"，而一次没落盘的写入和一次成功的写入看起来
+    /// 完全一样。f214 去掉了这个开关，也去掉了这条歧义。
+    ///
+    /// 零拷贝解码（[`Self::player_mf_decode`]）同样不再需要它为前置条件。
+    #[serde(default = "default_player_dcomp")]
+    pub player_dcomp: bool,
+    /// 零拷贝解码（Media Foundation 硬件解码 → NV12 纹理直接上屏），f209。
+    /// 默认 `true`：解码器把画面留在 GPU 上，播放器不再每帧上传 8.3 MB；
+    /// 打不开（没有硬件解码器 / 没有 DComp 视频层）时自动回退 ffmpeg 管道，
+    /// 日志写 `decode fallback reason=…`。`BILI_DECODE=ffmpeg` 按次关闭。
+    ///
+    /// f211：这条路径写进的是 DComp 视频层的设备 —— 只有画面直出这条播放路径
+    /// 有那个层。f214 之后画面直出恒为开（`BILI_PLAYER_DCOMP=0` 是唯一的例外），
+    /// 所以这个开关现在是"零拷贝开/关"本身，不再是"在有画面的前提下开/关"：
+    /// 逃生阀生效时它不会尝试（日志 `decode fallback reason=no_dcomp_platform`，
+    /// 一次），播放行为与改动前完全一致；开着时只要解码器能打开，seek / 换档 /
+    /// 起播都走零拷贝，120 帧插帧也才有 GPU 光流可做。
+    #[serde(default = "default_player_mf_decode")]
+    pub player_mf_decode: bool,
+    #[serde(default = "default_player_speed")]
+    pub player_speed: u32,
+    #[serde(default = "default_hwaccel")]
+    pub hwaccel: bool,
+    /// Preferred video codec when a quality offers several: 0 = 自动,
+    /// 7 = AVC, 12 = HEVC, 13 = AV1.
+    #[serde(default)]
+    pub codec_pref: u32,
+    #[serde(default)]
+    pub ai_on: bool,
+    #[serde(default)]
+    pub ai_level: u32,
+    /// UI theme: 1 = 浅色, 2 = 深色 ([`crate::theme::THEME_LIGHT`] /
+    /// [`crate::theme::THEME_DARK`]). There is no stored 跟随系统 state: a legacy
+    /// `0` (or any corrupt value) is resolved once against the Windows setting
+    /// at load and stored as the concrete mode, so the app never reports a third
+    /// state. See [`normalise_theme`].
+    #[serde(default)]
+    pub theme: u32,
+    /// Launch the app on Windows sign-in (HKCU Run key).
+    #[serde(default)]
+    pub autostart: bool,
+    /// Player shortcut remap: one candidate index per action (see
+    /// [`default_player_keys`]). Always normalised to [`PLAYER_KEY_ACTIONS`].
+    #[serde(default)]
+    pub player_keys: Vec<u32>,
+    /// Electron 播放器自己的快捷键（原始 VK 码），与原生候选索引的
+    /// `player_keys` 分开保存，避免被 `normalise_player_keys` 截断。
+    #[serde(default)]
+    pub electron_player_keys: Vec<u32>,
+    /// Main-window frosted glass: how see-through the window tint is, in
+    /// percent (0 = matte, 100 = maximally see-through).
+    #[serde(default = "default_glass_transparency")]
+    pub glass_transparency: f32,
+    /// Main-window frosted glass: Gaussian blur strength in percent (0 = no
+    /// blur layer at all, 100 = strongest; retired capture-engine slot).
+    #[serde(default = "default_glass_blur")]
+    pub glass_blur: f32,
+    /// 背景模糊: the generated wallpaper's blur radius in **image pixels**
+    /// (1024-space), `0..=160`, default 60. `0` leaves the coloured balls
+    /// crisp, `60` melts them into a mesh gradient, `160` is a near-flat wash.
+    /// Applied through `backdrop::set_blur` and persisted here.
+    #[serde(default = "default_backdrop_blur")]
+    pub backdrop_blur: u32,
+    /// Cards per page in the no-scroll lists (首页推荐 / 搜索 / 历史 / ...):
+    /// the 设置 menu offers [`PAGE_SIZES`]; Rust drives the UI's
+    /// `list_page_size` property and the paging helpers from this value.
+    #[serde(default = "default_page_size")]
+    pub page_size: i64,
+    /// 历史记录最多显示多少条: one of [`HISTORY_LIMITS`] (50 / 100 / 200 / 0 =
+    /// 全部), default 100. The history page still fetches one cursor page at a
+    /// time; this only caps how many loaded rows the grid keeps (see
+    /// `feed::load_history`), so the cap can never turn into one big fetch.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: i64,
+    /// 关闭主窗口（✕ / Alt+F4 / 任务栏关闭）后的行为：1 = 隐藏到系统托盘,
+    /// 2 = 直接退出程序. 旧的 0（最小化到任务栏）已下线，读到就迁移成 1
+    /// （[`normalise_close_action`]）。
+    #[serde(default = "default_close_action")]
+    pub close_action: u32,
+    /// 播放器窗口上次的位置与大小，逻辑像素 `[x, y, w, h]`，描述的是**基础**
+    /// 窗口——即没有任何外扩面板打开时的窗口（`x`/`y` 是画面区域的左上角，
+    /// 与 `apply_panel_geometry` 的 `home` 同一含义）。打开播放器时先与某块
+    /// 屏幕的工作区求交：仍落在某块屏幕上的位置才会被恢复，否则回落到系统
+    /// 默认摆放（`None`）。面板打开/关闭以及拖动、缩放结束后写回。
+    #[serde(default)]
+    pub player_layout: Option<[i32; 4]>,
+    /// 后台预加载的首页推荐批次数量（`0..=FEED_PREFETCH_MAX`）。刷新时若环
+    /// 中有成品批次就直接上屏，不再走网络；0 关闭预加载。见
+    /// [`normalise_feed_prefetch_batches`]。
+    #[serde(default = "default_feed_prefetch_batches")]
+    pub feed_prefetch_batches: u32,
+    /// 是否启用播放器的 CDN 择优层。本次只持久化并暴露给后续读取，暂不接线。
+    #[serde(default = "default_cdn_select")]
+    pub cdn_select: bool,
+    /// 是否启用本机回环的预取代理。本次只持久化并暴露给后续读取，暂不接线。
+    #[serde(default = "default_prefetch_proxy")]
+    pub prefetch_proxy: bool,
+    /// 预取代理后台预热的跳转位置数量：把整段媒体按 `i / seek_points`
+    /// 均分，每个位置缓存一小块（默认 4 MiB），拖到这些位置附近时直接从
+    /// 内存出画，不必等上游。范围 `4..=SEEK_POINTS_MAX`，见
+    /// [`normalise_seek_points`]。**0 不是合法值**：最少 4 个点，想更省流量
+    /// 就取 4，不能关到 0。
+    #[serde(default = "default_seek_points")]
+    pub seek_points: u32,
+    /// 预取代理的上游并发连接数（`PREFETCH_CONNECTIONS_MIN..=PREFETCH_CONNECTIONS_MAX`，
+    /// 默认 16）。开始播放前由 `player.rs` 读入 `PrefetchConfig::connections`：
+    /// 连接越多，开头几秒的缓存越快填满。`0` 表示"未设置"（旧文件或新建的
+    /// 字段），回落到默认值；其余越界值夹到区间内。见
+    /// [`normalise_prefetch_connections`]。
+    #[serde(default = "default_prefetch_connections")]
+    pub prefetch_connections: u32,
+    /// f244: the background preload scheduler's master switch. On by default:
+    /// idle minutes are spent preloading the next screens (comment first pages,
+    /// live/pgc/dynamic first pages), never while playback needs the link.
+    #[serde(default = "default_preload_enabled")]
+    pub preload_enabled: bool,
+    /// f244: how many home-feed videos' comment first pages one idle round
+    /// prefetches, one of [`PRELOAD_COMMENT_CHOICES`] (6 / 12 / 24).
+    #[serde(default = "default_preload_comments")]
+    pub preload_comments: u32,
+    /// f244: bandwidth ceiling for the preload scheduler alone, in MiB/s, one
+    /// of [`PRELOAD_BANDWIDTH_CHOICES`] (4 / 8 / 16; default 8).
+    #[serde(default = "default_preload_bandwidth_mbps")]
+    pub preload_bandwidth_mbps: u32,
+    /// 网络线程池的常驻线程数（`NET_THREADS_MIN..=NET_THREADS_MAX`，默认 12）。
+    /// 整个进程只创建一次，见 `net::init`：所有一次性网络请求（封面、
+    /// 头像、点赞/投币/收藏、评论分页……）都排进这个池；视频播放时预取代理
+    /// 只是把它的连接槽位绑定到这些已有线程上，开视频不再创建线程。
+    /// `BILI_NET_THREADS` 可在启动时覆盖本字段（用于 A/B）。
+    /// `0` 表示"未设置"，回落到默认值；其余越界值夹到区间内。见
+    /// [`normalise_net_threads`]。
+    #[serde(default = "default_net_threads")]
+    pub net_threads: u32,
+    /// 播放列表：整个应用共用的一个队列（见 `main.rs` 的 `PlaybackQueue`）。
+    /// 队首最早，队尾最新；重启后恢复但不自动播放。加载时用
+    /// [`normalise_playlist_state`] 去空、去重（同一 bvid 只留第一次出现）、
+    /// 截到 [`PLAYLIST_MAX`] 条（丢掉最旧的）。
+    #[serde(default)]
+    pub playlist: Vec<QueueEntry>,
+    /// 播放列表里当前播放项的下标；`None` = 队列里没有正在播放的条目。
+    /// 与 [`normalise_playlist_state`] 一起校正，永远落在 `playlist` 范围内。
+    #[serde(default)]
+    pub playlist_current: Option<usize>,
+    /// f249: legacy 循环模式 (0 手动 / 1 自动 / 2 随机). Read only so an old
+    /// `settings.json` can be migrated to the two switches below; never
+    /// written again. See [`migrate_playlist_mode`].
+    #[serde(default = "default_play_mode", skip_serializing)]
+    pub play_mode: u32,
+    /// f249: 自动播放。A track that ends advances to the next item (queue order,
+    /// or a random one while [`Self::playlist_random`] is on). Off means the
+    /// ended window closes and its queue row is removed.
+    #[serde(default = "default_playlist_autoplay")]
+    pub playlist_autoplay: bool,
+    /// f249: 随机播放. Only meaningful while `playlist_autoplay` is on.
+    #[serde(default = "default_playlist_random")]
+    pub playlist_random: bool,
+    /// 0 = the file still carries the legacy `play_mode`; 1 = the two-switch
+    /// model. `load` migrates once and writes the marker back.
+    #[serde(default)]
+    pub playlist_mode_rev: u32,
+    /// f249: 循环播放 (single video). On: a finished track seeks to 0 and keeps
+    /// playing in the SAME session, ignoring 自动播放. Off: the end follows the
+    /// 自动播放 / 随机播放 switches above.
+    #[serde(default = "default_loop_one")]
+    pub loop_one: bool,
+    /// 帧插值模式：0 = 关闭, 1 = CPU（线性混合）。未知值在加载时归一为 0。
+    /// 见 [`normalise_interp_mode`]。
+    #[serde(default)]
+    pub interp_mode: u8,
+    /// [`Self::interp_mode`] 的编号世代，见 [`INTERP_MODE_REV`]。
+    /// 旧文件没有这个字段（`0`），加载时迁移一次并写回，所以再读一次不会
+    /// 继续改值。
+    #[serde(default)]
+    pub interp_mode_rev: u32,
+    /// DeepSeek API key（`sk-...`），养鱼引擎用它替用户看视频。空串 = 未配置，
+    /// 此时引擎只报 `NeedsKey`、不发任何网络请求。界面上只显示
+    /// [`mask_key`] 的脱敏结果。
+    #[serde(default)]
+    pub deepseek_key: String,
+    /// 养鱼使用的 DeepSeek 模型（默认 `deepseek-flash`）。空串在加载时回落到
+    /// [`default_fish_model`]。
+    #[serde(default = "default_fish_model")]
+    pub fish_model: String,
+    /// 鱼主人的指令：拼在每条养鱼提示词的最后一段，告诉鲸鱼该怎么看视频。
+    /// 空白值在加载时回落到 [`default_fish_instruction`]。
+    #[serde(default = "default_fish_instruction")]
+    pub fish_instruction: String,
+    /// 每次出巡最多看多少条视频（`1..=FISH_BUDGET_MAX`，默认 40）。见
+    /// [`normalise_fish_budget`]。
+    #[serde(default = "default_fish_budget_videos")]
+    pub fish_budget_videos: u32,
+    /// 两条视频之间的休息毫秒数（`FISH_INTERVAL_MIN_MS..=FISH_INTERVAL_MAX_MS`，
+    /// 默认 1500）。见 [`normalise_fish_interval`]。
+    #[serde(default = "default_fish_interval_ms")]
+    pub fish_interval_ms: u64,
+    /// 养鱼开关；关闭时引擎不起线程。
+    #[serde(default)]
+    pub fish_enabled: bool,
+    /// 自动喂食：每天到 [`fish_feed_time`] 自己开饭。仍然需要
+    /// [`fish_enabled`]，关掉大肥鱼就什么都不会跑。
+    #[serde(default)]
+    pub fish_auto_feed: bool,
+    /// 自动喂食的时间，`HH:MM`（本机时间，默认 `20:00`）。加载时由
+    /// [`normalise_fish_time`] 归一，坏值回落到默认。
+    #[serde(default = "default_fish_feed_time")]
+    pub fish_feed_time: String,
+    /// 喂食来源位掩码：`1` 首页 / `2` 关注 / `4` 收藏夹。加载时由
+    /// [`normalise_fish_sources`] 去掉未知位，空掩码回落到首页。
+    #[serde(default = "default_fish_sources")]
+    pub fish_sources: u32,
+    /// 播放器选用的音频音质档位（Bilibili 的 `audio` id）。`0` = 自动（视频
+    /// 提供的最好一档）；其余见 [`AUDIO_QUALITIES`]。见
+    /// [`normalise_audio_quality`]。
+    #[serde(default)]
+    pub audio_quality: u32,
+    /// 防干扰：隐藏首页工具栏的「直播」入口。默认关闭 = 与改动前完全一致
+    /// （推荐 / 收藏 / 分区 / 番剧 / 直播 / 养鱼 六个 pill）。打开后只渲染五个
+    /// pill，左侧胶囊簇的宽度推导同步收窄；若当前正停在直播页（view_mode 23）
+    /// 打开本开关，会退回推荐页——那是它唯一的入口。见
+    /// [`normalise_hide_live_tab`]。
+    #[serde(default)]
+    pub hide_live_tab: bool,
+    /// 防干扰：搜索框展开时不显示热搜列表。默认关闭 = 空输入显示热搜。
+    /// 打开后空输入直接显示联想（没有联想就什么都不显示），不再出现一块空白
+    /// 的热搜面板。见 [`normalise_hide_hot_search`]。
+    #[serde(default)]
+    pub hide_hot_search: bool,
+    /// 看片力度：`0..=4` 是 T0–T4 预设，`5` = 自定义（下面六个开关为准）。
+    /// 未知值在加载时回落到 T1。见 [`normalise_fish_tier`]。
+    #[serde(default = "default_fish_tier")]
+    pub fish_tier: u32,
+    /// 自定义档位下的步骤开关。预设档位（`fish_tier < 5`）忽略这六个值，
+    /// 由 `fish.rs` 按档位展开，避免手改文件后档位与开关互相矛盾。
+    #[serde(default = "default_true")]
+    pub fish_step_meta: bool,
+    #[serde(default = "default_true")]
+    pub fish_step_subtitle: bool,
+    #[serde(default)]
+    pub fish_step_outline: bool,
+    #[serde(default = "default_true")]
+    pub fish_step_comments: bool,
+    #[serde(default)]
+    pub fish_step_asr: bool,
+    #[serde(default)]
+    pub fish_step_frames: bool,
+    /// ASR 总开关。关闭时 T3/T4 的 asr 步骤记 `skipped(ASR 未开启)`，不下载音频。
+    #[serde(default)]
+    pub fish_asr_enabled: bool,
+    /// `auto` | `faster-whisper` | `whisper.cpp`。见 [`normalise_fish_asr_engine`]。
+    #[serde(default = "default_fish_asr_engine")]
+    pub fish_asr_engine: String,
+    /// `gpu` | `cpu`。见 [`normalise_fish_asr_device`]。
+    #[serde(default = "default_fish_asr_device")]
+    pub fish_asr_device: String,
+    /// `small` | `turbo` | `medium`。见 [`normalise_fish_asr_model`]。
+    #[serde(default = "default_fish_asr_model")]
+    pub fish_asr_model: String,
+    /// whisper.cpp / faster-whisper 的线程数（`1..=FISH_ASR_THREADS_MAX`）。
+    #[serde(default = "default_fish_asr_threads")]
+    pub fish_asr_threads: u32,
+    /// 模型目录；空串 = 项目根下的 `models/whisper`。
+    #[serde(default)]
+    pub fish_asr_model_dir: String,
+    /// 模型下载源：`auto` | `official` | `mirror`。见 [`normalise_fish_model_mirror`]。
+    /// `auto` 先走官方，连续 3 次失败或 10 秒没有进度就切 hf-mirror。
+    #[serde(default = "default_fish_model_mirror")]
+    pub fish_model_mirror: String,
+    /// DeepSeek 视觉的图片精度：`low`（先缩到 512×512，省 token）或 `original`。
+    #[serde(default = "default_fish_vision_detail")]
+    pub fish_vision_detail: String,
+    /// 番剧索引的排序，按 season_type 分别记住：`{"1": "follows", "4": "score"}`
+    /// （键是 `pgc_season_type` 的十进制 season_type，值是 [`PGC_SORT_KEYS`] 之一）。
+    /// 缺省 = 该分区沿用 B站 的「追番人数」排序（`order=3`），即改动前的行为。
+    /// 见 [`normalise_pgc_sorts`]。
+    #[serde(default)]
+    pub pgc_sorts: BTreeMap<String, String>,
+    /// 搜索页上次选中的类型：0 视频 / 1 番剧 / 2 影视 / 3 直播 / 4 用户
+    /// （见 [`normalise_search_tab`]）。重启后搜索页回到这个 tab。
+    #[serde(default)]
+    pub search_tab: i32,
+}
+
+/// Number of remappable player actions.
+pub const PLAYER_KEY_ACTIONS: usize = 11;
+/// Size of the candidate key pool offered in the 设置 dropdown.
+pub const PLAYER_KEY_CANDIDATES: usize = 15;
+/// Cards-per-page steps offered by the 设置 menu and accepted by
+/// [`normalise_page_size`].
+pub const PAGE_SIZES: [i64; 4] = [12, 24, 36, 48];
+/// 历史记录「显示条数」的档位，按 UI 里的顺序排列。`0` = 全部（不裁剪）。
+/// [`normalise_history_limit`] 只接受这四个值。
+pub const HISTORY_LIMITS: [i64; 4] = [50, 100, 200, 0];
+/// 番剧索引的排序键，按这个顺序就是 UI 下拉里的顺序（见 [`Settings::pgc_sorts`]）。
+///
+/// 每一个键都对应 `pgc/season/index/result` 的一个 `order` 值，而且语义是对着
+/// 真实响应逐条核对过的（首条 + 整页的 `order` 文案单调递减、翻页接续不断）：
+///
+/// | key       | order | 该页 `order` 文案      | 真实含义 |
+/// |-----------|-------|------------------------|----------|
+/// | `follows` | 3     | `553.2万追番`          | 追番人数 |
+/// | `update`  | 0     | `8月14日更新`          | 最近更新 |
+/// | `views`   | 2     | `1.6亿次播放`          | 播放量   |
+/// | `score`   | 4     | `9.9分`                | 评分     |
+///
+/// `order=1`（响应里 `order` 为空，实际按弹幕数降序）和 `order=5`（`X月X日
+/// 开播`，按开播时间）也验证过，但没有做进 UI：前者不是用户能理解的排序，后者
+/// 的「敬请期待」行混在日期序列里，语义不够干净。
+pub const PGC_SORT_KEYS: [&str; 4] = ["follows", "update", "views", "score"];
+/// 一个 season_type 没存过排序时用的键（B站 的「追番人数」，`order=3`）。
+pub const PGC_SORT_DEFAULT: &str = "follows";
+
+/// Snap a stored 番剧排序 key to one of [`PGC_SORT_KEYS`], else empty.
+///
+/// The value arrives from JSON and may be hand-edited: an unknown string is
+/// dropped by [`normalise_pgc_sorts`] instead of being kept and later mapped to
+/// a guessed API `order`.
+pub fn normalise_pgc_sort(value: &str) -> String {
+    let value = value.trim();
+    if PGC_SORT_KEYS.contains(&value) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Clean a stored `season_type -> sort key` map.
+///
+/// Keys are the decimal season_type (B站's own numbers: 1 番剧, 4 国创, ...);
+/// anything that is not a positive integer is dropped, and a value that is not
+/// in [`PGC_SORT_KEYS`] is dropped too, so the page falls back to
+/// [`PGC_SORT_DEFAULT`] for that tab rather than to a wrong sort.
+pub fn normalise_pgc_sorts(stored: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    stored
+        .into_iter()
+        .filter_map(|(season_type, key)| {
+            let season_type = season_type.trim().to_string();
+            if season_type.parse::<i64>().map(|id| id > 0).unwrap_or(false) {
+                let key = normalise_pgc_sort(&key);
+                if !key.is_empty() {
+                    return Some((season_type, key));
+                }
+            }
+            None
+        })
+        .collect()
+}
+/// Snap a stored 搜索 tab to the five the UI has: 0 视频 / 1 番剧 / 2 影视 /
+/// 3 直播 / 4 用户. Anything else (a hand-edited file, a version that had fewer
+/// tabs) opens the search page on 视频 rather than on a tab that does not exist.
+pub fn normalise_search_tab(value: i32) -> i32 {
+    if (0..=4).contains(&value) {
+        value
+    } else {
+        0
+    }
+}
+
+/// 关闭主窗口后的行为（见 [`Settings::close_action`]）：1 = 隐藏到系统托盘,/// 2 = 直接退出程序.
+///
+/// `0`（旧的「最小化到任务栏」）已经下线：最小化之后窗口仍然占着任务栏按钮，
+/// 在主窗口的 ✕ 上看起来和「没关掉」一模一样，正是用户报的那个问题。
+/// 老 `settings.json` 里的 `0` 由 [`normalise_close_action`] 迁移成
+/// [`CLOSE_ACTION_TRAY`]。
+pub const CLOSE_ACTIONS: [u32; 2] = [CLOSE_ACTION_TRAY, CLOSE_ACTION_QUIT];
+/// 隐藏到系统托盘：任务栏按钮与 Alt-Tab 项都消失，进程继续驻留。
+pub const CLOSE_ACTION_TRAY: u32 = 1;
+/// 直接退出程序：走 `request_quit` 那条收尾路径。
+pub const CLOSE_ACTION_QUIT: u32 = 2;
+/// Upper bound for [`Settings::feed_prefetch_batches`].
+pub const FEED_PREFETCH_MAX: u32 = 4;
+/// Smallest accepted count of warmed seek positions. **0 is not allowed**:
+/// disabling point pre-warming is not offered, because 4 points already cost
+/// only `4 × chunk` and are what makes seeking feel instant.
+pub const SEEK_POINTS_MIN: u32 = 4;
+/// Largest accepted count of warmed seek positions. The point cache is capped
+/// at 80 MiB, so 20 points × 4 MiB still fits ([`crate::prefetch`] enforces it).
+pub const SEEK_POINTS_MAX: u32 = 20;
+/// Smallest number of upstream connections the prefetch proxy may use.
+pub const PREFETCH_CONNECTIONS_MIN: u32 = 1;
+/// Largest number of upstream connections the prefetch proxy may use.
+pub const PREFETCH_CONNECTIONS_MAX: u32 = 32;
+/// Smallest number of threads the network pool may own.
+pub const NET_THREADS_MIN: u32 = 2;
+/// Largest number of threads the network pool may own (see
+/// [`normalise_net_threads`]).
+pub const NET_THREADS_MAX: u32 = 32;
+/// Pool size when the field is absent or `0`: large enough to keep a dozen
+/// covers and a UI request in flight, small enough to leave the cores to the
+/// picture.
+pub const NET_THREADS_DEFAULT: u32 = 12;
+/// 播放列表最多保留多少条；超出时丢掉最旧的（见
+/// [`normalise_playlist_state`] 和 `PlaybackQueue::push`）。
+pub const PLAYLIST_MAX: usize = 200;
+/// Legacy 循环模式：0 = 手动, 1 = 自动, 2 = 随机. Only used to migrate an old
+/// `settings.json`; new files store the two switches instead.
+pub const PLAY_MODES: [u32; 3] = [0, 1, 2];
+/// [`Settings::playlist_mode_rev`] 的当前世代。0 = 旧 `play_mode`，1 = 两个开关。
+pub const PLAYLIST_MODE_REV: u32 = 1;
+/// 帧插值模式：0 = 关闭, 1 = CPU（线性混合）.
+pub const INTERP_MODES: [u8; 2] = [0, 1];
+/// [`Settings::interp_mode`] 的当前编号世代。
+///
+/// `0`（旧文件里没有这个字段）是最早的三档编号
+/// `0 关闭 / 1 混合 / 2 块匹配 / 3 硬件光流`；`2` 是 f229 的两档编号
+/// `0 关闭 / 1 CPU / 2 GPU`；`3` 是 f237 起的两档编号 `0 关闭 / 1 CPU`
+/// （GPU 插帧与 120 帧一并删除）。标记是迁移能幂等的原因：`2` 在旧文件里是
+/// 块匹配或 GPU、在新文件里没有对应档位，单看值分不出来。
+pub const INTERP_MODE_REV: u32 = 3;
+/// 播放器可选的音频档位（`audio` id）：0 = 自动。
+pub const AUDIO_QUALITIES: [u32; 6] = [0, 30216, 30232, 30280, 30250, 30251];
+/// 每次养鱼出巡最多看多少条视频的上限。
+pub const FISH_BUDGET_MAX: u32 = 500;
+/// 养鱼两条视频之间的最小休息间隔（毫秒）。
+pub const FISH_INTERVAL_MIN_MS: u64 = 800;
+/// 养鱼两条视频之间的最大休息间隔（毫秒）。
+pub const FISH_INTERVAL_MAX_MS: u64 = 10_000;
+/// 喂食来源：首页推荐（`feed_store` 里已经有的那一页）。
+pub const FISH_SOURCE_HOME: u32 = 1;
+/// 喂食来源：关注动态。
+pub const FISH_SOURCE_FOLLOW: u32 = 2;
+/// 喂食来源：收藏夹。
+pub const FISH_SOURCE_FAV: u32 = 4;
+/// 已知喂食来源的全部位。
+pub const FISH_SOURCES_ALL: u32 = FISH_SOURCE_HOME | FISH_SOURCE_FOLLOW | FISH_SOURCE_FAV;
+/// 看片力度里的「自定义」档位值；`0..=4` 是 T0–T4。
+pub const FISH_TIER_CUSTOM: u32 = 5;
+/// ASR 引擎的可选值。
+pub const FISH_ASR_ENGINES: [&str; 3] = ["auto", "faster-whisper", "whisper.cpp"];
+/// ASR 设备。
+pub const FISH_ASR_DEVICES: [&str; 2] = ["gpu", "cpu"];
+/// ASR 模型档位。tiny/base/small/medium 是 whisper.cpp 的 GGML 四档，
+/// turbo 只有 faster-whisper / GGML-large-v3-turbo 两套清单。
+pub const FISH_ASR_MODELS: [&str; 5] = ["tiny", "base", "small", "turbo", "medium"];
+/// 语音识别模型的下载源（`auto` = 先官方，不顺就切镜像）。
+pub const FISH_MODEL_MIRRORS: [&str; 3] = ["auto", "official", "mirror"];
+/// ASR 线程数上限（whisper.cpp 的 `-t`，faster-whisper 的 `cpu_threads`）。
+pub const FISH_ASR_THREADS_MAX: u32 = 16;
+/// DeepSeek 视觉的两种图片精度。
+pub const FISH_VISION_DETAILS: [&str; 2] = ["low", "original"];
+
+/// Default mapping, one candidate index per action:
+/// 播放/暂停, 快退, 快进, 音量+, 音量-, 静音, 全屏, 退出全屏, 弹幕, 点赞, 截图.
+pub fn default_player_keys() -> Vec<u32> {
+    vec![3, 4, 5, 6, 7, 0, 8, 12, 9, 10, 11]
+}
+
+fn normalize_player_keys(mut keys: Vec<u32>) -> Vec<u32> {
+    let defaults = default_player_keys();
+    keys.truncate(PLAYER_KEY_ACTIONS);
+    while keys.len() < PLAYER_KEY_ACTIONS {
+        keys.push(defaults[keys.len()]);
+    }
+    for key in keys.iter_mut() {
+        *key = (*key).min((PLAYER_KEY_CANDIDATES - 1) as u32);
+    }
+    keys
+}
+
+fn default_opacity() -> u32 {
+    100
+}
+
+fn default_font() -> u32 {
+    1
+}
+
+fn default_danmaku_speed() -> u32 {
+    100
+}
+
+fn default_danmaku_area() -> u32 {
+    100
+}
+
+fn default_player_speed() -> u32 {
+    1000
+}
+
+fn default_hwaccel() -> bool {
+    true
+}
+
+/// 零拷贝解码默认 **开启**（f212）。
+///
+/// f211 曾把它改回 `false`：搜索入口与同进程内关闭重开（新窗口）拿不到 DComp
+/// 视频层，播放器按设计回退 ffmpeg，起播多约 0.9 s。根因在 `src/dcomp` 的视频层
+/// 发布时机，f212 修掉了：窗口的合成树在创建时登记（`dcomp::attached`），会话等
+/// 视频层时不再把"UI 线程正忙"当成"这个窗口没有层"，两个入口连续 10+10 次全部
+/// `decode=mf`（`docs/f212.md`）。两个逃生阀都保留：`BILI_DECODE=ffmpeg` 按次
+/// 退回 ffmpeg 管道，设置里的 `player_mf_decode` 也仍然是开关。
+fn default_player_mf_decode() -> bool {
+    true
+}
+
+/// 兼容旧文件用：`player_dcomp` 缺失时的反序列化默认值。
+///
+/// f214 之后这个字段不再被读取（见 [`Settings::player_dcomp`]）；保留默认值只
+/// 是为了让旧 `settings.json` 继续解析成功，并在重写文件时保持同样的形状。
+fn default_player_dcomp() -> bool {
+    true
+}
+
+/// Default starting quality: 自动 (`0`) = the highest tier the source offers.
+/// f176: the owner asked for "open on the best source", so 4K is no longer
+/// something you have to pick by hand.
+fn default_player_quality() -> i64 {
+    0
+}
+
+pub fn normalise_player_quality(qn: i64) -> i64 {
+    if qn < 0 {
+        0
+    } else {
+        qn
+    }
+}
+
+/// 背景透明度 default: 45 % see-through. The window tint keeps 55 % alpha
+/// (0x8C over the wallpaper), which is the exact alpha this window shipped
+/// with before the slider existed.
+pub fn default_glass_transparency() -> f32 {
+    45.0
+}
+
+/// 背景模糊 default: 60 image px. Soft enough to read as a mesh gradient,
+/// sharp enough that the blobs still have a direction.
+pub fn default_backdrop_blur() -> u32 {
+    60
+}
+
+/// Normalise the stored wallpaper blur: clamp into the slider's range, so a
+/// hand-edited `9999` can never ask `backdrop` for a radius outside `0..=160`.
+pub fn normalise_backdrop_blur(value: u32) -> u32 {
+    value.min(160)
+}
+
+/// 100% blur: the strongest the slider offers, mapped to the full
+/// `glass::SIGMA_MAX` at the current DPI scale.
+pub fn default_glass_blur() -> f32 {
+    100.0
+}
+
+pub fn default_page_size() -> i64 {
+    24
+}
+
+/// 历史记录默认显示 100 条：够翻，又不会让一个滚到底的页面变成一次大请求。
+pub fn default_history_limit() -> i64 {
+    100
+}
+
+/// 只接受 [`HISTORY_LIMITS`] 里的档位；其它值（旧文件、手改坏的值）回落到默认。
+pub fn normalise_history_limit(value: i64) -> i64 {
+    if HISTORY_LIMITS.contains(&value) {
+        value
+    } else {
+        default_history_limit()
+    }
+}
+
+/// 默认关闭行为：隐藏到系统托盘。
+///
+/// 默认最小化（0）在任务栏上看起来和"没关掉"一模一样，用户报告的正是这个；
+/// 隐藏到托盘会真正让窗口从任务栏与 Alt-Tab 消失，托盘图标和「退出」是明确的
+/// 归处。已经写进 `settings.json` 的旧值不受影响（[`normalise_close_action`]
+/// 只做合法性校正）。
+pub fn default_close_action() -> u32 {
+    1
+}
+
+/// 默认预加载两个推荐批次：刷新时总能立刻拿到一个，同时再补一个。
+pub fn default_feed_prefetch_batches() -> u32 {
+    2
+}
+
+/// CDN 择优默认开启（择优层本身早已存在，这里只留开关）。
+pub fn default_cdn_select() -> bool {
+    true
+}
+
+/// 预取代理默认开启（见 `prefetch`，后续再接线到这个开关）。
+pub fn default_prefetch_proxy() -> bool {
+    true
+}
+
+/// 默认预热 10 个跳转位置（10 × 4 MiB ≈ 40 MiB）。
+pub fn default_seek_points() -> u32 {
+    10
+}
+
+/// 默认 16 路并发上游连接：足够在开头几秒把缓存推到 8 MiB 上限，
+/// 又不至于把带宽切得过碎（见 `player.rs` 的启动门）。
+pub fn default_prefetch_connections() -> u32 {
+    16
+}
+
+/// Normalise the prefetch connection count.
+///
+/// The value arrives both from JSON (a hand-edited or older file can hold
+/// anything) and from the future 设置 menu. `0` is the one special case: it
+/// means "unset" and falls back to [`default_prefetch_connections`] (16).
+/// Everything else is clamped into
+/// `PREFETCH_CONNECTIONS_MIN..=PREFETCH_CONNECTIONS_MAX`, so a corrupt `99` can
+/// never ask for more sockets than the UI offers.
+pub fn normalise_prefetch_connections(value: u32) -> u32 {
+    if value == 0 {
+        return default_prefetch_connections();
+    }
+    value.clamp(PREFETCH_CONNECTIONS_MIN, PREFETCH_CONNECTIONS_MAX)
+}
+
+/// f244: the comment-prefetch counts the settings menu offers.
+pub const PRELOAD_COMMENT_CHOICES: [u32; 3] = [6, 12, 24];
+
+/// f244: the preload bandwidth ceilings the settings menu offers, MiB/s.
+pub const PRELOAD_BANDWIDTH_CHOICES: [u32; 3] = [4, 8, 16];
+
+pub fn default_preload_enabled() -> bool {
+    true
+}
+
+pub fn default_preload_comments() -> u32 {
+    6
+}
+
+pub fn default_preload_bandwidth_mbps() -> u32 {
+    8
+}
+
+/// Snap a stored 评论预取数量 to one of [`PRELOAD_COMMENT_CHOICES`].
+pub fn normalise_preload_comments(value: u32) -> u32 {
+    match value {
+        0..=6 => PRELOAD_COMMENT_CHOICES[0],
+        7..=12 => PRELOAD_COMMENT_CHOICES[1],
+        _ => PRELOAD_COMMENT_CHOICES[2],
+    }
+}
+
+/// Snap a stored 预加载带宽上限 to one of [`PRELOAD_BANDWIDTH_CHOICES`].
+pub fn normalise_preload_bandwidth_mbps(value: u32) -> u32 {
+    match value {
+        0..=4 => PRELOAD_BANDWIDTH_CHOICES[0],
+        5..=8 => PRELOAD_BANDWIDTH_CHOICES[1],
+        _ => PRELOAD_BANDWIDTH_CHOICES[2],
+    }
+}
+
+/// Default size of the process-wide network thread pool.
+pub fn default_net_threads() -> u32 {
+    NET_THREADS_DEFAULT
+}
+
+/// Normalise the network pool size.
+///
+/// `0` means "unset" and falls back to [`default_net_threads`] (12); anything
+/// else is clamped into `NET_THREADS_MIN..=NET_THREADS_MAX`, so a hand-edited
+/// `999` can never ask for hundreds of threads.
+pub fn normalise_net_threads(value: u32) -> u32 {
+    if value == 0 {
+        return default_net_threads();
+    }
+    value.clamp(NET_THREADS_MIN, NET_THREADS_MAX)
+}
+
+/// 默认循环模式：自动（播完顺序播下一条）。Legacy; see [`PLAY_MODES`].
+pub fn default_play_mode() -> u32 {
+    1
+}
+
+/// 自动播放默认开：播完自动下一集/下一首。
+pub fn default_playlist_autoplay() -> bool {
+    true
+}
+
+/// 随机播放默认关：先按列表顺序播。
+pub fn default_playlist_random() -> bool {
+    false
+}
+
+/// 循环播放默认关：按 自动播放 / 随机播放 处理结尾。
+pub fn default_loop_one() -> bool {
+    false
+}
+
+/// Normalise a legacy 循环模式 value.
+///
+/// Accepts exactly the three offered modes ([`PLAY_MODES`]); anything else
+/// (a hand-edited or legacy value) falls back to [`default_play_mode`].
+pub fn normalise_play_mode(value: u32) -> u32 {
+    if PLAY_MODES.contains(&value) {
+        value
+    } else {
+        default_play_mode()
+    }
+}
+
+/// f249: map the old three-state `play_mode` to the two switches.
+///
+/// 手动 (0) -> 自动播放 off, 随机 off; 自动 (1) -> 自动播放 on, 随机 off;
+/// 随机 (2) -> 自动播放 on, 随机 on. Unknown values behave like the old default.
+pub fn migrate_playlist_mode(play_mode: u32) -> (bool, bool) {
+    match play_mode {
+        0 => (false, false),
+        2 => (true, true),
+        _ => (true, false),
+    }
+}
+
+/// Normalise the 帧插值 mode.
+///
+/// Only the modes this build implements ([`INTERP_MODES`]) are accepted; a
+/// hand-edited or newer `settings.json` value falls back to off. Off is always
+/// safe: it costs one atomic load per presented source frame and changes
+/// nothing else.
+pub fn normalise_interp_mode(value: u8) -> u8 {
+    if INTERP_MODES.contains(&value) {
+        value
+    } else {
+        0
+    }
+}
+
+/// 把旧编号的 [`Settings::interp_mode`] 迁移到 [`INTERP_MODE_REV`]。
+///
+/// f237 删掉了 GPU 光流这一档，菜单只剩 关闭 / CPU。旧文件的 `2` 是块匹配
+/// （更早）或 GPU 光流（f229..f236），`3` 是最早的硬件光流档，三者都落到 `1`
+/// （CPU：
+/// 都是同一类补帧，而 CPU 线性混合是现在唯一保留的实现）。返回值是
+/// `(迁移后的值, 发生的变化)`；变化只在真的改写时出现，用来写日志和决定回写。
+/// 迁移后值已经合法，所以调用方写回 [`INTERP_MODE_REV`] 后不会再进入这里。
+pub fn migrate_interp_mode(value: u8) -> (u8, Option<(u8, u8)>) {
+    let migrated = match value {
+        2 | 3 => 1,
+        other => other,
+    };
+    (normalise_interp_mode(migrated), (migrated != value).then_some((value, migrated)))
+}
+
+fn default_fish_model() -> String {
+    // The model the API docs serve for `deepseek-flash` (text + vision). The
+    // legacy `deepseek-chat` name is an alias for the same model and is folded
+    // into this one so the field never has to be typed by hand.
+    "deepseek-flash".to_string()
+}
+
+/// 默认的鱼主人指令：只说材料里有的内容。
+pub fn default_fish_instruction() -> String {
+    "看到什么就说什么；只说材料里有的内容。".to_string()
+}
+
+/// 自动喂食时间（`HH:MM`，本机时间）。
+pub fn default_fish_feed_time() -> String {
+    "20:00".to_string()
+}
+
+/// 喂食来源默认只有首页：关注 / 收藏夹还没有独立的入队路径。
+pub fn default_fish_sources() -> u32 {
+    FISH_SOURCE_HOME
+}
+
+fn default_fish_budget_videos() -> u32 {
+    40
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 默认档位 T1：字幕 + 评论，等于改动前的能力。
+pub fn default_fish_tier() -> u32 {
+    1
+}
+
+pub fn default_fish_asr_engine() -> String {
+    "auto".to_string()
+}
+
+pub fn default_fish_asr_device() -> String {
+    "gpu".to_string()
+}
+
+pub fn default_fish_asr_model() -> String {
+    "small".to_string()
+}
+
+pub fn default_fish_asr_threads() -> u32 {
+    4
+}
+
+/// 模型下载源：`auto`（官方优先，失败切镜像）。
+pub fn default_fish_model_mirror() -> String {
+    "auto".to_string()
+}
+
+pub fn default_fish_vision_detail() -> String {
+    "low".to_string()
+}
+
+/// Normalise the 看片力度 tier: `0..=4` presets and `5` custom; anything else
+/// falls back to T1 (the shipped default, never "no steps at all").
+pub fn normalise_fish_tier(value: u32) -> u32 {
+    if value <= FISH_TIER_CUSTOM {
+        value
+    } else {
+        default_fish_tier()
+    }
+}
+
+pub fn normalise_fish_asr_engine(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_ASR_ENGINES.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_asr_engine()
+    }
+}
+
+pub fn normalise_fish_asr_device(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_ASR_DEVICES.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_asr_device()
+    }
+}
+
+pub fn normalise_fish_asr_model(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_ASR_MODELS.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_asr_model()
+    }
+}
+
+/// Threads: 0 means "unset" and falls back to the default; anything else is
+/// clamped into `1..=FISH_ASR_THREADS_MAX`.
+pub fn normalise_fish_asr_threads(value: u32) -> u32 {
+    if value == 0 {
+        default_fish_asr_threads()
+    } else {
+        value.clamp(1, FISH_ASR_THREADS_MAX)
+    }
+}
+
+pub fn normalise_fish_vision_detail(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_VISION_DETAILS.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_vision_detail()
+    }
+}
+
+/// 模型下载源：`auto` / `official` / `mirror`，其它值回落 `auto`（先官方，
+/// 不顺再切镜像），这样手改坏了也不会让下载直接失败。
+pub fn normalise_fish_model_mirror(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_MODEL_MIRRORS.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_model_mirror()
+    }
+}
+
+fn default_fish_interval_ms() -> u64 {
+    1500
+}
+
+/// Normalise the 养鱼 model name.
+///
+/// A blank value (hand-edited or older file) falls back to
+/// [`default_fish_model`]; anything else is kept verbatim, so a newer model
+/// name typed into `settings.json` is never silently replaced.
+pub fn normalise_fish_model(value: &str) -> String {
+    let trimmed = value.trim();
+    // `deepseek-chat` is the retired alias for the same model the docs now
+    // call `deepseek-flash`; fold it in so old settings.json files migrate.
+    if trimmed.is_empty() || trimmed == "deepseek-chat" {
+        default_fish_model()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Normalise the 鱼主人的指令.
+///
+/// A blank instruction would leave the prompt's last section empty, so it falls
+/// back to [`default_fish_instruction`]; otherwise the text is kept verbatim
+/// (only trimmed at both ends).
+pub fn normalise_fish_instruction(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default_fish_instruction()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Normalise the per-run video budget (clamped into `1..=FISH_BUDGET_MAX`).
+///
+/// `0` is not a valid budget — it would mean "look at nothing" — so it clamps to
+/// the minimum of 1, exactly like a corrupt large value clamps to 500.
+pub fn normalise_fish_budget(value: u32) -> u32 {
+    value.clamp(1, FISH_BUDGET_MAX)
+}
+
+/// Normalise the pause between two videos (clamped into
+/// `FISH_INTERVAL_MIN_MS..=FISH_INTERVAL_MAX_MS`).
+pub fn normalise_fish_interval(value: u64) -> u64 {
+    value.clamp(FISH_INTERVAL_MIN_MS, FISH_INTERVAL_MAX_MS)
+}
+
+/// Snap an `HH:MM` string to a valid local time, falling back to `20:00`.
+///
+/// Accepts `H:MM` and `HH:MM` (24-hour); anything else — an empty field, a
+/// pasted date, `25:00` — falls back to [`default_fish_feed_time`] instead of
+/// silently scheduling nothing.
+pub fn normalise_fish_time(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut parts = trimmed.split(':');
+    let (Some(hour), Some(minute), None) = (parts.next(), parts.next(), parts.next()) else {
+        return default_fish_feed_time();
+    };
+    let (Ok(hour), Ok(minute)) = (hour.trim().parse::<u32>(), minute.trim().parse::<u32>())
+    else {
+        return default_fish_feed_time();
+    };
+    if hour > 23 || minute > 59 {
+        return default_fish_feed_time();
+    }
+    format!("{hour:02}:{minute:02}")
+}
+
+/// Drop unknown source bits; an empty mask falls back to 首页, because a source
+/// set of nothing would make every 开饭 a no-op.
+pub fn normalise_fish_sources(value: u32) -> u32 {
+    let known = value & FISH_SOURCES_ALL;
+    if known == 0 {
+        default_fish_sources()
+    } else {
+        known
+    }
+}
+
+/// Parse an `HH:MM` time into minutes since midnight (`None` when invalid).
+pub fn fish_time_minutes(value: &str) -> Option<u32> {
+    let normalised = normalise_fish_time(value);
+    let mut parts = normalised.split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+    Some(hour * 60 + minute)
+}
+
+/// Normalise the player's audio tier.
+///
+/// Only the ids the player can actually request ([`AUDIO_QUALITIES`]) are kept;
+/// anything else (a hand-edited or older file) becomes `0` = 自动, which always
+/// plays something.
+pub fn normalise_audio_quality(value: u32) -> u32 {
+    if AUDIO_QUALITIES.contains(&value) {
+        value
+    } else {
+        0
+    }
+}
+
+/// 隐藏直播默认关闭：工具栏保持改动前的六个 pill。
+pub fn default_hide_live_tab() -> bool {
+    false
+}
+
+/// Normalise the 防干扰 隐藏直播 switch.
+///
+/// A `bool` has only two states, so there is nothing to clamp — the function
+/// exists so [`load`] routes every persisted flag through a named normaliser
+/// (the project convention) and so tests can pin the default: a file written
+/// before this field existed parses through `#[serde(default)]` and lands here
+/// as [`default_hide_live_tab`] (off).
+pub fn normalise_hide_live_tab(value: bool) -> bool {
+    value
+}
+
+/// 隐藏搜索热搜默认关闭：空输入时热搜面板照旧出现。
+pub fn default_hide_hot_search() -> bool {
+    false
+}
+
+/// Normalise the 防干扰 隐藏热搜 switch (see [`normalise_hide_live_tab`]).
+pub fn normalise_hide_hot_search(value: bool) -> bool {
+    value
+}
+
+/// Human-readable name of one audio tier (see [`AUDIO_QUALITIES`]).
+pub fn audio_tier_name(id: u32) -> &'static str {
+    match id {
+        30216 => "64K",
+        30232 => "132K",
+        30280 => "192K",
+        30250 => "杜比全景声",
+        30251 => "Hi-Res 无损",
+        _ => "自动",
+    }
+}
+
+/// Mask a DeepSeek key for display: `sk-…abcd`.
+///
+/// Only the `sk-` prefix and the last four characters are shown, so a
+/// screenshot or a shared log never leaks a usable key. Short or blank values
+/// degrade to `sk-…` instead of revealing themselves.
+pub fn mask_key(key: &str) -> String {
+    let key = key.trim();
+    let last: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    if key.chars().count() <= 8 || last.chars().count() < 4 {
+        "sk-…".to_string()
+    } else {
+        format!("sk-…{last}")
+    }
+}
+
+/// Normalise a restored 播放列表 together with its current index.
+///
+/// The queue arrives from JSON and may be arbitrarily corrupt:
+///
+/// * an entry without a `bvid` is dropped (it could never be played);
+/// * a repeated `bvid` is dropped after its first occurrence, so the panel can
+///   never show the same video twice;
+/// * more than [`PLAYLIST_MAX`] entries keep the NEWEST ones, because the live
+///   queue drops its oldest item when it is full;
+/// * `current` is remapped through those edits and becomes `None` when the item
+///   it pointed at is gone, so it always indexes the returned list.
+pub fn normalise_playlist_state(
+    items: Vec<QueueEntry>,
+    current: Option<usize>,
+) -> (Vec<QueueEntry>, Option<usize>) {
+    let mut kept: Vec<(usize, QueueEntry)> = Vec::with_capacity(items.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for (index, entry) in items.into_iter().enumerate() {
+        if entry.bvid.trim().is_empty() {
+            continue;
+        }
+        if !seen.insert(entry.bvid.clone()) {
+            continue;
+        }
+        kept.push((index, entry));
+    }
+    let mut current =
+        current.and_then(|wanted| kept.iter().position(|(index, _)| *index == wanted));
+    if kept.len() > PLAYLIST_MAX {
+        let dropped = kept.len() - PLAYLIST_MAX;
+        kept.drain(0..dropped);
+        current = current.and_then(|index| index.checked_sub(dropped));
+    }
+    (kept.into_iter().map(|(_, entry)| entry).collect(), current)
+}
+
+/// Normalise the count of warmed seek positions.
+///
+/// The value arrives both from JSON (a hand-edited or older file can hold
+/// anything) and from the 设置 menu. Every value in
+/// `SEEK_POINTS_MIN..=SEEK_POINTS_MAX` is kept; anything else — including the
+/// tempting `0` — is corrupt for this field and falls back to
+/// [`default_seek_points`]. Use [`SEEK_POINTS_MIN`] for "as little traffic as
+/// possible", not 0.
+pub fn normalise_seek_points(value: u32) -> u32 {
+    if (SEEK_POINTS_MIN..=SEEK_POINTS_MAX).contains(&value) {
+        value
+    } else {
+        default_seek_points()
+    }
+}
+
+/// Normalise the preloaded-batch count.
+///
+/// The value arrives both from JSON (a hand-edited or older file can hold
+/// anything) and from the 设置 menu: every value in `0..=FEED_PREFETCH_MAX` is
+/// kept (0 = preloading off), anything above the cap is corrupt and falls back
+/// to [`default_feed_prefetch_batches`].
+pub fn normalise_feed_prefetch_batches(value: u32) -> u32 {
+    if value <= FEED_PREFETCH_MAX {
+        value
+    } else {
+        default_feed_prefetch_batches()
+    }
+}
+
+/// Normalise the 关闭主窗口 behaviour.
+///
+/// The value arrives both from JSON (a corrupt or hand-edited file can hold
+/// anything) and from the 设置 menu: only the offered actions ([`CLOSE_ACTIONS`])
+/// are kept, anything else falls back to [`default_close_action`].
+///
+/// `0` is the retired 「最小化到任务栏」: it is migrated to
+/// [`CLOSE_ACTION_TRAY`] rather than rejected, because an old `settings.json`
+/// holding it still expressed "don't quit", and minimising was exactly what made
+/// the window look unclosed on the taskbar.
+pub fn normalise_close_action(value: u32) -> u32 {
+    match value {
+        0 => CLOSE_ACTION_TRAY,
+        offered if CLOSE_ACTIONS.contains(&offered) => offered,
+        _ => default_close_action(),
+    }
+}
+
+/// Normalise the cards-per-page setting.
+///
+/// The value arrives both from JSON (a hand-edited or older file can hold
+/// anything) and from the 设置 menu: only the offered steps ([`PAGE_SIZES`])
+/// are kept, anything else falls back to [`default_page_size`].
+pub fn normalise_page_size(value: i64) -> i64 {
+    if PAGE_SIZES.contains(&value) {
+        value
+    } else {
+        default_page_size()
+    }
+}
+
+/// Normalise a frosted-glass slider value.
+///
+/// The values are persisted as floats and arrive both from JSON (where a
+/// hand-edited or older file can hold anything) and from the UI sliders:
+/// finite values in `0..=100` are kept, anything else — out of range, JSON
+/// `null`, `NaN` — falls back to `default`. The theme global must never hold a
+/// value outside the slider's range.
+pub fn normalise_glass(value: f32, default: f32) -> f32 {
+    if (0.0..=100.0).contains(&value) {
+        value
+    } else {
+        default
+    }
+}
+
+/// Validate a stored player layout.
+///
+/// A hand-edited or older file can hold anything: `[x, y, w, h]` in logical px
+/// is kept only when it is a usable rect (positive size, no absurd magnitude).
+/// Anything else becomes `None`, which means "use the default placement".
+pub fn normalise_player_layout(layout: Option<[i32; 4]>) -> Option<[i32; 4]> {
+    let [x, y, w, h] = layout?;
+    const LIMIT: i32 = 100_000;
+    let sane = w > 0 && h > 0 && x.abs() < LIMIT && y.abs() < LIMIT && w <= LIMIT && h <= LIMIT;
+    sane.then_some([x, y, w, h])
+}
+
+/// Snap a stored theme mode to one of the two explicit modes.
+///
+/// The only accepted values are [`crate::theme::THEME_LIGHT`] (1) and
+/// [`crate::theme::THEME_DARK`] (2). Anything else — the legacy 跟随系统 `0`, or
+/// a hand-edited corrupt value — is resolved ONCE against the Windows light/dark
+/// setting ([`crate::theme::system_mode`]) and kept as that concrete mode, so a
+/// follow-system state is never stored or reported again.
+pub fn normalise_theme(value: u32) -> u32 {
+    match value {
+        crate::theme::THEME_LIGHT => crate::theme::THEME_LIGHT,
+        crate::theme::THEME_DARK => crate::theme::THEME_DARK,
+        _ => crate::theme::system_mode(),
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            danmaku_opacity: default_opacity(),
+            danmaku_font: default_font(),
+            danmaku_speed: default_danmaku_speed(),
+            danmaku_area: default_danmaku_area(),
+            block_scroll: false,
+            block_top: false,
+            block_bottom: false,
+            blocked_senders: Vec::new(),
+            blocked_keywords: Vec::new(),
+            blocked_regex: Vec::new(),
+            player_quality: default_player_quality(),
+            // f176: decode at the stream's own size unless the owner opts out.
+            player_native_size: true,
+            player_enhance: 0,
+            // f212: the composite picture path is the shipped default (the
+            // two entries that used to miss the video layer are fixed);
+            // `BILI_PLAYER_DCOMP=0` still returns the winit window + ffmpeg.
+            player_dcomp: default_player_dcomp(),
+            // f209: the zero-copy decode path is on unless a run turns it off.
+            player_mf_decode: default_player_mf_decode(),
+            player_speed: default_player_speed(),
+            hwaccel: default_hwaccel(),
+            codec_pref: 0,
+            ai_on: false,
+            ai_level: 0,
+            theme: normalise_theme(0),
+            autostart: false,
+            player_keys: default_player_keys(),
+            electron_player_keys: Vec::new(),
+            glass_transparency: default_glass_transparency(),
+            glass_blur: default_glass_blur(),
+            backdrop_blur: default_backdrop_blur(),
+            page_size: default_page_size(),
+            history_limit: default_history_limit(),
+            close_action: default_close_action(),
+            player_layout: None,
+            feed_prefetch_batches: default_feed_prefetch_batches(),
+            cdn_select: default_cdn_select(),
+            prefetch_proxy: default_prefetch_proxy(),
+            seek_points: default_seek_points(),
+            prefetch_connections: default_prefetch_connections(),
+            preload_enabled: default_preload_enabled(),
+            preload_comments: default_preload_comments(),
+            preload_bandwidth_mbps: default_preload_bandwidth_mbps(),
+            net_threads: default_net_threads(),
+            playlist: Vec::new(),
+            playlist_current: None,
+            play_mode: default_play_mode(),
+            playlist_autoplay: default_playlist_autoplay(),
+            playlist_random: default_playlist_random(),
+            playlist_mode_rev: PLAYLIST_MODE_REV,
+            loop_one: default_loop_one(),
+            interp_mode: 0,
+            interp_mode_rev: INTERP_MODE_REV,
+            deepseek_key: String::new(),
+            fish_model: default_fish_model(),
+            fish_instruction: default_fish_instruction(),
+            fish_budget_videos: default_fish_budget_videos(),
+            fish_interval_ms: default_fish_interval_ms(),
+            fish_enabled: false,
+            fish_auto_feed: false,
+            fish_feed_time: default_fish_feed_time(),
+            fish_sources: default_fish_sources(),
+            audio_quality: 0,
+            hide_live_tab: default_hide_live_tab(),
+            hide_hot_search: default_hide_hot_search(),
+            fish_tier: default_fish_tier(),
+            fish_step_meta: true,
+            fish_step_subtitle: true,
+            fish_step_outline: false,
+            fish_step_comments: true,
+            fish_step_asr: false,
+            fish_step_frames: false,
+            fish_asr_enabled: false,
+            fish_asr_engine: default_fish_asr_engine(),
+            fish_asr_device: default_fish_asr_device(),
+            fish_asr_model: default_fish_asr_model(),
+            fish_asr_threads: default_fish_asr_threads(),
+            fish_asr_model_dir: String::new(),
+            fish_model_mirror: default_fish_model_mirror(),
+            fish_vision_detail: default_fish_vision_detail(),
+            pgc_sorts: BTreeMap::new(),
+            search_tab: 0,
+        }
+    }
+}
+
+pub fn settings_path() -> PathBuf {
+    crate::paths::root().join("settings.json")
+}
+
+/// Load preferences, clamping corrupted values and falling back to defaults.
+///
+/// The theme is the one value that MIGRATES rather than merely clamping: a
+/// legacy 跟随系统 `0` (or a corrupt value) is resolved once against the Windows
+/// light/dark setting and written straight back, so a stored file never keeps a
+/// third state. The write is best-effort — a read-only file still yields the
+/// migrated in-memory value.
+pub fn load() -> Settings {
+    let Some(data) = std::fs::read_to_string(settings_path()).ok() else {
+        return Settings::default();
+    };
+    // f237: the 120 fps field is gone. Serde ignores the unknown key, so the
+    // file would parse either way; the raw text is what lets the migration say
+    // it removed the field (and rewrite the file once).
+    let removed_interp_120 = data.contains("\"interp_120\"");
+    let Some(settings) = serde_json::from_str::<Settings>(&data).ok() else {
+        return Settings::default();
+    };
+    let stored_theme = settings.theme;
+    // f229/f237: one-time renumbering of the interpolation modes. The old file
+    // has no `interp_mode_rev`, so its `2` means block match or GPU flow and its
+    // `3` the oldest hardware-flow tier; both now load as CPU. The marker is
+    // written back below, which is what keeps a second load from migrating again.
+    let interp_migration = (settings.interp_mode_rev < INTERP_MODE_REV)
+        .then(|| migrate_interp_mode(settings.interp_mode));
+    // f249: the three-state `play_mode` became 自动播放 / 随机播放. An old file
+    // has no `playlist_mode_rev`; map its value once and write the marker back.
+    let playlist_migration = (settings.playlist_mode_rev < PLAYLIST_MODE_REV)
+        .then(|| migrate_playlist_mode(settings.play_mode));
+    let (playlist, playlist_current) =
+        normalise_playlist_state(settings.playlist, settings.playlist_current);
+    let loaded = Settings {
+        danmaku_opacity: settings.danmaku_opacity.min(100),
+        danmaku_font: settings.danmaku_font.min(2),
+        danmaku_speed: settings.danmaku_speed.clamp(50, 200),
+        danmaku_area: clamp_area(settings.danmaku_area),
+        block_scroll: settings.block_scroll,
+        block_top: settings.block_top,
+        block_bottom: settings.block_bottom,
+        blocked_senders: settings.blocked_senders,
+        blocked_keywords: settings.blocked_keywords,
+        blocked_regex: settings.blocked_regex,
+        player_quality: normalise_player_quality(settings.player_quality),
+        player_native_size: settings.player_native_size,
+        // Unknown tiers (a hand-edited file, a build from another branch) load as
+        // 关闭 rather than as a tier number the menu cannot name; the removed
+        // FSR tier (`3`) loads as 通用 (f231, see `normalise_player_enhance`).
+        player_enhance: normalise_player_enhance(settings.player_enhance),
+        player_dcomp: settings.player_dcomp,
+        player_mf_decode: settings.player_mf_decode,
+        player_speed: settings.player_speed.clamp(500, 2000),
+        hwaccel: settings.hwaccel,
+        codec_pref: match settings.codec_pref {
+            7 => 7,
+            12 => 12,
+            13 => 13,
+            _ => 0,
+        },
+        ai_on: settings.ai_on,
+        ai_level: settings.ai_level.min(10),
+        theme: normalise_theme(settings.theme),
+        autostart: settings.autostart,
+        player_keys: normalize_player_keys(settings.player_keys),
+        electron_player_keys: settings.electron_player_keys,
+        glass_transparency: normalise_glass(
+            settings.glass_transparency,
+            default_glass_transparency(),
+        ),
+        glass_blur: normalise_glass(settings.glass_blur, default_glass_blur()),
+        backdrop_blur: normalise_backdrop_blur(settings.backdrop_blur),
+        page_size: normalise_page_size(settings.page_size),
+        history_limit: normalise_history_limit(settings.history_limit),
+        close_action: normalise_close_action(settings.close_action),
+        player_layout: normalise_player_layout(settings.player_layout),
+        feed_prefetch_batches: normalise_feed_prefetch_batches(settings.feed_prefetch_batches),
+        cdn_select: settings.cdn_select,
+        prefetch_proxy: settings.prefetch_proxy,
+        seek_points: normalise_seek_points(settings.seek_points),
+        prefetch_connections: normalise_prefetch_connections(settings.prefetch_connections),
+        preload_enabled: settings.preload_enabled,
+        preload_comments: normalise_preload_comments(settings.preload_comments),
+        preload_bandwidth_mbps: normalise_preload_bandwidth_mbps(
+            settings.preload_bandwidth_mbps,
+        ),
+        net_threads: normalise_net_threads(settings.net_threads),
+        playlist,
+        playlist_current,
+        play_mode: normalise_play_mode(settings.play_mode),
+        playlist_autoplay: playlist_migration
+            .map_or(settings.playlist_autoplay, |(autoplay, _)| autoplay),
+        playlist_random: playlist_migration
+            .map_or(settings.playlist_random, |(_, random)| random),
+        playlist_mode_rev: PLAYLIST_MODE_REV,
+        loop_one: settings.loop_one,
+        interp_mode: interp_migration.map_or_else(
+            || normalise_interp_mode(settings.interp_mode),
+            |(mode, _)| mode,
+        ),
+        interp_mode_rev: if interp_migration.is_some() {
+            INTERP_MODE_REV
+        } else {
+            settings.interp_mode_rev
+        },
+        deepseek_key: settings.deepseek_key.trim().to_string(),
+        fish_model: normalise_fish_model(&settings.fish_model),
+        fish_instruction: normalise_fish_instruction(&settings.fish_instruction),
+        fish_budget_videos: normalise_fish_budget(settings.fish_budget_videos),
+        fish_interval_ms: normalise_fish_interval(settings.fish_interval_ms),
+        fish_enabled: settings.fish_enabled,
+        fish_auto_feed: settings.fish_auto_feed,
+        fish_feed_time: normalise_fish_time(&settings.fish_feed_time),
+        fish_sources: normalise_fish_sources(settings.fish_sources),
+        audio_quality: normalise_audio_quality(settings.audio_quality),
+        hide_live_tab: normalise_hide_live_tab(settings.hide_live_tab),
+        hide_hot_search: normalise_hide_hot_search(settings.hide_hot_search),
+        fish_tier: normalise_fish_tier(settings.fish_tier),
+        fish_step_meta: settings.fish_step_meta,
+        fish_step_subtitle: settings.fish_step_subtitle,
+        fish_step_outline: settings.fish_step_outline,
+        fish_step_comments: settings.fish_step_comments,
+        fish_step_asr: settings.fish_step_asr,
+        fish_step_frames: settings.fish_step_frames,
+        fish_asr_enabled: settings.fish_asr_enabled,
+        fish_asr_engine: normalise_fish_asr_engine(&settings.fish_asr_engine),
+        fish_asr_device: normalise_fish_asr_device(&settings.fish_asr_device),
+        fish_asr_model: normalise_fish_asr_model(&settings.fish_asr_model),
+        fish_asr_threads: normalise_fish_asr_threads(settings.fish_asr_threads),
+        fish_asr_model_dir: settings.fish_asr_model_dir.trim().to_string(),
+        fish_model_mirror: normalise_fish_model_mirror(&settings.fish_model_mirror),
+        fish_vision_detail: normalise_fish_vision_detail(&settings.fish_vision_detail),
+        pgc_sorts: normalise_pgc_sorts(settings.pgc_sorts),
+        search_tab: normalise_search_tab(settings.search_tab),
+    };
+    if let Some((_, Some((from, to)))) = interp_migration {
+        crate::debug_log(&format!("settings migrate interp_mode {from} -> {to}"));
+    }
+    if let Some((autoplay, random)) = playlist_migration {
+        crate::debug_log(&format!(
+            "settings migrate playlist play_mode={} -> autoplay={} random={}",
+            settings.play_mode,
+            u8::from(autoplay),
+            u8::from(random)
+        ));
+    }
+    if removed_interp_120 {
+        crate::debug_log("settings migrate interp_120 removed");
+    }
+    // f231: the removed FSR tier is the one 画质增强 value that has to MOVE: it
+    // was a second sharpener, so the nearest tier that still exists is 通用.
+    if settings.player_enhance == 3 {
+        crate::debug_log("settings migrate player_enhance 3 -> 1");
+    }
+    // The migration marker must reach disk, or the next start would re-read the
+    // legacy numbering and shuffle the mode again.
+    if loaded.theme != stored_theme
+        || interp_migration.is_some()
+        || playlist_migration.is_some()
+        || removed_interp_120
+        || settings.player_enhance != loaded.player_enhance
+    {
+        let _ = save(&loaded);
+    }
+    loaded
+}
+
+/// Snap a stored 画质增强 tier to one the menu can name.
+///
+/// Idempotent by construction: after one load the value is `0..=2`, and every
+/// one of those maps to itself. `3` was the removed FSR tier (f231) and becomes
+/// 通用; `4` was RTX VSR (removed in f207) and becomes 关闭.
+pub fn normalise_player_enhance(value: u32) -> u32 {
+    match value {
+        1 => 1,
+        2 => 2,
+        3 => 1,
+        _ => 0,
+    }
+}
+
+/// Snap a display-area percent to the nearest supported step (25/50/75/100).
+pub fn clamp_area(value: u32) -> u32 {
+    match value {
+        0..=37 => 25,
+        38..=62 => 50,
+        63..=87 => 75,
+        _ => 100,
+    }
+}
+
+pub fn save(settings: &Settings) -> Result<()> {
+    // Several writers exist (the settings panel, the player layout and the
+    // playback queue, each with its own snapshot). Serialising the write keeps
+    // the file from being interleaved by two of them; the last complete
+    // snapshot still wins, exactly as before.
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = match SAVE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let data = serde_json::to_string_pretty(settings)?;
+    std::fs::write(settings_path(), data)?;
+    Ok(())
+}
+
+// ---- 继续观看 (PGC progress) -----------------------------------------------
+//
+// `settings.json` carries preferences, and rewriting it for every episode
+// watched would make the file churn for something that is pure progress. This
+// is a separate small table in its own file instead, one row per season:
+//
+//   { "seasons": { "835": { "ep_id": 216351, "bvid": "BV1…", "cid": 12345,
+//                           "index": 4, "title": "第 4 话 …", "at": 1761… } } }
+//
+// `index` is the 1-based position of that episode inside the season's 正片 list
+// at the time it was watched, so the 番剧 page can print 「看到第 N 集」 from the
+// table alone (no season fetch on the card path). The whole table is capped at
+// [`CONTINUE_MAX_SEASONS`] rows, oldest `at` dropped first.
+
+/// Where one season was last watched (the episode that actually reached its
+/// first frame).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinueEntry {
+    /// The episode's `ep_id`.
+    #[serde(default)]
+    pub ep_id: i64,
+    #[serde(default)]
+    pub bvid: String,
+    #[serde(default)]
+    pub cid: u64,
+    /// 1-based position in the season's 正片 list (0 = unknown).
+    #[serde(default)]
+    pub index: u32,
+    /// The episode line the 选集 shows (`long_title` first).
+    #[serde(default)]
+    pub title: String,
+    /// Unix seconds of the write.
+    #[serde(default)]
+    pub at: i64,
+}
+
+impl ContinueEntry {
+    /// 「看到第 N 集」 for the card badge; empty when `index` is unknown.
+    pub fn badge_text(&self) -> String {
+        if self.index > 0 {
+            format!("看到第 {} 集", self.index)
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// The whole 继续观看 table, keyed by season_id.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContinueStore {
+    #[serde(default)]
+    pub seasons: BTreeMap<i64, ContinueEntry>,
+}
+
+/// One row per season; the table is a convenience, not a history.
+pub const CONTINUE_MAX_SEASONS: usize = 200;
+
+impl ContinueStore {
+    /// `continue.json` beside `settings.json`.
+    pub fn path() -> PathBuf {
+        crate::paths::root().join("continue.json")
+    }
+
+    pub fn load() -> Self {
+        Self::load_from(&Self::path())
+    }
+
+    /// Read one table. A missing or corrupt file is an empty table, never an
+    /// error: losing progress must not break the 番剧 page.
+    pub fn load_from(path: &Path) -> Self {
+        let Some(data) = std::fs::read_to_string(path).ok() else {
+            return Self::default();
+        };
+        let store: Self = serde_json::from_str(&data).unwrap_or_default();
+        store.pruned()
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    /// Write the table atomically: a temp file in the same directory, then a
+    /// rename over the destination, so a crash mid-write can never leave a
+    /// truncated table behind.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let data = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn get(&self, season_id: i64) -> Option<&ContinueEntry> {
+        self.seasons.get(&season_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.seasons.len()
+    }
+
+    /// Record one season's episode and drop the oldest rows over the cap.
+    pub fn set(&mut self, season_id: i64, entry: ContinueEntry) {
+        if season_id <= 0 {
+            return;
+        }
+        self.seasons.insert(season_id, entry);
+        while self.seasons.len() > CONTINUE_MAX_SEASONS {
+            let Some(oldest) = self
+                .seasons
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.seasons.remove(&oldest);
+        }
+    }
+
+    /// Same, then persist. A failed write is logged by the caller, not here.
+    pub fn set_and_save(&mut self, season_id: i64, entry: ContinueEntry) -> Result<()> {
+        self.set(season_id, entry);
+        self.save()
+    }
+
+    fn pruned(mut self) -> Self {
+        self.seasons.retain(|id, entry| *id > 0 && entry.ep_id > 0);
+        while self.seasons.len() > CONTINUE_MAX_SEASONS {
+            let Some(oldest) = self
+                .seasons
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.seasons.remove(&oldest);
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_continue_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "o11a1-continue-{}-{tag}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn pgc_sort_keys_are_the_verified_ones() {
+        // The four keys the dropdown offers, in dropdown order. Every one of
+        // them was checked against the live index endpoint; see PGC_SORT_KEYS.
+        assert_eq!(PGC_SORT_KEYS, ["follows", "update", "views", "score"]);
+        for key in PGC_SORT_KEYS {
+            assert_eq!(normalise_pgc_sort(key), key);
+        }
+        assert_eq!(normalise_pgc_sort("  score "), "score");
+    }
+
+    #[test]
+    fn pgc_sort_normalisation_drops_unknown_keys_and_values() {
+        assert_eq!(normalise_pgc_sort("danmaku"), "");
+        assert_eq!(normalise_pgc_sort(""), "");
+        let mut stored = BTreeMap::new();
+        stored.insert("1".to_string(), "update".to_string());
+        stored.insert("4".to_string(), "nonsense".to_string());
+        stored.insert("anime".to_string(), "score".to_string());
+        stored.insert("-3".to_string(), "score".to_string());
+        let clean = normalise_pgc_sorts(stored);
+        assert_eq!(clean.len(), 1);
+        assert_eq!(clean.get("1").map(String::as_str), Some("update"));
+    }
+
+    #[test]
+    fn pgc_sorts_survive_a_json_round_trip() {
+        let mut settings = Settings::default();
+        assert!(settings.pgc_sorts.is_empty());
+        settings
+            .pgc_sorts
+            .insert("1".to_string(), "views".to_string());
+        settings
+            .pgc_sorts
+            .insert("4".to_string(), "score".to_string());
+        let json = serde_json::to_string(&settings).expect("serialise settings");
+        let back: Settings = serde_json::from_str(&json).expect("parse settings");
+        assert_eq!(back.pgc_sorts, settings.pgc_sorts);
+        // A file written before this field existed still loads.
+        let old: Settings = serde_json::from_str(r#"{ "page_size": 24 }"#).expect("old file");
+        assert!(old.pgc_sorts.is_empty());
+    }
+
+    #[test]
+    fn continue_store_round_trips_through_a_file() {
+        let path = temp_continue_path("roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let mut store = ContinueStore::default();
+        store.set(
+            835,
+            ContinueEntry {
+                ep_id: 216351,
+                bvid: "BV1xx411c7mD".to_string(),
+                cid: 4321,
+                index: 4,
+                title: "第 4 话 秘密基地".to_string(),
+                at: 1_760_000_000,
+            },
+        );
+        store.save_to(&path).expect("save");
+        // Real read-back from the file, not the in-memory value.
+        let back = ContinueStore::load_from(&path);
+        assert_eq!(back.len(), 1);
+        let entry = back.get(835).expect("season 835");
+        assert_eq!(entry.ep_id, 216351);
+        assert_eq!(entry.cid, 4321);
+        assert_eq!(entry.index, 4);
+        assert_eq!(entry.badge_text(), "看到第 4 集");
+        assert_eq!(entry.at, 1_760_000_000);
+        assert_eq!(
+            serde_json::from_str::<ContinueStore>(&std::fs::read_to_string(&path).unwrap())
+                .map(|store| store.len())
+                .unwrap_or(0),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn continue_store_drops_the_oldest_rows_over_the_cap() {
+        let mut store = ContinueStore::default();
+        for index in 0..(CONTINUE_MAX_SEASONS as i64 + 5) {
+            store.set(
+                index + 1,
+                ContinueEntry {
+                    ep_id: index + 1,
+                    at: index,
+                    ..ContinueEntry::default()
+                },
+            );
+        }
+        assert_eq!(store.len(), CONTINUE_MAX_SEASONS);
+        assert!(store.get(1).is_none(), "oldest row must be dropped");
+        assert!(store.get(5).is_none(), "the five oldest rows are gone");
+        assert!(store.get(6).is_some());
+        assert!(store.get(CONTINUE_MAX_SEASONS as i64 + 5).is_some());
+    }
+
+    #[test]
+    fn continue_store_tolerates_a_missing_or_corrupt_file() {
+        let missing = temp_continue_path("missing");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(ContinueStore::load_from(&missing).len(), 0);
+
+        let corrupt = temp_continue_path("corrupt");
+        std::fs::write(&corrupt, "{ not json").expect("write corrupt file");
+        assert_eq!(ContinueStore::load_from(&corrupt).len(), 0);
+
+        // A row without an ep_id can never be resumed, so it is dropped.
+        let partial = temp_continue_path("partial");
+        std::fs::write(
+            &partial,
+            r#"{ "seasons": { "1": { "bvid": "BV1" }, "2": { "ep_id": 9, "index": 2 } } }"#,
+        )
+        .expect("write partial file");
+        let store = ContinueStore::load_from(&partial);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(2).map(|entry| entry.index), Some(2));
+        let _ = std::fs::remove_file(&corrupt);
+        let _ = std::fs::remove_file(&partial);
+    }
+
+    #[test]
+    fn search_tab_survives_a_round_trip_and_rejects_corrupt_values() {
+        for value in 0..=4 {
+            assert_eq!(normalise_search_tab(value), value);
+        }
+        for value in [-3, 5, 7, i32::MAX] {
+            assert_eq!(normalise_search_tab(value), 0);
+        }
+        let mut settings = Settings::default();
+        assert_eq!(settings.search_tab, 0, "default tab is 视频");
+        settings.search_tab = 3;
+        let json = serde_json::to_string(&settings).expect("serialise");
+        let back: Settings = serde_json::from_str(&json).expect("parse back");
+        assert_eq!(back.search_tab, 3);
+        // A file written before this field existed keeps the default.
+        let old: Settings = serde_json::from_str("{}").expect("old file");
+        assert_eq!(old.search_tab, 0);
+    }
+
+    #[test]
+    fn close_action_accepts_every_offered_value() {        for value in CLOSE_ACTIONS {
+            assert_eq!(normalise_close_action(value), value);
+        }
+    }
+
+    #[test]
+    fn close_action_rejects_corrupt_values() {
+        for value in [3u32, 4, 99, u32::MAX] {
+            assert_eq!(normalise_close_action(value), default_close_action());
+        }
+    }
+
+    #[test]
+    fn close_action_migrates_the_retired_minimize_value() {
+        // 0 = 「最小化到任务栏」 from an old settings.json: never offered again,
+        // and migrated to the tray instead of being treated as corrupt.
+        assert_eq!(normalise_close_action(0), CLOSE_ACTION_TRAY);
+        assert!(!CLOSE_ACTIONS.contains(&0));
+        assert_eq!(default_close_action(), CLOSE_ACTION_TRAY);
+    }
+
+    #[test]
+    fn default_settings_use_the_default_close_action() {
+        assert_eq!(Settings::default().close_action, default_close_action());
+    }
+
+    #[test]
+    fn corrupt_json_falls_back_to_the_default_close_action() {
+        let value = match serde_json::from_str::<Settings>(r#"{ "close_action": 99 }"#) {
+            Ok(settings) => settings.close_action,
+            Err(_) => default_close_action(),
+        };
+        assert_eq!(normalise_close_action(value), default_close_action());
+    }
+
+    #[test]
+    fn missing_close_action_uses_the_serde_default() {
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.close_action, default_close_action());
+    }
+
+    #[test]
+    fn feed_prefetch_batches_keeps_every_offered_value() {
+        for value in 0..=FEED_PREFETCH_MAX {
+            assert_eq!(normalise_feed_prefetch_batches(value), value);
+        }
+        assert_eq!(
+            Settings::default().feed_prefetch_batches,
+            default_feed_prefetch_batches()
+        );
+    }
+
+    #[test]
+    fn feed_prefetch_batches_corrupt_value_falls_back_to_default() {
+        for value in [FEED_PREFETCH_MAX + 1, 5, 99, u32::MAX] {
+            assert_eq!(
+                normalise_feed_prefetch_batches(value),
+                default_feed_prefetch_batches()
+            );
+        }
+        let settings = match serde_json::from_str::<Settings>(r#"{ "feed_prefetch_batches": 99 }"#)
+        {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(
+            normalise_feed_prefetch_batches(settings.feed_prefetch_batches),
+            default_feed_prefetch_batches()
+        );
+    }
+
+    #[test]
+    fn feed_prefetch_batches_missing_field_uses_the_serde_default() {
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(
+            settings.feed_prefetch_batches,
+            default_feed_prefetch_batches()
+        );
+    }
+
+    #[test]
+    fn cdn_select_and_prefetch_proxy_default_on() {
+        let defaults = Settings::default();
+        assert!(defaults.cdn_select);
+        assert!(defaults.prefetch_proxy);
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert!(settings.cdn_select);
+        assert!(settings.prefetch_proxy);
+        let off = match serde_json::from_str::<Settings>(
+            r#"{ "cdn_select": false, "prefetch_proxy": false }"#,
+        ) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert!(!off.cdn_select);
+        assert!(!off.prefetch_proxy);
+    }
+
+    #[test]
+    fn seek_points_keeps_every_offered_value() {
+        for value in SEEK_POINTS_MIN..=SEEK_POINTS_MAX {
+            assert_eq!(normalise_seek_points(value), value);
+        }
+        assert_eq!(Settings::default().seek_points, default_seek_points());
+        assert_eq!(default_seek_points(), 10);
+    }
+
+    #[test]
+    fn seek_points_zero_and_corrupt_values_fall_back() {
+        // 0 is not a valid count (use SEEK_POINTS_MIN for the cheapest setting).
+        for value in [0u32, 1, 2, 3] {
+            assert_eq!(normalise_seek_points(value), default_seek_points());
+            assert!(value < SEEK_POINTS_MIN);
+        }
+        for value in [SEEK_POINTS_MAX + 1, 21, 99, u32::MAX] {
+            assert_eq!(normalise_seek_points(value), default_seek_points());
+        }
+        let settings = match serde_json::from_str::<Settings>(r#"{ "seek_points": 99 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(
+            normalise_seek_points(settings.seek_points),
+            default_seek_points()
+        );
+    }
+
+    #[test]
+    fn seek_points_missing_field_uses_the_serde_default() {
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.seek_points, default_seek_points());
+    }
+
+    #[test]
+    fn seek_points_survive_a_json_round_trip() -> Result<()> {
+        let settings = Settings {
+            seek_points: SEEK_POINTS_MAX,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert_eq!(normalise_seek_points(decoded.seek_points), SEEK_POINTS_MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn net_threads_defaults_to_twelve_and_normalises() {
+        assert_eq!(default_net_threads(), NET_THREADS_DEFAULT);
+        assert_eq!(Settings::default().net_threads, NET_THREADS_DEFAULT);
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.net_threads, NET_THREADS_DEFAULT);
+        assert_eq!(normalise_net_threads(0), NET_THREADS_DEFAULT);
+        assert_eq!(normalise_net_threads(1), NET_THREADS_MIN);
+        assert_eq!(normalise_net_threads(12), 12);
+        assert_eq!(normalise_net_threads(999), NET_THREADS_MAX);
+        assert_eq!(normalise_net_threads(u32::MAX), NET_THREADS_MAX);
+        let encoded = match serde_json::to_string(&Settings::default()) {
+            Ok(encoded) => encoded,
+            Err(_) => String::new(),
+        };
+        assert!(encoded.contains("\"net_threads\":12"), "{encoded}");
+    }
+
+    #[test]
+    fn prefetch_connections_defaults_to_sixteen() {
+        assert_eq!(default_prefetch_connections(), 16);
+        assert_eq!(Settings::default().prefetch_connections, 16);
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.prefetch_connections, 16);
+    }
+
+    #[test]
+    fn prefetch_connections_keeps_every_offered_value() {
+        for value in PREFETCH_CONNECTIONS_MIN..=PREFETCH_CONNECTIONS_MAX {
+            assert_eq!(normalise_prefetch_connections(value), value);
+        }
+    }
+
+    #[test]
+    fn prefetch_connections_zero_means_unset() {
+        assert_eq!(
+            normalise_prefetch_connections(0),
+            default_prefetch_connections()
+        );
+        let settings = match serde_json::from_str::<Settings>(r#"{ "prefetch_connections": 0 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(
+            normalise_prefetch_connections(settings.prefetch_connections),
+            default_prefetch_connections()
+        );
+    }
+
+    #[test]
+    fn prefetch_connections_clamps_out_of_range_values() {
+        for value in 1..PREFETCH_CONNECTIONS_MIN {
+            assert_eq!(
+                normalise_prefetch_connections(value),
+                PREFETCH_CONNECTIONS_MIN
+            );
+        }
+        for value in [PREFETCH_CONNECTIONS_MAX + 1, 33, 99, u32::MAX] {
+            assert_eq!(
+                normalise_prefetch_connections(value),
+                PREFETCH_CONNECTIONS_MAX
+            );
+        }
+    }
+
+    #[test]
+    fn prefetch_connections_round_trips_through_json() -> Result<()> {
+        let settings = Settings {
+            prefetch_connections: PREFETCH_CONNECTIONS_MAX,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert_eq!(
+            normalise_prefetch_connections(decoded.prefetch_connections),
+            PREFETCH_CONNECTIONS_MAX
+        );
+        Ok(())
+    }
+
+    fn queued(bvid: &str) -> QueueEntry {
+        QueueEntry {
+            bvid: bvid.to_string(),
+            cid: 1,
+            aid: 1,
+            title: bvid.to_string(),
+            owner: "UP".to_string(),
+            duration: "01:00".to_string(),
+            cover: String::new(),
+        }
+    }
+
+    #[test]
+    fn playlist_defaults_to_empty_autoplay_queue() {
+        let defaults = Settings::default();
+        assert!(defaults.playlist.is_empty());
+        assert_eq!(defaults.playlist_current, None);
+        assert!(defaults.playlist_autoplay);
+        assert!(!defaults.playlist_random);
+        assert!(!defaults.loop_one);
+        assert_eq!(defaults.playlist_mode_rev, PLAYLIST_MODE_REV);
+    }
+
+    #[test]
+    fn legacy_play_mode_keeps_the_three_offered_values() {
+        for mode in PLAY_MODES {
+            assert_eq!(normalise_play_mode(mode), mode);
+        }
+        for mode in [3u32, 4, 99, u32::MAX] {
+            assert_eq!(normalise_play_mode(mode), default_play_mode());
+        }
+    }
+
+    #[test]
+    fn playlist_mode_migrates_manual_auto_random_to_the_two_switches() {
+        assert_eq!(migrate_playlist_mode(0), (false, false));
+        assert_eq!(migrate_playlist_mode(1), (true, false));
+        assert_eq!(migrate_playlist_mode(2), (true, true));
+        // Unknown values behave like the old default (自动).
+        assert_eq!(migrate_playlist_mode(99), (true, false));
+    }
+
+    #[test]
+    fn playlist_missing_fields_use_serde_defaults() {
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert!(settings.playlist.is_empty());
+        assert_eq!(settings.playlist_current, None);
+        assert!(settings.playlist_autoplay);
+        assert!(!settings.playlist_random);
+        assert!(!settings.loop_one);
+    }
+
+    #[test]
+    fn playlist_round_trips_through_json() -> Result<()> {
+        let settings = Settings {
+            playlist: vec![queued("BV1"), queued("BV2")],
+            playlist_current: Some(1),
+            playlist_autoplay: false,
+            playlist_random: false,
+            loop_one: true,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        assert!(!encoded.contains("\"play_mode\""));
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        let (items, current) = normalise_playlist_state(decoded.playlist, decoded.playlist_current);
+        assert_eq!(items, vec![queued("BV1"), queued("BV2")]);
+        assert_eq!(current, Some(1));
+        assert!(!decoded.playlist_autoplay);
+        assert!(!decoded.playlist_random);
+        assert!(decoded.loop_one);
+        assert_eq!(decoded.playlist_mode_rev, PLAYLIST_MODE_REV);
+        Ok(())
+    }
+
+    #[test]
+    fn playlist_drops_empty_and_duplicate_bvids() {
+        let (items, current) = normalise_playlist_state(
+            vec![queued("BV1"), queued(""), queued("BV1"), queued("BV2")],
+            Some(3),
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|entry| entry.bvid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BV1", "BV2"]
+        );
+        assert_eq!(current, Some(1), "BV2 moved from slot 3 to slot 1");
+    }
+
+    #[test]
+    fn playlist_cap_keeps_the_newest_and_remaps_current() {
+        let all: Vec<QueueEntry> = (0..PLAYLIST_MAX + 5)
+            .map(|index| queued(&format!("BV{index}")))
+            .collect();
+        let (items, current) = normalise_playlist_state(all.clone(), Some(PLAYLIST_MAX + 2));
+        let newest = format!("BV{}", PLAYLIST_MAX + 4);
+        assert_eq!(items.len(), PLAYLIST_MAX);
+        assert_eq!(items.first().map(|entry| entry.bvid.as_str()), Some("BV5"));
+        assert_eq!(
+            items.last().map(|entry| entry.bvid.as_str()),
+            Some(newest.as_str())
+        );
+        assert_eq!(current, Some(PLAYLIST_MAX - 3));
+        let (_, dropped_current) = normalise_playlist_state(all, Some(0));
+        assert_eq!(dropped_current, None);
+    }
+
+    #[test]
+    fn playlist_current_out_of_range_becomes_none() {
+        let (items, current) = normalise_playlist_state(vec![queued("BV1")], Some(4));
+        assert_eq!(items.len(), 1);
+        assert_eq!(current, None);
+        let (_, current) = normalise_playlist_state(vec![queued("BV1")], Some(0));
+        assert_eq!(current, Some(0));
+        let (_, none) = normalise_playlist_state(vec![queued("BV1")], None);
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn playlist_corrupt_json_falls_back_to_the_defaults() {
+        let (items, current) =
+            normalise_playlist_state(vec![queued("BV1"), queued("BV1")], Some(0));
+        assert_eq!(items.len(), 1);
+        assert_eq!(current, Some(0));
+        let settings = match serde_json::from_str::<Settings>(
+            r#"{ "playlist": [{ "title": "no bvid" }], "playlist_current": 7, "play_mode": 99 }"#,
+        ) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        let (items, current) =
+            normalise_playlist_state(settings.playlist, settings.playlist_current);
+        assert!(items.is_empty());
+        assert_eq!(current, None);
+        assert_eq!(normalise_play_mode(settings.play_mode), default_play_mode());
+    }
+
+    #[test]
+    fn enhance_tier_migrates_the_removed_fsr_value() {
+        // f231: 关闭 / 通用 / 番剧 are the only tiers left. The removed FSR
+        // tier (3) was a second sharpener, so it becomes 通用; the old RTX VSR
+        // tier (4, removed in f207) and anything unknown stay 关闭.
+        assert_eq!(normalise_player_enhance(0), 0);
+        assert_eq!(normalise_player_enhance(1), 1);
+        assert_eq!(normalise_player_enhance(2), 2);
+        assert_eq!(normalise_player_enhance(3), 1);
+        assert_eq!(normalise_player_enhance(4), 0);
+        assert_eq!(normalise_player_enhance(99), 0);
+        // Idempotent: one load is enough, and a second load changes nothing.
+        for value in [0u32, 1, 2, 3, 4, 99] {
+            let once = normalise_player_enhance(value);
+            assert_eq!(normalise_player_enhance(once), once);
+            assert!(once <= 2);
+        }
+    }
+
+    #[test]
+    fn interp_mode_defaults_to_off() {
+        let settings = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(settings.interp_mode, 0);
+    }
+
+    #[test]
+    fn interp_mode_keeps_the_implemented_modes() {
+        for value in INTERP_MODES {
+            assert_eq!(normalise_interp_mode(value), value);
+        }
+        assert_eq!(normalise_interp_mode(1), 1);
+    }
+
+    #[test]
+    fn interp_mode_rejects_corrupt_and_future_values() {
+        // 0..=1 are implemented (off / CPU); the retired GPU `2`, the oldest
+        // hardware-flow `3` and anything else are not.
+        for value in [2u8, 3, 4, 9, 99, u8::MAX] {
+            assert_eq!(normalise_interp_mode(value), 0);
+            assert!(!INTERP_MODES.contains(&value));
+        }
+    }
+
+    /// f237 removed the GPU mode: an old file's `2` (块匹配 or GPU 光流) and its
+    /// `3` (the oldest hardware-flow tier) both land on CPU. The migration is
+    /// one-shot: the marker is the current rev afterwards, so a reload takes the
+    /// stored value as-is.
+    #[test]
+    fn interp_mode_migrates_the_legacy_numbering_once() {
+        assert_eq!(migrate_interp_mode(0), (0, None));
+        assert_eq!(migrate_interp_mode(1), (1, None));
+        assert_eq!(migrate_interp_mode(2), (1, Some((2, 1))));
+        assert_eq!(migrate_interp_mode(3), (1, Some((3, 1))));
+        assert_eq!(migrate_interp_mode(9), (0, None));
+        // Idempotent by marker: after the migration the rev is current, so the
+        // stored value is normalised instead (a stale 2 is not a mode any more).
+        let mut stored = Settings {
+            interp_mode: 2,
+            interp_mode_rev: 0,
+            ..Settings::default()
+        };
+        let (mode, change) = migrate_interp_mode(stored.interp_mode);
+        assert_eq!(change, Some((2, 1)));
+        stored.interp_mode = mode;
+        stored.interp_mode_rev = INTERP_MODE_REV;
+        assert_eq!(stored.interp_mode, 1);
+        assert!(stored.interp_mode_rev >= INTERP_MODE_REV);
+        // A file already at the current rev is never migrated.
+        stored.interp_mode = 2;
+        assert_eq!(
+            if stored.interp_mode_rev < INTERP_MODE_REV {
+                migrate_interp_mode(stored.interp_mode).0
+            } else {
+                normalise_interp_mode(stored.interp_mode)
+            },
+            0
+        );
+    }
+
+    /// f237 deleted the `interp_120` field; an old file still carrying it must
+    /// load (serde ignores it) and must not write it back.
+    #[test]
+    fn interp_120_is_ignored_and_dropped_on_save() -> Result<()> {
+        let loaded: Settings =
+            serde_json::from_str(r#"{ "interp_mode": 1, "interp_120": true }"#)?;
+        assert_eq!(loaded.interp_mode, 1);
+        let encoded = serde_json::to_string(&loaded)?;
+        assert!(!encoded.contains("interp_120"));
+        Ok(())
+    }
+
+    #[test]
+    fn interp_mode_round_trips_through_json() -> Result<()> {
+        for mode in INTERP_MODES {
+            let settings = Settings {
+                interp_mode: mode,
+                ..Settings::default()
+            };
+            let encoded = serde_json::to_string(&settings)?;
+            let decoded = serde_json::from_str::<Settings>(&encoded)?;
+            assert_eq!(normalise_interp_mode(decoded.interp_mode), mode);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn audio_quality_keeps_every_offered_id() {
+        for id in AUDIO_QUALITIES {
+            assert_eq!(normalise_audio_quality(id), id);
+        }
+        assert_eq!(Settings::default().audio_quality, 0);
+    }
+
+    #[test]
+    fn audio_quality_rejects_unknown_ids() {
+        for id in [1u32, 999, 30217, 30252, u32::MAX] {
+            assert_eq!(normalise_audio_quality(id), 0);
+        }
+    }
+
+    #[test]
+    fn audio_tier_names_match_the_ids() {
+        assert_eq!(audio_tier_name(0), "自动");
+        assert_eq!(audio_tier_name(30216), "64K");
+        assert_eq!(audio_tier_name(30232), "132K");
+        assert_eq!(audio_tier_name(30280), "192K");
+        assert_eq!(audio_tier_name(30250), "杜比全景声");
+        assert_eq!(audio_tier_name(30251), "Hi-Res 无损");
+        assert_eq!(audio_tier_name(999), "自动");
+        for id in AUDIO_QUALITIES {
+            assert!(!audio_tier_name(id).is_empty());
+        }
+    }
+
+    #[test]
+    fn audio_quality_missing_from_a_legacy_file_loads_as_auto() -> Result<()> {
+        // A settings.json written before this field existed.
+        let legacy = r#"{ "page_size": 36, "play_mode": 1, "theme": 2 }"#;
+        let decoded = serde_json::from_str::<Settings>(legacy)?;
+        assert_eq!(decoded.audio_quality, 0);
+        assert_eq!(normalise_audio_quality(decoded.audio_quality), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn audio_quality_round_trips_through_json() -> Result<()> {
+        for id in AUDIO_QUALITIES {
+            let settings = Settings {
+                audio_quality: id,
+                ..Settings::default()
+            };
+            let encoded = serde_json::to_string(&settings)?;
+            let decoded = serde_json::from_str::<Settings>(&encoded)?;
+            assert_eq!(normalise_audio_quality(decoded.audio_quality), id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fish_defaults_are_off_with_a_usable_prompt() {
+        let defaults = Settings::default();
+        assert!(defaults.deepseek_key.is_empty());
+        assert!(!defaults.fish_enabled);
+        assert_eq!(defaults.fish_model, "deepseek-flash");
+        assert_eq!(defaults.fish_instruction, default_fish_instruction());
+        assert_eq!(defaults.fish_budget_videos, 40);
+        assert_eq!(defaults.fish_interval_ms, 1500);
+        let legacy = r#"{ "page_size": 36 }"#;
+        let decoded = serde_json::from_str::<Settings>(legacy).expect("legacy file parses");
+        assert_eq!(decoded.fish_model, "deepseek-flash");
+        assert_eq!(decoded.fish_instruction, default_fish_instruction());
+        assert_eq!(decoded.fish_budget_videos, 40);
+        assert_eq!(decoded.fish_interval_ms, 1500);
+        assert!(!decoded.fish_enabled);
+    }
+
+    #[test]
+    fn fish_budget_and_interval_clamp_into_range() {
+        assert_eq!(normalise_fish_budget(0), 1);
+        assert_eq!(normalise_fish_budget(1), 1);
+        assert_eq!(normalise_fish_budget(40), 40);
+        assert_eq!(normalise_fish_budget(FISH_BUDGET_MAX), FISH_BUDGET_MAX);
+        assert_eq!(normalise_fish_budget(FISH_BUDGET_MAX + 1), FISH_BUDGET_MAX);
+        assert_eq!(normalise_fish_budget(u32::MAX), FISH_BUDGET_MAX);
+        assert_eq!(normalise_fish_interval(0), FISH_INTERVAL_MIN_MS);
+        assert_eq!(normalise_fish_interval(1500), 1500);
+        assert_eq!(normalise_fish_interval(u64::MAX), FISH_INTERVAL_MAX_MS);
+    }
+
+    #[test]
+    fn fish_model_and_instruction_never_stay_blank() {
+        assert_eq!(normalise_fish_model("  "), "deepseek-flash");
+        assert_eq!(normalise_fish_model("deepseek-chat"), "deepseek-flash");
+        assert_eq!(normalise_fish_model("deepseek-reasoner"), "deepseek-reasoner");
+        assert_eq!(normalise_fish_instruction("   "), default_fish_instruction());
+        assert_eq!(normalise_fish_instruction(" 只看教程 "), "只看教程");
+    }
+
+    #[test]
+    fn mask_key_shows_only_the_last_four_characters() {
+        assert_eq!(mask_key("sk-1234567890abcd"), "sk-…abcd");
+        assert_eq!(mask_key("  sk-1234567890abcd  "), "sk-…abcd");
+        assert_eq!(mask_key(""), "sk-…");
+        assert_eq!(mask_key("sk-"), "sk-…");
+        assert_eq!(mask_key("sk-1234"), "sk-…");
+        assert!(!mask_key("sk-1234567890abcd").contains("1234567890"));
+    }
+
+    #[test]
+    fn guard_switches_default_off() {
+        let defaults = Settings::default();
+        assert!(!defaults.hide_live_tab);
+        assert!(!defaults.hide_hot_search);
+        assert!(!default_hide_live_tab());
+        assert!(!default_hide_hot_search());
+        // A settings.json written before 防干扰 existed: the missing fields take
+        // the serde default, so both switches come up off (the pre-change app).
+        let legacy = r#"{ "page_size": 36, "theme": 2 }"#;
+        let decoded = serde_json::from_str::<Settings>(legacy).expect("legacy file parses");
+        assert_eq!(decoded.hide_live_tab, default_hide_live_tab());
+        assert_eq!(decoded.hide_hot_search, default_hide_hot_search());
+        assert!(!decoded.hide_live_tab);
+        assert!(!decoded.hide_hot_search);
+    }
+
+    #[test]
+    fn guard_switches_keep_both_boolean_states() {
+        for value in [false, true] {
+            assert_eq!(normalise_hide_live_tab(value), value);
+            assert_eq!(normalise_hide_hot_search(value), value);
+        }
+    }
+
+    #[test]
+    fn guard_switches_round_trip_through_json() -> Result<()> {
+        let settings = Settings {
+            hide_live_tab: true,
+            hide_hot_search: true,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        assert!(encoded.contains("\"hide_live_tab\":true"), "{encoded}");
+        assert!(encoded.contains("\"hide_hot_search\":true"), "{encoded}");
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert!(
+            normalise_hide_live_tab(decoded.hide_live_tab),
+            "隐藏直播 survives a round trip"
+        );
+        assert!(
+            normalise_hide_hot_search(decoded.hide_hot_search),
+            "隐藏热搜 survives a round trip"
+        );
+        let encoded_default = serde_json::to_string(&Settings::default())?;
+        assert!(
+            encoded_default.contains("\"hide_live_tab\":false"),
+            "{encoded_default}"
+        );
+        assert!(
+            encoded_default.contains("\"hide_hot_search\":false"),
+            "{encoded_default}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn watch_tier_defaults_to_t1_and_normalises() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.fish_tier, 1);
+        assert!(defaults.fish_step_meta);
+        assert!(defaults.fish_step_subtitle);
+        assert!(defaults.fish_step_comments);
+        assert!(!defaults.fish_step_outline);
+        assert!(!defaults.fish_step_asr);
+        assert!(!defaults.fish_step_frames);
+        for tier in 0..=FISH_TIER_CUSTOM {
+            assert_eq!(normalise_fish_tier(tier), tier);
+        }
+        for tier in [6u32, 99, u32::MAX] {
+            assert_eq!(normalise_fish_tier(tier), default_fish_tier());
+        }
+        let legacy = match serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#) {
+            Ok(settings) => settings,
+            Err(_) => Settings::default(),
+        };
+        assert_eq!(legacy.fish_tier, 1);
+    }
+
+    #[test]
+    fn asr_settings_default_to_small_gpu_and_normalise() {
+        let defaults = Settings::default();
+        assert!(!defaults.fish_asr_enabled);
+        assert_eq!(defaults.fish_asr_engine, "auto");
+        assert_eq!(defaults.fish_asr_device, "gpu");
+        assert_eq!(defaults.fish_asr_model, "small");
+        assert_eq!(defaults.fish_asr_threads, 4);
+        assert_eq!(defaults.fish_vision_detail, "low");
+        for engine in FISH_ASR_ENGINES {
+            assert_eq!(normalise_fish_asr_engine(engine), engine);
+        }
+        for device in FISH_ASR_DEVICES {
+            assert_eq!(normalise_fish_asr_device(device), device);
+        }
+        for model in FISH_ASR_MODELS {
+            assert_eq!(normalise_fish_asr_model(model), model);
+        }
+        for detail in FISH_VISION_DETAILS {
+            assert_eq!(normalise_fish_vision_detail(detail), detail);
+        }
+        assert_eq!(normalise_fish_asr_engine("nope"), "auto");
+        assert_eq!(normalise_fish_asr_device("tpu"), "gpu");
+        assert_eq!(normalise_fish_asr_model("large"), "small");
+        assert_eq!(normalise_fish_vision_detail("high"), "low");
+        assert_eq!(normalise_fish_asr_threads(0), 4);
+        assert_eq!(normalise_fish_asr_threads(99), FISH_ASR_THREADS_MAX);
+    }
+
+    #[test]
+    fn model_mirror_defaults_to_auto_and_normalises() {
+        assert_eq!(Settings::default().fish_model_mirror, "auto");
+        for value in FISH_MODEL_MIRRORS {
+            assert_eq!(normalise_fish_model_mirror(value), value);
+        }
+        for bad in ["", "huggingface", " auto ", "mirror ", "OFFICIAL"] {
+            let expected = if bad.trim() == "mirror" {
+                "mirror".to_string()
+            } else {
+                "auto".to_string()
+            };
+            assert_eq!(normalise_fish_model_mirror(bad), expected);
+        }
+        let legacy = serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#)
+            .expect("legacy settings");
+        assert_eq!(legacy.fish_model_mirror, "auto");
+    }
+
+    #[test]
+    fn watch_and_asr_settings_survive_a_json_round_trip() -> Result<()> {
+        let settings = Settings {
+            fish_tier: FISH_TIER_CUSTOM,
+            fish_step_meta: true,
+            fish_step_subtitle: false,
+            fish_step_outline: true,
+            fish_step_comments: true,
+            fish_step_asr: true,
+            fish_step_frames: false,
+            fish_asr_enabled: true,
+            fish_asr_engine: "faster-whisper".to_string(),
+            fish_asr_device: "cpu".to_string(),
+            fish_asr_model: "medium".to_string(),
+            fish_asr_threads: 8,
+            fish_vision_detail: "original".to_string(),
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings)?;
+        let decoded = serde_json::from_str::<Settings>(&encoded)?;
+        assert_eq!(decoded.fish_tier, FISH_TIER_CUSTOM);
+        assert!(decoded.fish_step_asr);
+        assert!(!decoded.fish_step_subtitle);
+        assert_eq!(decoded.fish_asr_engine, "faster-whisper");
+        assert_eq!(decoded.fish_asr_device, "cpu");
+        assert_eq!(decoded.fish_asr_model, "medium");
+        assert_eq!(decoded.fish_asr_threads, 8);
+        assert_eq!(decoded.fish_vision_detail, "original");
+        Ok(())
+    }
+}
