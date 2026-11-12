@@ -3562,6 +3562,11 @@ impl Engine {
         self.last_mouse_activity = Instant::now();
         self.overlay
             .set_chrome_state(self.sidebar_open, self.fullscreen);
+        // The strip changes the picture area even when the outer window resize
+        // lands in the same turn: refresh the video transform with the final
+        // open state so it can never stay at the pre-panel scale.
+        self.client = window::client_size(self.hwnd);
+        self.update_video_rect();
         self.ui_dirty = true;
         if open {
             log::line(&format!("sidebar=1 tab={}", tab.label()));
@@ -3590,6 +3595,8 @@ impl Engine {
         self.last_mouse_activity = Instant::now();
         self.overlay
             .set_chrome_state(self.sidebar_open, self.fullscreen);
+        self.client = window::client_size(self.hwnd);
+        self.update_video_rect();
         self.ui_dirty = true;
         log::line(&format!("sidebar=1 tab={}", tab.label()));
         self.on_sidebar_tab(tab);
@@ -3842,6 +3849,7 @@ impl Engine {
         self.reset_storyboard();
         self.settings_menu = None;
         self.duration_ms = self.source.duration_ms;
+        self.update_video_rect();
         self.position_ms = 0;
         self.base_ms = 0;
         self.paused_at = 0;
@@ -3999,6 +4007,7 @@ impl Engine {
             log::line(&format!("danmaku clear on initial source failed: {error:#}"));
         }
         self.refresh_danmaku_geometry();
+        self.update_video_rect();
         self.ui_dirty = true;
         log::line(&format!(
             "source attached title={:?} duration_ms={} start_ms={start} qn={} codec={} {}x{}",
@@ -4931,6 +4940,10 @@ impl Engine {
     }
 
     fn update_video_rect(&mut self) {
+        // Always read the live client rect: the player window can be resized by
+        // the sidebar, maximize, DPI move or the user drag, and a cached size
+        // would leave the picture at the old scale (a tiny video in the corner).
+        self.client = window::client_size(self.hwnd);
         let (area_w, area_h) = self.video_area();
         let (x, y, scale_x, scale_y) = crate::gpu::video_transform(
             area_w as f32,
