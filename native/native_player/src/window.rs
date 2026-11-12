@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
     DWM_WINDOW_CORNER_PREFERENCE,
@@ -27,22 +27,23 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_LBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetClientRect, GetWindowLongPtrW, GetWindowRect, IsZoomed, LoadCursorW, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, GWLP_USERDATA,
     GWL_EXSTYLE, GWL_STYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT,
     HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MSG,
     PM_REMOVE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER,
     SWP_SHOWWINDOW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCDESTROY,
-    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_SYSKEYDOWN, NCCALCSIZE_PARAMS,
-    WNDCLASSW, CS_DBLCLKS,
+    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_PAINT, WM_RBUTTONDOWN,
+    WM_SIZE, WM_SYSKEYDOWN, NCCALCSIZE_PARAMS, WNDCLASSW, CS_DBLCLKS,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
     WS_POPUP, WS_THICKFRAME, SW_HIDE, SW_SHOWNOACTIVATE,
@@ -74,6 +75,173 @@ pub enum InputEvent {
 #[derive(Default)]
 pub struct WindowEvents {
     queue: Mutex<VecDeque<InputEvent>>,
+    /// A non-modal move/resize started on the player thread. Keeping the drag
+    /// out of the Win32 modal loop is what lets the video keep presenting
+    /// while the window moves or resizes.
+    drag: Mutex<Option<DragState>>,
+}
+
+#[derive(Clone, Copy)]
+struct DragState {
+    cursor: POINT,
+    window: RECT,
+    mode: DragMode,
+}
+
+#[derive(Clone, Copy)]
+enum DragMode {
+    Move,
+    Resize(u8),
+}
+
+const EDGE_LEFT: u8 = 1;
+const EDGE_RIGHT: u8 = 2;
+const EDGE_TOP: u8 = 4;
+const EDGE_BOTTOM: u8 = 8;
+
+fn edges_for_hit(hit: u32) -> Option<u8> {
+    if hit == HTLEFT as u32 {
+        Some(EDGE_LEFT)
+    } else if hit == HTRIGHT as u32 {
+        Some(EDGE_RIGHT)
+    } else if hit == HTTOP as u32 {
+        Some(EDGE_TOP)
+    } else if hit == HTBOTTOM as u32 {
+        Some(EDGE_BOTTOM)
+    } else if hit == HTTOPLEFT as u32 {
+        Some(EDGE_LEFT | EDGE_TOP)
+    } else if hit == HTTOPRIGHT as u32 {
+        Some(EDGE_RIGHT | EDGE_TOP)
+    } else if hit == HTBOTTOMLEFT as u32 {
+        Some(EDGE_LEFT | EDGE_BOTTOM)
+    } else if hit == HTBOTTOMRIGHT as u32 {
+        Some(EDGE_RIGHT | EDGE_BOTTOM)
+    } else {
+        None
+    }
+}
+
+unsafe fn events_for(hwnd: HWND) -> Option<&'static WindowEvents> {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowEvents;
+    if pointer.is_null() {
+        None
+    } else {
+        Some(unsafe { &*pointer })
+    }
+}
+
+unsafe fn start_drag(hwnd: HWND, events: Option<&WindowEvents>, mode: DragMode) -> bool {
+    let Some(events) = events else {
+        return false;
+    };
+    // Dragging a maximized window restores it first, the same way dragging the
+    // system title bar does. Resizing cannot start while maximized.
+    if matches!(mode, DragMode::Move) && unsafe { IsZoomed(hwnd) }.as_bool() {
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
+    let mut state = match events.drag.lock() {
+        Ok(state) => state,
+        Err(_) => return false,
+    };
+    if state.is_some() {
+        return true;
+    }
+    let mut cursor = POINT::default();
+    let mut window = RECT::default();
+    if unsafe { GetCursorPos(&mut cursor) }.is_err() || unsafe { GetWindowRect(hwnd, &mut window) }.is_err() {
+        return false;
+    }
+    *state = Some(DragState {
+        cursor,
+        window,
+        mode,
+    });
+    drop(state);
+    unsafe { SetCapture(hwnd) };
+    true
+}
+
+unsafe fn update_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
+    let Some(events) = events else {
+        return false;
+    };
+    let state = match events.drag.lock() {
+        Ok(state) => *state,
+        Err(_) => None,
+    };
+    let Some(state) = state else {
+        return false;
+    };
+    let mut cursor = POINT::default();
+    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        return false;
+    }
+    let dx = cursor.x - state.cursor.x;
+    let dy = cursor.y - state.cursor.y;
+    match state.mode {
+        DragMode::Move => {
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    state.window.left + dx,
+                    state.window.top + dy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
+        DragMode::Resize(edges) => {
+            let dpi = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+            let min_w = (480.0 * dpi).round() as i32;
+            let min_h = (270.0 * dpi).round() as i32;
+            let mut left = state.window.left;
+            let mut top = state.window.top;
+            let mut right = state.window.right;
+            let mut bottom = state.window.bottom;
+            if edges & EDGE_LEFT != 0 {
+                left = (state.window.left + dx).min(state.window.right - min_w);
+            }
+            if edges & EDGE_RIGHT != 0 {
+                right = (state.window.right + dx).max(state.window.left + min_w);
+            }
+            if edges & EDGE_TOP != 0 {
+                top = (state.window.top + dy).min(state.window.bottom - min_h);
+            }
+            if edges & EDGE_BOTTOM != 0 {
+                bottom = (state.window.bottom + dy).max(state.window.top + min_h);
+            }
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    left,
+                    top,
+                    (right - left).max(min_w),
+                    (bottom - top).max(min_h),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
+    }
+    true
+}
+
+unsafe fn end_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
+    let Some(events) = events else {
+        return false;
+    };
+    let active = events
+        .drag
+        .lock()
+        .map(|mut state| state.take().is_some())
+        .unwrap_or(false);
+    if active {
+        let _ = unsafe { ReleaseCapture() };
+    }
+    let _ = hwnd;
+    active
 }
 
 impl WindowEvents {
@@ -108,6 +276,33 @@ unsafe extern "system" fn wndproc(
         }
     };
     match message {
+        WM_NCLBUTTONDOWN => {
+            let hit = wparam.0 as u32;
+            if let Some(edges) = edges_for_hit(hit) {
+                if unsafe { start_drag(hwnd, events, DragMode::Resize(edges)) } {
+                    return LRESULT(0);
+                }
+            }
+            if hit == HTCAPTION as u32 && unsafe { start_drag(hwnd, events, DragMode::Move) } {
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_NCLBUTTONUP => {
+            if unsafe { end_drag(hwnd, events) } {
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+        }
+        WM_CAPTURECHANGED => {
+            if let Some(events) = events {
+                if let Ok(mut state) = events.drag.lock() {
+                    *state = None;
+                }
+            }
+            LRESULT(0)
+        }
         WM_NCCALCSIZE => {
             // Keep the client equal to the whole window: the custom top strip
             // and toolbar are drawn by the overlay, not by the non-client area.
@@ -213,6 +408,11 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // A manual move/resize owns the mouse: no client event and no
+            // modal loop, so the player thread keeps presenting frames.
+            if unsafe { update_drag(hwnd, events) } {
+                return LRESULT(0);
+            }
             let mut track = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -239,6 +439,9 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            if unsafe { end_drag(hwnd, events) } {
+                return LRESULT(0);
+            }
             if let Some(events) = events {
                 events.push(InputEvent::LeftUp);
             }
@@ -453,6 +656,9 @@ unsafe extern "system" fn hosted_wndproc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            if unsafe { end_drag(hwnd, events) } {
+                return LRESULT(0);
+            }
             if let Some(events) = events {
                 events.push(InputEvent::LeftUp);
             }
@@ -610,15 +816,20 @@ pub fn destroy(hwnd: HWND) {
 }
 
 /// Drag the frameless window by its custom top strip.
+/// Begin a non-modal whole-window drag. The old implementation sent
+/// `WM_NCLBUTTONDOWN/HTCAPTION`, which hands control to Windows' modal move
+/// loop and freezes the engine thread (and therefore the video) until the mouse
+/// is released. Here the window proc moves the window from its own message
+/// pump, so playback and presentation continue for the whole gesture.
 pub fn drag_window(hwnd: HWND) {
     unsafe {
-        let _ = ReleaseCapture();
-        let _ = SendMessageW(
-            hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            Some(LPARAM(0)),
-        );
+        // Only a real left-button press may start a drag. `handle_click` runs
+        // on LeftDown, but keeping the guard makes a stray release harmless.
+        if GetKeyState(VK_LBUTTON.0 as i32) >= 0 {
+            return;
+        }
+        let events = events_for(hwnd);
+        let _ = start_drag(hwnd, events, DragMode::Move);
     }
 }
 

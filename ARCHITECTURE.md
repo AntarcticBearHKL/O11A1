@@ -84,8 +84,10 @@ engine 打开一个 `native_player` 独立窗口：
   画面区始终铺满，不会停留在原始分辨率或旧窗口尺寸。
 - 工具条是底部居中圆角胶囊；窗口内保持可见，指针离开窗口隐藏；全屏静止 2.5 秒隐藏。
 - 顶栏背景、标题、画质徽标全部移除，只保留右上角三个悬浮窗口按钮。
-- 整窗左键拖动：画面按下后移动超过 4px 调用原生 `WM_NCLBUTTONDOWN/HTCAPTION`
-  移动整个窗口；未移动直接松开仍切换播放/暂停。
+- 整窗左键拖动与四边/四角缩放都由窗口过程直接处理：按下时 `SetCapture`，随后在
+  `WM_MOUSEMOVE` 里用 `SetWindowPos` 移动/改尺寸，松开 `WM_LBUTTONUP` 结束。
+  不再发送 `WM_NCLBUTTONDOWN/HTCAPTION` 进入 Windows 模态移动循环，因此拖动和缩放
+  期间引擎线程继续出帧；拖动结束的松开事件被吞掉，不会误触播放/暂停。
 - 多个播放器窗口按 46px 级联摆放；视频、弹幕和控制条都在同一个原生窗口内，
   不存在 Electron 与原生窗口互相遮挡的问题。
 - 窗口创建后做一次 topmost → not-topmost 的 z-order bump，保证从 Electron 点击卡片
