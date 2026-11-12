@@ -45,14 +45,20 @@ const NAV = [
   { key: 'messages', label: '消息' },
 ];
 
-export default function App() {
+export interface AppInitial {
+  settings: Settings;
+  account: Account | null;
+  version?: string;
+}
+
+export default function App({ initial }: { initial?: AppInitial }) {
   const [route, setRoute] = useState<Route>(parseRoute);
-  const [settings, setSettings] = useState<Settings | null>(null);
-  const [account, setAccount] = useState<Account | null>(null);
+  const [settings, setSettings] = useState<Settings | null>(initial?.settings ?? null);
+  const [account, setAccount] = useState<Account | null>(initial?.account ?? null);
   const [bootError, setBootError] = useState('');
   const [notice, setNotice] = useState<any>(null);
   const [maximized, setMaximized] = useState(false);
-  const [appVersion, setAppVersion] = useState('0.1.0');
+  const [appVersion, setAppVersion] = useState(initial?.version || '0.1.0');
   const [hud, setHud] = useState(false);
   const [hudStats, setHudStats] = useState({ fps: 0, ms: 0 });
   const [searchOpen, setSearchOpen] = useState(false);
@@ -125,6 +131,7 @@ export default function App() {
   }, [searchOpen, accountOpen, playlistOpen]);
 
   useEffect(() => {
+    if (initial) return;
     let cancelled = false;
     let timer: any;
     const boot = async () => {
@@ -146,7 +153,7 @@ export default function App() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, []);
+  }, [initial]);
 
   useEffect(() => {
     window.o11a1.info().then((info: any) => setAppVersion(info.version)).catch(() => {});

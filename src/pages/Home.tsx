@@ -3,13 +3,15 @@ import { call } from '../api';
 import { useApp } from '../context';
 import type { FeedVideo } from '../types';
 import { ErrorBox, SkeletonGrid, VideoGrid } from '../components/Common';
+import { takePreloadedFeed } from '../preload';
 
 export default function Home() {
   const { launch, toast } = useApp();
-  const [items, setItems] = useState<FeedVideo[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [preloaded] = useState(() => takePreloadedFeed());
+  const [items, setItems] = useState<FeedVideo[]>(() => preloaded ?? []);
+  const [loading, setLoading] = useState(() => !preloaded?.length);
   const [error, setError] = useState('');
-  const [fresh, setFresh] = useState(0);
+  const [fresh, setFresh] = useState(() => (preloaded?.length ? 1 : 0));
   const sentinel = useRef<HTMLDivElement>(null);
   const autoLoads = useRef(0);
 
@@ -37,8 +39,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    load(0, true);
-  }, [load]);
+    if (!preloaded?.length) load(0, true);
+  }, [load, preloaded]);
 
   useEffect(() => {
     const onRefresh = () => load(fresh, true);

@@ -3,6 +3,7 @@ import { call, cover, formatCount } from '../api';
 import { useApp } from '../context';
 import type { SearchHitPage } from '../types';
 import { Empty, ErrorBox, Tabs, VideoGrid } from '../components/Common';
+import { takePreloadedSearch } from '../preload';
 
 const TABS = ['视频', '番剧', '影视', '直播', '用户'];
 
@@ -14,13 +15,15 @@ export default function Search() {
   const [data, setData] = useState<SearchHitPage | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [history, setHistory] = useState<string[]>([]);
-  const [hot, setHot] = useState<Array<{ keyword: string; show_name: string }>>([]);
+  const [preloaded] = useState(() => takePreloadedSearch());
+  const [history, setHistory] = useState<string[]>(preloaded?.history ?? []);
+  const [hot, setHot] = useState<Array<{ keyword: string; show_name: string }>>(preloaded?.hot ?? []);
 
   useEffect(() => {
+    if (preloaded) return;
     call<string[]>('search.history.get').then(setHistory).catch(() => {});
     call<Array<{ keyword: string; show_name: string }>>('search.hot').then(setHot).catch(() => {});
-  }, []);
+  }, [preloaded]);
 
   const submit = useCallback(async (value: string) => {
     const trimmed = value.trim();

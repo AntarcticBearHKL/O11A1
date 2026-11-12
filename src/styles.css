@@ -107,6 +107,153 @@ img { display: block; }
 .drag { -webkit-app-region: drag; }
 .no-drag { -webkit-app-region: no-drag; }
 
+/* ---- startup / login gate ---- */
+.login-gate {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+}
+.login-gate::before {
+  content: '';
+  position: absolute;
+  inset: -80px;
+  background: var(--wallpaper);
+  filter: blur(var(--wallpaper-blur));
+  pointer-events: none;
+}
+.login-gate > * { position: relative; z-index: 1; }
+.login-drag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 54px;
+  -webkit-app-region: drag;
+  z-index: 2;
+}
+.login-window-controls {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  z-index: 5;
+  -webkit-app-region: no-drag;
+}
+.login-window-controls .icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--text-dim);
+}
+.login-window-controls .icon-btn:hover { background: rgba(0, 0, 0, 0.06); color: var(--text); }
+.login-window-controls .icon-btn.close:hover { background: #d3453d; color: #fff; }
+.login-card {
+  width: 420px;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 44px);
+  overflow-y: auto;
+  padding: 26px 28px 20px;
+  border-radius: 22px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  box-shadow: 0 30px 80px rgba(24, 34, 58, 0.18);
+  backdrop-filter: blur(var(--glass-blur));
+  animation: loginIn 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.login-card::-webkit-scrollbar { width: 0; }
+@keyframes loginIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.login-brand { font-size: 28px; font-weight: 600; letter-spacing: 0.3px; line-height: 1.1; }
+.login-brand span { color: var(--accent); }
+.login-sub { margin-top: 5px; font-size: 12px; color: var(--text-dim); }
+.login-account {
+  margin-top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(0, 95, 184, 0.06);
+}
+.login-account img,
+.login-avatar-placeholder {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--accent-soft);
+}
+.login-account-copy { flex: 1; min-width: 0; }
+.login-account-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.login-account-uid { margin-top: 2px; font-size: 11px; color: var(--text-faint); }
+.login-account-badge {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(47, 138, 90, 0.12);
+  color: var(--success);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.login-no-account { margin-top: 18px; }
+.login-no-account-title { font-size: 15px; font-weight: 600; }
+.login-no-account-sub { margin-top: 3px; font-size: 11.5px; color: var(--text-faint); }
+.login-qr { margin-top: 12px; display: flex; flex-direction: column; align-items: center; gap: 7px; }
+.login-qr-frame {
+  width: 210px;
+  height: 210px;
+  padding: 10px;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(20, 28, 48, 0.08);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+.login-qr-frame canvas { width: 190px !important; height: 190px !important; }
+.login-qr-wait { display: grid; place-items: center; width: 100%; height: 100%; }
+.login-qr-state { min-height: 17px; font-size: 12px; color: var(--text-dim); text-align: center; }
+.login-qr-state.error { color: var(--danger); }
+.login-actions { margin-top: 14px; display: flex; flex-direction: column; align-items: center; gap: 7px; }
+.login-primary { width: 100%; height: 40px; justify-content: center; border-radius: 12px; font-size: 13.5px; }
+.login-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 6px;
+  color: var(--accent);
+  font-size: 12px;
+  border-radius: 7px;
+}
+.login-link:hover { background: var(--accent-soft); }
+.login-link:disabled { opacity: 0.45; cursor: default; }
+.login-link.guest { color: var(--text-dim); }
+.login-loading {
+  margin-top: 16px;
+  padding-top: 13px;
+  border-top: 1px solid var(--card-border);
+}
+.login-progress { height: 4px; border-radius: 2px; background: rgba(0, 0, 0, 0.08); overflow: hidden; }
+.login-progress span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.35s ease;
+}
+.login-step { margin-top: 8px; min-height: 16px; font-size: 11.5px; color: var(--text-dim); text-align: center; }
+.login-step.error { color: var(--danger); }
+
 /* Old top strip: account avatar/name/UID on the left, exactly one small gear
    after the account block; the page itself is identified by the bottom tab. */
 .topbar {
