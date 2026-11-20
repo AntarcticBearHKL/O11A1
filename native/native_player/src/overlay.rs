@@ -4674,66 +4674,100 @@ impl Overlay {
         self.draw_speed_wheel(layout, speed, model.speed_base, model.tuner_offset);
     }
 
-    /// A flat horizontal picker wheel. Every stop sits one equal gap apart;
-    /// the only chrome is a soft centre window. There is no ruler rail, no
-    /// tall graduation marks and no needle: the chosen label grows into the
-    /// window while its neighbours recede into the paper as they leave the
-    /// centre, exactly like a reel passing a fixed selection slot.
+    /// A flat horizontal picker wheel modelled on the precision frame ruler:
+    /// every speed stop owns one tick, the reel travels under a fixed centre
+    /// band, and a tall red aim line marks the stop under the middle. The
+    /// selected value is read out above the ruler, so the red line never
+    /// crosses a label.
     unsafe fn draw_speed_wheel(&self, layout: &Layout, speed: f32, base: f32, offset: f32) {
         let s = layout.scale;
-        let wheel = layout.speed_wheel;
-        let centre = (wheel.left + wheel.right) * 0.5;
-        let centre_y = (wheel.top + wheel.bottom) * 0.5;
+        let card = layout.speed_wheel;
+        let centre = (card.left + card.right) * 0.5;
         let gap = crate::speed::WHEEL_GAP * s;
         let base_index = crate::speed::index_of(base) as f32;
-        let selected = crate::speed::index_of(speed);
 
-        // One flat tinted cap marks the selection slot. No border, shadow or
-        // inner chip: the paper itself is the wheel.
-        let well_w = 112.0 * s;
-        let well_h = 42.0 * s;
-        let well = Rect {
-            left: centre - well_w * 0.5,
-            top: centre_y - well_h * 0.5,
-            right: centre + well_w * 0.5,
-            bottom: centre_y + well_h * 0.5,
-        };
-        let well_round = D2D1_ROUNDED_RECT {
-            rect: to_d2d(well),
-            radiusX: 13.0 * s,
-            radiusY: 13.0 * s,
-        };
-        self.d2d.FillRoundedRectangle(&well_round, &self.loop_fill);
+        // Fixed readout above the ruler. The ruler itself only carries the
+        // scale, exactly like the frame wheel in the precision panel.
+        self.text(
+            "速度",
+            card.left + 14.0 * s,
+            card.top + 8.0 * s,
+            80.0 * s,
+            &self.small_format,
+            &self.sidebar_text_faint,
+        );
+        self.text_centered(
+            &crate::speed::label(speed),
+            Rect {
+                left: centre - 60.0 * s,
+                top: card.top + 3.0 * s,
+                right: centre + 60.0 * s,
+                bottom: card.top + 27.0 * s,
+            },
+            &self.speed_value_format,
+            &self.accent_blue,
+        );
 
-        // The reel runs under the paper edges; inset the clip so labels stop
-        // at the toolbar's rounded corners instead of spilling onto video.
+        let strip = Rect {
+            left: card.left + 12.0 * s,
+            top: card.top + 28.0 * s,
+            right: card.right - 12.0 * s,
+            bottom: card.bottom - 8.0 * s,
+        };
+        let strip_round = D2D1_ROUNDED_RECT {
+            rect: to_d2d(strip),
+            radiusX: 10.0 * s,
+            radiusY: 10.0 * s,
+        };
+        self.d2d.FillRoundedRectangle(&strip_round, &self.chip);
+        self.d2d
+            .DrawRoundedRectangle(&strip_round, &self.panel_border, 1.0 * s, None);
+
+        let label_top = strip.top + 1.0 * s;
+        let label_bottom = strip.top + 15.0 * s;
+        let tick_top = strip.top + 18.0 * s;
+        let tick_bottom = strip.bottom - 6.0 * s;
+
         let clip = windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
-            left: wheel.left + 12.0 * s,
-            top: wheel.top,
-            right: wheel.right - 12.0 * s,
-            bottom: wheel.bottom,
+            left: strip.left + 1.0 * s,
+            top: strip.top + 1.0 * s,
+            right: strip.right - 1.0 * s,
+            bottom: strip.bottom - 1.0 * s,
         };
         self.d2d
             .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
         for (index, value) in crate::speed::TICKS.iter().enumerate() {
             let x = centre + (index as f32 - base_index) * gap + offset;
-            if x < wheel.left - gap || x > wheel.right + gap {
+            if x < strip.left - 30.0 * s || x > strip.right + 30.0 * s {
                 continue;
             }
-            if index == selected {
-                self.text_centered(
-                    &crate::speed::label(*value),
-                    Rect {
-                        left: x - 50.0 * s,
-                        top: centre_y - 18.0 * s,
-                        right: x + 50.0 * s,
-                        bottom: centre_y + 18.0 * s,
-                    },
-                    &self.speed_value_format,
-                    &self.accent_blue,
-                );
-            } else {
+            let at_aim = (x - centre).abs() < 1.0 * s;
+            if !at_aim {
+                let major = value.fract().abs() < 0.001;
+                let distance = (x - centre).abs() / gap;
+                let (top, width, brush): (f32, f32, &ID2D1SolidColorBrush) = if major {
+                    (tick_top, 1.6 * s, &self.accent_blue)
+                } else if distance < 1.6 {
+                    (tick_top + 5.0 * s, 1.0 * s, &self.text_dim)
+                } else if distance < 3.6 {
+                    (tick_top + 5.0 * s, 1.0 * s, &self.text_faint)
+                } else {
+                    (tick_top + 5.0 * s, 1.0 * s, &self.sidebar_text_faint)
+                };
+                self.line(x, top, x, tick_bottom, width, brush);
+                if major {
+                    self.line(
+                        x - 3.5 * s,
+                        tick_top,
+                        x + 3.5 * s,
+                        tick_top,
+                        1.0 * s,
+                        &self.accent_blue,
+                    );
+                }
+            }
+            if !at_aim {
                 let distance = (x - centre).abs() / gap;
                 let brush = if distance < 1.6 {
                     &self.text_dim
@@ -4746,9 +4780,9 @@ impl Overlay {
                     &crate::speed::label(*value),
                     Rect {
                         left: x - 26.0 * s,
-                        top: centre_y - 9.0 * s,
+                        top: label_top,
                         right: x + 26.0 * s,
-                        bottom: centre_y + 9.0 * s,
+                        bottom: label_bottom,
                     },
                     &self.speed_scale_format,
                     brush,
@@ -4756,6 +4790,18 @@ impl Overlay {
             }
         }
         self.d2d.PopAxisAlignedClip();
+
+        // Full-height centred aim line: the tick under it is the stop that
+        // will be committed. The centre label is omitted, so the line never
+        // cuts through the selected value at rest.
+        self.line(
+            centre,
+            strip.top + 2.0 * s,
+            centre,
+            strip.bottom - 2.0 * s,
+            2.0 * s,
+            &self.aim_line,
+        );
     }
 
     /// Precision seek: a two-sided timecode / frame readout, a full-width
