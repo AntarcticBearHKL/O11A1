@@ -129,7 +129,7 @@ impl SidebarTab {
 }
 
 /// The 设置 tab's rows, in draw/hit-test order.
-pub const SETTINGS_ROWS: usize = 9;
+pub const SETTINGS_ROWS: usize = 8;
 
 /// Opening-quality choices. `0` means the highest stream the source has.
 pub const DEFAULT_QUALITY_HEIGHTS: [u32; 7] = [0, 2160, 1440, 1080, 720, 480, 360];
@@ -164,7 +164,6 @@ pub enum SettingsMenu {
     Quality,
     Audio,
     Interp,
-    RifeModel,
     Enhance,
 }
 
@@ -1274,10 +1273,6 @@ pub struct UiModel {
     pub interp_rows: Vec<ChoiceRowUi>,
     /// 画质增强 menu rows (关闭 / 通用 / 动漫).
     pub enhance_rows: Vec<ChoiceRowUi>,
-    /// 插帧算法 menu rows (线性混合 + 7 个 RIFE).
-    pub rife_rows: Vec<ChoiceRowUi>,
-    /// Current algorithm label shown on the settings row.
-    pub rife_label: String,
     pub settings_menu: Option<SettingsMenu>,
     pub sleep_label: String,
     pub keys_label: String,
@@ -4274,7 +4269,6 @@ impl Overlay {
                 ("音轨", model.audio_label.clone(), true),
                 ("速度", crate::speed::label(model.speed), true),
                 ("插帧", interp_level_label(model), true),
-                ("插帧算法", model.rife_label.clone(), true),
                 ("画质增强", model.enhance.label().to_string(), true),
                 (
                     "置顶",
@@ -4298,8 +4292,7 @@ impl Overlay {
                 }
                 Some(SettingsMenu::Audio) => Some((2usize, model.audio_rows.len())),
                 Some(SettingsMenu::Interp) => Some((4usize, model.interp_rows.len())),
-                Some(SettingsMenu::RifeModel) => Some((5usize, model.rife_rows.len())),
-                Some(SettingsMenu::Enhance) => Some((6usize, model.enhance_rows.len())),
+                Some(SettingsMenu::Enhance) => Some((5usize, model.enhance_rows.len())),
                 None => None,
             }
         };
@@ -4425,17 +4418,6 @@ impl Overlay {
                 }
                 Some(SettingsMenu::Interp) => {
                     let Some(item) = model.interp_rows.get(index) else {
-                        continue;
-                    };
-                    (
-                        item.label.as_str(),
-                        item.detail.as_str(),
-                        item.current,
-                        false,
-                    )
-                }
-                Some(SettingsMenu::RifeModel) => {
-                    let Some(item) = model.rife_rows.get(index) else {
                         continue;
                     };
                     (

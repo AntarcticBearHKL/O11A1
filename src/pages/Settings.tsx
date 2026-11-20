@@ -234,22 +234,10 @@ export default function SettingsPage() {
                   <option value={2}>番剧（Anime4K）</option>
                 </select>
               </SettingsRow>
-              <SettingsRow name="插帧" desc="关闭 / 开启；算法在下一行手动选择">
+              <SettingsRow name="插帧" desc="CPU 线性混合；只按这个开关启停">
                 <select className="select" value={settings.interp_mode} onChange={(event) => saveSettings({ interp_mode: Number(event.target.value) })}>
                   <option value={0}>关闭</option>
                   <option value={1}>开启</option>
-                </select>
-              </SettingsRow>
-              <SettingsRow name="插帧算法" desc="手动选择，选哪个就一直用哪个；线性混合是原来的合成">
-                <select className="select" value={settings.interp_algorithm || 'blend'} onChange={(event) => saveSettings({ interp_algorithm: event.target.value })}>
-                  <option value="blend">线性混合（原合成）</option>
-                  <option value="rife_4_25_lite">RIFE 4.25 Lite（通用·快）</option>
-                  <option value="rife_4_26">RIFE 4.26（通用·画质）</option>
-                  <option value="rife_4_18">RIFE 4.18（高分辨率·大运动）</option>
-                  <option value="rife_4_7">RIFE 4.7（动漫）</option>
-                  <option value="rife_4_8">RIFE 4.8（动漫）</option>
-                  <option value="rife_4_9">RIFE 4.9（动漫）</option>
-                  <option value="rife_4_10">RIFE 4.10（动漫）</option>
                 </select>
               </SettingsRow>
               <SettingsRow name="插帧帧率" desc="目标帧率；达不到时按实际能到的最高输出，不会卡死">
