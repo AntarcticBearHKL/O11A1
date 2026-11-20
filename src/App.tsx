@@ -218,7 +218,12 @@ export default function App({ initial }: { initial?: AppInitial }) {
     setSearchHotLoading(true);
     const timer = setTimeout(async () => {
       try {
-        const items = await callRaw<HotSearchItem[]>('search.hot');
+        // The startup preloader already warms `search.hot`; use that page-cache
+        // entry first and only hit the WBI endpoint when it is missing/empty.
+        let items = await call<HotSearchItem[]>('search.hot').catch(() => [] as HotSearchItem[]);
+        if (!items.length) {
+          items = await callRaw<HotSearchItem[]>('search.hot').catch(() => [] as HotSearchItem[]);
+        }
         if (cancelled) return;
         const list = Array.isArray(items)
           ? items.filter((item) => item && (item.keyword || item.show_name)).slice(0, 10)
@@ -904,9 +909,6 @@ export default function App({ initial }: { initial?: AppInitial }) {
                           <IconSearch size={14} />
                         )}
                         <span>{searchTerm ? highlightSuggestion(item.label) : item.label}</span>
-                        <svg className="search-suggest-go" width="14" height="14" viewBox="0 0 24 24" aria-hidden>
-                          <path d="M7 17 17 7M9 7h8v8" />
-                        </svg>
                       </button>
                     ))
                   )}

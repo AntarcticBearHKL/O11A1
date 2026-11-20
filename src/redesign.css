@@ -730,8 +730,7 @@ em { font-style: normal; }
   border: 1px solid var(--card-border);
   background: var(--card-solid);
   box-shadow: var(--shadow-lg);
-  backdrop-filter: blur(22px) saturate(1.1);
-  animation: searchSuggestIn 0.18s var(--ease);
+  animation: searchSuggestIn 0.16s var(--ease);
   max-height: min(404px, 56vh);
   overflow-y: auto;
 }
@@ -743,8 +742,9 @@ em { font-style: normal; }
   height: 38px;
   padding: 0 11px;
   border-radius: 10px;
-  color: var(--text-dim);
-  font-size: 13px;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 500;
   text-align: left;
   transition: background 0.14s, color 0.14s;
 }
@@ -772,19 +772,6 @@ em { font-style: normal; }
 }
 .search-suggest-item:hover svg,
 .search-suggest-item.active svg { color: var(--accent); }
-.search-suggest-go {
-  margin-left: auto;
-  flex: 0 0 auto;
-  color: var(--text-faint);
-  opacity: 0.5;
-  transition: color 0.14s, opacity 0.14s, transform 0.14s;
-}
-.search-suggest-item:hover .search-suggest-go,
-.search-suggest-item.active .search-suggest-go {
-  color: var(--accent);
-  opacity: 1;
-  transform: translate(1px, -1px);
-}
 .search-suggest-status {
   display: flex;
   align-items: center;
@@ -802,8 +789,8 @@ em { font-style: normal; }
   animation: searchSuggestPulse 1s ease-in-out infinite;
 }
 @keyframes searchSuggestIn {
-  from { opacity: 0; transform: translateY(-4px); }
-  to { opacity: 1; transform: none; }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 @keyframes searchSuggestPulse {
   0%, 100% { opacity: 0.35; transform: scale(0.8); }
