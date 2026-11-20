@@ -4265,7 +4265,7 @@ impl Overlay {
                     true,
                 ),
                 ("音轨", model.audio_label.clone(), true),
-                ("速度", format!("{:.2}×", model.speed), true),
+                ("速度", crate::speed::label(model.speed), true),
                 ("插帧", interp_level_label(model), true),
                 ("画质增强", model.enhance.label().to_string(), true),
                 (
@@ -4688,14 +4688,6 @@ impl Overlay {
 
         // Fixed readout above the ruler. The ruler itself only carries the
         // scale, exactly like the frame wheel in the precision panel.
-        self.text(
-            "速度",
-            card.left + 14.0 * s,
-            card.top + 8.0 * s,
-            80.0 * s,
-            &self.small_format,
-            &self.sidebar_text_faint,
-        );
         self.text_centered(
             &crate::speed::label(speed),
             Rect {

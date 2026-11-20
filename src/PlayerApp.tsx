@@ -15,6 +15,10 @@ const QUALITY_LABEL: Record<number, string> = { 127: '8K', 126: '杜比视界', 
 
 const DEFAULT_KEYS = [0x20, 0x25, 0x27, 0x26, 0x28, 0x4d, 0x46, 0x1b, 0x44, 0x4c, 0x53];
 
+function speedLabel(value: number): string {
+  return `${Number.isInteger(value) ? value.toFixed(1) : String(value)}倍`;
+}
+
 function keyFor(event: KeyboardEvent): number {
   return event.keyCode || event.which;
 }
@@ -1137,7 +1141,7 @@ export default function PlayerApp() {
                   <div className="side-title" style={{ marginTop: 18 }}>播放速度</div>
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                     {[0.5, 0.75, 1, 1.25, 1.5, 2].map((speed) => (
-                      <button key={speed} className="chip small" onClick={() => command('speed', speed)}>{speed}×</button>
+                      <button key={speed} className="chip small" onClick={() => command('speed', speed)}>{speedLabel(speed)}</button>
                     ))}
                   </div>
                 </>

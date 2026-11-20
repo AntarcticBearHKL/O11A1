@@ -1,6 +1,6 @@
-//! Playback speed: the 0.1×–10× range, the wheel's stop table, and the
-//! `atempo` chain large factors need (one filter only accepts 0.5×–2×, so
-//! 0.1× and 10× are built from several stages).
+//! Playback speed: the 0.1倍–10倍 range, the wheel's stop table, and the
+//! `atempo` chain large factors need (one filter only accepts 0.5–2.0, so
+//! 0.1倍 and 10倍 are built from several stages).
 
 /// Slowest playback the panel can select.
 pub const MIN: f32 = 0.1;
@@ -12,7 +12,7 @@ pub const MAX: f32 = 10.0;
 /// window.
 pub const WHEEL_GAP: f32 = 52.0;
 
-/// Every stop on the speed wheel, slowest first. Below 1× each 0.1× is a
+/// Every stop on the speed wheel, slowest first. Below 1.0倍 each 0.1倍 is a
 /// stop; above it the stops widen so fast playback stays usable. Adjacent
 /// stops are always one equal wheel step apart.
 pub const TICKS: [f32; 21] = [
@@ -62,22 +62,22 @@ pub fn clamp(value: f32) -> f32 {
     }
 }
 
-/// Readout / chip label: `0.1×`, `1×`, `1.25×`, `1.5×`, `2×`, `10×`.
+/// Readout / chip label: `0.1倍`, `1.0倍`, `1.25倍`, `1.5倍`, `2.0倍`, `10.0倍`.
 pub fn label(value: f32) -> String {
     let value = clamp(value);
     let rounded = value.round();
     if (value - rounded).abs() < 0.005 {
-        format!("{}×", rounded as i32)
+        format!("{value:.1}倍")
     } else {
         let text = format!("{value:.2}");
         let text = text.trim_end_matches('0').trim_end_matches('.');
-        format!("{text}×")
+        format!("{text}倍")
     }
 }
 
 /// ffmpeg audio filter for one speed, or `None` at normal speed. A single
 /// `atempo` instance only accepts 0.5–2.0, so extremes are chained:
-/// 0.1× → 0.5·0.5·0.5·0.8 and 10× → 2·2·2·1.25.
+/// 0.1倍 → 0.5·0.5·0.5·0.8 and 10倍 → 2·2·2·1.25.
 pub fn atempo(speed: f64) -> Option<String> {
     if !speed.is_finite() || (speed - 1.0).abs() < 0.001 {
         return None;
@@ -146,15 +146,15 @@ mod tests {
 
     #[test]
     fn labels_name_every_stop_without_trailing_zeros() {
-        assert_eq!(label(0.1), "0.1×");
-        assert_eq!(label(0.9), "0.9×");
-        assert_eq!(label(1.0), "1×");
-        assert_eq!(label(1.25), "1.25×");
-        assert_eq!(label(1.5), "1.5×");
-        assert_eq!(label(2.0), "2×");
-        assert_eq!(label(9.0), "9×");
-        assert_eq!(label(10.0), "10×");
-        assert_eq!(label(f32::NAN), "1×");
+        assert_eq!(label(0.1), "0.1倍");
+        assert_eq!(label(0.9), "0.9倍");
+        assert_eq!(label(1.0), "1.0倍");
+        assert_eq!(label(1.25), "1.25倍");
+        assert_eq!(label(1.5), "1.5倍");
+        assert_eq!(label(2.0), "2.0倍");
+        assert_eq!(label(9.0), "9.0倍");
+        assert_eq!(label(10.0), "10.0倍");
+        assert_eq!(label(f32::NAN), "1.0倍");
     }
 
     #[test]
