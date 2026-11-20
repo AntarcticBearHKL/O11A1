@@ -63,7 +63,7 @@
 - [x] 托盘：显示主窗口 / 检查更新 / 退出 `[E/R]`
 - [x] 关闭到托盘 / 最小化到托盘提示 `[E/R]`
 - [x] 开机自启（写入 Run 键，与设置同步）`[E/R]`
-- [x] GitHub release 更新检查 + 顶部横幅 `[E/R]`
+- [x] 更新：启动 4 秒后检查 GitHub Release；发现新版后台下载 NSIS 安装包并按 API `digest` 校验 sha256，横幅显示百分比，完成后变「重启安装」；点击后退出、静默安装（`/S --updated`）并自动重启。设置页同步显示下载状态与「重启安装」，再次检查会复用已下载文件或重试失败下载 `[E/R]`
 - [x] 桌面快捷方式、开始菜单快捷方式、托盘/窗口图标 `o11a1.ico`；原生播放器窗口启动时设置 32 / 16px 窗口图标，`native_player.exe` 与 `o11a1-engine.exe` 也内嵌同一 ICO 资源，任务栏 / Alt-Tab / Explorer 不再显示默认程序图标 `[E/R]`
 - [x] `BILI_NATIVE_DEBUG=1` 调试 HUD：fps + render ms `[E]`（首页 F12 调试层已随 HUD 一起移除）
 - [x] 启动无 CMD 窗口（GUI 子系统）`[R]`
@@ -443,5 +443,5 @@
 - [ ] 播放器控件与视频区域 airspace 方案：控件在视频外，或透明覆盖窗口 `[E/R]`
 - [ ] Electron UI 文本使用 Chromium 渲染；原生弹幕继续 GDI `[E/R]`
 - [ ] 旧版数据迁移 `[R]`
-- [ ] Electron 自动更新（electron-updater 或自建）`[E]`
+- [x] Electron 后台更新：自建下载器（GitHub Release API 资产 + sha256）、静默 NSIS `/S --updated`、等待旧进程退出后重启；不依赖 electron-updater / `latest.yml` / blockmap，不做差分 `[E]`
 - [ ] 打包：Electron + Rust sidecar/napi + FFmpeg + 字体/图标 `[E/R]`

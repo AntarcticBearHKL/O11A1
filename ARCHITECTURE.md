@@ -66,6 +66,28 @@ Electron main (Node)
 在 Electron 主进程里创建 `WS_CHILD`。代价是原生崩溃会带崩整个应用，且每次
 Electron ABI 升级要重编。v1 建议先用独立进程 + owned popup。
 
+### 2.1 后台更新
+
+自动检查只在启动 4 秒后跑一次（托盘菜单 / 设置页可手动再查），只发一个 GitHub API 请求。发现更高版本后由主进程直接下载，不阻塞 UI：
+
+```text
+GET /repos/AntarcticBearHKL/O11A1/releases
+  → 最新非 draft / prerelease，取第一个 .exe 资产（排除 uninstaller）
+  → 后台下载到 <userData>/updates/<asset>.exe
+  → sha256 对比 API 的 digest；大小必须等于 asset.size
+  → update:progress（约 4 次/秒）→ update:ready
+  → 横幅 / 设置页显示「重启安装」
+  → update:install
+       detached PowerShell 等 Electron 与 o11a1-engine PID 退出
+       → Start-Process <installer> -ArgumentList '/S','--updated' -Wait
+       → Start-Process <app exe> 重启
+```
+
+- 下载器在 `electron/updater.cjs`，不依赖 Electron：跟随 302 到 CDN、写 `.part` 后原子改名、失败删除半成品。
+- `<userData>/updates` 里同版本的完整文件会直接复用；启动时 `cleanInstalledUpdates()` 删除不高于当前版本的旧安装包。
+- `--updated` 让 NSIS 在检测到旧进程时短暂等待 / 强杀，并跳过完成页；`/S` 保证全程无窗口。安装目录沿用上次写入的 `InstallLocation`（默认当前用户 `HKCU\Software\<APP_GUID>`）。
+- 不接 electron-updater，因此不需要 `latest.yml` / `.blockmap`，也不支持差分更新。
+
 ## 3. 播放器窗口布局
 
 播放窗口不再由 Electron 包裹，也不再创建视频占位矩形。Electron 收到播放请求后，直接让

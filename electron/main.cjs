@@ -6,12 +6,21 @@ const fs = require('fs');
 const net = require('net');
 const { spawn } = require('child_process');
 const https = require('https');
+const updater = require('./updater.cjs');
 
 const IS_DEV = !!process.env.O11A1_DEV_URL;
 const ROOT = path.join(__dirname, '..');
 const ICON = path.join(ROOT, 'assets', 'o11a1.ico');
-const RELEASE_API = 'https://api.github.com/repos/AntarcticBearHKL/O11A1/releases';
+const RELEASE_API =
+  process.env.O11A1_UPDATE_API ||
+  'https://api.github.com/repos/AntarcticBearHKL/O11A1/releases';
 const APP_VERSION = require(path.join(ROOT, 'package.json')).version;
+
+// QA / portable-profile hook: keep an isolated userData (and therefore an
+// isolated single-instance lock and update cache).
+if (process.env.O11A1_USER_DATA) {
+  app.setPath('userData', path.resolve(process.env.O11A1_USER_DATA));
+}
 
 let mainWindow = null;
 let tray = null;
@@ -677,24 +686,188 @@ function newer(remote, local) {
   return false;
 }
 
+/// One in-flight/completed installer download. The shell mirrors this to the
+/// renderer as `update:progress` / `update:ready`.
+let updateDownload = null;
+
+function updatesDir() {
+  return path.join(app.getPath('userData'), 'updates');
+}
+
+function updatePublicState() {
+  if (!updateDownload) return null;
+  const total = updateDownload.total || 0;
+  const received = updateDownload.received || 0;
+  return {
+    version: updateDownload.version,
+    status: updateDownload.status,
+    received,
+    total,
+    percent: total > 0 ? Math.min(100, (received / total) * 100) : 0,
+    path: updateDownload.status === 'ready' ? updateDownload.path : '',
+    url: updateDownload.url || '',
+    error: updateDownload.error || '',
+  };
+}
+
+function broadcastUpdateProgress() {
+  broadcast('update:progress', updatePublicState());
+}
+
+function pruneOldInstallers(keep) {
+  try {
+    for (const name of fs.readdirSync(updatesDir())) {
+      const full = path.join(updatesDir(), name);
+      if (full !== keep && /\.exe$/i.test(name)) fs.rmSync(full, { force: true });
+    }
+  } catch {
+    /* the directory may not exist yet */
+  }
+}
+
+/// Drop installers for versions this build already includes (the app updated,
+/// but the downloaded setup stayed behind).
+function cleanInstalledUpdates() {
+  try {
+    for (const name of fs.readdirSync(updatesDir())) {
+      if (!/\.exe$/i.test(name)) continue;
+      const match = name.match(/(\d+\.\d+\.\d+)/);
+      if (match && !newer(`v${match[1]}`, APP_VERSION)) {
+        fs.rmSync(path.join(updatesDir(), name), { force: true });
+      }
+    }
+  } catch {
+    /* first run: no updates directory */
+  }
+}
+
+async function downloadUpdate(update, target) {
+  try {
+    const size = await updater.downloadAsset(update.asset, target, (received, total) => {
+      if (!updateDownload || updateDownload.version !== update.version) return;
+      updateDownload.received = received;
+      if (total > 0) updateDownload.total = total;
+      broadcastUpdateProgress();
+    });
+    if (!updateDownload || updateDownload.version !== update.version) return;
+    updateDownload.received = size;
+    updateDownload.total = size;
+    updateDownload.status = 'ready';
+    broadcast('update:ready', updatePublicState());
+    broadcastUpdateProgress();
+    pruneOldInstallers(target);
+  } catch (error) {
+    if (!updateDownload || updateDownload.version !== update.version) return;
+    updateDownload.status = 'error';
+    updateDownload.error = String(error.message || error);
+    broadcastUpdateProgress();
+  }
+}
+
+/// Start (or reuse) the background download for one release. A complete file
+/// from an earlier session is picked up without another 200 MB transfer.
+function ensureUpdateDownload(update) {
+  if (!update || !update.asset || !update.asset.url || !update.asset.name) return;
+  const version = update.version;
+  if (updateDownload && updateDownload.version === version) {
+    if (updateDownload.status === 'downloading' || updateDownload.status === 'ready') return;
+  }
+  const target = path.join(updatesDir(), update.asset.name);
+  try {
+    const stat = fs.statSync(target);
+    if (!update.asset.size || stat.size === update.asset.size) {
+      updateDownload = {
+        version,
+        path: target,
+        received: stat.size,
+        total: stat.size,
+        status: 'ready',
+        url: update.url,
+        notes: update.notes,
+        error: '',
+      };
+      broadcast('update:ready', updatePublicState());
+      return;
+    }
+    fs.rmSync(target, { force: true });
+  } catch {
+    /* not downloaded yet */
+  }
+  updateDownload = {
+    version,
+    path: target,
+    received: 0,
+    total: update.asset.size || 0,
+    status: 'downloading',
+    url: update.url,
+    notes: update.notes,
+    error: '',
+  };
+  broadcastUpdateProgress();
+  void downloadUpdate(update, target);
+}
+
+/// Quit, then let a detached helper run the silent NSIS installer and relaunch
+/// the freshly installed app. The helper waits for this process (and the Rust
+/// engine) to exit first, so no file is locked during the install.
+function launchInstallerAfterExit(installer, relaunch) {
+  const targets = [process.pid];
+  if (engineProcess && engineProcess.pid) targets.push(engineProcess.pid);
+  const script = updater.installerScript(installer, relaunch, targets);
+  const encoded = updater.encodePowerShell(script);
+  const helper = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
+    { detached: true, stdio: 'ignore', windowsHide: true },
+  );
+  helper.unref();
+}
+
 function checkUpdate() {
   return new Promise((resolve, reject) => {
-    const request = https.get(RELEASE_API, { headers: { 'User-Agent': 'O11A1-Electron', Accept: 'application/vnd.github+json' } }, (response) => {
+    const client = new URL(RELEASE_API).protocol === 'http:' ? require('http') : https;
+    const request = client.get(RELEASE_API, { headers: { 'User-Agent': 'O11A1-Electron', Accept: 'application/vnd.github+json' } }, (response) => {
       let body = '';
       response.on('data', (chunk) => { body += chunk; });
       response.on('end', () => {
         try {
           const releases = JSON.parse(body);
           if (!Array.isArray(releases) || releases.length === 0) {
-            resolve({ current: APP_VERSION, update: null });
+            resolve({ current: APP_VERSION, update: null, download: updatePublicState() });
             return;
           }
           const release = releases.find((item) => !item.draft && !item.prerelease) || releases[0];
           const version = String(release.tag_name || release.name || '').trim();
+          const installer = (release.assets || []).find(
+            (asset) =>
+              /\.exe$/i.test(asset.name || '') &&
+              !/uninstaller/i.test(asset.name || '') &&
+              Number(asset.size) > 0,
+          );
+          const update = newer(version, APP_VERSION)
+            ? {
+                version,
+                notes: release.body || '',
+                url: release.html_url || '',
+                asset: installer
+                  ? {
+                      name: installer.name,
+                      size: Number(installer.size) || 0,
+                      url: installer.browser_download_url,
+                      digest: installer.digest || '',
+                    }
+                  : null,
+              }
+            : null;
+          if (update) ensureUpdateDownload(update);
           resolve({
             current: APP_VERSION,
             latest: version,
-            update: newer(version, APP_VERSION) ? { version, notes: release.body || '', url: release.html_url || '' } : null,
+            update,
+            download:
+              updateDownload && update && updateDownload.version === update.version
+                ? updatePublicState()
+                : null,
           });
         } catch (error) {
           reject(error);
@@ -716,6 +889,7 @@ app.on('before-quit', stopWindowDrag);
 
 app.whenReady().then(() => {
   app.setAppUserModelId('com.o11a1.electron');
+  cleanInstalledUpdates();
   copyRuntimeAssets();
   startEngine();
   createWindow();
@@ -994,6 +1168,21 @@ ipcMain.handle('tray:balloon', (_event, title, content) => {
   if (tray) tray.displayBalloon({ title: title || 'O11A1', content: content || '', iconType: 'info' });
 });
 ipcMain.handle('update:check', () => checkUpdate());
+ipcMain.handle('update:install', () => {
+  const download = updateDownload;
+  if (
+    !download ||
+    download.status !== 'ready' ||
+    !download.path ||
+    !fs.existsSync(download.path)
+  ) {
+    return { ok: false, error: '安装包尚未下载完成' };
+  }
+  launchInstallerAfterExit(download.path, process.execPath);
+  quitting = true;
+  app.quit();
+  return { ok: true };
+});
 ipcMain.handle('update:open', (_event, url) => {
   if (/^https?:/i.test(url)) shell.openExternal(url);
 });

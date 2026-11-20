@@ -58,7 +58,10 @@ contextBridge.exposeInMainWorld('o11a1', {
   update: {
     check: () => ipcRenderer.invoke('update:check'),
     open: (url) => ipcRenderer.invoke('update:open', url),
+    install: () => ipcRenderer.invoke('update:install'),
     onResult: (callback) => on('update:result', callback),
+    onProgress: (callback) => on('update:progress', callback),
+    onReady: (callback) => on('update:ready', callback),
   },
   autostart: {
     set: (enabled) => ipcRenderer.invoke('autostart:set', enabled),

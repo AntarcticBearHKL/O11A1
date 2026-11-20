@@ -41,6 +41,7 @@ export default function SettingsPage() {
   const [regex, setRegex] = useState('');
   const [sender, setSender] = useState('');
   const [updateState, setUpdateState] = useState('');
+  const [updateReady, setUpdateReady] = useState<any>(null);
   const [theme, setTheme] = useState<0 | 1 | 2>(settings.theme === 2 ? 1 : 0);
   const [appVersion, setAppVersion] = useState('0.2.1');
 
@@ -101,11 +102,38 @@ export default function SettingsPage() {
     setUpdateState('检查中…');
     try {
       const result = await window.o11a1.update.check();
-      setUpdateState(result?.update ? `发现 ${result.update.version}` : `已是最新版本（${result?.current || ''}）`);
+      if (result?.download?.status === 'ready') {
+        setUpdateReady(result.download);
+        setUpdateState(`发现 ${result?.update?.version || result?.latest || ''} · 安装包已就绪`);
+      } else if (result?.update) {
+        setUpdateState(`发现 ${result.update.version} · 正在后台下载`);
+      } else {
+        setUpdateState(`已是最新版本（${result?.current || ''}）`);
+      }
     } catch (error: any) {
       setUpdateState(`检查失败：${error.message}`);
     }
   };
+
+  useEffect(() => {
+    void checkUpdate();
+    const offProgress = window.o11a1.update.onProgress?.((state: any) => {
+      if (state?.status === 'ready') {
+        setUpdateReady(state);
+        setUpdateState(`发现 ${state.version} · 安装包已就绪`);
+      }
+    });
+    const offReady = window.o11a1.update.onReady?.((state: any) => {
+      setUpdateReady(state);
+      setUpdateState(`发现 ${state.version} · 安装包已就绪`);
+    });
+    return () => {
+      offProgress?.();
+      offReady?.();
+    };
+    // The mount check fills the status; the button covers later checks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <>
@@ -275,7 +303,11 @@ export default function SettingsPage() {
                 </select>
               </SettingsRow>
               <SettingsRow name="检查更新" desc={updateState || 'GitHub Release'}>
-                <button className="btn sm" onClick={checkUpdate}>检查更新</button>
+                {updateReady ? (
+                  <button className="btn sm primary" onClick={() => window.o11a1.update.install()}>重启安装</button>
+                ) : (
+                  <button className="btn sm" onClick={checkUpdate}>检查更新</button>
+                )}
               </SettingsRow>
               <SettingsRow name="数据目录" desc="设置、账号、缓存与下载">
                 <button className="btn sm" onClick={() => window.o11a1.info().then((info: any) => window.o11a1.shell.openPath(info.dataRoot))}>打开</button>

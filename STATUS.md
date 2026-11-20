@@ -35,7 +35,7 @@
 - 全应用字体统一为本地打包的 **Chill Round Gothic（寒蝉圆黑体）** 400/500/700；基于思源黑体 SC 圆角化，覆盖常用简体与「巽」，不再需要 Chiron 缺字回退；原生播放器 UI 和弹幕使用同一字族。原生播放器以 `FR_NOT_ENUM` 注册字体，GDI 与 DirectWrite 都能解析同一 family，顶栏 / 帧号 / 弹幕不再回退 YaHei。
 - 所有滚动区域隐藏滚动条（`scrollbar-width:none` + `::-webkit-scrollbar{display:none}`），滚轮、触控板和键盘滚动不受影响。
 - 主窗口 24px 外沿圆角 + 22px 透明留边：留边内是 1px 发丝边和 yah 同款三层外阴影，最大化 / 全屏时去掉留边、边框和阴影回到直角满窗；深色主题改用低亮冷色发丝边和 3% 内高光，不再出现白色内圈，外阴影也换成纯黑；登录页 `.login-gate` 与 `.app` 共用同一条窗口边缘规则，启动窗口的登录 / 加载页同样四角 24px 圆角，`.login-gate.maximized` 在最大化时归零留边、边框、圆角与阴影；原生播放器窗口 16px GDI region 圆角（DWM 圆角与默认边框关闭），另建一层 26px 可点击穿透的 layered 阴影窗口跟随移动 / 缩放，最大化 / 全屏 / 关闭时隐藏，因此播放器不再和后面的窗口糊在一起。
-- 托盘：显示主窗口 / 检查更新 / 退出；关闭到托盘；开机自启；GitHub Release 更新提示。
+- 托盘：显示主窗口 / 检查更新 / 退出；关闭到托盘；开机自启；更新在后台下载安装包，横幅显示百分比，完成后变「重启安装」：点击退出 → 静默 NSIS 安装 → 自动重启。
 
 ### 页面
 
@@ -113,13 +113,13 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.6.174.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
-- `release/win-unpacked-0.6.174/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
+- 产物：`release/O11A1 Setup 0.6.175.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- `release/win-unpacked-0.6.175/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 
 ## 已知差异 / 后续
 
-- GitHub 更新只提示并打开 Release 页面，不做 electron-updater 自动下载安装。
+- 更新不做差分：每次下载完整 NSIS（约 206 MB）；安装包未签名，SmartScreen / 安全软件仍可能拦截静默安装。
 - 搜索的番剧 / 影视 tab 依赖服务端索引；部分关键词服务端返回 0 条（与原生版相同）。
 - 部分版权番剧在所有档位都返回 `-10403`（地区限制）；这是服务端拒绝，不是播放器解码失败。
 - 原生弹幕字体走 GDI 5x + 0.3 锐化；Electron UI 字体走 Chromium，两者观感不完全一致。
@@ -136,6 +136,9 @@
 | GPU 硬解 | 探测：本机 RTX 4060 Ti 对 `h264_cuvid` / `hevc_cuvid` / `av1_cuvid` 全部 supported=1；B 站 4K 流 `decoder=h264_cuvid`，直播 FLV `codec=h264 decoder=h264_cuvid` |
 | 4K 播放 | 真实 B 站 4K60 缓存流 + 音频：插帧 + CAS 103–121fps、`dropped=0`、`pos_ms == audio_ms`；关闭插帧稳定 60fps、`dropped=0`；1080P30 插帧 + CAS 120.1fps |
 | 自动下一分P | `BV1NDsS6UE8D` P1→P2→P3 实测：尾部自动切换一次、P3（未缓存）解码后首帧到达并 60fps 播放；拖到结尾之后立即进入切换；无重复切换日志 |
+| 更新下载 | 自建下载器实测 GitHub Release 资产 206,921,979 字节，sha256 与 API `digest` 一致；资产 302 跳转、节流进度、失败清理 `.part` 均通过 |
+| 更新 UI | 模拟 Release API（2 MB 资产）+ 隔离 `userData`：`update.check()` 返回 downloading 0→100%，收到 7 次进度事件与 `ready`；安装包落在 `<userData>/updates` 且 sha256 匹配 |
+| 静默安装 helper | PowerShell 先等旧 PID 退出，再串行执行安装器与重启；用 `.cmd` 替身实测顺序为 installer → relaunch |
 | 字体 | 主界面 / 登录页 computed family 为 `Chill Round Gothic`，400/500/700 三个 face 均 `loaded`；原生播放器工具条与弹幕实测同一字族 |
 | 滚动条 | 主界面、登录页、原生播放器侧栏全部不画滚动条；滚轮仍可滚动 |
 | 全局框选 / 右键 | 页面 `user-select:none`；Chromium context-menu 被阻止；输入框仍可选中 |

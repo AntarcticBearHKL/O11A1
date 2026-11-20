@@ -71,6 +71,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
   const avatarFace = account?.face || lastAccount?.face || '';
   const [bootError, setBootError] = useState('');
   const [notice, setNotice] = useState<any>(null);
+  const [updateDownload, setUpdateDownload] = useState<any>(null);
   const [maximized, setMaximized] = useState(false);
   const [appVersion, setAppVersion] = useState(initial?.version || '0.1.0');
   const [searchOpen, setSearchOpen] = useState(false);
@@ -248,19 +249,30 @@ export default function App({ initial }: { initial?: AppInitial }) {
     const touch = setTimeout(async () => {
       try {
         const result = await window.o11a1.update.check();
-        if (result?.update) setNotice(result.update);
+        if (result?.update) {
+          setNotice(result.update);
+          if (result.download) setUpdateDownload(result.download);
+        }
       } catch {
         /* offline is fine */
       }
     }, 4000);
     const off = window.o11a1.update.onResult?.((result: any) => {
-      if (result?.update) setNotice(result.update);
-      else if (result?.error) show(`检查更新失败：${result.error}`, true);
+      if (result?.update) {
+        setNotice(result.update);
+        if (result.download) setUpdateDownload(result.download);
+      } else if (result?.error) show(`检查更新失败：${result.error}`, true);
       else show('已经是最新版本');
     });
+    // The shell downloads the installer in the background and reports its
+    // progress here; the banner turns into the restart-install action.
+    const offProgress = window.o11a1.update.onProgress?.((state: any) => setUpdateDownload(state));
+    const offReady = window.o11a1.update.onReady?.((state: any) => setUpdateDownload(state));
     return () => {
       clearTimeout(timer);
       off?.();
+      offProgress?.();
+      offReady?.();
     };
   }, [show]);
 
@@ -748,9 +760,24 @@ export default function App({ initial }: { initial?: AppInitial }) {
             <div className="page-inner" key={`${route.name}-${route.id}`}>
               {notice ? (
                 <div className="banner">
-                  <span>发现新版本 {notice.version}（当前 {appVersion}）</span>
+                  <span>
+                    发现新版本 {notice.version}（当前 {appVersion}）
+                    {updateDownload?.version === notice.version && updateDownload.status === 'downloading'
+                      ? ` · 正在后台下载 ${Math.round(updateDownload.percent || 0)}%`
+                      : ''}
+                    {updateDownload?.version === notice.version && updateDownload.status === 'ready'
+                      ? ' · 安装包已就绪'
+                      : ''}
+                    {updateDownload?.version === notice.version && updateDownload.status === 'error'
+                      ? ' · 下载失败'
+                      : ''}
+                  </span>
                   <span className="spacer" />
-                  <button className="btn sm primary" onClick={() => window.o11a1.update.open(notice.url)}>查看</button>
+                  {updateDownload?.version === notice.version && updateDownload.status === 'ready' ? (
+                    <button className="btn sm primary" onClick={() => window.o11a1.update.install()}>重启安装</button>
+                  ) : (
+                    <button className="btn sm primary" onClick={() => window.o11a1.update.open(notice.url)}>查看</button>
+                  )}
                   <button className="btn sm ghost" onClick={() => setNotice(null)}>忽略</button>
                 </div>
               ) : null}
