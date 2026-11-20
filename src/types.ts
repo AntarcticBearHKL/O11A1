@@ -56,6 +56,9 @@ export interface Settings {
   interp_mode: number;
   /// 0 = follow the display refresh; otherwise a fixed interpolation target.
   interp_hz: number;
+  /// Manual algorithm: `blend` keeps the original GPU blend; `rife_*` picks a
+  /// RIFE model. No automatic selection.
+  interp_algorithm: string;
   deepseek_key: string;
   fish_model: string;
   fish_instruction: string;

@@ -303,6 +303,11 @@ pub struct Settings {
     /// 而不是补帧。见 [`normalise_interp_hz`]。
     #[serde(default)]
     pub interp_hz: u32,
+    /// 插帧算法：`blend` = 原来的 GPU 线性混合；`rife_*` = 手动选择的
+    /// RIFE 模型。不自动按内容或分辨率挑选，选哪一个就一直用哪一个。
+    /// 见 [`normalise_interp_algorithm`]。
+    #[serde(default = "default_interp_algorithm")]
+    pub interp_algorithm: String,
     /// DeepSeek API key（`sk-...`），养鱼引擎用它替用户看视频。空串 = 未配置，
     /// 此时引擎只报 `NeedsKey`、不发任何网络请求。界面上只显示
     /// [`mask_key`] 的脱敏结果。
@@ -940,6 +945,35 @@ pub fn normalise_interp_hz(value: u32) -> u32 {
     }
 }
 
+/// Manual interpolation algorithms. The first entry keeps the original GPU
+/// linear blend; every other entry is a RIFE ONNX model. There is deliberately
+/// no `auto`: the user picks one and the player uses it for every source.
+pub const INTERP_ALGORITHMS: [&str; 8] = [
+    "blend",
+    "rife_4_25_lite",
+    "rife_4_26",
+    "rife_4_18",
+    "rife_4_7",
+    "rife_4_8",
+    "rife_4_9",
+    "rife_4_10",
+];
+
+pub fn default_interp_algorithm() -> String {
+    "blend".to_string()
+}
+
+/// Normalise the selected algorithm. Unknown / hand-edited values keep the
+/// original blend rather than enabling an inference path the user did not pick.
+pub fn normalise_interp_algorithm(value: &str) -> String {
+    let value = value.trim();
+    if INTERP_ALGORITHMS.contains(&value) {
+        value.to_string()
+    } else {
+        default_interp_algorithm()
+    }
+}
+
 /// 把旧编号的 [`Settings::interp_mode`] 迁移到 [`INTERP_MODE_REV`]。
 ///
 /// f237 删掉了 GPU 光流这一档，菜单只剩 关闭 / CPU。旧文件的 `2` 是块匹配
@@ -1479,6 +1513,7 @@ impl Default for Settings {
             interp_mode: 0,
             interp_mode_rev: INTERP_MODE_REV,
             interp_hz: 0,
+            interp_algorithm: default_interp_algorithm(),
             deepseek_key: String::new(),
             fish_model: default_fish_model(),
             fish_instruction: default_fish_instruction(),
@@ -1623,6 +1658,7 @@ pub fn load() -> Settings {
             settings.interp_mode_rev
         },
         interp_hz: normalise_interp_hz(settings.interp_hz),
+        interp_algorithm: normalise_interp_algorithm(&settings.interp_algorithm),
         deepseek_key: settings.deepseek_key.trim().to_string(),
         fish_model: normalise_fish_model(&settings.fish_model),
         fish_instruction: normalise_fish_instruction(&settings.fish_instruction),
@@ -2489,6 +2525,16 @@ mod tests {
             assert_eq!(normalise_interp_mode(value), value);
         }
         assert_eq!(normalise_interp_mode(1), 1);
+    }
+
+    #[test]
+    fn interp_algorithm_defaults_to_the_original_blend() {
+        assert_eq!(default_interp_algorithm(), "blend");
+        assert_eq!(normalise_interp_algorithm(""), "blend");
+        assert_eq!(normalise_interp_algorithm("auto"), "blend");
+        for value in INTERP_ALGORITHMS {
+            assert_eq!(normalise_interp_algorithm(value), value);
+        }
     }
 
     #[test]

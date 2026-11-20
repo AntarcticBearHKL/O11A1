@@ -15,8 +15,9 @@ use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_L
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
     ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
@@ -33,9 +34,6 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::System::Threading::{WaitForSingleObject, THREAD_PRIORITY_HIGHEST};
 use windows_numerics::Matrix3x2;
-
-#[cfg(test)]
-use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
 
 use crate::enhance::{EnhanceMode, EnhancePipeline, VideoPasses};
 use crate::interp::{self, Signature};
@@ -176,12 +174,15 @@ impl AspectMode {
 /// shader-readable textures so a 4K frame costs a 1.5 bytes/pixel upload
 /// instead of the old 4 bytes/pixel BGRA conversion, and the BGRA picture the
 /// enhance/blend passes consume is produced by `nv12_main`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GpuFrame {
     pub slot: usize,
     pub ts_ms: u64,
     /// Coarse luma fingerprint for scene-cut detection (no readback).
     pub signature: Signature,
+    /// The decoded NV12 bytes, shared with the decoder. RIFE reads this from
+    /// its worker thread, so it must outlive the GPU slot.
+    pub data: std::sync::Arc<Vec<u8>>,
 }
 
 struct Plane {
@@ -196,6 +197,41 @@ struct Picture {
     _tex: ID3D11Texture2D,
     srv: ID3D11ShaderResourceView,
     rtv: ID3D11RenderTargetView,
+}
+
+/// A CPU-writable BGRA texture used for RIFE output frames. The inference
+/// worker runs on the CPU/ORT side and hands back BGRA bytes; this is the
+/// upload side of that path.
+struct ExternalPicture {
+    _tex: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+}
+
+impl ExternalPicture {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let tex = unsafe {
+            let description = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut texture: Option<ID3D11Texture2D> = None;
+            device.CreateTexture2D(&description, None, Some(&mut texture))?;
+            texture.ok_or_else(|| anyhow!("no external BGRA texture"))?
+        };
+        let srv = shader_view(device, &tex)?;
+        Ok(Self { _tex: tex, srv })
+    }
 }
 
 /// A small ring of decoded pictures plus the GPU passes that turn them into
@@ -269,6 +305,7 @@ impl FramePool {
             slot,
             ts_ms,
             signature: interp::luma_signature(nv12, width, height),
+            data: std::sync::Arc::new(Vec::new()),
         })
     }
 }
@@ -408,6 +445,9 @@ pub struct VideoSurface {
     pub presents: u64,
     failures: u64,
     pool: FramePool,
+    /// BGRA upload slots for RIFE output. Three slots let the presenter keep
+    /// one frame while the worker fills the next.
+    external: Vec<ExternalPicture>,
 }
 
 impl VideoSurface {
@@ -416,6 +456,10 @@ impl VideoSurface {
         let height = height.max(2) & !1;
         let (swap, waiter) = gpu.create_swapchain(width, height, DXGI_ALPHA_MODE_IGNORE, true)?;
         let pool = FramePool::new(gpu, width, height)?;
+        let mut external = Vec::with_capacity(3);
+        for _ in 0..3 {
+            external.push(ExternalPicture::new(&gpu.device, width, height)?);
+        }
         log::line(&format!(
             "video surface swapchain={width}x{height} flip-seq alpha=ignore waitable=1 gpu=1"
         ));
@@ -427,6 +471,7 @@ impl VideoSurface {
             presents: 0,
             failures: 0,
             pool,
+            external,
         })
     }
 
@@ -435,6 +480,61 @@ impl VideoSurface {
     /// no release bookkeeping is needed.
     pub fn upload(&mut self, gpu: &Gpu, nv12: &[u8], ts_ms: u64) -> Result<GpuFrame> {
         self.pool.upload(gpu, nv12, ts_ms)
+    }
+
+    pub fn external_slots(&self) -> usize {
+        self.external.len()
+    }
+
+    /// Upload one BGRA frame produced by the RIFE worker into an external slot.
+    /// The rows are copied into a dynamic texture; no NV12 conversion is
+    /// needed because the model already returns display-ready RGB.
+    pub fn upload_bgra(&mut self, gpu: &Gpu, slot: usize, bgra: &[u8]) -> Result<()> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let needed = width.saturating_mul(height).saturating_mul(4);
+        if bgra.len() < needed || self.external.is_empty() {
+            return Err(anyhow!(
+                "RIFE BGRA frame {} bytes, need {needed} for {width}x{height}",
+                bgra.len()
+            ));
+        }
+        let index = slot % self.external.len();
+        let texture = &self.external[index]._tex;
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context
+                .Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            let destination = mapped.pData as *mut u8;
+            let pitch = mapped.RowPitch as usize;
+            for row in 0..height {
+                std::ptr::copy_nonoverlapping(
+                    bgra.as_ptr().add(row * width * 4),
+                    destination.add(row * pitch),
+                    width * 4,
+                );
+            }
+            gpu.context.Unmap(texture, 0);
+        }
+        Ok(())
+    }
+
+    /// Present an uploaded BGRA slot, reusing the normal enhance / brightness
+    /// path. The SRV is the same shape as the decoded pictures, so Anime4K and
+    /// CAS need no special case.
+    pub fn present_bgra(
+        &mut self,
+        gpu: &Gpu,
+        enhance: &mut Option<EnhancePipeline>,
+        mode: &mut EnhanceMode,
+        slot: usize,
+        brightness: f32,
+    ) -> Result<(bool, bool)> {
+        if self.external.is_empty() {
+            return Err(anyhow!("no external BGRA slots"));
+        }
+        let source = self.external[slot % self.external.len()].srv.clone();
+        self.present_source(gpu, enhance, mode, &source, brightness)
     }
 
     pub fn wait_frame(&self) -> bool {

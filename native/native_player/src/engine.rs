@@ -1,7 +1,7 @@
 //! The player engine: window thread, decode sessions, pacer, audio clock,
 //! overlay state and every command the public [`crate::Player`] can send.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -34,6 +34,7 @@ use crate::gpu::{AspectMode, Composition, Gpu, GpuFrame, VideoSurface};
 use crate::heartbeat::{Beat, Heartbeat};
 use crate::interp::{self, InterpMode};
 use crate::log;
+use crate::rife::{RifeEvent, RifeFrame, RifeWorker};
 use crate::overlay::{
     dm_menu_rect, dm_menu_row, dm_report_rect, dm_report_row, settings_menu_height, AudioRowUi,
     ChoiceRowUi, CommentUi, DanmakuMenuUi, ImageData, InfoUi, Overlay, PageUi, QualityRowUi, Rect,
@@ -449,6 +450,19 @@ struct Engine {
     last_source_present: Option<Instant>,
     next_tick_at: Option<Instant>,
     out_period: Duration,
+    /// Manual interpolation choice from `settings.json`: `blend` or a RIFE
+    /// model id. Never picked automatically.
+    interp_algorithm: String,
+    rife: Option<RifeWorker>,
+    /// Completed RIFE pictures waiting for their presentation tick. The cap is
+    /// small: a late model must never build an unbounded backlog.
+    rife_frames: VecDeque<RifeFrame>,
+    rife_slot: usize,
+    rife_submit_key: Option<(u64, u64, u16)>,
+    rife_held: u64,
+    rife_dropped: u64,
+    rife_errors: u64,
+    last_rife_us: u32,
 
     // Counters.
     presents_window: u64,
@@ -1051,6 +1065,17 @@ impl Engine {
             interp: InterpMode::Off,
             enhance: EnhanceMode::Off,
             interp_hz: 0,
+            interp_algorithm: o11a1::settings::normalise_interp_algorithm(
+                &stored_settings.interp_algorithm,
+            ),
+            rife: None,
+            rife_frames: VecDeque::new(),
+            rife_slot: 0,
+            rife_submit_key: None,
+            rife_held: 0,
+            rife_dropped: 0,
+            rife_errors: 0,
+            last_rife_us: 0,
             interp_out_hz,
             monitor_hz: display_hz,
             monitor_check_at: Instant::now(),
@@ -1475,6 +1500,8 @@ impl Engine {
 
     fn restart_at(&mut self, target_ms: u64) -> Result<()> {
         self.drop_loop_prefetch();
+        self.rife_frames.clear();
+        self.rife_submit_key = None;
         self.stall_audio_paused = false;
         self.ab_swap_wait = None;
         self.ab_cache_playing = false;
@@ -1533,6 +1560,7 @@ impl Engine {
         self.audio_master = false;
         self.first_frame_at = None;
         self.next = None;
+        self.cur = None;
         self.cur_ts_ms = target;
         self.next_tick_at = None;
         self.gate(false);
@@ -3803,6 +3831,7 @@ impl Engine {
         let mut stored = o11a1::settings::load();
         stored.interp_mode = self.interp.as_u8();
         stored.interp_hz = self.interp_hz;
+        stored.interp_algorithm = self.interp_algorithm.clone();
         match o11a1::settings::save(&stored) {
             Ok(()) => {
                 self.shared
@@ -3834,13 +3863,21 @@ impl Engine {
             return;
         }
         let stored = o11a1::settings::load();
+        let algorithm = o11a1::settings::normalise_interp_algorithm(&stored.interp_algorithm);
+        if algorithm != self.interp_algorithm {
+            self.interp_algorithm = algorithm;
+            self.rife = None;
+            self.rife_frames.clear();
+            self.rife_submit_key = None;
+        }
         self.set_interp_hz(stored.interp_hz);
         self.apply_interp_mode(InterpMode::from_u8(stored.interp_mode));
         self.set_enhance(EnhanceMode::from_u8(stored.player_enhance as u8));
         log::line(&format!(
-            "player prefs reloaded interp={} hz={} enhance={}",
+            "player prefs reloaded interp={} hz={} algorithm={} enhance={}",
             self.interp.as_u8(),
             self.interp_hz,
+            self.interp_algorithm,
             self.enhance.as_u8()
         ));
     }
@@ -3909,11 +3946,17 @@ impl Engine {
             }
             self.next_tick_at = None;
         }
+        if grid && self.interp_algorithm != "blend" {
+            self.configure_rife();
+        } else {
+            self.drop_rife();
+        }
         if changed {
             log::line(&format!(
-                "interp mode={} label={} out_hz={} source_fps={:.2}",
+                "interp mode={} label={} algorithm={} out_hz={} source_fps={:.2}",
                 self.interp.as_u8(),
                 self.interp.label(),
+                self.interp_algorithm,
                 self.interp_out_hz.unwrap_or(0),
                 self.source.fps
             ));
@@ -5125,11 +5168,11 @@ impl Engine {
         if self.source.width == 0 || self.source.height == 0 {
             return None;
         }
-        match self
-            .video
-            .upload(&self.gpu, &frame.data, frame.ts_ms)
-        {
-            Ok(prepared) => Some(prepared),
+        match self.video.upload(&self.gpu, &frame.data, frame.ts_ms) {
+            Ok(mut prepared) => {
+                prepared.data = frame.data;
+                Some(prepared)
+            }
             Err(error) => {
                 log::line(&format!("gpu frame upload failed: {error:#}"));
                 None
@@ -5138,9 +5181,9 @@ impl Engine {
     }
 
     fn show_source(&mut self, frame: GpuFrame) {
-        self.cur = Some(frame);
         self.cur_ts_ms = frame.ts_ms;
         self.last_frame_ts = frame.ts_ms;
+        self.cur = Some(frame);
         self.present_current();
         if self.stall_audio_paused {
             self.stall_audio_paused = false;
@@ -5161,7 +5204,7 @@ impl Engine {
     }
 
     fn present_current(&mut self) {
-        let Some(frame) = self.cur.as_ref().copied() else {
+        let Some(frame) = self.cur.as_ref().cloned() else {
             return;
         };
         let mut mode = self.enhance;
@@ -5222,9 +5265,265 @@ impl Engine {
         }
     }
 
+    /// Read the manual algorithm again. Called when the player regains focus
+    /// so a change made in the Settings window applies without reopening the
+    /// player. This never chooses a model on its own.
+    fn reload_interp_algorithm(&mut self) {
+        let stored = o11a1::settings::load();
+        let algorithm = o11a1::settings::normalise_interp_algorithm(&stored.interp_algorithm);
+        if algorithm == self.interp_algorithm {
+            return;
+        }
+        self.interp_algorithm = algorithm;
+        self.rife_frames.clear();
+        self.rife_submit_key = None;
+        let grid = self.interp == InterpMode::Gpu && self.interp_out_hz.is_some();
+        if grid && self.interp_algorithm != "blend" {
+            self.configure_rife();
+        } else {
+            self.drop_rife();
+        }
+        log::line(&format!(
+            "interp algorithm reloaded id={} rife={}",
+            self.interp_algorithm,
+            u8::from(self.rife.is_some())
+        ));
+    }
+
+    fn configure_rife(&mut self) {
+        if self.interp_algorithm == "blend" {
+            self.drop_rife();
+            return;
+        }
+        let width = self.source.width.max(2);
+        let height = self.source.height.max(2);
+        if let Some(worker) = &self.rife {
+            if worker.model_id() == self.interp_algorithm
+                && worker.width() == width
+                && worker.height() == height
+            {
+                return;
+            }
+        }
+        self.rife = None;
+        self.rife_frames.clear();
+        self.rife_submit_key = None;
+        self.rife_slot = 0;
+        match RifeWorker::new(&self.interp_algorithm, width, height) {
+            Ok(worker) => {
+                log::line(&format!(
+                    "rife configured id={} label={} size={}x{}",
+                    self.interp_algorithm,
+                    worker.label(),
+                    width,
+                    height
+                ));
+                self.rife = Some(worker);
+                self.rife_errors = 0;
+            }
+            Err(error) => {
+                self.rife_errors = self.rife_errors.saturating_add(1);
+                log::line(&format!("rife configure failed: {error:#}"));
+                self.show_toast(&format!("RIFE 启动失败：{error}"), true);
+            }
+        }
+    }
+
+    fn drop_rife(&mut self) {
+        if self.rife.take().is_some() {
+            log::line("rife worker dropped");
+        }
+        self.rife_frames.clear();
+        self.rife_submit_key = None;
+    }
+
+    fn poll_rife(&mut self) {
+        let mut events = Vec::new();
+        if let Some(worker) = &self.rife {
+            while let Some(event) = worker.try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            match event {
+                RifeEvent::Ready => log::line("rife worker ready"),
+                RifeEvent::Error(error) => {
+                    self.rife_errors = self.rife_errors.saturating_add(1);
+                    log::line(&format!("rife worker error: {error}"));
+                    self.show_toast(&format!("RIFE 运行失败：{error}"), true);
+                }
+                RifeEvent::Frame(frame) => {
+                    self.last_rife_us = frame.infer_us;
+                    self.rife_frames.push_back(frame);
+                    while self.rife_frames.len() > 2 {
+                        self.rife_frames.pop_front();
+                        self.rife_dropped = self.rife_dropped.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pick the newest completed picture whose media timestamp is due. A
+    /// future picture is kept for its own tick; a picture more than 300 ms
+    /// behind the clock is discarded rather than replayed as a burst.
+    fn take_rife_frame(&mut self, position_ms: u64) -> Option<RifeFrame> {
+        let mut due = None;
+        for (index, frame) in self.rife_frames.iter().enumerate() {
+            if frame.media_ts <= position_ms.saturating_add(2) {
+                due = Some(index);
+            }
+        }
+        let frame = self.rife_frames.remove(due?)?;
+        while let Some(front) = self.rife_frames.front() {
+            if front.media_ts.saturating_add(300) < position_ms {
+                self.rife_frames.pop_front();
+                self.rife_dropped = self.rife_dropped.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        if frame.media_ts.saturating_add(300) < position_ms {
+            self.rife_dropped = self.rife_dropped.saturating_add(1);
+            return None;
+        }
+        Some(frame)
+    }
+
+    fn present_rife_frame(&mut self, frame: RifeFrame) -> bool {
+        if self.audio_only {
+            let _ = self.video.present_black(&self.gpu);
+            return false;
+        }
+        let slots = self.video.external_slots();
+        if slots == 0 {
+            return false;
+        }
+        let slot = self.rife_slot % slots;
+        self.rife_slot = (self.rife_slot + 1) % slots;
+        if let Err(error) = self.video.upload_bgra(&self.gpu, slot, &frame.bgra) {
+            log::line(&format!("rife upload failed: {error:#}"));
+            return false;
+        }
+        let mut mode = self.enhance;
+        let result = self.video.present_bgra(
+            &self.gpu,
+            &mut self.enhance_pipeline,
+            &mut mode,
+            slot,
+            self.brightness,
+        );
+        match result {
+            Ok((_enhanced, presented)) => {
+                if presented {
+                    self.presents_window = self.presents_window.saturating_add(1);
+                }
+                if mode != self.enhance {
+                    self.enhance = mode;
+                    self.shared.enhance.store(mode.as_u8(), Ordering::SeqCst);
+                    self.ui_dirty = true;
+                }
+            }
+            Err(error) => {
+                log::line(&format!("rife present failed: {error:#}"));
+                return false;
+            }
+        }
+        self.last_source_present = Some(Instant::now());
+        self.last_frame_ts = frame.media_ts;
+        self.last_rife_us = frame.infer_us;
+        self.generated = self.generated.saturating_add(1);
+        self.interp_blends = self.interp_blends.saturating_add(1);
+        self.shared.generated.store(self.generated, Ordering::SeqCst);
+        self.shared.blend_us.store(frame.infer_us, Ordering::SeqCst);
+        true
+    }
+
+    /// RIFE output-time scheduler. Source frames advance the A/B window but are
+    /// not themselves presented on the output grid; every tick asks for the
+    /// frame at `t = (T - A) / (B - A)`. A miss presents the current source
+    /// picture, which is the agreed drop policy (never a blend fallback).
+    fn interp_tick_rife(&mut self, position_ms: u64) -> bool {
+        self.fill_next(position_ms.saturating_add(INTERP_LOOKAHEAD_MS));
+
+        if self.cur.is_none() {
+            if let Some(next) = self.next.take() {
+                self.show_source(next);
+                self.fill_next(position_ms.saturating_add(INTERP_LOOKAHEAD_MS));
+            }
+            return true;
+        }
+
+        loop {
+            let due = self
+                .next
+                .as_ref()
+                .map(|next| next.ts_ms <= position_ms)
+                .unwrap_or(false);
+            if !due {
+                break;
+            }
+            let Some(next) = self.next.take() else {
+                break;
+            };
+            if next.ts_ms < self.cur_ts_ms {
+                continue;
+            }
+            self.cur_ts_ms = next.ts_ms;
+            self.last_frame_ts = next.ts_ms;
+            self.cur = Some(next);
+            self.fill_next(position_ms.saturating_add(INTERP_LOOKAHEAD_MS));
+        }
+
+        let (Some(current), Some(next)) = (self.cur.as_ref().cloned(), self.next.as_ref().cloned())
+        else {
+            self.present_current();
+            self.rife_held = self.rife_held.saturating_add(1);
+            return false;
+        };
+        if next.ts_ms <= self.cur_ts_ms {
+            self.present_current();
+            self.rife_held = self.rife_held.saturating_add(1);
+            return false;
+        }
+        let span = next.ts_ms - self.cur_ts_ms;
+        let phase = position_ms.saturating_sub(self.cur_ts_ms).min(span);
+        let t = (phase as f64 / span as f64) as f32;
+        if interp::signature_difference(&current.signature, &next.signature) >= INTERP_CUT_DIFF {
+            self.interp_cuts = self.interp_cuts.saturating_add(1);
+            self.present_current();
+            return false;
+        }
+
+        let key = (self.cur_ts_ms, next.ts_ms, (t * 1000.0).round() as u16);
+        if self.rife_submit_key != Some(key) {
+            if let Some(worker) = &self.rife {
+                if !current.data.is_empty() && !next.data.is_empty() {
+                    worker.submit(
+                        current.data.clone(),
+                        next.data.clone(),
+                        t,
+                        position_ms,
+                    );
+                    self.rife_submit_key = Some(key);
+                }
+            }
+        }
+        self.poll_rife();
+        if let Some(frame) = self.take_rife_frame(position_ms) {
+            return self.present_rife_frame(frame);
+        }
+        self.present_current();
+        self.rife_held = self.rife_held.saturating_add(1);
+        false
+    }
+
     /// Build one output tick at `position_ms`. Returns true when a real source
     /// picture was presented, so the stall detector can treat it as progress.
     fn interp_tick(&mut self, position_ms: u64) -> bool {
+        if self.interp_algorithm != "blend" {
+            return self.interp_tick_rife(position_ms);
+        }
         self.fill_next(position_ms.saturating_add(INTERP_LOOKAHEAD_MS));
 
         if let Some(next) = self.next.as_ref() {
@@ -5259,7 +5558,10 @@ impl Engine {
     /// engine iteration; a long stall restarts the grid instead of bursting
     /// a row of catch-up frames.
     fn poll_interp(&mut self, position_ms: u64) -> bool {
-        if self.cur.is_none() || self.interp_out_hz.is_none() {
+        if self.interp_out_hz.is_none() {
+            return false;
+        }
+        if self.cur.is_none() && self.interp_algorithm == "blend" {
             return false;
         }
         let now = Instant::now();
@@ -5279,7 +5581,7 @@ impl Engine {
 
     fn present_blend(&mut self, weight: u16) {
         let started = Instant::now();
-        let (Some(current), Some(next)) = (self.cur.as_ref().copied(), self.next.as_ref().copied())
+        let (Some(current), Some(next)) = (self.cur.as_ref().cloned(), self.next.as_ref().cloned())
         else {
             return;
         };
@@ -5539,6 +5841,7 @@ impl Engine {
                 // soon as the window is active again instead of waiting for a
                 // popup slider to be touched.
                 self.reload_danmaku_settings();
+                self.reload_interp_algorithm();
             }
             InputEvent::Resize { width, height } => {
                 if width < 32 || height < 32 {
@@ -6610,6 +6913,8 @@ impl Engine {
 
     fn apply_switched_source(&mut self, new_source: MediaSource) {
         self.reload_danmaku_settings();
+        self.rife_frames.clear();
+        self.rife_submit_key = None;
         let size_changed =
             new_source.width != self.source.width || new_source.height != self.source.height;
         // Always rebuild the surface on a part switch. Reusing the old swapchain
@@ -6832,6 +7137,8 @@ impl Engine {
         // open and an in-place replacement deterministic.
         self.stop_sessions();
         self.reload_danmaku_settings();
+        self.rife_frames.clear();
+        self.rife_submit_key = None;
         self.reset_ab_cache();
         let crate::DeferredOpen {
             mut source,

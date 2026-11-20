@@ -34,6 +34,7 @@ mod log;
 mod mediacache;
 mod overlay;
 mod proc;
+mod rife;
 mod source;
 mod speed;
 mod state;
