@@ -126,7 +126,9 @@ function LoginProgress({ value }: { value: number | null }) {
 
 /// The single login surface. It deliberately contains only three kinds of
 /// objects: the user portrait / QR handshake, one loading bar and one status
-/// line. No brand row, title, subtitle, chips, last-login pill or footnote.
+/// line. The QR handshake hides the portrait (`showAvatar={false}`), so the
+/// scan screen is just code, bar and status. No brand row, title, subtitle,
+/// chips, last-login pill or footnote.
 export function LoginSurface({
   account,
   showAvatar = true,

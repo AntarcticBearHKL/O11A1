@@ -166,6 +166,7 @@ export default function Member() {
       <div className="login-embed">
         <LoginSurface
           account={last}
+          showAvatar={false}
           progress={null}
           status={qrError || qrState}
           tone={qrError ? 'error' : 'normal'}

@@ -227,6 +227,7 @@ function LoginGate({ bootstrap, expired = false, onAccount, onEnter }: GateProps
     <LoginScreen closeAction={closeAction}>
       <LoginSurface
         account={last}
+        showAvatar={false}
         progress={null}
         status={qrError || qrState}
         tone={qrError ? 'error' : 'normal'}
