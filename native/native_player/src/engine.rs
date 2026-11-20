@@ -797,6 +797,8 @@ enum QaKind {
     LoopNext,
     LoopPart,
     InterpMenu,
+    RifeMenu,
+    RifePick,
     EnhanceMenu,
     Fault,
     Retry,
@@ -3806,6 +3808,33 @@ impl Engine {
                 }
             })
             .collect()
+    }
+
+    fn rife_rows(&self) -> Vec<ChoiceRowUi> {
+        let mut rows = Vec::with_capacity(8);
+        rows.push(ChoiceRowUi {
+            index: 0,
+            label: "线性混合".to_string(),
+            detail: "原合成".to_string(),
+            current: self.interp_algorithm == "blend",
+        });
+        for (index, (id, label, _)) in crate::rife::MODELS.iter().enumerate() {
+            rows.push(ChoiceRowUi {
+                index: index + 1,
+                label: (*label).to_string(),
+                detail: "RIFE · DirectML".to_string(),
+                current: self.interp_algorithm == *id,
+            });
+        }
+        rows
+    }
+
+    fn interp_algorithm_label(&self) -> String {
+        if self.interp_algorithm == "blend" {
+            "线性混合".to_string()
+        } else {
+            crate::rife::model_label(&self.interp_algorithm).to_string()
+        }
     }
 
     fn enhance_rows(&self) -> Vec<ChoiceRowUi> {
@@ -7358,6 +7387,19 @@ impl Engine {
                 ));
             }
             5 => {
+                self.settings_menu = if self.settings_menu == Some(SettingsMenu::RifeModel) {
+                    None
+                } else {
+                    Some(SettingsMenu::RifeModel)
+                };
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "settings menu={:?} rows={}",
+                    self.settings_menu,
+                    self.rife_rows().len()
+                ));
+            }
+            6 => {
                 self.settings_menu = if self.settings_menu == Some(SettingsMenu::Enhance) {
                     None
                 } else {
@@ -7370,8 +7412,8 @@ impl Engine {
                     self.enhance_rows().len()
                 ));
             }
-            6 => self.toggle_ontop(),
-            7 => self.toggle_audio_only(),
+            7 => self.toggle_ontop(),
+            8 => self.toggle_audio_only(),
             _ => {}
         }
     }
@@ -7457,7 +7499,8 @@ impl Engine {
             Some(SettingsMenu::DefaultQuality) => Some((1, DEFAULT_QUALITY_HEIGHTS.len())),
             Some(SettingsMenu::Audio) => Some((2, self.audio_rows().len())),
             Some(SettingsMenu::Interp) => Some((4, self.interp_rows().len())),
-            Some(SettingsMenu::Enhance) => Some((5, self.enhance_rows().len())),
+            Some(SettingsMenu::RifeModel) => Some((5, self.rife_rows().len())),
+            Some(SettingsMenu::Enhance) => Some((6, self.enhance_rows().len())),
             None => None,
         }
     }
@@ -7485,6 +7528,7 @@ impl Engine {
                 SettingsMenu::DefaultQuality => DEFAULT_QUALITY_HEIGHTS.len(),
                 SettingsMenu::Audio => self.audio_rows().len(),
                 SettingsMenu::Interp => self.interp_rows().len(),
+                SettingsMenu::RifeModel => self.rife_rows().len(),
                 SettingsMenu::Enhance => self.enhance_rows().len(),
             }
         ));
@@ -7561,6 +7605,35 @@ impl Engine {
                 self.ui_dirty = true;
                 log::line(&format!("interp select index={index} level={level:?}"));
                 self.select_interp_level(level);
+            }
+            Some(SettingsMenu::RifeModel) => {
+                let ids = [
+                    "blend",
+                    "rife_4_25_lite",
+                    "rife_4_26",
+                    "rife_4_18",
+                    "rife_4_7",
+                    "rife_4_8",
+                    "rife_4_9",
+                    "rife_4_10",
+                ];
+                let Some(id) = ids.get(index).copied() else {
+                    return;
+                };
+                self.settings_menu = None;
+                self.interp_algorithm = id.to_string();
+                self.rife_frames.clear();
+                self.rife_submit_key = None;
+                let grid = self.interp == InterpMode::Gpu && self.interp_out_hz.is_some();
+                if grid && id != "blend" {
+                    self.configure_rife();
+                } else {
+                    self.drop_rife();
+                }
+                self.persist_interp_prefs();
+                self.ui_dirty = true;
+                log::line(&format!("interp algorithm selected id={id}"));
+                self.show_toast(&format!("插帧算法：{}", self.interp_algorithm_label()), false);
             }
             Some(SettingsMenu::Enhance) => {
                 let Some(row) = self.enhance_rows().get(index).cloned() else {
@@ -8799,6 +8872,8 @@ impl Engine {
             audio_rows: self.audio_rows(),
             interp_rows: self.interp_rows(),
             enhance_rows: self.enhance_rows(),
+            rife_rows: self.rife_rows(),
+            rife_label: self.interp_algorithm_label(),
             settings_menu: self.settings_menu,
             sleep_label: self.sleep_label(),
             keys_label: self.player_keys_hint.clone(),
@@ -9077,6 +9152,15 @@ impl Engine {
                 QaKind::InterpMenu => {
                     log::line("qa interp menu");
                     self.open_settings_menu(SettingsMenu::Interp);
+                }
+                QaKind::RifeMenu => {
+                    log::line("qa rife menu");
+                    self.open_settings_menu(SettingsMenu::RifeModel);
+                }
+                QaKind::RifePick => {
+                    log::line("qa rife pick 4.26");
+                    self.open_settings_menu(SettingsMenu::RifeModel);
+                    self.select_settings_menu_row(2);
                 }
                 QaKind::EnhanceMenu => {
                     log::line("qa enhance menu");
@@ -9646,6 +9730,8 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
             "loop_next" | "loopnext" => QaKind::LoopNext,
             "loop_part" | "looppart" => QaKind::LoopPart,
             "interp_menu" | "interpmenu" => QaKind::InterpMenu,
+            "rife_menu" | "rifemenu" => QaKind::RifeMenu,
+            "rife_pick" | "rifepick" => QaKind::RifePick,
             "enhance_menu" | "enhancemenu" => QaKind::EnhanceMenu,
             "fault" => QaKind::Fault,
             "retry" => QaKind::Retry,

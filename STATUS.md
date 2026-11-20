@@ -113,7 +113,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.7.0.exe`（约 360 MB，含 FFmpeg、Chill Round Gothic 三个字重、7 个 RIFE ONNX 与 DirectML 版 ONNX Runtime）。
+- 产物：`release/O11A1 Setup 0.7.1.exe`（约 360 MB，含 FFmpeg、Chill Round Gothic 三个字重、7 个 RIFE ONNX 与 DirectML 版 ONNX Runtime）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - RIFE 运行时在 `release/win-unpacked/resources/runtime/rife/`：`onnxruntime.dll`、`DirectML.dll`、`onnxruntime_providers_shared.dll` 和 `models/` 下 7 个 ONNX；引擎与播放器按 exe 同级的 `rife/` 目录查找，不依赖开发机的 Python/venv。
@@ -152,7 +152,7 @@
 | 工具条图标 | 循环 / 精准定位 / 播放速度改为 repeat 双箭头、准星、开口仪表盘线性图标；16px path + 1.5px 笔画，1× 与 8× 截图检查 |
 | 速度面板 | 顶部「速度」+ 16px 当前值；刻度槽内 21 个档位各一根刻度，整数档蓝色加高并带刻度帽，正中 2px 红色瞄准线贯穿全高；标签随拖动滚动，松手吸附回红线 |
 | 弹幕设置同步 | 用真实 `settings.json`（透明度 50 / 字号 110 / 速度 53 / 区域 100）启动引擎，播放器弹窗显示 50% / 110% / 53% / 100%；打开播放器、窗口重新聚焦、打开弹幕浮层都会重新读盘并应用。0.6.191 起 `refresh_danmaku_geometry` 在 resize / 全屏 / 还原时同步把模型字号推给 D2D 层：实测 1211×681 时模型与层都是 14.98 / 18.39 / 21.79，切 1920×1080 后两者一起变成 23.76 / 29.16 / 34.56，不再停留在启动字号等滑块触发 |
-| 插帧算法 | 设置页「插帧算法」手动选择，`blend` 保留原 `present_blend`；7 个 RIFE 模型全部打包。4.26 / 1080p 实测：DirectML 会话约 0.6s，首次推理约 1.0s（着色器编译），之后约 100–170ms/帧，60Hz 输出约 5–10 个 RIFE 帧/秒，其余拍显示源帧；4.25 Lite、4.18、4.7、4.8、4.9、4.10 在 720p 全部加载并输出 `[1,3,720,1280]`。没有自动选模型 / 自动降级 / 自动关闭 |
+| 插帧算法 | 主设置页和播放器侧栏「设置」tab 都有「插帧算法」行（侧栏行号 5，展开 8 项内联菜单），`blend` 保留原 `present_blend`；7 个 RIFE 模型全部打包。4.26 / 1080p 实测：DirectML 会话约 0.6s，首次推理约 1.0s（着色器编译），之后约 100–170ms/帧，60Hz 输出约 5–10 个 RIFE 帧/秒，其余拍显示源帧；4.25 Lite、4.18、4.7、4.8、4.9、4.10 在 720p 全部加载并输出 `[1,3,720,1280]`。没有自动选模型 / 自动降级 / 自动关闭 |
 | 主进程 EPIPE | 引擎 stderr 只在 dev 或 `O11A1_ENGINE_LOG=1` 时回显，其余情况只排空管道；stdout/stderr 都挂 error 监听，断开的管道不再弹主进程 JavaScript 错误框 |
 | 选集切换 | 点击 P2 后先同步重绘选中态并显示「正在加载第 2 P…」，再停止旧解码/音频；解析约 2.2s 后新分P首帧上屏，不会出现点完没反应的等待窗口 |
 | 卡片左键 / 右键 | 左键 `player.replace`：同一 HWND（如 7473580）标题从 A 变 C，窗口矩形不变，新视频 120fps 播放；右键走 `player.open` 新窗口。连续点 B、C：B 的解析结果先到后立即被 C 替换，最终播放 C |
