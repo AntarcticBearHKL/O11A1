@@ -6479,7 +6479,6 @@ impl Engine {
         // spinner is honest about what is happening.
         self.current_page = index;
         self.page_loading = Some(index);
-        self.stop_sessions();
         self.drop_loop_prefetch();
         self.reset_ab_cache();
         self.cur = None;
@@ -6505,7 +6504,12 @@ impl Engine {
         self.danmaku.clear();
         let _ = self.danmaku_layer.clear();
         self.ui_dirty = true;
+        // Paint the new selection + loading card before stopping the old
+        // decoder/audio. `stop_sessions` can wait for network/decoder threads,
+        // and doing it first made the click look ignored until that wait ended.
+        self.draw_ui_now();
         self.sync_shared();
+        self.stop_sessions();
         let (tx, rx) = std::sync::mpsc::channel();
         // A newer click supersedes a pending one.
         self.switch_rx = Some(rx);
