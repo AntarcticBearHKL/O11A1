@@ -113,8 +113,8 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.6.176.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
-- `release/win-unpacked-0.6.176/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
+- 产物：`release/O11A1 Setup 0.6.177.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- `release/win-unpacked-0.6.177/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 
 ## 已知差异 / 后续
@@ -148,6 +148,7 @@
 | 顶部栏 / 搜索 | 绝对定位的透明磨砂条覆盖内容；左侧头像 40px、中间 320px 搜索框（浅灰 `搜索视频或 UP 主` placeholder）、右侧窗口钮；展开后从 70px 到右侧窗口钮前，铺满中间全部宽度；打开后右键任意位置关闭；空输入不显示热搜或历史 |
 | Debug FPS | 默认关闭；开关在播放器侧栏「性能 → 右上角性能显示」，状态写入 `player_state.json`；开启后右上角五行显示 `画面 FPS 120.0 · 8.3 ms` + `弹幕 FPS x` + 读取 bps / 码率 bps + 缓冲秒数 + `UI FPS x`；弹幕值按最近 1 秒实际绘制计数，无可见弹幕为 0；UI FPS 覆盖工具栏、侧栏、HUD 与动画；F12 / Ctrl+Shift+H 仍可切换；首页右上角 HUD 与头像菜单开关已删除 |
 | 性能 / 网络 | 性能 tab 无标题，只剩一个 HUD 开关；网络 tab 显示播放位置 / 已播放 / 已加载（真实缓存百分比与字节数；本地文件 100%）/ 缓冲 / 码率 / 线程 / 速度 / 源；24×6 = 144 格固定切片热力图（每格 0.7%）带图例区分已播放、已加载、当前位置、未加载；工具条进度条用同一可用区间画缓存带 |
+| 工具条图标 | 循环 / 精准定位 / 播放速度改为 repeat 双箭头、准星、开口仪表盘线性图标；16px path + 1.5px 笔画，1× 与 8× 截图检查 |
 | 选集切换 | 点击 P2 后选中态立即移动到 P2、画面马上显示「正在加载第 2 P…」；解析约 2.2s 后新分P首帧上屏，旧解码/音频在点击时即停止 |
 | 卡片左键 / 右键 | 左键 `player.replace`：同一 HWND（如 7473580）标题从 A 变 C，窗口矩形不变，新视频 120fps 播放；右键走 `player.open` 新窗口。连续点 B、C：B 的解析结果先到后立即被 C 替换，最终播放 C |
 | 缓冲提示 | 只有居中圆环 + `正在缓冲`，不再显示「网络恢复后会自动继续播放」；加载 / 定位仍保留第二行说明 |

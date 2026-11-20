@@ -6249,11 +6249,13 @@ impl Overlay {
         }
     }
 
-    /// Timeline + centre needle glyph for the precision-panel toggle.
+    /// Crosshair for the precision-panel toggle: precise seek/selection.
     unsafe fn icon_precision(&self, cx: f32, cy: f32, s: f32, on: bool) {
         let brush = if on { &self.accent } else { &self.text_dim };
         self.icon_path(
-            "M 1.6 10.8 L 14.4 10.8 M 4.4 7.4 L 4.4 12.4 M 8 4.2 L 8 12.4 M 11.6 7.4 L 11.6 12.4",
+            "M 8 2.8 A 5.2 5.2 0 1 1 7.99 2.8 \
+             M 8 1.0 L 8 2.6 M 8 13.4 L 8 15.0 \
+             M 1.0 8 L 2.6 8 M 13.4 8 L 15.0 8",
             16.0,
             16.0,
             cx,
@@ -6267,8 +6269,10 @@ impl Overlay {
 
     unsafe fn icon_speed(&self, cx: f32, cy: f32, s: f32, on: bool) {
         let brush = if on { &self.accent } else { &self.text_dim };
+        // Open-bottom dial with a needle and centre pin: the standard playback
+        // speed metaphor, kept to three strokes so it stays crisp at 16px.
         self.icon_path(
-            "M 2.2 12.2 A 6 6 0 0 1 13.8 12.2 M 8 12.2 L 11.1 7.1",
+            "M 3.0 12.0 A 6.2 6.2 0 1 1 13.0 12.0 M 8 9.0 L 10.6 5.9",
             16.0,
             16.0,
             cx,
@@ -6278,16 +6282,13 @@ impl Overlay {
             1.5 * s,
             false,
         );
-        self.icon_path(
-            "M 8 12.2 A 1.1 1.1 0 0 1 8 14.4 A 1.1 1.1 0 0 1 8 12.2",
-            16.0,
-            16.0,
-            cx,
-            cy,
-            s,
+        self.d2d.FillEllipse(
+            &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
+                point: Vector2::new(cx, cy + 1.0 * s),
+                radiusX: 1.25 * s,
+                radiusY: 1.25 * s,
+            },
             brush,
-            1.2 * s,
-            false,
         );
     }
 
@@ -6326,8 +6327,13 @@ impl Overlay {
 
     unsafe fn icon_loop(&self, cx: f32, cy: f32, s: f32, on: bool) {
         let brush = if on { &self.accent } else { &self.text_dim };
+        // Two chasing arrows with rounded corners: a repeat/loop glyph, not a
+        // refresh glyph. The arrowheads point along the cycle.
         self.icon_path(
-            "M 13.2 8 A 5.2 5.2 0 1 1 11.9 4.6 M 9.6 3.9 L 11.9 4.6 L 10.8 6.8",
+            "M 3.2 6.4 A 2.8 2.8 0 0 1 6 3.6 L 12.2 3.6 \
+             M 10.4 1.8 L 12.6 3.6 L 10.4 5.4 \
+             M 12.8 9.6 A 2.8 2.8 0 0 1 10 12.4 L 3.8 12.4 \
+             M 5.6 10.6 L 3.4 12.4 L 5.6 14.2",
             16.0,
             16.0,
             cx,
