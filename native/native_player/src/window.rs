@@ -7,9 +7,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use windows::core::{w, PCWSTR};
@@ -213,6 +213,13 @@ pub enum InputEvent {
         width: u32,
         height: u32,
     },
+    /// A non-modal window move/resize began or ended. The engine uses this to
+    /// switch to the interaction fast path: only the video transform is
+    /// updated, while the chrome, shadow and overlay layout settle at the end.
+    Interaction {
+        active: bool,
+        resizing: bool,
+    },
 }
 
 #[derive(Default)]
@@ -222,6 +229,17 @@ pub struct WindowEvents {
     /// out of the Win32 modal loop is what lets the video keep presenting
     /// while the window moves or resizes.
     drag: Mutex<Option<DragState>>,
+    /// True for the whole move/resize gesture. While set, the window proc
+    /// skips the shadow upload and the rounded region update; the engine only
+    /// follows with the video transform.
+    interacting: AtomicBool,
+    /// Whether the active gesture is a resize (the shadow is hidden and the
+    /// rounded region is deferred) or a move (the cached shadow is moved).
+    interaction_resizing: AtomicBool,
+    /// Last time the non-modal drag applied a geometry update. Mouse moves
+    /// arrive far faster than the display; coalescing them keeps the window
+    /// thread from flooding DWM with `SetWindowPos` calls.
+    last_drag_update: Mutex<Option<Instant>>,
     /// Current source aspect (width, height). Shift-resize locks the window
     /// client area to it, so the letterbox background disappears.
     video_aspect: Mutex<(u32, u32)>,
@@ -427,6 +445,7 @@ unsafe fn start_drag(hwnd: HWND, events: Option<&WindowEvents>, mode: DragMode) 
         aspect,
         inset_right,
     });
+    let resizing = matches!(mode, DragMode::Resize(_));
     crate::log::line(&format!(
         "window drag start mode={:?} window={}x{} client={}x{} aspect={aspect:.4}",
         match mode {
@@ -439,11 +458,25 @@ unsafe fn start_drag(hwnd: HWND, events: Option<&WindowEvents>, mode: DragMode) 
         client_h
     ));
     drop(state);
-    unsafe { SetCapture(hwnd) };
+    if let Ok(mut last) = events.last_drag_update.lock() {
+        *last = None;
+    }
+    events.interacting.store(true, Ordering::SeqCst);
+    events
+        .interaction_resizing
+        .store(resizing, Ordering::SeqCst);
+    unsafe {
+        begin_interaction(hwnd, resizing);
+        SetCapture(hwnd);
+    }
+    events.push(InputEvent::Interaction {
+        active: true,
+        resizing,
+    });
     true
 }
 
-unsafe fn update_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
+unsafe fn update_drag(hwnd: HWND, events: Option<&WindowEvents>, force: bool) -> bool {
     let Some(events) = events else {
         return false;
     };
@@ -454,6 +487,20 @@ unsafe fn update_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
     let Some(state) = state else {
         return false;
     };
+    if !force {
+        if let Ok(mut last) = events.last_drag_update.lock() {
+            let now = Instant::now();
+            if last
+                .map(|at| now.duration_since(at) < Duration::from_millis(8))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            *last = Some(now);
+        }
+    } else if let Ok(mut last) = events.last_drag_update.lock() {
+        *last = Some(Instant::now());
+    }
     let mut cursor = POINT::default();
     if unsafe { GetCursorPos(&mut cursor) }.is_err() {
         return false;
@@ -557,20 +604,22 @@ unsafe fn update_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
     true
 }
 
-unsafe fn end_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
-    let Some(events) = events else {
-        return false;
-    };
-    let active = events
-        .drag
-        .lock()
-        .map(|mut state| state.take())
-        .unwrap_or(None);
-    let Some(state) = active else {
-        return false;
-    };
-    let _ = unsafe { ReleaseCapture() };
-    if matches!(state.mode, DragMode::Resize(_)) {
+unsafe fn finish_drag(hwnd: HWND, events: &WindowEvents, state: DragState, release: bool) {
+    if release {
+        let _ = unsafe { ReleaseCapture() };
+    }
+    events.interacting.store(false, Ordering::SeqCst);
+    events.interaction_resizing.store(false, Ordering::SeqCst);
+    if let Ok(mut last) = events.last_drag_update.lock() {
+        *last = None;
+    }
+    let resizing = matches!(state.mode, DragMode::Resize(_));
+    unsafe { end_interaction(hwnd, resizing) };
+    events.push(InputEvent::Interaction {
+        active: false,
+        resizing,
+    });
+    if resizing {
         let mut client = RECT::default();
         if unsafe { GetClientRect(hwnd, &mut client) }.is_ok() {
             let width = (client.right - client.left).max(1) as u32;
@@ -583,6 +632,21 @@ unsafe fn end_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
     } else {
         crate::log::line("window drag end move");
     }
+}
+
+unsafe fn end_drag(hwnd: HWND, events: Option<&WindowEvents>) -> bool {
+    let Some(events) = events else {
+        return false;
+    };
+    let active = events
+        .drag
+        .lock()
+        .map(|mut state| state.take())
+        .unwrap_or(None);
+    let Some(state) = active else {
+        return false;
+    };
+    unsafe { finish_drag(hwnd, events, state, true) };
     true
 }
 
@@ -658,8 +722,15 @@ unsafe extern "system" fn wndproc(
         }
         WM_CAPTURECHANGED => {
             if let Some(events) = events {
-                if let Ok(mut state) = events.drag.lock() {
-                    *state = None;
+                let active = events
+                    .drag
+                    .lock()
+                    .map(|mut state| state.take())
+                    .unwrap_or(None);
+                if let Some(state) = active {
+                    // Capture can be stolen (Alt-Tab, another window). The
+                    // shadow/rounding must not stay in interaction mode.
+                    unsafe { finish_drag(hwnd, events, state, false) };
                 }
             }
             LRESULT(0)
@@ -745,14 +816,33 @@ unsafe extern "system" fn wndproc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_MOVE => {
-            update_shadow(hwnd);
+            let interacting = events
+                .map(|events| events.interacting.load(Ordering::SeqCst))
+                .unwrap_or(false);
+            if interacting {
+                let resizing = events
+                    .map(|events| events.interaction_resizing.load(Ordering::SeqCst))
+                    .unwrap_or(false);
+                if !resizing {
+                    // A move keeps the cached shadow: re-uploading the whole
+                    // layered bitmap on every WM_MOVE was the dominant cost.
+                    unsafe { move_shadow(hwnd) };
+                }
+            } else {
+                update_shadow(hwnd);
+            }
             LRESULT(0)
         }
         WM_SIZE => {
             let width = (lparam.0 as u32 & 0xffff).max(1);
             let height = ((lparam.0 as u32 >> 16) & 0xffff).max(1);
-            unsafe { apply_player_region(hwnd) };
-            update_shadow(hwnd);
+            let interacting = events
+                .map(|events| events.interacting.load(Ordering::SeqCst))
+                .unwrap_or(false);
+            if !interacting {
+                unsafe { apply_player_region(hwnd) };
+                update_shadow(hwnd);
+            }
             if let Some(events) = events {
                 events.push(InputEvent::Resize { width, height });
             }
@@ -782,7 +872,7 @@ unsafe extern "system" fn wndproc(
             // A manual move/resize owns the mouse: no modal loop, so the player
             // thread keeps presenting frames. Still notify the engine of the
             // pointer position so the chrome stays awake during the gesture.
-            if unsafe { update_drag(hwnd, events) } {
+            if unsafe { update_drag(hwnd, events, false) } {
                 if let Some(events) = events {
                     events.push(InputEvent::MouseMove {
                         x: loword(lparam.0),
@@ -817,6 +907,9 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            // Apply the pointer's final position even when the last move was
+            // throttled, then finish the gesture.
+            let _ = unsafe { update_drag(hwnd, events, true) };
             if unsafe { end_drag(hwnd, events) } {
                 if let Some(events) = events {
                     events.push(InputEvent::MouseMove {
@@ -1099,6 +1192,77 @@ unsafe fn regenerate_shadow(slot: &mut ShadowSlot, width: i32, height: i32, pad:
         slot.width = width;
         slot.height = height;
         slot.pad = pad;
+    }
+}
+
+/// During a drag-resize the 16 px rounded silhouette is replaced by a large
+/// square region. Updating the rounded region on every WM_SIZE forced a DWM
+/// shape update for each message; the rounded region is applied once when the
+/// gesture ends.
+unsafe fn apply_player_region_square(hwnd: HWND) {
+    let region = unsafe { CreateRectRgn(0, 0, 32767, 32767) };
+    if region.0.is_null() {
+        return;
+    }
+    if unsafe { SetWindowRgn(hwnd, Some(region), true) } == 0 {
+        let _ = unsafe { DeleteObject(region.into()) };
+    }
+}
+
+/// Enter the non-modal interaction fast path. A resize hides the shadow and
+/// uses a square window region; a move keeps the cached shadow and only
+/// repositions it. Neither path uploads the shadow bitmap or rebuilds the
+/// rounded region per mouse message.
+unsafe fn begin_interaction(hwnd: HWND, resizing: bool) {
+    if resizing {
+        hide_shadow(hwnd);
+        unsafe { apply_player_region_square(hwnd) };
+    } else {
+        unsafe { move_shadow(hwnd) };
+    }
+}
+
+/// Restore the normal chrome once the gesture ends: rounded region first,
+/// then one shadow upload at the final rectangle.
+unsafe fn end_interaction(hwnd: HWND, resizing: bool) {
+    if resizing {
+        unsafe { apply_player_region(hwnd) };
+    }
+    update_shadow(hwnd);
+}
+
+/// Move the already-uploaded layered shadow with its owner. Moving a layered
+/// window with SetWindowPos keeps its bitmap; calling UpdateLayeredWindow on
+/// every WM_MOVE re-uploaded the whole ARGB surface (about 34 MB at 4K).
+unsafe fn move_shadow(owner: HWND) {
+    let Some((shadow_key, pad)) = shadows()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&(owner.0 as isize)).map(|slot| (slot.hwnd, slot.pad)))
+    else {
+        return;
+    };
+    if shadow_key == 0 || pad <= 0 {
+        return;
+    }
+    unsafe {
+        let shadow = HWND(shadow_key as *mut c_void);
+        if !IsWindowVisible(shadow).as_bool() {
+            return;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(owner, &mut rect).is_err() {
+            return;
+        }
+        let _ = SetWindowPos(
+            shadow,
+            Some(owner),
+            rect.left - pad,
+            rect.top - pad,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 

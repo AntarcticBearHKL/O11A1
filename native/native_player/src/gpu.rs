@@ -400,6 +400,10 @@ fn upload_plane(
 pub struct VideoSurface {
     pub swap: IDXGISwapChain1,
     pub waiter: isize,
+    /// Frame-latency wait timeout. The normal path tolerates a slow compositor
+    /// for 200 ms; during a window drag/resize it must not block the message
+    /// pump, so the engine switches to a 2 ms wait.
+    wait_ms: u32,
     /// Decoded picture size (the pool's size). Public for diagnostics.
     #[allow(dead_code)]
     pub width: u32,
@@ -422,12 +426,32 @@ impl VideoSurface {
         Ok(Self {
             swap,
             waiter,
+            wait_ms: 200,
             width,
             height,
             presents: 0,
             failures: 0,
             pool,
         })
+    }
+
+    /// Interaction fast path. A window move/resize must never stop the player
+    /// thread on the compositor: wait at most 2 ms for a free frame and allow
+    /// two frames in flight. Restore the normal 200 ms / one-frame policy
+    /// after the gesture.
+    pub fn set_interaction(&mut self, active: bool) {
+        self.wait_ms = if active { 2 } else { 200 };
+        if self.waiter == 0 {
+            return;
+        }
+        let latency = if active { 2 } else { 1 };
+        if let Ok(swap2) = self.swap.cast::<IDXGISwapChain2>() {
+            if let Err(error) = unsafe { swap2.SetMaximumFrameLatency(latency) } {
+                log::line(&format!(
+                    "video frame latency {latency} failed: {error:#}"
+                ));
+            }
+        }
     }
 
     /// Upload a decoded NV12 picture and convert it to BGRA on the GPU. The
@@ -438,7 +462,11 @@ impl VideoSurface {
     }
 
     pub fn wait_frame(&self) -> bool {
-        let result = unsafe { WaitForSingleObject(HANDLE(self.waiter as *mut c_void), 200) };
+        if self.waiter == 0 {
+            return false;
+        }
+        let result =
+            unsafe { WaitForSingleObject(HANDLE(self.waiter as *mut c_void), self.wait_ms) };
         result == WAIT_OBJECT_0
     }
 
@@ -689,6 +717,39 @@ impl Composition {
         };
         unsafe {
             self.root.SetClip2(&rect)?;
+            self.device.Commit()?;
+        }
+        Ok(())
+    }
+
+    /// One commit for the interaction fast path: clip the composition to the
+    /// new client size and move/scale the video layer in the same transaction.
+    pub fn set_video_layout(
+        &self,
+        width: u32,
+        height: u32,
+        x: f32,
+        y: f32,
+        scale_x: f32,
+        scale_y: f32,
+    ) -> Result<()> {
+        let rect = windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: width.max(1) as f32,
+            bottom: height.max(1) as f32,
+        };
+        let matrix = Matrix3x2 {
+            M11: scale_x,
+            M12: 0.0,
+            M21: 0.0,
+            M22: scale_y,
+            M31: x,
+            M32: y,
+        };
+        unsafe {
+            self.root.SetClip2(&rect)?;
+            self.video_visual.SetTransform2(&matrix)?;
             self.device.Commit()?;
         }
         Ok(())

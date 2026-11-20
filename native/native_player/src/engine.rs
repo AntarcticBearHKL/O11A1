@@ -436,6 +436,13 @@ struct Engine {
     stall_pause: Option<StallPause>,
     ended: bool,
     last_frame_ts: u64,
+    /// A non-modal window move/resize is in progress. The engine keeps the
+    /// video presenting and defers chrome, shadow and overlay layout until
+    /// the gesture ends.
+    interacting: bool,
+    /// Latest client size from WM_SIZE during a resize; applied once per
+    /// frame instead of once per Win32 message.
+    pending_live_resize: Option<(u32, u32)>,
 
     // Audio/UI settings.
     volume: u8,
@@ -1098,6 +1105,8 @@ impl Engine {
             stall_pause: None,
             ended: false,
             last_frame_ts: start_ms,
+            interacting: false,
+            pending_live_resize: None,
             volume,
             muted,
             loop_mode: stored_settings.loop_mode,
@@ -4417,6 +4426,7 @@ impl Engine {
                 }
             }
 
+            self.flush_live_resize();
             self.poll_picture();
             self.draw_danmaku();
 
@@ -4976,7 +4986,8 @@ impl Engine {
         // follows the source cadence: a fixed 6 ms window made a 4K60 picture
         // drop every frame the compositor delivered a hair late, which read as
         // ~47 fps even though nothing had failed.
-        let interp_on = self.interp == InterpMode::Gpu && self.interp_out_hz.is_some();
+        let interp_on =
+            !self.interacting && self.interp == InterpMode::Gpu && self.interp_out_hz.is_some();
         let due_window = if self.source.fps.is_finite() && self.source.fps > 1.0 {
             (1000.0 / self.source.fps / 2.0).round().clamp(6.0, 24.0) as u64
         } else {
@@ -5019,7 +5030,9 @@ impl Engine {
                 .last_source_present
                 .map(|at| at.elapsed() <= Duration::from_millis(600))
                 .unwrap_or(false);
-        if self.stall_audio_paused {
+        if self.interacting {
+            self.video_lag_since = None;
+        } else if self.stall_audio_paused {
             if lag <= AV_VIDEO_LAG_MS {
                 self.resume_audio_with_picture(position);
             } else {
@@ -5290,7 +5303,11 @@ impl Engine {
     /// sound for the short seek. The sound is the timeline; the picture may
     /// skip content, but it must never continue behind the sound.
     fn start_video_catch_up(&mut self, position: u64) {
-        if self.video_resync.is_some() || self.is_live || !self.playing {
+        if self.interacting
+            || self.video_resync.is_some()
+            || self.is_live
+            || !self.playing
+        {
             return;
         }
         if self.decoder.is_none() {
@@ -5448,7 +5465,11 @@ impl Engine {
         let Some(frame) = self.cur.as_ref().copied() else {
             return;
         };
-        let mut mode = self.enhance;
+        let mut mode = if self.interacting {
+            EnhanceMode::Off
+        } else {
+            self.enhance
+        };
         let result = if self.audio_only {
             self.video
                 .present_black(&self.gpu)
@@ -5467,7 +5488,7 @@ impl Engine {
                 if presented {
                     self.presents_window = self.presents_window.saturating_add(1);
                 }
-                if mode != self.enhance {
+                if !self.interacting && mode != self.enhance {
                     self.enhance = mode;
                     self.shared.enhance.store(mode.as_u8(), Ordering::SeqCst);
                     self.ui_dirty = true;
@@ -5543,7 +5564,7 @@ impl Engine {
     /// engine iteration; a long stall restarts the grid instead of bursting
     /// a row of catch-up frames.
     fn poll_interp(&mut self, position_ms: u64) -> bool {
-        if self.cur.is_none() || self.interp_out_hz.is_none() {
+        if self.interacting || self.cur.is_none() || self.interp_out_hz.is_none() {
             return false;
         }
         let now = Instant::now();
@@ -5567,7 +5588,11 @@ impl Engine {
         else {
             return;
         };
-        let mut mode = self.enhance;
+        let mut mode = if self.interacting {
+            EnhanceMode::Off
+        } else {
+            self.enhance
+        };
         let result = if self.audio_only {
             self.video
                 .present_black(&self.gpu)
@@ -5588,7 +5613,7 @@ impl Engine {
                 if presented {
                     self.presents_window = self.presents_window.saturating_add(1);
                 }
-                if mode != self.enhance {
+                if !self.interacting && mode != self.enhance {
                     self.enhance = mode;
                     self.shared.enhance.store(mode.as_u8(), Ordering::SeqCst);
                     self.ui_dirty = true;
@@ -5831,10 +5856,46 @@ impl Engine {
                     return;
                 }
                 self.client = (width, height);
-                self.apply_client_geometry();
+                if self.interacting {
+                    // Keep only the newest size; the loop applies one layout
+                    // and one video transform per frame, not per WM_SIZE.
+                    self.pending_live_resize = Some((width, height));
+                } else {
+                    self.apply_client_geometry();
+                }
             }
             InputEvent::ResizeEnded { width, height } => {
                 self.remember_window_size(width, height);
+            }
+            InputEvent::Interaction { active, resizing } => {
+                if active {
+                    if !self.interacting {
+                        self.interacting = true;
+                        self.pending_live_resize = None;
+                        self.video_lag_since = None;
+                        self.video.set_interaction(true);
+                        self.ui_dirty = false;
+                        log::line(&format!(
+                            "interaction begin resize={} client={}x{}",
+                            u8::from(resizing),
+                            self.client.0,
+                            self.client.1
+                        ));
+                    }
+                } else if self.interacting {
+                    self.interacting = false;
+                    self.pending_live_resize = None;
+                    self.video_lag_since = None;
+                    self.video.set_interaction(false);
+                    self.client = window::client_size(self.hwnd);
+                    self.apply_client_geometry();
+                    self.next_tick_at = Some(Instant::now());
+                    self.ui_dirty = true;
+                    log::line(&format!(
+                        "interaction settle client={}x{}",
+                        self.client.0, self.client.1
+                    ));
+                }
             }
             InputEvent::Key(key) => {
                 self.note_activity();
@@ -8196,6 +8257,43 @@ impl Engine {
         log::line(&format!("fullscreen={}", u8::from(self.fullscreen)));
     }
 
+    /// Apply the newest size seen during a drag/resize, once per frame. The
+    /// overlay and danmaku swapchains are already monitor-sized, so this is a
+    /// layout update plus one DComp commit; the old UI frame stays on screen
+    /// until the gesture settles.
+    fn flush_live_resize(&mut self) {
+        let Some((width, height)) = self.pending_live_resize.take() else {
+            return;
+        };
+        if !self.interacting || width < 32 || height < 32 {
+            return;
+        }
+        self.apply_client_geometry_live(width, height);
+    }
+
+    /// Interaction geometry: clip and video transform only. No overlay layout
+    /// redraw, no shadow, no rounded region, no hoisted UI text.
+    fn apply_client_geometry_live(&mut self, width: u32, height: u32) {
+        self.client = (width.max(1), height.max(1));
+        if let Err(error) = self.overlay.resize(self.client.0, self.client.1, self.scale) {
+            log::line(&format!("interaction layout failed: {error:#}"));
+        }
+        let (x, y, picture_w, picture_h) =
+            self.overlay.layout.stage_video_bounds(
+                self.source.width,
+                self.source.height,
+                AspectMode::Fit,
+            );
+        let scale_x = picture_w / self.source.width.max(2) as f32;
+        let scale_y = picture_h / self.source.height.max(2) as f32;
+        if let Err(error) = self
+            .composition
+            .set_video_layout(self.client.0, self.client.1, x, y, scale_x, scale_y)
+        {
+            log::line(&format!("interaction video layout failed: {error:#}"));
+        }
+    }
+
     fn apply_client_geometry(&mut self) {
         self.reconcile_sidebar_window();
         let (width, height) = self.client;
@@ -8573,7 +8671,8 @@ impl Engine {
     }
 
     fn draw_danmaku(&mut self) {
-        if !self.danmaku_visible
+        if self.interacting
+            || !self.danmaku_visible
             || self.danmaku.is_empty()
             || self.danmaku.settings().opacity <= 0.0
             || !self.playing
@@ -8641,6 +8740,11 @@ impl Engine {
     }
 
     fn draw_ui_with(&mut self, sync: bool) -> Result<()> {
+        if self.interacting {
+            // The window proc owns the drag; keeping the last overlay frame
+            // avoids a full D2D relayout on every resize message.
+            return Ok(());
+        }
         if self.external {
             let preview = self.preview_time().and_then(|time| {
                 self.storyboard_cell
