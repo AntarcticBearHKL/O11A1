@@ -42,7 +42,7 @@
 // whole module would be one long dead-code warning; remove this once
 // `snapshot`/`stats`/`verdicts` are called from the app.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bilibili::Session;
+use crate::fishwatch::agent::{AgentReplyView, AgentView};
 use crate::fishwatch::evidence::Evidence;
+use crate::fishwatch::steps::StepId;
 use crate::fishwatch::transcript::ConclusionGate;
 use crate::fishwatch::{
     AsrOptions, DeepseekOptions, Gathered, Meta, ProgressHook, StepProgress, StepSelection,
@@ -239,8 +241,14 @@ CREATE TABLE IF NOT EXISTS queue (
     last_error TEXT,
     updated_at INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS watched (
+    bvid   TEXT PRIMARY KEY,
+    at     INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_verdicts_at ON verdicts(at DESC);
 CREATE INDEX IF NOT EXISTS idx_queue_state ON queue(state, priority DESC);
+CREATE INDEX IF NOT EXISTS idx_watched_at ON watched(at DESC);
 INSERT INTO kv (k, v) VALUES ('schema_version', '2') ON CONFLICT(k) DO UPDATE SET v = excluded.v;
 "#;
 
@@ -292,6 +300,10 @@ pub struct FishSnapshot {
     /// polling UI needs no second call; [`FishEngine::set_step_hook`] is the
     /// push-style equivalent.
     pub progress: Option<FishProgressView>,
+    /// The same run as a chat transcript: prompt, tool rows, DeepSeek thinking
+    /// and the reply card. Kept beside `progress` because the Agent panel uses
+    /// the richer shape while older surfaces keep the checklist.
+    pub agent: Option<AgentView>,
     /// True while a `fish-worker` thread exists.
     pub worker_alive: bool,
     /// The newest successful verdict.
@@ -567,6 +579,8 @@ fn watch_config_from_settings(
         },
         vision: VisionOptions {
             detail: settings::normalise_fish_vision_detail(&settings.fish_vision_detail),
+            interval_s: settings::normalise_fish_frame_interval(settings.fish_frame_interval_s)
+                as u64,
             ..VisionOptions::default()
         },
         deepseek: DeepseekOptions {
@@ -577,7 +591,18 @@ fn watch_config_from_settings(
         model_dir,
         audio_dir: crate::paths::root().join("cache/fishaudio"),
         work_dir: std::env::temp_dir().join("o11a1-fishwatch"),
-        ffmpeg: "ffmpeg".to_string(),
+        ffmpeg: {
+            let candidate = crate::paths::ffmpeg_dir().join(if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            });
+            if candidate.is_file() {
+                candidate.to_string_lossy().into_owned()
+            } else {
+                "ffmpeg".to_string()
+            }
+        },
     }
 }
 
@@ -586,6 +611,170 @@ fn watch_config_from_settings(
 pub fn watch_config(prefs: &Settings) -> WatchConfig {
     let model = settings::normalise_fish_model(&prefs.fish_model);
     watch_config_from_settings(prefs, prefs.deepseek_key.trim(), &model, DEEPSEEK_URL)
+}
+
+/// One manual tool invocation, as the 养鱼 工具台 renders it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolRunView {
+    pub id: String,
+    pub label: String,
+    /// `ok` | `skipped` | `failed`.
+    pub state: String,
+    pub reason: String,
+    pub detail: String,
+    /// Material excerpt the step actually produced (subtitle text, comments,
+    /// outline, frame observations, …). Empty when the step produced none.
+    pub preview: String,
+    pub ms: u64,
+    pub bytes: u64,
+    pub tokens: u64,
+    pub bvid: String,
+    pub cid: u64,
+}
+
+/// Run exactly one watch step for a video, outside the queue. This is the
+/// backend of the 工具台: it uses the same `make_step` factory and the same
+/// `WatchRun` executor, so a manual result is byte-for-byte what the agent
+/// would see.
+pub async fn run_tool(
+    session: Arc<Session>,
+    mut config: WatchConfig,
+    id: &str,
+    bvid: &str,
+    cid: u64,
+) -> Result<ToolRunView> {
+    let step = StepId::from_str(id).ok_or_else(|| anyhow!("未知工具：{id}"))?;
+    let bvid = bvid.trim();
+    if bvid.is_empty() {
+        bail!("缺少 bvid");
+    }
+    let info = session
+        .fish_meta(bvid)
+        .await
+        .with_context(|| format!("读取视频信息失败：{bvid}"))?;
+    let cid = if cid > 0 { cid } else { info.cid };
+    if cid == 0 {
+        bail!("视频没有可用的 cid");
+    }
+    let meta = Meta {
+        bvid: bvid.to_string(),
+        cid,
+        aid: info.aid,
+        title: info.title,
+        up_mid: info.up_mid,
+        up_name: info.up_name,
+        duration_s: info.duration_s,
+        view: info.view,
+        pub_ts: info.pub_ts,
+        cover: info.cover,
+        tname: info.tname,
+        desc: info.desc,
+    };
+    config.selection = StepSelection::only(step);
+    config.online = true;
+    let ctx = WatchCtx::new(config, meta).with_session(session);
+    let run = WatchRun::new(ctx);
+    let timeout = run.timeout();
+    let outcome = tokio::time::timeout(timeout, run.execute())
+        .await
+        .map_err(|_| anyhow!("工具调用超时（{}s）", timeout.as_secs()))?;
+    let record = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|row| row.id == step.as_str())
+        .cloned()
+        .ok_or_else(|| anyhow!("工具没有返回结果"))?;
+    Ok(ToolRunView {
+        id: step.as_str().to_string(),
+        label: step.label().to_string(),
+        state: record.state,
+        reason: record.reason,
+        detail: record.detail,
+        preview: tool_preview(step, &outcome.gathered),
+        ms: record.ms,
+        bytes: record.bytes,
+        tokens: record.tokens,
+        bvid: bvid.to_string(),
+        cid,
+    })
+}
+
+/// Human-readable material excerpt for the tool tester. Deliberately bounded:
+/// the panel shows a sample, not a 90-minute transcript.
+fn tool_preview(id: StepId, gathered: &Gathered) -> String {
+    let text = match id {
+        StepId::Meta => format!(
+            "{} · {} · {} · {} 播放 · {}\n{}",
+            gathered.meta.title,
+            gathered.meta.up_name,
+            mmss(gathered.meta.duration_s),
+            gathered.meta.view,
+            if gathered.meta.tname.is_empty() {
+                "未知分区"
+            } else {
+                &gathered.meta.tname
+            },
+            clip(&gathered.meta.desc, 900)
+        ),
+        StepId::Subtitle | StepId::Asr => {
+            let source = if gathered.transcript_source.trim().is_empty() {
+                "未知来源"
+            } else {
+                gathered.transcript_source.as_str()
+            };
+            format!(
+                "来源：{source} · {} 字 · {} 段\n{}",
+                gathered.transcript.chars().count(),
+                gathered.transcript_segments.len(),
+                clip(&gathered.transcript, 1800)
+            )
+        }
+        StepId::Outline => {
+            let mut out = String::new();
+            for section in gathered.outline.iter().take(12) {
+                out.push_str(&format!("{} {}\n", mmss(section.timestamp), section.title));
+                for point in section.points.iter().take(3) {
+                    out.push_str(&format!("  · {}\n", point.content));
+                }
+            }
+            out
+        }
+        StepId::Comments => {
+            let mut out = String::new();
+            for comment in gathered.comments.iter().take(10) {
+                out.push_str(&format!("{} 赞 · {}\n", comment.like, comment.text));
+            }
+            for peak in gathered.danmaku.iter().take(3) {
+                out.push_str(&format!(
+                    "弹幕 {} · {} 条 · {}\n",
+                    mmss(peak.minute as u64 * 60),
+                    peak.count,
+                    peak.sample
+                ));
+            }
+            out
+        }
+        StepId::Frames => gathered
+            .frames
+            .as_ref()
+            .map(|frames| {
+                format!(
+                    "{} 帧 / 每 {}s · 图片 {} 字节 · {} tok\n{}",
+                    frames.frames,
+                    frames.interval_s,
+                    frames.image_bytes,
+                    frames.tokens,
+                    clip(&frames.observations, 1800)
+                )
+            })
+            .unwrap_or_default(),
+    };
+    if text.trim().is_empty() {
+        "（本次没有拿到材料）".to_string()
+    } else {
+        text
+    }
 }
 
 /// One queue row the worker picked up.
@@ -669,6 +858,8 @@ pub struct FishEngine {
     current: Mutex<Option<(String, String)>>,
     /// Live step checklist for the current/most-recent video.
     progress: Mutex<Option<FishProgressView>>,
+    /// The same run as the Agent chat transcript (tool / thinking / reply).
+    agent: Mutex<Option<AgentView>>,
     /// Last time `progress` was pushed to the snapshot hook (throttle).
     last_progress_publish: Mutex<Option<Instant>>,
     signals: Mutex<Option<Signals>>,
@@ -753,6 +944,7 @@ impl FishEngine {
             state: Mutex::new(state),
             current: Mutex::new(None),
             progress: Mutex::new(None),
+            agent: Mutex::new(None),
             last_progress_publish: Mutex::new(None),
             signals: Mutex::new(None),
             hook: Mutex::new(None),
@@ -813,21 +1005,28 @@ impl FishEngine {
             .unwrap_or(FishState::Idle);
         let current = self.current.lock().ok().and_then(|guard| guard.clone());
         let progress = self.progress.lock().ok().and_then(|guard| guard.clone());
+        let agent = self.agent.lock().ok().and_then(|guard| guard.clone());
         let mut snapshot = FishSnapshot {
             state,
             current,
             progress,
+            agent,
             worker_alive: self.worker.load(Ordering::SeqCst),
             ..FishSnapshot::default()
         };
         let Ok(db) = self.db.lock() else {
             return snapshot;
         };
-        snapshot.queued = count(&db, "SELECT COUNT(*) FROM queue WHERE state IN ('pending','running')")
-            .unwrap_or(0) as usize;
-        snapshot.done =
-            count(&db, "SELECT COUNT(DISTINCT bvid) FROM verdicts WHERE error IS NULL").unwrap_or(0)
-                as u32;
+        snapshot.queued = count(
+            &db,
+            "SELECT COUNT(*) FROM queue WHERE state IN ('pending','running')",
+        )
+        .unwrap_or(0) as usize;
+        snapshot.done = count(
+            &db,
+            "SELECT COUNT(DISTINCT bvid) FROM verdicts WHERE error IS NULL",
+        )
+        .unwrap_or(0) as u32;
         snapshot.errors =
             count(&db, "SELECT COUNT(*) FROM queue WHERE state = 'error'").unwrap_or(0) as u32;
         if let Ok((tokens_in, tokens_out)) = db.query_row(
@@ -870,6 +1069,38 @@ impl FishEngine {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Whether this video is already in the watched ledger. The feed picker
+    /// skips these; the test bench can also check one directly.
+    pub fn is_watched(&self, bvid: &str) -> Result<bool> {
+        let bvid = bvid.trim();
+        if bvid.is_empty() {
+            return Ok(false);
+        }
+        let db = self.lock_db()?;
+        let row: Option<String> = db
+            .query_row("SELECT bvid FROM watched WHERE bvid = ?1", params![bvid], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(row.is_some())
+    }
+
+    /// Record a video as watched. `source` is `fish` for a completed watch run
+    /// and `manual` for the test bench.
+    pub fn mark_watched(&self, bvid: &str, source: &str) -> Result<()> {
+        let bvid = bvid.trim();
+        if bvid.is_empty() {
+            bail!("缺少 bvid");
+        }
+        let db = self.lock_db()?;
+        db.execute(
+            "INSERT INTO watched (bvid, at, source) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(bvid) DO UPDATE SET at = excluded.at, source = excluded.source",
+            params![bvid, now(), source.trim()],
+        )?;
+        Ok(())
     }
 
     /// Move every `error` row back to `pending` (attempts are kept, so a
@@ -943,11 +1174,9 @@ impl FishEngine {
         let Ok(db) = self.lock_db() else {
             return 0;
         };
-        db.query_row(
-            "SELECT v FROM kv WHERE k = 'cleared_at'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
+        db.query_row("SELECT v FROM kv WHERE k = 'cleared_at'", [], |row| {
+            row.get::<_, String>(0)
+        })
         .optional()
         .ok()
         .flatten()
@@ -977,9 +1206,7 @@ impl FishEngine {
             tx.commit()?;
             (cleared, kept.max(0) as usize)
         };
-        crate::debug_log(&format!(
-            "fish clear queue={cleared} verdicts_kept={kept}"
-        ));
+        crate::debug_log(&format!("fish clear queue={cleared} verdicts_kept={kept}"));
         self.set_current(None);
         self.clear_progress();
         // After the transaction released the connection: `publish` takes the
@@ -1259,7 +1486,10 @@ impl FishEngine {
                 continue;
             }
             let Ok(config) = self.config() else {
-                self.set_state_if_current(generation, FishState::Error("养鱼配置不可用".to_string()));
+                self.set_state_if_current(
+                    generation,
+                    FishState::Error("养鱼配置不可用".to_string()),
+                );
                 return;
             };
             if config.key.trim().is_empty() {
@@ -1434,6 +1664,7 @@ impl FishEngine {
     ) -> Result<VerdictView> {
         let base = self.materials_from_db(&job.bvid)?;
         self.begin_progress(&base.bvid, &base.title);
+        self.begin_agent(&base, config);
         if self.stale_or_cancelled(generation) {
             return Err(anyhow!("已取消"));
         }
@@ -1472,7 +1703,8 @@ impl FishEngine {
                 if self.stale_or_cancelled(generation) {
                     return Err(anyhow!("已取消"));
                 }
-                let materials = materials_from_gathered(&base, &outcome.gathered, &outcome.evidence);
+                let materials =
+                    materials_from_gathered(&base, &outcome.gathered, &outcome.evidence);
                 (materials, outcome.evidence)
             }
             #[cfg(test)]
@@ -1490,6 +1722,9 @@ impl FishEngine {
         self.progress_note("材料已齐 · 正在请求 DeepSeek 判定…");
         let (system, user) = build_prompt(&materials, &config.instruction);
         let model = config.model.trim();
+        let prompt_chars = system.chars().count() + user.chars().count();
+        self.agent_begin_thinking(model, prompt_chars);
+        let ask_started = Instant::now();
         let asked = runtime().block_on(async {
             let ask = self.ask(config, model, &system, &user);
             let cancel = wait_cancel(self.cancel_current.clone());
@@ -1503,6 +1738,13 @@ impl FishEngine {
         if self.stale_or_cancelled(generation) {
             return Err(anyhow!("已取消"));
         }
+        let ask_ms = ask_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.agent_finish_thinking(
+            ask_ms,
+            asked.tokens_in,
+            asked.tokens_out,
+            asked.content.chars().count(),
+        );
         let parsed = parse_verdict(&asked.content);
         if parsed.verdict == "也许" && parsed.reasons.is_empty() {
             crate::debug_log(&format!(
@@ -1544,6 +1786,17 @@ impl FishEngine {
             &evidence,
             started.elapsed(),
         )?;
+        self.agent_finish_reply(AgentReplyView {
+            score: view.score,
+            verdict: view.verdict.clone(),
+            one_line: view.one_line.clone(),
+            reasons: view.reasons.clone(),
+            tags: view.tags.clone(),
+            quote: view.quote.clone(),
+            ms: ask_ms,
+            tokens_in: view.tokens_in,
+            tokens_out: view.tokens_out,
+        });
         Ok(view)
     }
 
@@ -1670,6 +1923,11 @@ impl FishEngine {
         let tx = db.transaction()?;
         upsert_video(&tx, materials, at)?;
         tx.execute(
+            "INSERT INTO watched (bvid, at, source) VALUES (?1, ?2, 'fish') \
+             ON CONFLICT(bvid) DO UPDATE SET at = excluded.at, source = excluded.source",
+            params![materials.bvid, at],
+        )?;
+        tx.execute(
             "INSERT INTO signals (bvid, summary, outline_json, transcript, transcript_source, \
              transcript_chars, comments_json, danmaku_json, conclusion_code, fetched_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
@@ -1794,8 +2052,30 @@ impl FishEngine {
         self.notify_step(progress);
     }
 
+    /// Open the Agent chat transcript beside the checklist. It carries the
+    /// cover / UP / instruction the prompt card paints, which the checklist
+    /// does not need.
+    fn begin_agent(&self, base: &Materials, config: &EngineConfig) {
+        let agent = AgentView::begin(
+            &base.bvid,
+            &base.title,
+            &base.up_name,
+            &base.cover,
+            base.duration_s,
+            &config.instruction,
+            &config.model,
+        );
+        if let Ok(mut slot) = self.agent.lock() {
+            *slot = Some(agent);
+        }
+        self.publish();
+    }
+
     fn clear_progress(&self) {
         if let Ok(mut slot) = self.progress.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.agent.lock() {
             *slot = None;
         }
         self.publish();
@@ -1807,8 +2087,7 @@ impl FishEngine {
     fn apply_watch_progress(&self, event: StepProgress) {
         // A stopping worker can still deliver one last step event; it must not
         // turn the cancelled checklist back into "running".
-        if self.stop_requested.load(Ordering::SeqCst)
-            || self.cancel_current.load(Ordering::SeqCst)
+        if self.stop_requested.load(Ordering::SeqCst) || self.cancel_current.load(Ordering::SeqCst)
         {
             return;
         }
@@ -1864,6 +2143,11 @@ impl FishEngine {
         if let Ok(mut slot) = self.progress.lock() {
             *slot = Some(view.clone());
         }
+        if let Ok(mut slot) = self.agent.lock() {
+            if let Some(agent) = slot.as_mut() {
+                agent.apply_step(&event);
+            }
+        }
         self.notify_step(view);
         self.publish_throttled();
     }
@@ -1877,15 +2161,54 @@ impl FishEngine {
             let Some(progress) = slot.as_mut() else {
                 return;
             };
-            progress.note = note;
+            progress.note = note.clone();
             progress.state = "running".to_string();
             progress.clone()
         };
+        if let Ok(mut slot) = self.agent.lock() {
+            if let Some(agent) = slot.as_mut() {
+                agent.set_note(&note);
+            }
+        }
         self.notify_step(view);
         self.publish_throttled();
     }
 
+    fn agent_begin_thinking(&self, model: &str, prompt_chars: usize) {
+        if let Ok(mut slot) = self.agent.lock() {
+            if let Some(agent) = slot.as_mut() {
+                agent.begin_thinking(model, prompt_chars);
+            }
+        }
+        self.publish();
+    }
+
+    fn agent_finish_thinking(
+        &self,
+        ms: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+        answer_chars: usize,
+    ) {
+        if let Ok(mut slot) = self.agent.lock() {
+            if let Some(agent) = slot.as_mut() {
+                agent.finish_thinking(ms, tokens_in, tokens_out, answer_chars);
+            }
+        }
+        self.publish();
+    }
+
+    fn agent_finish_reply(&self, reply: AgentReplyView) {
+        if let Ok(mut slot) = self.agent.lock() {
+            if let Some(agent) = slot.as_mut() {
+                agent.finish_reply(reply);
+            }
+        }
+        self.publish();
+    }
+
     fn finish_progress(&self, state: &str, note: impl Into<String>) {
+        let note = note.into();
         let view = {
             let Ok(mut slot) = self.progress.lock() else {
                 return;
@@ -1895,9 +2218,14 @@ impl FishEngine {
             };
             progress.state = state.to_string();
             progress.current = None;
-            progress.note = note.into();
+            progress.note = note.clone();
             progress.clone()
         };
+        if let Ok(mut slot) = self.agent.lock() {
+            if let Some(agent) = slot.as_mut() {
+                agent.finish(state, &note);
+            }
+        }
         self.notify_step(view);
         self.publish();
     }
@@ -1921,9 +2249,7 @@ impl FishEngine {
     }
 
     pub(crate) fn lock_db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.db
-            .lock()
-            .map_err(|_| anyhow!("fish.db 锁被污染"))
+        self.db.lock().map_err(|_| anyhow!("fish.db 锁被污染"))
     }
 
     fn set_current(&self, value: Option<(String, String)>) {
@@ -1991,11 +2317,12 @@ fn open_db(path: &Path) -> Result<Connection> {
     }
     db.execute_batch("PRAGMA foreign_keys = ON;")?;
     db.busy_timeout(Duration::from_millis(3_000))?;
-    db.execute_batch(SCHEMA)
-        .context("创建养鱼数据库表失败")?;
+    db.execute_batch(SCHEMA).context("创建养鱼数据库表失败")?;
     migrate_verdict_columns(&db).context("迁移 verdicts 证据列失败")?;
     let version: String = db
-        .query_row("SELECT v FROM kv WHERE k = 'schema_version'", [], |row| row.get(0))
+        .query_row("SELECT v FROM kv WHERE k = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap_or_else(|_| SCHEMA_VERSION.to_string());
     if version != SCHEMA_VERSION {
         // Future migrations hook in here; today only version 1 → 2 exists, and
@@ -2197,7 +2524,11 @@ fn meta_of(materials: &Materials) -> Meta {
 /// Fold the watch result back into the row shape `build_prompt` and the
 /// `signals` table already use. The `videos` columns keep the feed's values;
 /// only what the steps learned replaces them.
-fn materials_from_gathered(base: &Materials, gathered: &Gathered, evidence: &Evidence) -> Materials {
+fn materials_from_gathered(
+    base: &Materials,
+    gathered: &Gathered,
+    evidence: &Evidence,
+) -> Materials {
     let mut materials = base.clone();
     materials.bvid = gathered.meta.bvid.clone();
     materials.cid = gathered.meta.cid;
@@ -2417,9 +2748,17 @@ fn build_prompt(materials: &Materials, instruction: &str) -> (String, String) {
         out.push_str("（接口没有给出提纲。）\n");
     } else {
         for section in &materials.outline {
-            out.push_str(&format!("[{}] {}\n", mmss(section.timestamp), section.title.trim()));
+            out.push_str(&format!(
+                "[{}] {}\n",
+                mmss(section.timestamp),
+                section.title.trim()
+            ));
             for point in &section.points {
-                out.push_str(&format!("  - [{}] {}\n", mmss(point.timestamp), point.content));
+                out.push_str(&format!(
+                    "  - [{}] {}\n",
+                    mmss(point.timestamp),
+                    point.content
+                ));
             }
         }
     }
@@ -2478,7 +2817,9 @@ fn build_prompt(materials: &Materials, instruction: &str) -> (String, String) {
 
     if !materials.frame_observations.trim().is_empty() {
         out.push_str("\n## 画面观察（抽样画面，不代表完整观看）\n");
-        out.push_str("下面只来自每隔一段时间抽一张的画面，不是逐帧观看；没画到的段落不要当作没有内容。\n");
+        out.push_str(
+            "下面只来自每隔一段时间抽一张的画面，不是逐帧观看；没画到的段落不要当作没有内容。\n",
+        );
         out.push_str(materials.frame_observations.trim());
         out.push('\n');
     }
@@ -2490,7 +2831,9 @@ fn build_prompt(materials: &Materials, instruction: &str) -> (String, String) {
     }
 
     if materials.transcript.trim().is_empty() {
-        out.push_str("\n（这个视频没有 AI 字幕，上面的评论和弹幕峰值就是能拿到的全部内容材料。）\n");
+        out.push_str(
+            "\n（这个视频没有 AI 字幕，上面的评论和弹幕峰值就是能拿到的全部内容材料。）\n",
+        );
     }
 
     out.push_str("\n## 鱼主人的指令\n");
@@ -2964,10 +3307,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "o11a1-fish-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("o11a1-fish-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join(DB_FILE)
     }
@@ -3110,7 +3451,10 @@ mod tests {
                 "cost_tokens",
                 "steps_json",
             ] {
-                assert!(columns.iter().any(|column| column == added), "missing {added}");
+                assert!(
+                    columns.iter().any(|column| column == added),
+                    "missing {added}"
+                );
             }
             let (channels, coverage, steps): (String, f64, String) = db
                 .query_row(
@@ -3123,7 +3467,9 @@ mod tests {
             assert_eq!(coverage, 0.0);
             assert_eq!(steps, "[]");
             let version: String = db
-                .query_row("SELECT v FROM kv WHERE k = 'schema_version'", [], |row| row.get(0))
+                .query_row("SELECT v FROM kv WHERE k = 'schema_version'", [], |row| {
+                    row.get(0)
+                })
                 .expect("version");
             assert_eq!(version, SCHEMA_VERSION);
         }
@@ -3219,7 +3565,10 @@ mod tests {
     fn comments_are_part_of_the_prompt_even_with_a_transcript() {
         let mut materials = materials_fixture();
         materials.transcript = "第一句讲的是所有权，第二句讲的是借用。".to_string();
-        assert!(!materials.transcript.is_empty(), "the prompt has a transcript");
+        assert!(
+            !materials.transcript.is_empty(),
+            "the prompt has a transcript"
+        );
         materials.comments = vec![
             StoredComment {
                 like: 9_876,
@@ -3232,7 +3581,10 @@ mod tests {
         ];
         let (_, user) = build_prompt(&materials, TEST_INSTRUCTION);
         assert!(user.contains("## AI 字幕"), "transcript section stays");
-        assert!(user.contains("## 热门评论（按点赞）"), "comments are always included");
+        assert!(
+            user.contains("## 热门评论（按点赞）"),
+            "comments are always included"
+        );
         assert!(user.contains("[赞 9876] 这段演示我反复看了三遍"));
         // The "no transcript" note only belongs to the fallback path.
         assert!(!user.contains("没有 AI 字幕"));
@@ -3382,11 +3734,9 @@ mod tests {
         engine.enqueue(&[feed("BV8", "八")]);
         let db = engine.lock_db().expect("db");
         let rows: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM queue WHERE bvid = 'BV8'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM queue WHERE bvid = 'BV8'", [], |row| {
+                row.get(0)
+            })
             .expect("rows");
         assert_eq!(rows, 1);
         drop(db);
@@ -3403,7 +3753,11 @@ mod tests {
         assert_eq!(queue_state(&engine, "BV8").as_deref(), Some("error"));
         assert_eq!(queue_attempts(&engine, "BV8"), 1);
         engine
-            .store_error(&job, &anyhow!("mock failure again"), Duration::from_millis(5))
+            .store_error(
+                &job,
+                &anyhow!("mock failure again"),
+                Duration::from_millis(5),
+            )
             .expect("store error");
         assert_eq!(queue_attempts(&engine, "BV8"), 2);
         assert_eq!(engine.snapshot().errors, 1);
@@ -3432,6 +3786,18 @@ mod tests {
     }
 
     #[test]
+    fn watched_ledger_marks_and_checks_a_video() {
+        let path = temp_db("watched");
+        let engine = FishEngine::open_at(&path).expect("open watched db");
+        assert!(!engine.is_watched("BV1WATCH").expect("check"));
+        engine
+            .mark_watched("BV1WATCH", "manual")
+            .expect("mark watched");
+        assert!(engine.is_watched("BV1WATCH").expect("check again"));
+        cleanup(&path);
+    }
+
+    #[test]
     fn newest_verdict_replaces_the_feed_row_and_history_is_kept() {
         let path = temp_db("supersede");
         let engine = FishEngine::open_at(&path).expect("open");
@@ -3454,7 +3820,10 @@ mod tests {
         assert_eq!(feed[0].one_line, "升级后的结论", "the newest row wins");
         assert_eq!(feed[0].evidence.coverage, 0.9);
         let stats = engine.stats(0).expect("stats");
-        assert_eq!(stats.watched, 1, "stats count the video once, not the history");
+        assert_eq!(
+            stats.watched, 1,
+            "stats count the video once, not the history"
+        );
         let rows: i64 = {
             let db = engine.lock_db().expect("db");
             db.query_row(
@@ -3674,7 +4043,10 @@ mod tests {
         assert_eq!(board.today.tokens_out, 350);
         assert_eq!(board.today.tokens(), 2_100);
 
-        assert_eq!(board.week.watched, 5, "today + yesterday, not the 8-day-old row");
+        assert_eq!(
+            board.week.watched, 5,
+            "today + yesterday, not the 8-day-old row"
+        );
         assert_eq!(board.month.watched, 6);
         assert_eq!(board.month.recommend, 3);
         // The histogram/tags follow the 30-day window.
@@ -3806,7 +4178,10 @@ mod tests {
         assert_eq!(progress.cost_bytes, 100);
         let events = seen.lock().expect("progress lock");
         assert_eq!(events.len(), 4, "begin + running + finished + finish");
-        assert_eq!(events.last().map(|event| event.state.as_str()), Some("done"));
+        assert_eq!(
+            events.last().map(|event| event.state.as_str()),
+            Some("done")
+        );
         drop(events);
         drop(engine);
         cleanup(&path);
@@ -3968,7 +4343,10 @@ mod tests {
             if snapshot.queued == 0 && snapshot.done > 0 && snapshot.state == FishState::Idle {
                 break;
             }
-            assert!(Instant::now() < deadline, "mock run timed out: {snapshot:?}");
+            assert!(
+                Instant::now() < deadline,
+                "mock run timed out: {snapshot:?}"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         let elapsed_ms = started.elapsed().as_millis();
@@ -3999,9 +4377,26 @@ mod tests {
         assert!(snapshot.last.is_some());
         assert!(snapshot.current.is_none());
         assert_eq!(snapshot.state, FishState::Idle);
+        let agent = snapshot.agent.expect("agent transcript");
+        assert_eq!(agent.bvid, "BV1TEST");
+        assert_eq!(agent.state, "done");
+        assert_eq!(agent.tokens_in, 1234);
+        assert_eq!(agent.reply.as_ref().map(|reply| reply.score), Some(8.0));
+        assert!(agent.note.contains("看"));
+        let thinking = agent
+            .steps
+            .iter()
+            .find(|row| row.id == "deepseek")
+            .expect("thinking row");
+        assert_eq!(thinking.kind, "thinking");
+        assert_eq!(thinking.state, "ok");
+        assert_eq!(thinking.tokens, 1290);
 
         let body = server.request_body();
-        assert!(body.contains(TEST_INSTRUCTION), "instruction missing: {body}");
+        assert!(
+            body.contains(TEST_INSTRUCTION),
+            "instruction missing: {body}"
+        );
         assert!(body.contains("\"response_format\":{\"type\":\"json_object\"}"));
         assert!(body.contains("\"max_tokens\":800"));
         assert!(body.contains("\"thinking\":{\"type\":\"disabled\"}"));
@@ -4177,6 +4572,16 @@ mod tests {
         assert_eq!(queue_attempts(&engine, "BV1FAIL"), 1);
         assert_eq!(engine.snapshot().errors, 1);
         assert!(engine.verdicts(5).expect("verdicts").is_empty());
+        let agent = engine.snapshot().agent.expect("agent transcript");
+        assert_eq!(agent.state, "error");
+        assert!(agent.reply.is_none());
+        assert!(agent.note.contains("401"), "agent note: {}", agent.note);
+        let thinking = agent
+            .steps
+            .iter()
+            .find(|row| row.id == "deepseek")
+            .expect("thinking row");
+        assert_eq!(thinking.state, "failed");
         let db = engine.lock_db().expect("db");
         let last_error: String = db
             .query_row(
@@ -4228,8 +4633,7 @@ mod tests {
         if std::env::var("BILI_FISH_FRAMES").as_deref() == Ok("1") {
             watch.selection.frames = true;
         }
-        watch.model_dir =
-            crate::paths::root().join("models/whisper");
+        watch.model_dir = crate::paths::root().join("models/whisper");
         watch.audio_dir = crate::paths::root().join("cache/fishaudio");
         let selected = watch
             .selection
@@ -4296,8 +4700,12 @@ mod tests {
         let verdict = &verdicts[0];
         eprintln!(
             "verdict={} score={:.1} one_line={} tokens={}+{} evidence={}",
-            verdict.verdict, verdict.score, verdict.one_line, verdict.tokens_in,
-            verdict.tokens_out, verdict.evidence.line()
+            verdict.verdict,
+            verdict.score,
+            verdict.one_line,
+            verdict.tokens_in,
+            verdict.tokens_out,
+            verdict.evidence.line()
         );
         eprintln!("evidence detail:\n{}", verdict.evidence.detail());
         let (channels, coverage, cost_ms, cost_bytes, cost_tokens, steps_json): (
@@ -4341,7 +4749,8 @@ mod tests {
 
     #[test]
     #[ignore = "hits DeepSeek and Bilibili; needs DEEPSEEK_API_KEY and BILI_FISH_LIVE=1"]
-    fn live_smoke() {        let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
+    fn live_smoke() {
+        let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
             eprintln!("DEEPSEEK_API_KEY absent: skipped");
             return;
         };
@@ -4380,7 +4789,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(500));
         }
         let verdicts = engine.verdicts(5).expect("verdicts");
-        eprintln!("live verdicts={} snapshot={:?}", verdicts.len(), engine.snapshot());
+        eprintln!(
+            "live verdicts={} snapshot={:?}",
+            verdicts.len(),
+            engine.snapshot()
+        );
         assert!(!verdicts.is_empty(), "live run produced no verdict");
         drop(engine);
         cleanup(&path);

@@ -19,7 +19,6 @@
 
 mod audio;
 mod clipboard;
-mod convert;
 mod danmaku;
 mod decode;
 mod detail;
@@ -29,14 +28,22 @@ mod format;
 pub mod gdi_text;
 mod gpu;
 mod heartbeat;
+mod hwdecode;
 mod interp;
 mod log;
+mod mediacache;
 mod overlay;
 mod proc;
 mod source;
+mod speed;
 mod state;
 mod storyboard;
 mod window;
+
+/// Release the bundled font resources at process exit.
+pub fn unload_player_fonts() {
+    overlay::unload_player_fonts();
+}
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -52,12 +59,12 @@ pub fn drag_window(hwnd: isize) {
 
 pub use danmaku::DanmakuHit;
 pub use engine::Command;
+use engine::SharedState;
 pub use enhance::EnhanceMode;
 pub use format::{format_time, format_time_ms, parse_time_ms};
 pub use gpu::AspectMode;
 pub use interp::InterpMode;
 pub use state::PlayerState;
-use engine::SharedState;
 
 /// What to open.
 ///
@@ -89,6 +96,10 @@ pub struct PlayerConfig {
     pub title: String,
     pub start_ms: u64,
     pub quality_qn: Option<i64>,
+    /// Preferred opening resolution as a track height (`0` = highest available;
+    /// otherwise the highest stream at or below this height). Takes priority
+    /// over `quality_qn` when present.
+    pub quality_height: Option<u32>,
     /// When set, create an owned video-only window at this rectangle instead of
     /// the standalone player window with its native UI.
     pub host: Option<PlayerHost>,
@@ -97,6 +108,9 @@ pub struct PlayerConfig {
     pub quality_codecid: Option<i64>,
     /// Initial DASH audio track index; `None` picks the best non-VIP stream.
     pub audio_index: Option<usize>,
+    /// Live stream: interpolation and enhancement are disabled and the player
+    /// shows a live-specific settings list.
+    pub is_live: bool,
 }
 
 /// A running native player window.
@@ -202,6 +216,9 @@ impl Player {
         shared
             .position_ms
             .store(config.start_ms, std::sync::atomic::Ordering::SeqCst);
+        shared
+            .loop_mode
+            .store(o11a1::settings::LOOP_NEXT, std::sync::atomic::Ordering::SeqCst);
         let placeholder_title = if config.title.trim().is_empty() {
             "正在打开视频…".to_string()
         } else {
@@ -328,6 +345,13 @@ impl Player {
         self.send(Command::SetInterp(mode));
     }
 
+    /// Set the interpolation grid: `0` follows the display refresh, otherwise
+    /// the requested fixed target in Hz (bounded by the native safety ceiling).
+    /// A target the machine cannot sustain is not lowered — late ticks drop.
+    pub fn set_interp_hz(&self, hz: u32) {
+        self.send(Command::SetInterpHZ(hz));
+    }
+
     pub fn set_enhance(&self, mode: EnhanceMode) {
         self.send(Command::SetEnhance(mode));
     }
@@ -353,9 +377,7 @@ impl Player {
     }
 
     pub fn is_mini(&self) -> bool {
-        self.shared
-            .mini
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.shared.mini.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 比例: 适应 / 填充 / 拉伸 (`A` in the window).
@@ -443,6 +465,14 @@ impl Player {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// How many times this window has written danmaku settings to the global
+    /// settings file. The engine polls it to broadcast `settings.changed`.
+    pub fn settings_revision(&self) -> u64 {
+        self.shared
+            .settings_revision
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The picture position on the media timeline, in ms.
     pub fn position_ms(&self) -> u64 {
         self.shared
@@ -473,6 +503,22 @@ impl Player {
         self.shared
             .double_click_seq
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Bumped when this native window is activated. The shell picks the
+    /// player with the newest value when a card left-click should replace the
+    /// video instead of opening another window.
+    pub fn focus_seq(&self) -> u64 {
+        self.shared
+            .focus_seq
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Load a different video into this existing window. The window keeps its
+    /// size, position and chrome; the engine resolves the new source on a
+    /// worker and swaps the media session in place.
+    pub fn replace_source(&self, config: PlayerConfig) {
+        self.send(Command::LoadSource(config));
     }
 
     pub fn move_seq(&self) -> u64 {
@@ -524,19 +570,26 @@ impl Player {
     }
 
     pub fn enhance(&self) -> EnhanceMode {
-        EnhanceMode::from_u8(self.shared.enhance.load(std::sync::atomic::Ordering::SeqCst))
+        EnhanceMode::from_u8(
+            self.shared
+                .enhance
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
     pub fn is_open(&self) -> bool {
-        !self.shared
-            .closed
-            .load(std::sync::atomic::Ordering::SeqCst)
+        !self.shared.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// True when the decoder reached the natural end of the stream.
     pub fn ended(&self) -> bool {
+        self.shared.ended.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// End-of-video behaviour: 0 pause, 1 loop, 2 next / close.
+    pub fn loop_mode(&self) -> u8 {
         self.shared
-            .ended
+            .loop_mode
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 

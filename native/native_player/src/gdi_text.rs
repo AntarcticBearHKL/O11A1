@@ -1,12 +1,12 @@
 //! Hinted grayscale text, coloured by Direct2D.
 //!
-//! Chiron GoRound TC ships no TrueType instructions
-//! (`maxp.maxSizeOfInstructions == 0`, no `fpgm`/`cvt`, no glyph programs), so
-//! outline hinting has nothing to execute and 11-14px glyphs stay soft. GDI's
-//! `ANTIALIASED_QUALITY` rasteriser synthesises grid-fitting even for such
-//! fonts. Measurement and line metrics are pure GDI (`OUTLINETEXTMETRIC`,
-//! because Chiron's `usWinAscent` is 1810/1000 and `tmAscent` is not a usable
-//! baseline). The mask itself is rasterised at 5x and box-averaged 5x5 back to
+//! The bundled face (Chill Round Gothic) does not rely
+//! on TrueType hinting for their small-size rendering, so direct outline
+//! rasterisation at 11-14px stays soft. GDI's `ANTIALIASED_QUALITY` rasteriser
+//! synthesises grid-fitting for it. Measurement and line metrics are pure GDI
+//! (`OUTLINETEXTMETRIC`), because bundled and system faces use different
+//! `usWinAscent`/`tmAscent` conventions and neither is a reliable baseline on
+//! its own. The mask itself is rasterised at 5x and box-averaged 5x5 back to
 //! 1x (`SUPERSAMPLE`), then a 3x3 unsharp mask (`SHARPEN`) restores edge
 //! contrast before tinting. Layout (box, alignment, trimming, scrolling,
 //! layers) stays at 1x with the caller.
@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT, D2D_SIZE_U, D2D_RECT_F,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Bitmap, ID2D1RenderTarget, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
@@ -28,10 +28,10 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
     GetOutlineTextMetricsW, GetTextMetricsW, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_TOP, DT_WORDBREAK, FF_DONTCARE, HDC, HFONT, HGDIOBJ, OUTLINETEXTMETRICW,
-    OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT, ANTIALIASED_QUALITY,
+    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CALCRECT, DT_CENTER,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_WORDBREAK, FF_DONTCARE, HDC, HFONT, HGDIOBJ,
+    OUTLINETEXTMETRICW, OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT,
 };
 
 const MAX_MASKS: usize = 2048;
@@ -181,10 +181,10 @@ impl GdiText {
             } else {
                 (key.0 as f32 * 0.88) as i32
             };
-            // GDI's tmAscent uses usWinAscent (1810/1000 for Chiron), which is
-            // a clipping bound, not the typographic baseline. OUTLINETEXTMETRIC
-            // carries hhea's ascent/descent/lineGap, the same values DWrite
-            // used for its line metrics.
+            // GDI's tmAscent uses usWinAscent, which is a clipping bound, not
+            // the typographic baseline. OUTLINETEXTMETRIC carries hhea's
+            // ascent/descent/lineGap, the same values DWrite used for its line
+            // metrics.
             let mut baseline_ratio = 0.88;
             let mut height_ratio = 1.2;
             let needed = GetOutlineTextMetricsW(self.dc, 0, None);
@@ -194,8 +194,7 @@ impl GdiText {
                 if GetOutlineTextMetricsW(self.dc, needed, Some(otm)) > 0 {
                     let otm = &*otm;
                     // OUTLINETEXTMETRIC's ascent/descent/lineGap are already in
-                    // logical device units at the selected height (Chiron's
-                    // em square reports 1000 but is not the divisor here).
+                    // logical device units at the selected height.
                     let px = key.0 as f32;
                     baseline_ratio = otm.otmAscent as f32 / px;
                     height_ratio =
@@ -222,10 +221,7 @@ impl GdiText {
     /// These are GDI's OUTLINETEXTMETRIC values, not DirectWrite's.
     pub unsafe fn metrics(&mut self, size: f32, weight: u16) -> (f32, f32) {
         match self.font(size, weight) {
-            Some(entry) => (
-                entry.baseline_ratio * size,
-                entry.height_ratio * size,
-            ),
+            Some(entry) => (entry.baseline_ratio * size, entry.height_ratio * size),
             None => (size * 0.88, size * 1.2),
         }
     }
@@ -238,7 +234,11 @@ impl GdiText {
             bottom: 0,
         };
         let mut flags = DT_CALCRECT | DT_NOPREFIX | DT_TOP;
-        flags |= if multiline { DT_WORDBREAK } else { DT_SINGLELINE };
+        flags |= if multiline {
+            DT_WORDBREAK
+        } else {
+            DT_SINGLELINE
+        };
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         DrawTextW(self.dc, &mut wide, &mut rect, flags);
         (rect.right.max(0), rect.bottom.max(0))
@@ -271,6 +271,21 @@ impl GdiText {
         let mut out: String = chars[..lo].iter().collect();
         out.push('\u{2026}');
         out
+    }
+
+    /// Wrap one style's text at `width`, with the same font selection and
+    /// measurement the rasteriser uses. Comment rows call this so their
+    /// measured height and the drawn lines cannot disagree.
+    pub unsafe fn wrap(&mut self, text: &str, style: Style, width: f32) -> Vec<String> {
+        let Some(font) = self.font(style.size, style.weight).map(|entry| entry.font) else {
+            return vec![text.to_string()];
+        };
+        let previous = SelectObject(self.dc, HGDIOBJ(font.0));
+        let lines = self.wrap_lines(text, width.ceil().max(1.0) as i32);
+        if !previous.0.is_null() {
+            let _ = SelectObject(self.dc, previous);
+        }
+        lines
     }
 
     /// Greedy character wrap at `width`, matching the layout's line height so
@@ -389,10 +404,14 @@ impl GdiText {
         }
 
         // Rasterise the glyphs. GDI's rasteriser synthesises grid-fitting even
-        // for fonts without TrueType instructions (Chiron has none), so stems
-        // land on whole pixels.
+        // for fonts without TrueType instructions, so stems land on whole
+        // pixels.
         for row in 0..dh {
-            std::ptr::write_bytes(self.bits.add(row as usize * self.stride), 0, dw as usize * 4);
+            std::ptr::write_bytes(
+                self.bits.add(row as usize * self.stride),
+                0,
+                dw as usize * 4,
+            );
         }
         {
             let (ascent, draw_font) = match self.font(style.size * ss as f32, style.weight) {
@@ -443,15 +462,12 @@ impl GdiText {
             for column in 0..mw as usize {
                 let mut sum = 0u32;
                 for sy in 0..ss as usize {
-                    let source = self
-                        .bits
-                        .add((row * ss as usize + sy) * self.stride);
+                    let source = self.bits.add((row * ss as usize + sy) * self.stride);
                     for sx in 0..ss as usize {
                         sum += *source.add((column * ss as usize + sx) * 4 + 2) as u32;
                     }
                 }
-                coverage[row * mw as usize + column] =
-                    (sum as f32 / samples + 0.5) as u8;
+                coverage[row * mw as usize + column] = (sum as f32 / samples + 0.5) as u8;
             }
         }
         let mut sharpened = coverage.clone();
@@ -473,8 +489,7 @@ impl GdiText {
                 }
                 blur /= 16.0;
                 let value = center + SHARPEN * (center - blur);
-                sharpened[row * mw as usize + column] =
-                    value.clamp(0.0, 255.0) as u8;
+                sharpened[row * mw as usize + column] = value.clamp(0.0, 255.0) as u8;
             }
         }
         let mut pixels = vec![0u8; (mw * mask_h * 4) as usize];
@@ -585,7 +600,10 @@ fn mask_key(
     ellipsis.hash(&mut hasher);
     multiline.hash(&mut hasher);
     for channel in color {
-        (channel.clamp(0.0, 1.0) * 255.0).round().to_bits().hash(&mut hasher);
+        (channel.clamp(0.0, 1.0) * 255.0)
+            .round()
+            .to_bits()
+            .hash(&mut hasher);
     }
     hasher.finish()
 }

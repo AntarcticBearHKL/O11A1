@@ -23,5 +23,10 @@ New-Item -ItemType Directory -Force $runtime | Out-Null
 Copy-Item (Join-Path $target 'release\o11a1-engine.exe') (Join-Path $runtime 'o11a1-engine.exe') -Force
 New-Item -ItemType Directory -Force (Join-Path $runtime 'assets\fonts') | Out-Null
 $fonts = Join-Path $root 'public\fonts'
-Copy-Item (Join-Path $fonts '*.ttf') (Join-Path $runtime 'assets\fonts') -Force
+$fontTarget = Join-Path $runtime 'assets\fonts'
+# Clear stale faces so an older bundled family can never ship alongside the
+# current one.
+if (Test-Path $fontTarget) { Remove-Item (Join-Path $fontTarget '*') -Force }
+Copy-Item (Join-Path $fonts '*.ttf') $fontTarget -Force
+Copy-Item (Join-Path $fonts '*.txt') $fontTarget -Force
 Write-Output "engine -> $(Join-Path $runtime 'o11a1-engine.exe')"

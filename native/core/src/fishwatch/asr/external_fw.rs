@@ -136,9 +136,7 @@ impl Transcriber for ExternalFw {
         let out_path = self
             .work_dir
             .join(format!("fw-{}.json", std::process::id()));
-        let log_path = self
-            .work_dir
-            .join(format!("fw-{}.log", std::process::id()));
+        let log_path = self.work_dir.join(format!("fw-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&out_path);
 
         let started = std::time::Instant::now();
@@ -195,7 +193,9 @@ impl Transcriber for ExternalFw {
             })
             .collect();
         if segments.is_empty() {
-            return Err(anyhow!("faster-whisper 没有转写出任何句子（可能是纯音乐或静音）"));
+            return Err(anyhow!(
+                "faster-whisper 没有转写出任何句子（可能是纯音乐或静音）"
+            ));
         }
         crate::debug_log(&format!(
             "fish asr fw device={} compute={} load_s={:.2} decode_s={:.2} wall_s={:.2} segments={} lang={} p={:.2} audio_s={:.1}",
@@ -278,7 +278,14 @@ mod tests {
 
     #[test]
     fn the_helper_script_sets_every_argument_it_is_given() {
-        for flag in ["--model", "--audio", "--device", "--compute", "--threads", "--out"] {
+        for flag in [
+            "--model",
+            "--audio",
+            "--device",
+            "--compute",
+            "--threads",
+            "--out",
+        ] {
             assert!(FW_SCRIPT.contains(flag), "missing {flag}");
         }
         assert!(FW_SCRIPT.contains("faster_whisper"));

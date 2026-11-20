@@ -9,7 +9,7 @@ export interface AppContextValue {
   navigate: (to: string) => void;
   route: Route;
   toast: (text: string, error?: boolean) => void;
-  launch: (options: Record<string, any>) => Promise<void>;
+  launch: (options: Record<string, any>, newWindow?: boolean) => Promise<void>;
   refreshAccount: () => Promise<void>;
   openSearch: () => void;
 }

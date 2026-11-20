@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { call, cover, formatCount } from '../api';
+import { call, formatCount } from '../api';
+import { CoverImage } from '../components/CoverImage';
 import { useApp } from '../context';
 import type { PgcEpisode, PgcIndexPage, PgcSeason } from '../types';
 import { Empty, ErrorBox, PageHead, SkeletonGrid, Tabs } from '../components/Common';
@@ -62,15 +63,44 @@ export default function Pgc() {
   const playEpisode = async (ep: PgcEpisode) => {
     setPlaying(ep.ep_id);
     try {
+      const title = `${season?.title || ''} ${ep.title} ${ep.long_title || ''}`.trim();
+      const episodes = (season?.episodes || []).map((row) => ({
+        ep_id: row.ep_id,
+        cid: row.cid,
+        title: row.title,
+        long_title: row.long_title,
+      }));
+      // PGC episodes carry a real bvid/cid, so open them through the exact same
+      // native pipeline as a normal video: full DASH track list in the 画质
+      // menu, cid-based danmaku, and the usual quality switching.
+      if (ep.bvid && ep.cid) {
+        await launch({
+          bvid: ep.bvid,
+          cid: ep.cid,
+          aid: ep.aid || undefined,
+          epId: ep.ep_id,
+          seasonId: season?.season_id,
+          title,
+          cover: season?.cover,
+          owner: season?.title,
+          duration: ep.duration_ms ? Math.round(ep.duration_ms / 1000) : undefined,
+          episodes,
+        });
+        return;
+      }
+      // Old/odd seasons can omit bvid. Keep the PGC resolver as the fallback;
+      // it still plays, but only with the resolved direct stream.
       const source = await resolvePgcSource(ep.ep_id, ep.cid);
       await launch({
         url: source.url,
         audioUrl: source.audioUrl,
         epId: ep.ep_id,
         cid: ep.cid,
-        title: `${season?.title || ''} ${ep.title} ${ep.long_title || ''}`.trim(),
+        title,
         cover: season?.cover,
-        episodes: (season?.episodes || []).map((row) => ({ ep_id: row.ep_id, cid: row.cid, title: row.title, long_title: row.long_title })),
+        owner: season?.title,
+        duration: ep.duration_ms ? Math.round(ep.duration_ms / 1000) : undefined,
+        episodes,
       });
     } catch (reason: any) {
       toast(reason.message, true);
@@ -82,13 +112,10 @@ export default function Pgc() {
   if (seasonId) {
     return (
       <>
-        <PageHead title="番剧详情" sub={season?.index_show || ''}>
-          <button className="btn sm" onClick={() => navigate('pgc')}>返回索引</button>
-        </PageHead>
         {loading ? <SkeletonGrid count={6} /> : error ? <ErrorBox error={error} onRetry={loadSeason} /> : season ? (
           <>
             <div className="card hero" style={{ marginBottom: 16 }}>
-              <img className="hero-cover" src={cover(season.cover)} referrerPolicy="no-referrer" alt="" style={{ aspectRatio: '3/4' }} />
+              <CoverImage className="hero-cover" src={season.cover} eager alt="" style={{ aspectRatio: '3/4' }} />
               <div>
                 <h1 className="hero-title">{season.title}</h1>
                 <div className="stats" style={{ marginBottom: 10 }}>
@@ -98,9 +125,10 @@ export default function Pgc() {
                   <span>{season.is_finish ? '已完结' : '连载中'}</span>
                 </div>
                 <div className="hero-desc" style={{ maxHeight: 120 }}>{season.evaluate || '暂无简介'}</div>
-                <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 14 }}>
                   {season.episodes[0] ? <button className="btn primary" disabled={!!playing} onClick={() => playEpisode(season.episodes[0])}>▶ 播放第 1 集</button> : null}
                   <button className="btn" onClick={() => navigate(`pgc?season=${season.season_id}&view=index`)}>相关推荐</button>
+                  <button className="btn ghost" onClick={() => navigate('pgc')}>返回索引</button>
                 </div>
               </div>
             </div>
@@ -134,17 +162,17 @@ export default function Pgc() {
 
   return (
     <>
-      <PageHead title="番剧 / 影视" sub="每日放送 · 索引 · 排行榜">
+      <PageHead eyebrow="浏览" title="番剧 / 影视" sub="每日放送 · 索引 · 排行榜">
         <Tabs tabs={['每日放送', '索引', '排行榜']} active={view === 'daily' ? 0 : view === 'index' ? 1 : 2} onChange={(next) => { setView(next === 0 ? 'daily' : next === 1 ? 'index' : 'rank'); setPage(1); }} />
       </PageHead>
 
       {view !== 'daily' ? (
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap', alignItems: 'center', width: '100%' }}>
           {TYPES.map(([value, label]) => (
             <button key={value} className={`chip ${type === value ? 'active' : ''}`} onClick={() => { setType(value); setPage(1); }}>{label}</button>
           ))}
           {view === 'index' ? (
-            <select className="select" style={{ marginLeft: 8 }} value={order} onChange={(event) => { setOrder(Number(event.target.value)); setPage(1); }}>
+            <select className="select pgc-sort" value={order} onChange={(event) => { setOrder(Number(event.target.value)); setPage(1); }}>
               <option value={3}>追番人数</option>
               <option value={0}>更新时间</option>
               <option value={1}>播放数量</option>
@@ -161,12 +189,11 @@ export default function Pgc() {
               <h3 style={{ margin: 0, fontSize: 15 }}>{day.date}</h3>
               {day.is_today ? <span className="chip small active">今天</span> : null}
             </div>
-            <div className="pgc-grid">
-              {day.episodes.map((ep: any) => (
-                <div className="pgc-card" key={`${day.date}-${ep.season_id}-${ep.pub_index}`} onClick={() => navigate(`pgc?season=${ep.season_id}`)}>
+            <div className="pgc-grid pgc-daily-grid">
+              {day.episodes.map((ep: any, index: number) => (
+                <div className="pgc-card pgc-daily-card" style={{ animationDelay: `${Math.min(index, 14) * 32}ms` }} key={`${day.date}-${ep.season_id}-${ep.pub_index}`} onClick={() => navigate(`pgc?season=${ep.season_id}`)}>
                   <div className="pgc-cover">
-                    <img src={cover(ep.cover)} referrerPolicy="no-referrer" alt="" />
-                    {ep.pub_time ? <div className="pgc-badge">{ep.pub_time}</div> : null}
+                    <CoverImage src={ep.cover} alt="" />
                   </div>
                   <div className="pgc-body">
                     <div className="video-title">{ep.title}</div>
@@ -181,13 +208,13 @@ export default function Pgc() {
         index && index.items.length ? (
           <>
             <div className="pgc-grid">
-              {index.items.map((item) => {
+              {index.items.map((item, index) => {
                 const badge = item.badge || (item.score ? `${item.score}分` : item.order);
                 const meta = [item.index_show, item.score ? `${item.score}分` : ''].filter(Boolean).join(' · ') || item.order || '暂无信息';
                 return (
-                  <div className="pgc-card" key={item.season_id} onClick={() => navigate(`pgc?season=${item.season_id}`)}>
+                  <div className="pgc-card" style={{ animationDelay: `${Math.min(index, 14) * 32}ms` }} key={item.season_id} onClick={() => navigate(`pgc?season=${item.season_id}`)}>
                     <div className="pgc-cover">
-                      <img src={cover(item.cover)} referrerPolicy="no-referrer" alt="" />
+                      <CoverImage src={item.cover} alt="" />
                       {badge ? <div className="pgc-badge">{badge}</div> : null}
                     </div>
                     <div className="pgc-body">
@@ -198,17 +225,17 @@ export default function Pgc() {
                 );
               })}
             </div>
-            <div style={{ display: 'flex', justifyContent: 'center', padding: 20 }}>
-              {index.has_next ? <button className="btn" onClick={() => setPage(page + 1)}>下一页</button> : <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>已经到底了</span>}
+            <div className="page-more">
+              {index.has_next ? <button className="btn" onClick={() => setPage(page + 1)}>下一页</button> : <span>已经到底了</span>}
             </div>
           </>
         ) : <Empty title="没有索引结果" />
       ) : (
-        <div className="card panel">
+        <div className="pgc-rank-list">
           {rank.map((item: any) => (
             <div className="row" key={item.season_id} style={{ cursor: 'pointer' }} onClick={() => navigate(`pgc?season=${item.season_id}`)}>
               <div style={{ width: 32, textAlign: 'center', fontWeight: 600, color: item.rank <= 3 ? 'var(--accent)' : 'var(--text-faint)' }}>{item.rank}</div>
-              <img src={cover(item.cover)} referrerPolicy="no-referrer" alt="" style={{ width: 52, aspectRatio: '3/4', objectFit: 'cover', borderRadius: 7 }} />
+              <CoverImage src={item.cover} alt="" eager style={{ width: 52, aspectRatio: '3/4', objectFit: 'cover', borderRadius: 7 }} />
               <div style={{ flex: 1 }}>
                 <div className="row-title">{item.title}</div>
                 <div className="row-sub">{item.index_show} · {item.rating} · {formatCount(item.follow)} 追番</div>

@@ -78,7 +78,10 @@ pub fn enc_wbi(params: Vec<(String, String)>, img_key: &str, sub_key: &str) -> S
         .join("&");
 
     // Direct concatenation: query string immediately followed by the key.
-    let w_rid = format!("{:x}", Md5::digest(format!("{query}{mixin_key}").as_bytes()));
+    let w_rid = format!(
+        "{:x}",
+        Md5::digest(format!("{query}{mixin_key}").as_bytes())
+    );
     format!("{query}&w_rid={w_rid}")
 }
 

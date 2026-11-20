@@ -911,6 +911,7 @@ dependencies = [
  "image",
  "o11a1-core",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

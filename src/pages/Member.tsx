@@ -1,15 +1,21 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
-import { call, cover, formatCount } from '../api';
+import { call, cover } from '../api';
+import { clearPreloadedData } from '../preload';
 import { useApp } from '../context';
-import { Empty, ErrorBox, PageHead, Spinner } from '../components/Common';
+import { Empty, Spinner } from '../components/Common';
+import { LoginQrPlaceholder, LoginSurface, loginQrColors, readLastAccount } from '../components/LoginSurface';
+import type { Account } from '../types';
 
 export default function Member() {
   const { account, refreshAccount, toast, navigate } = useApp();
   const [qr, setQr] = useState<{ url: string; key: string } | null>(null);
   const [qrError, setQrError] = useState('');
-  const [qrState, setQrState] = useState('等待扫码');
+  const [qrState, setQrState] = useState('正在生成二维码…');
   const [polling, setPolling] = useState(false);
+  const [entering, setEntering] = useState(false);
+  const [scanned, setScanned] = useState<Account | null>(null);
+  const [last, setLast] = useState<Account | null>(() => readLastAccount());
   const [vip, setVip] = useState<any>(null);
   const [nav, setNav] = useState<any>(null);
   const [vipLoading, setVipLoading] = useState(false);
@@ -17,60 +23,89 @@ export default function Member() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pollRef = useRef<any>(null);
 
+  // Keep the in-app login portrait in step with the account that just left.
+  useEffect(() => {
+    if (account?.mid) setLast(account);
+  }, [account]);
+
   const loadQr = useCallback(async () => {
     setQrError('');
     setQrState('正在生成二维码…');
+    setPolling(false);
     try {
       const data = await call<{ url: string; key: string }>('login.qr');
       setQr(data);
-      setQrState('请使用哔哩哔哩手机客户端扫码');
+      setQrState('打开哔哩哔哩扫一扫');
       setPolling(true);
-    } catch (reason: any) {
-      setQrError(reason?.message || String(reason));
-      setQrState('生成失败');
+    } catch {
+      setQrError('二维码生成失败，点击重试');
     }
   }, []);
 
+  // Generate on mount, and again after an expired code is cleared.
+  useEffect(() => {
+    if (account || qr || qrError || entering) return;
+    loadQr();
+  }, [account, qr, qrError, entering, loadQr]);
+
   useEffect(() => {
     if (!qr || !canvasRef.current) return;
-    QRCode.toCanvas(canvasRef.current, qr.url, { width: 180, margin: 1, color: { dark: '#1a1a1a', light: '#ffffff' } }).catch((error) => setQrError(error.message));
+    QRCode.toCanvas(canvasRef.current, qr.url, {
+      width: 240,
+      margin: 2,
+      color: loginQrColors(),
+    }).catch(() => setQrError('二维码生成失败，点击重试'));
   }, [qr]);
 
   useEffect(() => {
-    if (!polling || !qr) return;
+    if (!polling || !qr || entering) return;
+    let stopped = false;
     let polls = 0;
     const tick = async () => {
       polls += 1;
       if (polls > 90) {
         setPolling(false);
-        setQrState('二维码已过期，请刷新');
+        setQrState('二维码已过期，正在刷新…');
+        setQr(null);
+        setQrError('');
         return;
       }
       try {
-        const result = await call<{ stateCode: number; account?: any }>('login.poll', { key: qr.key });
+        const result = await call<{ stateCode: number; account?: Account }>('login.poll', { key: qr.key });
         if (result.stateCode === 0) {
           setPolling(false);
-          setQrState('登录成功');
-          await refreshAccount();
-          toast('登录成功');
+          setEntering(true);
+          setScanned(result.account ?? null);
+          try {
+            await refreshAccount();
+            toast('登录成功');
+          } catch {
+            setEntering(false);
+            setQrError('登录成功但没有返回账号信息，点击重试');
+          }
           return;
         }
         if (result.stateCode === 86038) {
           setPolling(false);
-          setQrState('二维码已过期，请刷新');
+          setQrState('二维码已过期，正在刷新…');
+          setQr(null);
+          setQrError('');
         } else if (result.stateCode === 86090) {
           setQrState('已扫码，请在手机上确认');
         } else if (result.stateCode === 86101) {
-          setQrState('已扫码，等待确认');
+          setQrState('打开哔哩哔哩扫一扫');
         }
       } catch {
         /* transient poll errors are ignored */
       }
-      pollRef.current = setTimeout(tick, 2000);
+      if (!stopped) pollRef.current = setTimeout(tick, 2000);
     };
     pollRef.current = setTimeout(tick, 1200);
-    return () => clearTimeout(pollRef.current);
-  }, [polling, qr, refreshAccount, toast]);
+    return () => {
+      stopped = true;
+      clearTimeout(pollRef.current);
+    };
+  }, [polling, qr, entering, refreshAccount, toast]);
 
   const loadVip = useCallback(async () => {
     if (!account) return;
@@ -111,6 +146,7 @@ export default function Member() {
     if (!window.confirm('退出当前账号？')) return;
     try {
       await call('login.logout');
+      clearPreloadedData();
       await refreshAccount();
       setVip(null);
       setNav(null);
@@ -119,24 +155,36 @@ export default function Member() {
   };
 
   if (!account) {
-    return (
-      <>
-        <PageHead title="账户" sub="扫码登录后可以同步收藏、历史、弹幕与大会员信息" />
-        <div className="card panel" style={{ maxWidth: 520, margin: '40px auto', textAlign: 'center' }}>
-          <div className="panel-title">二维码登录</div>
-          {qrError ? <ErrorBox error={qrError} onRetry={loadQr} /> : qr ? (
-            <>
-              <div className="qr-wrap" style={{ margin: '10px auto 12px' }}><canvas ref={canvasRef} /></div>
-              <div style={{ color: 'var(--text-dim)', fontSize: 12.5 }}>{qrState}</div>
-              <div style={{ marginTop: 12, display: 'flex', gap: 8, justifyContent: 'center' }}>
-                <button className="btn sm" onClick={loadQr}>刷新二维码</button>
-                <button className="btn sm ghost" onClick={() => { setPolling(false); setQr(null); }}>取消</button>
-              </div>
-            </>
-          ) : <Spinner label={qrState} />}
-          <div style={{ color: 'var(--text-faint)', fontSize: 11.5, marginTop: 16 }}>二维码由哔哩哔哩官方接口生成，不会保存在本地。</div>
+    if (entering) {
+      return (
+        <div className="login-embed">
+          <LoginSurface account={scanned} progress={null} status="登录成功，正在进入主页…" />
         </div>
-      </>
+      );
+    }
+    return (
+      <div className="login-embed">
+        <LoginSurface
+          account={last}
+          progress={null}
+          status={qrError || qrState}
+          tone={qrError ? 'error' : 'normal'}
+        >
+          <div
+            className={`login-qr-frame ${qrError ? 'error' : ''}`}
+            onClick={() => {
+              if (!polling || qrError) loadQr();
+            }}
+            title={qrError ? '点击重试' : '点击刷新二维码'}
+          >
+            {qr ? (
+              <canvas ref={canvasRef} />
+            ) : (
+              <LoginQrPlaceholder />
+            )}
+          </div>
+        </LoginSurface>
+      </div>
     );
   }
 
@@ -146,29 +194,30 @@ export default function Member() {
 
   return (
     <>
-      <PageHead title="账户 / 大会员" sub="扫码登录、权益、任务与经验">
-        <button className="btn sm" onClick={() => navigate('settings')}>账户设置</button>
-        <button className="btn sm danger" onClick={logout}>退出登录</button>
-      </PageHead>
-
-      <div className="card panel" style={{ display: 'flex', gap: 18, alignItems: 'center', marginBottom: 16 }}>
-        <img className="avatar" style={{ width: 84, height: 84 }} src={cover(account.face)} referrerPolicy="no-referrer" alt="" />
-        <div style={{ flex: 1 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <h2 style={{ margin: 0, fontSize: 22 }}>{account.uname}</h2>
+      <section className="profile-hero member-hero">
+        <div className="profile-avatar-wrap">
+          <img className="profile-avatar" src={cover(account.face)} referrerPolicy="no-referrer" alt="" />
+        </div>
+        <div className="profile-copy">
+          <div className="profile-name">
+            <h1>{account.uname}</h1>
             {nav?.LoggedIn ? <span className="chip small">LV{nav.LoggedIn.level}</span> : null}
-            {account.vip ? <span className="chip small" style={{ color: 'var(--accent)' }}>大会员</span> : null}
+            {account.vip ? <span className="chip small accent-chip">大会员</span> : null}
           </div>
-          <div style={{ fontSize: 12.5, color: 'var(--text-dim)', marginTop: 8 }}>UID {account.mid}</div>
+          <p className="profile-sign">UID {account.mid}</p>
           {nav?.LoggedIn ? (
-            <div style={{ display: 'flex', gap: 16, marginTop: 8, fontSize: 12, color: 'var(--text-faint)' }}>
-              <span>硬币 {nav.LoggedIn.money}</span>
-              <span>节操 {nav.LoggedIn.moral}</span>
-              <span>{nav.LoggedIn.vip_text}</span>
+            <div className="profile-stats">
+              <span><b>{nav.LoggedIn.money}</b>硬币</span>
+              <span><b>{nav.LoggedIn.moral}</b>节操</span>
+              <span><b>{nav.LoggedIn.vip_text}</b>会员状态</span>
             </div>
           ) : null}
+          <div className="member-actions">
+            <button className="btn sm" onClick={() => navigate('settings')}>账户设置</button>
+            <button className="btn sm danger" onClick={logout}>退出登录</button>
+          </div>
         </div>
-      </div>
+      </section>
 
       <div className="card panel" style={{ marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>

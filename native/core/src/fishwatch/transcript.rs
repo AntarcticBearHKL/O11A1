@@ -135,7 +135,6 @@ impl Step for SubtitleStep {
         StepId::Subtitle
     }
 
-
     fn timeout(&self) -> Duration {
         Duration::from_secs(45)
     }
@@ -207,7 +206,6 @@ impl Step for OutlineStep {
         StepId::Outline
     }
 
-
     fn timeout(&self) -> Duration {
         Duration::from_secs(45)
     }
@@ -264,11 +262,7 @@ impl Step for OutlineStep {
 
 /// Attach a transcript produced by ASR. Kept here so official and ASR
 /// transcripts share one representation and one coverage calculation.
-pub fn attach_asr(
-    gathered: &mut Gathered,
-    segments: Vec<Segment>,
-    source: &str,
-) -> (usize, usize) {
+pub fn attach_asr(gathered: &mut Gathered, segments: Vec<Segment>, source: &str) -> (usize, usize) {
     let chars = Segment::chars_of(&segments);
     let count = segments.len();
     gathered.transcript_source = source.to_string();

@@ -1,10 +1,12 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { call, cover } from './api';
 import { AppContext, Route } from './context';
+import { readLastAccount } from './components/LoginSurface';
 import { useToast } from './hooks';
 import type { Account, Settings } from './types';
 import {
-  IconClock, IconClose, IconDownload, IconGear, IconMax, IconMin, IconSearch, IconStar,
+  IconActivity, IconBell, IconClock, IconClose, IconCompass, IconDownload, IconFish, IconGear,
+  IconHome, IconMax, IconMin, IconRadio, IconRefresh, IconSearch, IconStar, IconTv, IconUser,
 } from './components/Icons';
 import Home from './pages/Home';
 import Search from './pages/Search';
@@ -20,7 +22,9 @@ import Member from './pages/Member';
 import SettingsPage from './pages/Settings';
 import Downloads from './pages/Downloads';
 import Fish from './pages/Fish';
-import { enqueuePlaylist, launchPlayer } from './player';
+import { launchPlayer } from './player';
+import { CoverImage } from './components/CoverImage';
+import { clearPreloadedData } from './preload';
 
 function parseRoute(): Route {
   const raw = window.location.hash.replace(/^#\/?/, '');
@@ -35,15 +39,21 @@ function parseRoute(): Route {
 }
 
 const NAV = [
-  { key: 'home', label: '推荐' },
-  { key: 'favorites', label: '收藏' },
-  { key: 'regions', label: '分区' },
-  { key: 'pgc', label: '番剧' },
-  { key: 'live', label: '直播' },
-  { key: 'fish', label: '养鱼' },
-  { key: 'dynamic', label: '动态' },
-  { key: 'messages', label: '消息' },
-];
+  { key: 'home', label: '推荐', icon: IconHome, hint: '首页' },
+  { key: 'favorites', label: '收藏', icon: IconStar, hint: '收藏' },
+  { key: 'regions', label: '分区', icon: IconCompass, hint: '分区' },
+  { key: 'pgc', label: '番剧', icon: IconTv, hint: '番剧' },
+  { key: 'live', label: '直播', icon: IconRadio, hint: '直播' },
+  { key: 'fish', label: '养鱼', icon: IconFish, hint: '大肥鱼' },
+  { key: 'dynamic', label: '动态', icon: IconActivity, hint: '动态' },
+  { key: 'messages', label: '消息', icon: IconBell, hint: '私信' },
+] as const;
+
+const LIBRARY = [
+  { key: 'history', label: '历史', icon: IconClock },
+  { key: 'downloads', label: '下载', icon: IconDownload },
+  { key: 'member', label: '账户', icon: IconUser },
+] as const;
 
 export interface AppInitial {
   settings: Settings;
@@ -55,27 +65,73 @@ export default function App({ initial }: { initial?: AppInitial }) {
   const [route, setRoute] = useState<Route>(parseRoute);
   const [settings, setSettings] = useState<Settings | null>(initial?.settings ?? null);
   const [account, setAccount] = useState<Account | null>(initial?.account ?? null);
+  // Signed out? Keep showing the user's own portrait instead of an empty disc,
+  // so the account button never reads as an application icon.
+  const lastAccount = useMemo(() => (account ? null : readLastAccount()), [account]);
+  const avatarFace = account?.face || lastAccount?.face || '';
   const [bootError, setBootError] = useState('');
   const [notice, setNotice] = useState<any>(null);
   const [maximized, setMaximized] = useState(false);
   const [appVersion, setAppVersion] = useState(initial?.version || '0.1.0');
-  const [hud, setHud] = useState(false);
-  const [hudStats, setHudStats] = useState({ fps: 0, ms: 0 });
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchDraft, setSearchDraft] = useState('');
   const [accountOpen, setAccountOpen] = useState(false);
   const [playlistOpen, setPlaylistOpen] = useState(false);
-  const [holdRing, setHoldRing] = useState<{ x: number; y: number; progress: number; fired: boolean } | null>(null);
+  const [holdPoint, setHoldPoint] = useState<{ id: number; x: number; y: number } | null>(null);
+  const [dockRefresh, setDockRefresh] = useState(false);
+  const appRef = useRef<HTMLDivElement>(null);
   const [playlistScroll, setPlaylistScroll] = useState(0);
-  const [vinylCover, setVinylCover] = useState(() => localStorage.getItem('o11a1:vinyl-cover') || '');
   const searchInputRef = useRef<HTMLInputElement>(null);
   const accountRef = useRef<HTMLDivElement>(null);
   const searchWrapRef = useRef<HTMLDivElement>(null);
   const searchBtnRef = useRef<HTMLButtonElement>(null);
   const playlistRef = useRef<HTMLDivElement>(null);
   const vinylRef = useRef<HTMLButtonElement>(null);
+  const bottomBarRef = useRef<HTMLDivElement>(null);
+  const [bottomPill, setBottomPill] = useState({ left: 0, top: 8, size: 42, ready: false });
   const holdRef = useRef<{ start: number; x: number; y: number; raf: number; timer: any; fired: boolean } | null>(null);
+  const holdBoxRef = useRef<HTMLDivElement>(null);
+  const holdFillRef = useRef<SVGCircleElement>(null);
+  const HOLD_RING_LENGTH = 2 * Math.PI * 18;
+  const HOLD_MS = 400;
+  const holdIdRef = useRef(0);
   const { toast, show } = useToast();
+
+  // Windowed mode keeps the 22px transparent rim for the paper shadow. The
+  // maximized window must drop it and fill the work area.
+  useEffect(() => {
+    let alive = true;
+    const sync = () => {
+      window.o11a1.window
+        ?.isMaximized?.()
+        .then((value: boolean) => {
+          if (alive) setMaximized(!!value);
+        })
+        .catch(() => {});
+    };
+    sync();
+    window.addEventListener('resize', sync);
+    return () => {
+      alive = false;
+      window.removeEventListener('resize', sync);
+    };
+  }, []);
+
+  // Remember who signed in here so the sign-in screen can greet them with
+  // their own avatar and name after `login.logout` clears the saved session.
+  useEffect(() => {
+    if (!account?.mid) return;
+    try {
+      localStorage.setItem('o11a1:last-account', JSON.stringify({
+        mid: account.mid,
+        uname: account.uname,
+        face: account.face,
+        vip: account.vip,
+      }));
+    } catch {
+      /* local storage is optional */
+    }
+  }, [account]);
 
   useEffect(() => {
     const onChange = () => {
@@ -91,12 +147,6 @@ export default function App({ initial }: { initial?: AppInitial }) {
   }, []);
 
   useEffect(() => {
-    const onCover = (event: Event) => setVinylCover((event as CustomEvent<string>).detail || '');
-    window.addEventListener('o11a1:vinyl-cover', onCover);
-    return () => window.removeEventListener('o11a1:vinyl-cover', onCover);
-  }, []);
-
-  useEffect(() => {
     if (searchOpen) {
       const timer = setTimeout(() => searchInputRef.current?.focus(), 30);
       return () => clearTimeout(timer);
@@ -105,6 +155,15 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
   useEffect(() => {
     const onDown = (event: MouseEvent) => {
+      // While the search dock is open it owns the right button: a right press
+      // anywhere closes it immediately and must not start the hold-refresh
+      // gesture behind it.
+      if (event.button === 2 && searchOpen) {
+        event.preventDefault();
+        event.stopPropagation();
+        setSearchOpen(false);
+        return;
+      }
       const target = event.target as Node;
       if (searchOpen && !searchWrapRef.current?.contains(target) && !searchBtnRef.current?.contains(target)) {
         setSearchOpen(false);
@@ -158,17 +217,12 @@ export default function App({ initial }: { initial?: AppInitial }) {
   useEffect(() => {
     window.o11a1.info().then((info: any) => setAppVersion(info.version)).catch(() => {});
     const off = window.o11a1.accountChanged?.((value: Account | null) => setAccount(value));
-    const offHud = window.o11a1.onHudToggle?.(() => setHud((value) => !value));
     const offSettings = window.o11a1.settingsChanged?.((value: Settings) => setSettings(value));
-    return () => { off?.(); offHud?.(); offSettings?.(); };
+    return () => { off?.(); offSettings?.(); };
   }, []);
 
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
-      if ((event.key === 'F12') || (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'h')) {
-        event.preventDefault();
-        setHud((value) => !value);
-      }
       if (event.key === '/' && !(event.target as HTMLElement)?.closest('input, textarea, select')) {
         event.preventDefault();
         setSearchOpen(true);
@@ -179,33 +233,11 @@ export default function App({ initial }: { initial?: AppInitial }) {
   }, []);
 
   useEffect(() => {
-    if (!hud) return;
-    let raf = 0;
-    let frames = 0;
-    let started = performance.now();
-    let last = performance.now();
-    let ms = 0;
-    const tick = (now: number) => {
-      frames += 1;
-      ms = ms * 0.9 + (now - last) * 0.1;
-      last = now;
-      if (now - started >= 500) {
-        setHudStats({ fps: frames / ((now - started) / 1000), ms });
-        frames = 0;
-        started = now;
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [hud]);
-
-  useEffect(() => {
     if (!settings) return;
     const dark = settings.theme === 2;
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
     const alpha = Math.max(0.58, 0.62 + (1 - Number(settings.glass_transparency || 0) / 100) * 0.36);
-    const rgb = dark ? '38, 40, 46' : '255, 255, 255';
+    const rgb = dark ? '38, 40, 46' : '255, 252, 246';
     document.documentElement.style.setProperty('--card', `rgba(${rgb}, ${alpha})`);
     document.documentElement.style.setProperty('--glass-blur', `${Math.max(0, Number(settings.glass_blur || 0)) * 0.18}px`);
     document.documentElement.style.setProperty('--wallpaper-blur', `${Math.max(0, Number(settings.backdrop_blur || 0))}px`);
@@ -285,6 +317,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
     if (!window.confirm('退出当前账号？')) return;
     try {
       await call('login.logout');
+      clearPreloadedData();
       await refreshAccount();
       show('已退出登录');
     } catch (error: any) {
@@ -299,28 +332,45 @@ export default function App({ initial }: { initial?: AppInitial }) {
     return () => off?.();
   }, [navigate]);
 
-  const launch = useCallback(async (options: Record<string, any>) => {
-    if (options?.bvid) {
-      await enqueuePlaylist({
-        bvid: options.bvid,
-        cid: options.cid || 0,
-        aid: options.aid || 0,
-        title: options.title || '',
-        owner: options.owner || '',
-        duration: options.duration ? String(options.duration) : '',
-        cover: options.cover || '',
-      }).catch(() => {});
-    }
-    await launchPlayer(options);
+  const launch = useCallback(async (options: Record<string, any>, newWindow = false) => {
+    // The native shell owns the queue update: a left-click replaces the
+    // focused window's row (delete old, insert new), a right-click enqueues a
+    // new row. Doing it here too would fight that bookkeeping.
+    await launchPlayer(options, newWindow);
   }, []);
 
   const triggerRefresh = useCallback(() => {
+    // Refresh always returns to the top of the active page first, then asks
+    // every page to reload its data. The home feed consumes one pre-fetched
+    // batch on the same tick.
+    const page = document.querySelector<HTMLElement>('.page');
+    page?.scrollTo({ top: 0, behavior: 'smooth' });
     window.dispatchEvent(new CustomEvent('o11a1:refresh'));
   }, []);
 
-  // Old Slint shell gesture: hold the right mouse button for 500 ms to
-  // refresh the current page. Moving more than 16 px cancels; the stale-hold
-  // guard is why a left press always aborts an unfinished ring (f246).
+  const dockGo = useCallback((key: string) => {
+    setSearchOpen(false);
+    setPlaylistOpen(false);
+    setAccountOpen(false);
+    navigate(key);
+  }, [navigate]);
+
+  const dockRefreshNow = useCallback(() => {
+    setDockRefresh(true);
+    triggerRefresh();
+    window.setTimeout(() => setDockRefresh(false), 650);
+  }, [triggerRefresh]);
+
+  // The top and bottom chrome keep their live backdrop blur while the page
+  // scrolls; the glass samples the moving content every frame instead of
+  // switching to an opaque surface.
+
+  // Shell gesture: hold the right mouse button for 400 ms anywhere on the
+  // page, including video cards and their hover controls, to refresh the
+  // current page. Only text-editing targets keep their native right button.
+  // Moving more than 16 px cancels. The indicator is a bare progress ring
+  // centered on the pointer; its fill is written straight to the DOM each
+  // frame, so holding never re-renders the page behind it.
   useEffect(() => {
     const clear = () => {
       const current = holdRef.current;
@@ -328,13 +378,27 @@ export default function App({ initial }: { initial?: AppInitial }) {
       cancelAnimationFrame(current.raf);
       clearTimeout(current.timer);
       holdRef.current = null;
-      setHoldRing(null);
+      setHoldPoint(null);
     };
 
     const start = (event: MouseEvent) => {
       if (event.button !== 2) return;
-      if ((event.target as HTMLElement)?.closest('input, textarea, select, [contenteditable="true"]')) return;
+      // 养鱼 (大肥鱼) owns its own interaction surface; a long right press must
+      // not reload the page while inspecting frames or chatting with the agent.
+      // 设置页也禁用长按刷新：那里全是开关、滑杆和下拉，误触刷新会打断配置。
+      if (route.name === 'fish' || route.name === 'settings') return;
+      // Video cards, links and buttons all start the hold-refresh gesture:
+      // right-click has no other meaning in this shell. Text editing is the
+      // one exception, where the native right-click menu is still useful.
+      if ((event.target as HTMLElement)?.closest(
+        'input, textarea, select, [contenteditable="true"]',
+      )) return;
       clear();
+      holdIdRef.current += 1;
+      holdBoxRef.current?.classList.remove('fired');
+      if (holdFillRef.current) {
+        holdFillRef.current.style.strokeDashoffset = String(HOLD_RING_LENGTH);
+      }
       const current = {
         start: performance.now(),
         x: event.clientX,
@@ -344,25 +408,26 @@ export default function App({ initial }: { initial?: AppInitial }) {
         fired: false,
       };
       holdRef.current = current;
-      setHoldRing({ x: current.x, y: current.y, progress: 0, fired: false });
+      setHoldPoint({ id: holdIdRef.current, x: current.x, y: current.y });
 
       const tick = (now: number) => {
         const active = holdRef.current;
         if (!active) return;
-        const progress = Math.min(1, (now - active.start) / 500);
+        const progress = Math.min(1, (now - active.start) / HOLD_MS);
+        if (holdFillRef.current) {
+          holdFillRef.current.style.strokeDashoffset = String(HOLD_RING_LENGTH * (1 - progress));
+        }
         if (progress >= 1) {
           if (!active.fired) {
             active.fired = true;
-            setHoldRing({ x: active.x, y: active.y, progress: 1, fired: true });
+            holdBoxRef.current?.classList.add('fired');
             triggerRefresh();
-            show('已刷新');
             active.timer = setTimeout(() => {
               if (holdRef.current === active) clear();
-            }, 160);
+            }, 200);
           }
           return;
         }
-        setHoldRing({ x: active.x, y: active.y, progress, fired: false });
         active.raf = requestAnimationFrame(tick);
       };
       current.raf = requestAnimationFrame(tick);
@@ -371,7 +436,17 @@ export default function App({ initial }: { initial?: AppInitial }) {
     const move = (event: MouseEvent) => {
       const current = holdRef.current;
       if (!current || current.fired) return;
-      if (Math.hypot(event.clientX - current.x, event.clientY - current.y) > 16) clear();
+      if (Math.hypot(event.clientX - current.x, event.clientY - current.y) > 16) {
+        clear();
+        return;
+      }
+      // Keep the ring wrapped around the pointer without re-rendering the
+      // page: write the position straight to the fixed element.
+      const box = holdBoxRef.current;
+      if (box) {
+        box.style.left = `${event.clientX}px`;
+        box.style.top = `${event.clientY}px`;
+      }
     };
     const release = (event: MouseEvent) => {
       if (event.button !== 2) return;
@@ -398,7 +473,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
       window.removeEventListener('blur', blur);
       clear();
     };
-  }, [show, triggerRefresh]);
+  }, [route.name, triggerRefresh]);
 
   const openSearchMorph = useCallback(() => {
     setSearchDraft(route.name === 'search' ? (route.query.get('q') || '') : '');
@@ -412,14 +487,32 @@ export default function App({ initial }: { initial?: AppInitial }) {
     navigate(query ? `search?q=${encodeURIComponent(query)}` : 'search');
   }, [searchDraft, navigate]);
 
-  const navItems = useMemo(() => NAV.filter((item) => !(item.key === 'live' && settings?.hide_live_tab)), [settings?.hide_live_tab]);
-  const navLeft = NAV.slice(0, 5).filter((item) => !(item.key === 'live' && settings?.hide_live_tab));
-  const navRight = NAV.slice(5);
+  type DockItem = { key: string; label: string; icon: React.ComponentType<{ size?: number }>; hint?: string };
+  const dock = useMemo(() => {
+    const items: DockItem[] = [...NAV, LIBRARY[0]].filter((item) => !(
+      (item.key === 'live' && settings?.hide_live_tab)
+      || (item.key === 'pgc' && settings?.hide_pgc_tab)
+      || (item.key === 'fish' && settings?.hide_fish_tab)
+    ));
+    // Keep the vinyl optically centred. Hidden entries always pull the next
+    // button over from the right, so the two nav groups stay contiguous; an
+    // even number of remaining entries leaves an odd slot count, which the
+    // refresh button absorbs by spanning two slots.
+    const wideRefresh = items.length % 2 === 0;
+    const slots = items.length + (wideRefresh ? 2 : 1);
+    const leftCount = Math.floor(slots / 2);
+    return {
+      items,
+      left: items.slice(0, leftCount),
+      right: items.slice(leftCount),
+      wideRefresh,
+    };
+  }, [settings?.hide_live_tab, settings?.hide_pgc_tab, settings?.hide_fish_tab]);
   const playlist = settings?.playlist || [];
   const playlistCurrent = settings?.playlist_current ?? null;
-  const rows = Math.min(5, playlist.length);
+  const rows = Math.min(7, playlist.length);
   const playlistStart = Math.min(playlistScroll, Math.max(0, playlist.length - rows));
-  const vinylArt = (playlistCurrent != null ? playlist[playlistCurrent]?.cover : '') || vinylCover;
+  const vinylArt = playlistCurrent != null ? playlist[playlistCurrent]?.cover || '' : '';
 
   const playQueueIndex = useCallback(async (index: number) => {
     const entry = playlist[index];
@@ -443,14 +536,62 @@ export default function App({ initial }: { initial?: AppInitial }) {
     setPlaylistOpen(false);
   }, [saveSettings]);
 
-  const stepQueue = useCallback((direction: number) => {
-    if (!playlist.length) return;
-    const base = playlistCurrent ?? (direction > 0 ? -1 : 0);
-    let next = base + direction;
-    if (next < 0) next = playlist.length - 1;
-    if (next >= playlist.length) next = 0;
-    playQueueIndex(next);
-  }, [playlist, playlistCurrent, playQueueIndex]);
+  // The active pill is one shared element, so switching tabs slides it under
+  // the vinyl instead of swapping two unrelated backgrounds.
+  useLayoutEffect(() => {
+    const bar = bottomBarRef.current;
+    if (!bar) return;
+    const measure = () => {
+      const active = bar.querySelector<HTMLButtonElement>('.bottom-item.active');
+      if (!active) {
+        setBottomPill((pill) => (pill.ready ? { ...pill, ready: false } : pill));
+        return;
+      }
+      // Use layout offsets, not getBoundingClientRect: the bar's entrance
+      // animation scales it to 0.96, which would leave the pill permanently
+      // 4% too small and a fraction of a pixel off-centre.
+      const nav = active.closest<HTMLElement>('.bottom-nav');
+      setBottomPill({
+        left: (nav?.offsetLeft || 0) + active.offsetLeft,
+        top: (nav?.offsetTop || 0) + active.offsetTop,
+        size: active.offsetWidth,
+        ready: true,
+      });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(bar);
+    const timer = window.setTimeout(measure, 80);
+    window.addEventListener('resize', measure);
+    return () => {
+      observer.disconnect();
+      window.clearTimeout(timer);
+      window.removeEventListener('resize', measure);
+    };
+  }, [route.name, dock]);
+
+  // Optical centering: several icon paths (TV antenna, fish tail, refresh
+  // arrow) do not put their ink at 12,12 inside the 24px viewBox. Shift each
+  // SVG by the measured bbox delta so the visible strokes, not just the box,
+  // sit in the exact centre of the round button.
+  useLayoutEffect(() => {
+    const bar = bottomBarRef.current;
+    if (!bar) return;
+    const center = () => {
+      bar.querySelectorAll<SVGSVGElement>('.bottom-icon svg').forEach((svg) => {
+        const box = svg.getBBox();
+        const width = svg.getBoundingClientRect().width;
+        if (!box.width || !box.height || !width) return;
+        const scale = width / 24;
+        const dx = (12 - (box.x + box.width / 2)) * scale;
+        const dy = (12 - (box.y + box.height / 2)) * scale;
+        svg.style.transform = `translate(${dx}px, ${dy}px)`;
+      });
+    };
+    center();
+    const timer = window.setTimeout(center, 60);
+    return () => window.clearTimeout(timer);
+  }, [route.name, dock]);
 
   if (!settings) {
     return (
@@ -471,7 +612,8 @@ export default function App({ initial }: { initial?: AppInitial }) {
     );
   }
 
-  const activeNav = navItems.some((item) => item.key === route.name) ? route.name : '';
+  const activeNav = dock.items.some((item) => item.key === route.name) ? route.name : '';
+  const currentEntry = playlistCurrent != null ? playlist[playlistCurrent] : null;
 
   const page = (() => {
     switch (route.name) {
@@ -494,164 +636,142 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
   return (
     <AppContext.Provider value={{ settings, account, saveSettings, reloadSettings, navigate, route, toast: show, launch, refreshAccount, openSearch: openSearchMorph }}>
-      <div className="app">
-        <header className="topbar drag">
-          <div className="account-area no-drag" ref={accountRef}>
-            <button
-              className={`account-trigger ${accountOpen ? 'open' : ''}`}
-              title="账户"
-              onClick={() => {
-                setSearchOpen(false);
-                setPlaylistOpen(false);
-                setAccountOpen((open) => !open);
-              }}
-            >
-              {account?.face
-                ? <img className="account-avatar" src={cover(account.face)} referrerPolicy="no-referrer" alt="" />
-                : <div className="account-avatar placeholder" />}
-              <div className="account-copy">
-                <div className="account-name">{account?.uname || '未登录'}</div>
-                <div className="account-uid">{account?.mid ? `UID: ${account.mid}` : '点击头像登录'}</div>
-              </div>
-            </button>
+      <div className={`app${maximized ? ' maximized' : ''}`} ref={appRef}>
 
-            <button className="top-gear" title="设置" onClick={() => accountGo('settings')}><IconGear size={17} /></button>
+        <div className="workspace">
+          <header className="topbar">
+            <div className="topbar-account no-drag" ref={accountRef}>
+              <button
+                className={`topbar-avatar ${accountOpen ? 'open' : ''}`}
+                title={
+                  account
+                    ? `${account.uname} · UID ${account.mid}`
+                    : lastAccount
+                      ? `上次登录 · ${lastAccount.uname}`
+                      : '点击头像登录'
+                }
+                onClick={() => {
+                  setSearchOpen(false);
+                  setPlaylistOpen(false);
+                  setAccountOpen((open) => !open);
+                }}
+              >
+                {avatarFace
+                  ? <img className="account-avatar" src={cover(avatarFace)} referrerPolicy="no-referrer" alt="" />
+                  : <div className="account-avatar placeholder" />}
+              </button>
 
-            {accountOpen ? (
-              <div className="account-menu no-drag">
-                <div className="account-menu-head">
-                  {account?.face
-                    ? <img src={cover(account.face)} referrerPolicy="no-referrer" alt="" />
-                    : <div className="account-avatar placeholder" />}
-                  <div>
-                    <div className="account-menu-name">{account?.uname || '未登录'}</div>
-                    <div className="account-menu-uid">{account?.mid ? `UID: ${account.mid}` : '点击下方登录'}</div>
+              {accountOpen ? (
+                <div className="account-menu topbar-account-menu">
+                  <div className="account-menu-head">
+                    {avatarFace
+                      ? <img src={cover(avatarFace)} referrerPolicy="no-referrer" alt="" />
+                      : <div className="account-avatar placeholder" />}
+                    <div>
+                      <div className="account-menu-name">
+                        {account?.uname || (lastAccount ? `上次登录 · ${lastAccount.uname}` : '未登录')}
+                      </div>
+                      <div className="account-menu-uid">
+                        {account?.mid
+                          ? `UID ${account.mid}`
+                          : lastAccount
+                            ? `UID ${lastAccount.mid}`
+                            : '点击下方登录'}
+                      </div>
+                    </div>
                   </div>
+                  <div className="account-menu-rule" />
+                  <button className="account-menu-row" onClick={() => accountGo('member')}><IconStar size={15} />会员 / 账户</button>
+                  <button className="account-menu-row" onClick={() => accountGo('settings')}><IconGear size={15} />设置</button>
+                  <button className="account-menu-row danger" disabled={!account} onClick={logout}><IconClose size={14} />退出登录</button>
                 </div>
-                <div className="account-menu-rule" />
-                <button className="account-menu-row" onClick={() => accountGo('member')}><IconStar size={15} />会员 / 账户</button>
-                <button className="account-menu-row" onClick={() => accountGo('settings')}><IconGear size={15} />设置</button>
-                <button className="account-menu-row" onClick={() => accountGo('history')}><IconClock size={15} />历史</button>
-                <button className="account-menu-row" onClick={() => accountGo('downloads')}><IconDownload size={15} />下载</button>
-                <button className="account-menu-row danger" disabled={!account} onClick={logout}><IconClose size={14} />退出登录</button>
+              ) : null}
+            </div>
+
+            <div ref={searchWrapRef} className={`search-area no-drag ${searchOpen ? 'open' : ''}`}>
+              <div
+                className={`search-dock ${searchOpen ? 'open' : ''}`}
+                onClick={() => {
+                  setPlaylistOpen(false);
+                  if (!searchOpen) openSearchMorph();
+                  else searchInputRef.current?.focus();
+                }}
+              >
+                <button
+                  ref={searchBtnRef}
+                  className="search-toggle"
+                  title="搜索（/）"
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setPlaylistOpen(false);
+                    if (!searchOpen) openSearchMorph();
+                    else searchInputRef.current?.focus();
+                  }}
+                ><IconSearch size={16} /></button>
+                <span className="search-placeholder">搜索视频或 UP 主</span>
+                <input
+                  ref={searchInputRef}
+                  tabIndex={searchOpen ? 0 : -1}
+                  placeholder="搜索视频或 UP 主"
+                  value={searchDraft}
+                  onChange={(event) => setSearchDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') submitSearch();
+                    if (event.key === 'Escape') setSearchOpen(false);
+                  }}
+                />
+                <button
+                  className="search-close"
+                  tabIndex={searchOpen ? 0 : -1}
+                  title="关闭"
+                  onClick={(event) => { event.stopPropagation(); setSearchOpen(false); }}
+                ><IconClose size={12} /></button>
               </div>
-            ) : null}
-          </div>
-          <div className="spacer" />
-          <div className="window-controls no-drag">
-            <button className="icon-btn" title="最小化" onClick={() => window.o11a1.window.minimize()}><IconMin /></button>
-            <button className="icon-btn" title={maximized ? '还原' : '最大化'} onClick={async () => setMaximized(await window.o11a1.window.maximize())}><IconMax /></button>
-            <button
-              className="icon-btn close"
-              title={settings.close_action === 2 ? '退出程序' : '关闭到托盘'}
-              onClick={() => {
-                if (settings.close_action === 2) window.o11a1.window.quit();
-                else window.o11a1.window.close();
-              }}
-            ><IconClose /></button>
-          </div>
-        </header>
+            </div>
 
-        <main className="page">
-          <div className="page-inner" key={`${route.name}-${route.id}`}>
-            {notice ? (
-              <div className="banner">
-                <span>发现新版本 {notice.version}（当前 {appVersion}）</span>
-                <span className="spacer" />
-                <button className="btn sm primary" onClick={() => window.o11a1.update.open(notice.url)}>查看</button>
-                <button className="btn sm ghost" onClick={() => setNotice(null)}>忽略</button>
-              </div>
-            ) : null}
-            {page}
-          </div>
-        </main>
+            <div className="window-controls no-drag">
+              <button className="icon-btn" title="最小化" onClick={() => window.o11a1.window.minimize()}><IconMin /></button>
+              <button className="icon-btn" title={maximized ? '还原' : '最大化'} onClick={async () => setMaximized(await window.o11a1.window.maximize())}><IconMax /></button>
+              <button
+                className="icon-btn close"
+                title={settings.close_action === 2 ? '退出程序' : '关闭到托盘'}
+                onClick={() => {
+                  if (settings.close_action === 2) window.o11a1.window.quit();
+                  else window.o11a1.window.close();
+                }}
+              ><IconClose /></button>
+            </div>
+          </header>
 
-        <nav className={`bottom ${searchOpen ? 'searching' : ''}`}>
-          {navLeft.map((item) => (
-            <button
-              key={item.key}
-              className={`nav-pill ${activeNav === item.key ? 'active' : ''}`}
-              onClick={() => navigate(item.key === 'home' ? 'home' : `${item.key}`)}
-            >
-              {item.label}
-            </button>
-          ))}
+          <main className="page">
+            <div className="page-inner" key={`${route.name}-${route.id}`}>
+              {notice ? (
+                <div className="banner">
+                  <span>发现新版本 {notice.version}（当前 {appVersion}）</span>
+                  <span className="spacer" />
+                  <button className="btn sm primary" onClick={() => window.o11a1.update.open(notice.url)}>查看</button>
+                  <button className="btn sm ghost" onClick={() => setNotice(null)}>忽略</button>
+                </div>
+              ) : null}
+              {page}
+            </div>
+          </main>
 
-          <div className="vinyl-slot">
-            <button
-              ref={vinylRef}
-              className={`vinyl-record ${playlistOpen ? 'open' : ''}`}
-              title="播放列表"
-              onClick={() => {
-                setSearchOpen(false);
-                setPlaylistOpen((open) => {
-                  if (!open) {
-                    const max = Math.max(0, playlist.length - 5);
-                    setPlaylistScroll(Math.min(Math.max(0, (playlistCurrent ?? 0) - 2), max));
-                  }
-                  return !open;
-                });
-              }}
-            >
-              {vinylArt ? <img className="vinyl-art" src={cover(vinylArt)} referrerPolicy="no-referrer" alt="" /> : <span className="vinyl-fallback">O11A1</span>}
-              <span className="vinyl-ring" />
-              <span className="vinyl-hole" />
-            </button>
-          </div>
-
-          {navRight.map((item) => (
-            <button
-              key={item.key}
-              className={`nav-pill ${activeNav === item.key ? 'active' : ''}`}
-              onClick={() => navigate(item.key === 'home' ? 'home' : `${item.key}`)}
-            >
-              {item.label}
-            </button>
-          ))}
-
-          <button className="refresh-pill" onClick={triggerRefresh}>刷新</button>
-          <button
-            ref={searchBtnRef}
-            className={`search-btn ${searchOpen ? 'active' : ''}`}
-            title="搜索"
-            onClick={() => {
-              setPlaylistOpen(false);
-              if (searchOpen) setSearchOpen(false);
-              else openSearchMorph();
-            }}
-          ><IconSearch size={16} /></button>
-
-          <div ref={searchWrapRef} className={`search-morph ${searchOpen ? 'open' : ''}`} aria-hidden={!searchOpen}>
-            <IconSearch size={15} className="search-morph-icon" />
-            <input
-              ref={searchInputRef}
-              tabIndex={searchOpen ? 0 : -1}
-              value={searchDraft}
-              placeholder="输入关键词，回车搜索 · Esc 关闭"
-              onChange={(event) => setSearchDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') submitSearch();
-                if (event.key === 'Escape') setSearchOpen(false);
-              }}
-            />
-            <button tabIndex={searchOpen ? 0 : -1} title="关闭" onClick={() => setSearchOpen(false)}><IconClose size={12} /></button>
-          </div>
-
+        <div className="dock">
           {playlistOpen ? (
             <div
               ref={playlistRef}
               className="playlist-popover"
               onWheel={(event) => {
-                const max = Math.max(0, playlist.length - 5);
+                const max = Math.max(0, playlist.length - 7);
                 if (max === 0) return;
                 setPlaylistScroll((start) => Math.min(max, Math.max(0, start + (event.deltaY > 0 ? 1 : -1))));
               }}
             >
               <div className="queue-head">
-                <strong>播放列表</strong>
-                <span>{playlist.length} 项</span>
+                <strong>播放队列</strong>
               </div>
-              {rows === 0 ? <div className="queue-empty">播放列表为空</div> : null}
               <div className="queue-rows">
                 {playlist.slice(playlistStart, playlistStart + rows).map((entry: any, index: number) => {
                   const actual = playlistStart + index;
@@ -664,7 +784,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
                     >
                       <div className="queue-cover">
                         {entry.cover
-                          ? <img src={cover(entry.cover)} referrerPolicy="no-referrer" alt="" />
+                          ? <CoverImage src={entry.cover} alt="" />
                           : <span className="queue-cover-fallback" />}
                         {active ? <span className="queue-playing"><i /><i /><i /></span> : null}
                       </div>
@@ -681,51 +801,117 @@ export default function App({ initial }: { initial?: AppInitial }) {
                   );
                 })}
               </div>
-              <div className="queue-foot">
-                <button
-                  className={`queue-switch ${settings.playlist_autoplay ? 'on' : ''}`}
-                  onClick={() => saveSettings({ playlist_autoplay: !settings.playlist_autoplay })}
-                >
-                  <span>自动播放</span>
-                  <i className="queue-switch-track"><i /></i>
-                </button>
-                <button
-                  className={`queue-switch ${settings.playlist_random ? 'on' : ''}`}
-                  onClick={() => saveSettings({ playlist_random: !settings.playlist_random })}
-                >
-                  <span>随机播放</span>
-                  <i className="queue-switch-track"><i /></i>
-                </button>
-                <span className="queue-foot-spacer" />
-                <button className="queue-step" title="上一首" onClick={() => stepQueue(-1)}>‹</button>
-                <button className="queue-step" title="下一首" onClick={() => stepQueue(1)}>›</button>
-                <button className="queue-clear" onClick={clearQueue}>清空</button>
-              </div>
+              {playlist.length ? (
+                <div className="queue-foot">
+                  <button className="queue-clear" onClick={clearQueue}>清空</button>
+                </div>
+              ) : null}
             </div>
           ) : null}
-        </nav>
 
-        {holdRing ? (
+          <div className="bottom-bar no-drag" ref={bottomBarRef}>
+            <span
+              className={`bottom-pill ${bottomPill.ready ? 'ready' : ''}`}
+              style={{
+                transform: `translate(${bottomPill.left}px, ${bottomPill.top}px)`,
+                width: bottomPill.size,
+                height: bottomPill.size,
+              }}
+            />
+            <nav className="bottom-nav">
+              {dock.left.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.key}
+                    className={`bottom-item ${activeNav === item.key ? 'active' : ''}`}
+                    data-tip={item.hint || item.label}
+                    aria-label={item.hint || item.label}
+                    onClick={() => dockGo(item.key)}
+                  >
+                    <span className="bottom-icon"><Icon size={18} /></span>
+                  </button>
+                );
+              })}
+            </nav>
+
+            <button
+              ref={vinylRef}
+              className={`bottom-disc ${playlistOpen ? 'open' : ''} ${currentEntry ? 'playing' : ''}`}
+              data-tip="播放队列"
+              aria-label="播放队列"
+              onClick={() => {
+                setSearchOpen(false);
+                setAccountOpen(false);
+                setPlaylistOpen((open) => {
+                  if (!open) {
+                    const max = Math.max(0, playlist.length - 7);
+                    setPlaylistScroll(Math.min(Math.max(0, (playlistCurrent ?? 0) - 2), max));
+                  }
+                  return !open;
+                });
+              }}
+            >
+              <span className="vinyl-disc">
+                {vinylArt ? <img className="vinyl-art" src={cover(vinylArt)} referrerPolicy="no-referrer" alt="" /> : null}
+                <span className="vinyl-ring" />
+                <span className="vinyl-hole" />
+              </span>
+            </button>
+
+            <nav className="bottom-nav">
+              {dock.right.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.key}
+                    className={`bottom-item ${activeNav === item.key ? 'active' : ''}`}
+                    data-tip={item.hint || item.label}
+                    aria-label={item.hint || item.label}
+                    onClick={() => dockGo(item.key)}
+                  >
+                    <span className="bottom-icon"><Icon size={18} /></span>
+                  </button>
+                );
+              })}
+              <button
+                className={`bottom-item refresh ${dock.wideRefresh ? 'wide' : ''} ${dockRefresh ? 'refreshing' : ''}`}
+                data-tip="刷新"
+                aria-label="刷新"
+                onClick={dockRefreshNow}
+              >
+                <span className="bottom-icon"><IconRefresh size={18} /></span>
+              </button>
+            </nav>
+          </div>
+        </div>
+
+        </div>
+
+        {holdPoint ? (
           <div
-            className={`hold-ring ${holdRing.fired ? 'fired' : ''}`}
-            style={{ left: holdRing.x, top: holdRing.y }}
+            key={holdPoint.id}
+            ref={holdBoxRef}
+            className="hold-refresh"
+            style={{ left: holdPoint.x, top: holdPoint.y }}
+            role="status"
+            aria-live="polite"
           >
-            <svg viewBox="0 0 36 36" aria-hidden="true">
-              <circle className="track" cx="18" cy="18" r="15.5" />
+            <svg className="hold-refresh-ring" viewBox="0 0 44 44" aria-hidden="true">
+              <circle className="hold-refresh-track" cx="22" cy="22" r="18" />
               <circle
-                className="fill"
-                cx="18"
-                cy="18"
-                r="15.5"
-                pathLength={100}
-                strokeDasharray={100}
-                strokeDashoffset={100 - holdRing.progress * 100}
+                ref={holdFillRef}
+                className="hold-refresh-fill"
+                cx="22"
+                cy="22"
+                r="18"
+                strokeDasharray={HOLD_RING_LENGTH}
+                strokeDashoffset={HOLD_RING_LENGTH}
               />
             </svg>
           </div>
         ) : null}
 
-        {hud ? <div className="hud">FPS {hudStats.fps.toFixed(0)} · frame {hudStats.ms.toFixed(2)} ms</div> : null}
         {toast ? <div className={`toast ${toast.error ? 'error' : ''}`}>{toast.text}</div> : null}
       </div>
     </AppContext.Provider>

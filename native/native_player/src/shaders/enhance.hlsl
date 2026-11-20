@@ -50,6 +50,38 @@ float4 brightness_main(float4 frag : SV_Position) : SV_Target
     return float4(saturate(colour.rgb * extra.x), 1.0);
 }
 
+// ------------------------------------------------------------ GPU 插帧
+// Two decoded pictures -> one in-between picture. `extra.x` is the weight of
+// `tex_aux` in 0..1. Both textures are the picture's own size, so a point load
+// is exact and the whole 4K blend stays on the GPU (no BGRA readback).
+float4 blend_main(float4 frag : SV_Position) : SV_Target
+{
+    int2 p = int2(frag.xy);
+    float3 a = L(tex_src, p).rgb;
+    float3 b = L(tex_aux, p).rgb;
+    return float4(lerp(a, b, saturate(extra.x)), 1.0);
+}
+
+// ------------------------------------------------------ NV12 -> BGRA (GPU)
+// The decoder's Y (R8) and interleaved UV (R8G8) planes become one BGRA
+// picture. Coefficients are the same BT.709 limited-range integers the old CPU
+// `convert.rs` used (298/403/48/120/475 over 256), and chroma is sampled with
+// `p / 2` exactly like the CPU loop did. This replaces the per-frame 4K
+// NV12→BGRA pass that limited playback to ~22 fps.
+float4 nv12_main(float4 frag : SV_Position) : SV_Target
+{
+    int2 p = int2(frag.xy);
+    float yy = tex_src.Load(int3(p, 0)).x * 255.0;
+    float2 uv = tex_aux.Load(int3(p / 2, 0)).rg * 255.0;
+    float luma = (yy - 16.0) * (298.0 / 256.0);
+    float cb = uv.x - 128.0;
+    float cr = uv.y - 128.0;
+    float rr = luma + cr * (403.0 / 256.0);
+    float gg = luma - (48.0 * cb + 120.0 * cr) / 256.0;
+    float bb = luma + cb * (475.0 / 256.0);
+    return float4(saturate(rr / 255.0), saturate(gg / 255.0), saturate(bb / 255.0), 1.0);
+}
+
 // ------------------------------------------------------- AMD CAS (锐化)
 // 5-tap cross plus the soft clamp: the negative lobe is limited to what cannot
 // drive a tap past [0, 1], then scaled by the strength. `extra.x` is the

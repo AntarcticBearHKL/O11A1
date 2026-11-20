@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { call, cover, formatCount, formatDate, formatDuration, formatTime, relativeTime } from './api';
+import { CoverImage } from './components/CoverImage';
 import { addToPlaylist, enqueuePlaylist, resolvePgcSource } from './player';
 import { useToast } from './hooks';
 import type { Comment, CommentPage, FeedVideo, Settings, VideoDetail } from './types';
@@ -143,6 +144,10 @@ export default function PlayerApp() {
       setDuration(Number(merged.startMs || 0));
       setPosition(Number(merged.startMs || 0));
       sendRect();
+      // The native window owns the danmaku sliders and stores them in the
+      // global settings file. Refresh the renderer snapshot after opening so
+      // the side panel edits the freshly persisted values, not stale ones.
+      call<Settings>('settings.get').then(setSettings).catch(() => {});
     } catch (error: any) {
       setOpenError(error.message || '播放器打开失败');
       show(error.message || '播放器打开失败', true);
@@ -558,10 +563,11 @@ export default function PlayerApp() {
     if (!state.ended) return;
     const playlist = settings?.playlist || [];
     if (settings?.playlist_autoplay && playlist.length > 1) {
-      if (settings.loop_one) {
+      const loopMode = Number(settings?.loop_mode ?? (settings?.loop_one ? 1 : 2));
+      if (loopMode === 1) {
         seek(0);
         command('play');
-      } else {
+      } else if (loopMode === 2) {
         nextPlaylist();
       }
     } else if (!settings?.playlist_autoplay && settings?.playlist_current != null) {
@@ -896,7 +902,7 @@ export default function PlayerApp() {
                   {detail ? (
                     <>
                       <div className="side-cover" role="button" tabIndex={0} title="播放 / 暂停" onClick={togglePlay}>
-                        <img src={cover(detail.pic)} referrerPolicy="no-referrer" alt="" />
+                        <CoverImage src={detail.pic} alt="" eager />
                         <span>{formatDuration(detail.duration)}</span>
                       </div>
                       <div className="side-info-title">{detail.title}</div>
@@ -957,7 +963,7 @@ export default function PlayerApp() {
                     <>
                       {options.cover ? (
                         <div className="side-cover">
-                          <img src={cover(options.cover)} referrerPolicy="no-referrer" alt="" />
+                          <CoverImage src={options.cover} alt="" eager />
                         </div>
                       ) : null}
                       <div className="side-info-title">{options.title || title}</div>
@@ -973,7 +979,7 @@ export default function PlayerApp() {
                   {related.slice(0, 8).map((item) => (
                     <div className="side-related" key={item.bvid} onClick={() => playVideoNow(item)}>
                       <div className="side-related-cover">
-                        <img src={cover(item.pic)} referrerPolicy="no-referrer" alt="" />
+                        <CoverImage src={item.pic} alt="" />
                         {item.duration > 0 ? <span>{formatDuration(item.duration)}</span> : null}
                       </div>
                       <div className="side-related-body">
@@ -1098,11 +1104,16 @@ export default function PlayerApp() {
                   <input type="range" min={0} max={100} style={{ width: '100%' }} value={settings.danmaku_opacity} onChange={(event) => saveSettings({ danmaku_opacity: Number(event.target.value) })} onMouseUp={() => reopenAt({})} />
                   <label style={{ fontSize: 11.5, display: 'block', marginTop: 8 }}>速度 {settings.danmaku_speed}%</label>
                   <input type="range" min={50} max={200} style={{ width: '100%' }} value={settings.danmaku_speed} onChange={(event) => saveSettings({ danmaku_speed: Number(event.target.value) })} onMouseUp={() => reopenAt({})} />
-                  <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-                    {['小', '标准', '大'].map((label, index) => (
-                      <button key={label} className={`chip small ${settings.danmaku_font === index ? 'active' : ''}`} onClick={() => applyDanmakuSettings({ danmaku_font: index })}>{label}</button>
-                    ))}
-                  </div>
+                  <label style={{ fontSize: 11.5, display: 'block', marginTop: 8 }}>字号 {settings.danmaku_font}%</label>
+                  <input
+                    type="range"
+                    min={50}
+                    max={150}
+                    style={{ width: '100%' }}
+                    value={settings.danmaku_font}
+                    onChange={(event) => saveSettings({ danmaku_font: Number(event.target.value) })}
+                    onMouseUp={() => reopenAt({})}
+                  />
                   <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
                     {[25, 50, 75, 100].map((area) => (
                       <button key={area} className={`chip small ${settings.danmaku_area === area ? 'active' : ''}`} onClick={() => applyDanmakuSettings({ danmaku_area: area })}>{area}%</button>
@@ -1209,7 +1220,7 @@ export default function PlayerApp() {
           <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
             <button className={`chip small ${settings?.playlist_autoplay ? 'active' : ''}`} onClick={() => saveSettings({ playlist_autoplay: !settings?.playlist_autoplay })}>自动连播</button>
             <button className={`chip small ${settings?.playlist_random ? 'active' : ''}`} onClick={() => saveSettings({ playlist_random: !settings?.playlist_random })}>随机</button>
-            <button className={`chip small ${settings?.loop_one ? 'active' : ''}`} onClick={() => saveSettings({ loop_one: !settings?.loop_one })}>单曲循环</button>
+            <button className={`chip small ${Number(settings?.loop_mode ?? (settings?.loop_one ? 1 : 2)) !== 2 ? 'active' : ''}`} onClick={() => { const loopMode = Number(settings?.loop_mode ?? (settings?.loop_one ? 1 : 2)); const next = (loopMode + 1) % 4; saveSettings({ loop_mode: next, loop_one: next === 1 }); }}>{['循环：暂停', '循环：单曲', '循环：下一首', '循环：下一分P'][Number(settings?.loop_mode ?? (settings?.loop_one ? 1 : 2))]}</button>
             <button className="btn sm danger" style={{ marginLeft: 'auto' }} onClick={() => saveSettings({ playlist: [], playlist_current: null })}>清空</button>
           </div>
         </div>

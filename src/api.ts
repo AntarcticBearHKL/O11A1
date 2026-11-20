@@ -1,13 +1,25 @@
+import { takePageCache } from './pageCache';
+
 declare global {
   interface Window {
     o11a1: any;
   }
 }
 
-export async function call<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {
+/// Always go to the engine. Used by the background page preloader so warming
+/// a key can never consume the very entry it is trying to create.
+export async function callRaw<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {
   const response = await window.o11a1.call(method, params);
   if (!response?.ok) throw new Error(response?.error || '引擎调用失败');
   return response.data as T;
+}
+
+/// Page code uses this. A background-warmed entry is served once and removed;
+/// everything after that is a normal engine request.
+export async function call<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {
+  const cached = takePageCache<T>(method, params);
+  if (cached.hit) return cached.data as T;
+  return callRaw<T>(method, params);
 }
 
 export function formatCount(value: number | string | undefined | null): string {
@@ -56,6 +68,18 @@ export function cover(url: string | undefined | null): string {
   if (url.startsWith('//')) return `https:${url}`;
   if (url.startsWith('http://')) return `https://${url.slice(7)}`;
   return url;
+}
+
+/// Grid covers are displayed at roughly 226×142; requesting a 480px CDN
+/// rendition cuts decode and GPU memory by a large factor and keeps scrolling
+/// smooth. Animated GIFs and URLs that already carry an @ rendition are left
+/// untouched.
+export function cardCover(url: string | undefined | null): string {
+  const full = cover(url);
+  if (!full || !/hdslb\.com\/bfs\//i.test(full)) return full;
+  const [path, query] = full.split('?');
+  if (/@[^/]+$/.test(path) || /\.gif$/i.test(path)) return full;
+  return `${path}@480w_300h_1c.webp${query ? `?${query}` : ''}`;
 }
 
 export function stripHtml(value: string): string {

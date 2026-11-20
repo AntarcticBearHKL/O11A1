@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { call, cover } from '../api';
+import { call } from '../api';
+import { CoverImage } from '../components/CoverImage';
 import { useApp } from '../context';
 import type { DownloadTask } from '../types';
-import { Empty, PageHead } from '../components/Common';
+import { Empty } from '../components/Common';
 import { IconDownload, IconTrash } from '../components/Icons';
 
 export default function Downloads() {
@@ -61,30 +62,31 @@ export default function Downloads() {
 
   return (
     <>
-      <PageHead title="离线下载" sub="DASH 视频 + 音频，ffmpeg 无损合流为 MP4 · 最多同时 2 个任务" />
       {!tasks.length && !loading ? <Empty title="还没有下载任务" hint="在视频详情页点击「下载」加入队列" /> : null}
-      <div className="card panel">
-        {tasks.map((task) => (
-          <div className="download-row" key={task.id}>
-            <img src={cover(task.cover)} referrerPolicy="no-referrer" alt="" />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 13 }}>{task.title || task.bvid}</div>
-              <div style={{ color: task.status === 'error' ? 'var(--danger)' : 'var(--text-faint)', fontSize: 11.5, marginTop: 4 }}>{statusText(task)}</div>
+      {tasks.length || loading ? (
+        <div className="card panel">
+          {tasks.map((task) => (
+            <div className="download-row" key={task.id}>
+              <CoverImage src={task.cover} alt="" style={{ width: 112, aspectRatio: '16/9', objectFit: 'cover', borderRadius: 9 }} />
+              <div className="download-copy">
+                <div className="download-title">{task.title || task.bvid}</div>
+                <div className={`download-state ${task.status === 'error' ? 'error' : ''}`}>{statusText(task)}</div>
+                {task.status === 'running' || task.status === 'queued' ? (
+                  <div className="bar"><div style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }} /></div>
+                ) : null}
+              </div>
               {task.status === 'running' || task.status === 'queued' ? (
-                <div className="bar"><div style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }} /></div>
+                <button className="btn sm" onClick={() => cancel(task)}>取消</button>
               ) : null}
+              {task.status === 'done' ? (
+                <button className="btn sm" onClick={() => window.o11a1.shell.openPath(task.path)}><IconDownload size={13} /> 打开</button>
+              ) : null}
+              <button className="btn sm ghost" onClick={() => remove(task)}><IconTrash size={13} /></button>
             </div>
-            {task.status === 'running' || task.status === 'queued' ? (
-              <button className="btn sm" onClick={() => cancel(task)}>取消</button>
-            ) : null}
-            {task.status === 'done' ? (
-              <button className="btn sm" onClick={() => window.o11a1.shell.openPath(task.path)}><IconDownload size={13} /> 打开</button>
-            ) : null}
-            <button className="btn sm ghost" onClick={() => remove(task)}><IconTrash size={13} /></button>
-          </div>
-        ))}
-        {loading && !tasks.length ? <div className="empty"><span className="spinner" /></div> : null}
-      </div>
+          ))}
+          {loading && !tasks.length ? <div className="empty"><span className="spinner" /></div> : null}
+        </div>
+      ) : null}
     </>
   );
 }

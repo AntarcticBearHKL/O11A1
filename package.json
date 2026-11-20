@@ -1,6 +1,6 @@
 {
   "name": "o11a1-electron",
-  "version": "0.1.6",
+  "version": "0.6.174",
   "private": true,
   "description": "O11A1 Electron UI + Rust video engine",
   "author": "O11A1",
@@ -42,6 +42,7 @@
       "dist/**/*",
       "electron/**/*",
       "assets/**/*",
+      "!assets/fonts/*.ttf",
       "package.json"
     ],
     "extraResources": [

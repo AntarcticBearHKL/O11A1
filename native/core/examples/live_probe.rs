@@ -1,4 +1,4 @@
-﻿//! QA helper: print one live room's FLV/HLS URL. Not part of the app.
+//! QA helper: print one live room's FLV/HLS URL. Not part of the app.
 //!
 //! `cargo run -p o11a1-core --example live_probe`
 
@@ -28,4 +28,3 @@ fn main() -> anyhow::Result<()> {
     });
     result
 }
-

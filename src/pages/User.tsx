@@ -3,9 +3,10 @@ import { call, cover, formatCount } from '../api';
 import { useApp } from '../context';
 import type { SpaceVideoPage, UpInfo } from '../types';
 import { ErrorBox, SkeletonGrid, VideoGrid } from '../components/Common';
+import { IconBack } from '../components/Icons';
 
 export default function User({ mid }: { mid: number }) {
-  const { launch, toast } = useApp();
+  const { launch, toast, navigate } = useApp();
   const [info, setInfo] = useState<UpInfo | null>(null);
   const [relation, setRelation] = useState<{ following: number; follower: number } | null>(null);
   const [videos, setVideos] = useState<any[]>([]);
@@ -59,28 +60,38 @@ export default function User({ mid }: { mid: number }) {
   if (loading) return <SkeletonGrid count={8} />;
   if (error || !info) return <ErrorBox error={error || '没有找到 UP 主'} onRetry={load} />;
 
+  const goBack = () => {
+    if (window.history.length > 1) window.history.back();
+    else navigate('home');
+  };
+
   return (
     <>
-      <div className="card panel" style={{ display: 'flex', gap: 18, alignItems: 'center', marginBottom: 18 }}>
-        <img className="avatar lg" style={{ width: 82, height: 82 }} src={cover(info.face)} referrerPolicy="no-referrer" alt="" />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <h1 style={{ margin: 0, fontSize: 24 }}>{info.name}</h1>
+      <div className="page-back">
+        <button className="btn ghost sm" onClick={goBack} title="返回上一页"><IconBack size={13} />返回</button>
+      </div>
+      <section className="profile-hero">
+        <div className="profile-avatar-wrap">
+          <img className="profile-avatar" src={cover(info.face)} referrerPolicy="no-referrer" alt="" />
+        </div>
+        <div className="profile-copy">
+          <div className="profile-name">
+            <h1>{info.name}</h1>
             <span className="chip small">LV{info.level}</span>
-            {info.vip ? <span className="chip small" style={{ color: 'var(--accent)' }}>{info.vip}</span> : null}
+            {info.vip ? <span className="chip small accent-chip">{info.vip}</span> : null}
           </div>
-          <div style={{ color: 'var(--text-dim)', fontSize: 12.5, marginTop: 8, lineHeight: 1.55 }}>{info.sign || '这个人很神秘，什么都没有写'}</div>
-          <div style={{ display: 'flex', gap: 18, marginTop: 10, color: 'var(--text-faint)', fontSize: 12 }}>
-            <span>{formatCount(info.fans)} 粉丝</span>
-            <span>{formatCount(info.friend)} 关注</span>
-            {relation ? <span>{formatCount(relation.follower)} 关注者</span> : null}
+          <p className="profile-sign">{info.sign || '这个人很神秘，什么都没有写'}</p>
+          <div className="profile-stats">
+            <span><b>{formatCount(info.fans)}</b>粉丝</span>
+            <span><b>{formatCount(info.friend)}</b>关注</span>
+            {relation ? <span><b>{formatCount(relation.follower)}</b>关注者</span> : null}
           </div>
         </div>
-        <button className="btn primary" onClick={follow}>关注</button>
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
-        <h2 style={{ margin: 0, fontSize: 18 }}>投稿</h2>
-        <span style={{ marginLeft: 10, color: 'var(--text-faint)', fontSize: 12 }}>{videos.length} 个视频</span>
+        <button className="btn primary profile-follow" onClick={follow}>+ 关注</button>
+      </section>
+      <div className="section-head">
+        <div><span className="section-kicker">作品</span><h2>投稿</h2></div>
+        <span className="section-meta">{videos.length} 个视频</span>
       </div>
       {videos.length ? (
         <VideoGrid
@@ -96,11 +107,11 @@ export default function User({ mid }: { mid: number }) {
             duration: item.length,
             pub_ts: 0,
           }))}
-          onPlay={(item) => launch({ bvid: item.bvid, title: item.title, cover: item.pic, owner: info.name, duration: item.duration }).catch((error) => toast(error.message, true))}
+          onPlay={(item, newWindow) => launch({ bvid: item.bvid, title: item.title, cover: item.pic, owner: info.name, duration: item.duration }, newWindow).catch((error) => toast(error.message, true))}
         />
       ) : <div className="empty">还没有投稿</div>}
       {hasMore ? (
-        <div style={{ display: 'flex', justifyContent: 'center', padding: 22 }}>
+        <div className="page-more">
           <button className="btn" onClick={more}>加载更多</button>
         </div>
       ) : null}

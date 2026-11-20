@@ -172,12 +172,11 @@ fn run(
                 if meta.cell_w == 0 || meta.cell_h == 0 || meta.sheets == 0 {
                     continue;
                 }
-                let per_sheet = (meta.cols as usize).saturating_mul(meta.rows as usize).max(1);
-                let index = cell_index_for(&meta.times, time_ms).min(
-                    meta.sheets
-                        .saturating_mul(per_sheet)
-                        .saturating_sub(1),
-                );
+                let per_sheet = (meta.cols as usize)
+                    .saturating_mul(meta.rows as usize)
+                    .max(1);
+                let index = cell_index_for(&meta.times, time_ms)
+                    .min(meta.sheets.saturating_mul(per_sheet).saturating_sub(1));
                 let sheet_index = index / per_sheet;
                 let Some(sheet) = sheets.get(sheet_index) else {
                     continue;

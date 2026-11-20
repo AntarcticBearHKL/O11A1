@@ -38,11 +38,17 @@ pub struct PlayerState {
     pub audio_only: bool,
     pub topmost: bool,
     pub danmaku_visible: bool,
+    /// Show the five-line debug panel on the video window (性能 tab switch).
+    pub stats: bool,
     /// Last explicitly selected video stream (`qn` + `codecid`).
     pub quality_qn: Option<i64>,
     pub quality_codecid: Option<i64>,
     /// Last explicitly selected DASH audio track index.
     pub audio_index: Option<usize>,
+    /// Last user-resized player client size in 96-DPI units. `None` means the
+    /// window opens at the default size.
+    pub window_width: Option<u32>,
+    pub window_height: Option<u32>,
 }
 
 impl Default for PlayerState {
@@ -56,9 +62,12 @@ impl Default for PlayerState {
             audio_only: false,
             topmost: false,
             danmaku_visible: true,
+            stats: false,
             quality_qn: None,
             quality_codecid: None,
             audio_index: None,
+            window_width: None,
+            window_height: None,
         }
     }
 }
@@ -101,8 +110,7 @@ impl PlayerState {
         let temporary = path.with_extension("json.tmp");
         std::fs::write(&temporary, data)
             .with_context(|| format!("write {}", temporary.display()))?;
-        std::fs::rename(&temporary, path)
-            .with_context(|| format!("replace {}", path.display()))?;
+        std::fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
         Ok(())
     }
 
@@ -110,10 +118,7 @@ impl PlayerState {
     /// loading a normalised file yields the same state again.
     pub fn normalise(&mut self) {
         self.volume = self.volume.min(100);
-        if !self.speed.is_finite() {
-            self.speed = 1.0;
-        }
-        self.speed = self.speed.clamp(0.5, 2.0);
+        self.speed = crate::speed::clamp(self.speed);
         if !self.brightness.is_finite() {
             self.brightness = 1.0;
         }
@@ -126,6 +131,15 @@ impl PlayerState {
         }
         if !matches!(self.quality_qn, Some(qn) if qn > 0) {
             self.quality_qn = None;
+        }
+        let valid_window = matches!(
+            (self.window_width, self.window_height),
+            (Some(width), Some(height))
+                if (320..=16_384).contains(&width) && (180..=16_384).contains(&height)
+        );
+        if !valid_window {
+            self.window_width = None;
+            self.window_height = None;
         }
     }
 }
@@ -158,7 +172,11 @@ impl SaveDebouncer {
         if !self.dirty {
             return false;
         }
-        if self.deadline.map(|deadline| now >= deadline).unwrap_or(true) {
+        if self
+            .deadline
+            .map(|deadline| now >= deadline)
+            .unwrap_or(true)
+        {
             self.dirty = false;
             self.deadline = None;
             true
@@ -191,7 +209,10 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         let id = TEMP_ID.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir()
-            .join(format!("o11a1-player-state-{}-{name}-{id}", std::process::id()))
+            .join(format!(
+                "o11a1-player-state-{}-{name}-{id}",
+                std::process::id()
+            ))
             .join(FILE_NAME)
     }
 
@@ -207,6 +228,8 @@ mod tests {
         assert!(!state.audio_only);
         assert!(!state.topmost);
         assert_eq!(state.quality_qn, None);
+        assert_eq!(state.window_width, None);
+        assert_eq!(state.window_height, None);
     }
 
     #[test]
@@ -221,9 +244,12 @@ mod tests {
             audio_only: true,
             topmost: true,
             danmaku_visible: false,
+            stats: true,
             quality_qn: Some(64),
             quality_codecid: Some(12),
             audio_index: Some(2),
+            window_width: Some(1180),
+            window_height: Some(664),
         };
         state.save_to(&path).expect("save");
         let loaded = PlayerState::load_from(&path);
@@ -235,6 +261,17 @@ mod tests {
     fn missing_file_yields_defaults() {
         let path = temp_path("missing");
         assert_eq!(PlayerState::load_from(&path), PlayerState::default());
+    }
+
+    #[test]
+    fn half_a_saved_window_size_is_discarded() {
+        let path = temp_path("half-window");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"window_width":1280,"window_height":0}"#).unwrap();
+        let loaded = PlayerState::load_from(&path);
+        assert_eq!(loaded.window_width, None);
+        assert_eq!(loaded.window_height, None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -252,13 +289,13 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            r#"{"volume":55,"speed":9.0,"brightness":-4.0,"aspect":99,"quality_codecid":7,"future_field":true}"#,
+            r#"{"volume":55,"speed":99.0,"brightness":-4.0,"aspect":99,"quality_codecid":7,"future_field":true}"#,
         )
         .unwrap();
         let loaded = PlayerState::load_from(&path);
         assert_eq!(loaded.volume, 55);
         // Out-of-range values are normalised rather than trusted.
-        assert_eq!(loaded.speed, 2.0);
+        assert_eq!(loaded.speed, 10.0);
         assert_eq!(loaded.brightness, 0.4);
         assert_eq!(loaded.aspect, 0);
         // A codec without a qn cannot be applied on open.

@@ -6,8 +6,32 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::format::fit_capped;
+use crate::hwdecode;
 use crate::proc;
 use crate::{log, PlayerConfig};
+
+/// Hard decoder ceiling even in 原始分辨率 mode. 8K tracks are downscaled so the
+/// NV12 pipe and the GPU upload stay bounded; 4K passes through untouched.
+const DECODE_MAX_W: u32 = 3840;
+const DECODE_MAX_H: u32 = 2160;
+
+/// Decode size budget for one resolve.
+///
+/// `原始分辨率解码` on: follow the stream up to 4K. off: the 1080p cap. The
+/// picture now stays on the GPU for conversion/interpolation/enhancement, so a
+/// 4K decode is no longer a CPU limitation; the cap is only about VRAM and the
+/// pipe's bandwidth.
+fn decode_cap(native_size: bool) -> (u32, u32) {
+    if native_size {
+        (DECODE_MAX_W, DECODE_MAX_H)
+    } else {
+        (1920, 1080)
+    }
+}
+
+fn decode_cap_for() -> (u32, u32) {
+    decode_cap(o11a1::settings::load().player_native_size)
+}
 
 /// One selectable DASH video representation, copied out of `PlayInfo` so the
 /// player can rebuild the 画质 menu without holding the whole playurl response.
@@ -51,6 +75,10 @@ pub struct MediaSource {
     pub audio_url: Option<String>,
     pub headers: Vec<(String, String)>,
     pub duration_ms: u64,
+    /// Selected video/audio stream bitrates in bits per second (0 when a
+    /// direct URL did not advertise one).
+    pub video_bitrate: u64,
+    pub audio_bitrate: u64,
     /// Native size as declared by the manifest/probe.
     pub source_width: u32,
     pub source_height: u32,
@@ -66,6 +94,10 @@ pub struct MediaSource {
     pub qn_label: String,
     pub audio_label: String,
     pub codec: String,
+    /// The GPU decoder every session for this source must use
+    /// (`h264_cuvid`, ...). Empty only for the loading placeholder; a real
+    /// source without one is refused before a window can open.
+    pub hw_decoder: String,
     /// Every playable video representation returned by `playurl`.
     pub video_tracks: Vec<VideoTrackInfo>,
     /// Every playable DASH audio track, high→low bitrate.
@@ -80,7 +112,6 @@ impl MediaSource {
     pub fn has_track_menu(&self) -> bool {
         !self.video_tracks.is_empty()
     }
-
     /// The stand-in source the window opens with while `resolve` runs on a
     /// worker thread. It has no URL, so the engine skips the decoder and paints
     /// the loading card until [`crate::DeferredOpen`] replaces it.
@@ -93,6 +124,8 @@ impl MediaSource {
             audio_url: None,
             headers: Vec::new(),
             duration_ms: 0,
+            video_bitrate: 0,
+            audio_bitrate: 0,
             source_width: 1280,
             source_height: 720,
             width: 1280,
@@ -104,6 +137,7 @@ impl MediaSource {
             qn_label: String::new(),
             audio_label: String::new(),
             codec: String::new(),
+            hw_decoder: String::new(),
             video_tracks: Vec::new(),
             audio_tracks: Vec::new(),
             quality_tiers: Vec::new(),
@@ -115,6 +149,54 @@ impl MediaSource {
     pub(crate) fn is_placeholder(&self) -> bool {
         self.video_url.is_empty()
     }
+}
+
+/// Stable identity for the disk cache. Bilibili sources key by video/cid and
+/// the exact selected representation, so the same episode opened again (or
+/// prefetched from the queue) reuses one complete file. Direct remote URLs
+/// fall back to a URL hash; a combined audio+video URL deliberately shares the
+/// video key so the file is not downloaded twice.
+pub fn media_cache_key(source: &MediaSource, audio: bool) -> Option<String> {
+    if !source.remote || source.video_url.trim().is_empty() {
+        return None;
+    }
+    let base = source
+        .bvid
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| source.cid.map(|cid| format!("cid{cid}")));
+    if let Some(base) = base {
+        let cid = source.cid.unwrap_or(0);
+        return Some(if audio {
+            format!(
+                "{base}-{cid}-a{}-{}",
+                source.audio_index, source.audio_bitrate
+            )
+        } else {
+            format!(
+                "{base}-{cid}-v{}-{}-{}x{}",
+                source.qn, source.codecid, source.width, source.height
+            )
+        });
+    }
+    let (url, tag) = if audio {
+        match source.audio_url.as_deref() {
+            Some(url) if url != source.video_url => (url, "a"),
+            _ => (source.video_url.as_str(), "v"),
+        }
+    } else {
+        (source.video_url.as_str(), "v")
+    };
+    Some(format!("url-{:016x}-{tag}", fnv1a(url.as_bytes())))
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// The resolved media plus the session that resolved it. `Player::open` hands
@@ -132,7 +214,12 @@ pub fn resolve(config: &PlayerConfig) -> Result<ResolvedSource> {
     let direct = std::env::var("BILI_PLAYER_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| config.direct_url.clone().filter(|value| !value.trim().is_empty()));
+        .or_else(|| {
+            config
+                .direct_url
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        });
     if let Some(url) = direct {
         return resolve_direct(url.trim(), config);
     }
@@ -157,23 +244,47 @@ fn resolve_direct(url: &str, config: &PlayerConfig) -> Result<ResolvedSource> {
         ];
     }
     let probe = ffprobe(url, &headers, remote);
-    let (source_width, source_height, mut duration_ms, fps) = match probe {
-        Some(probe) => (probe.width, probe.height, probe.duration_ms, probe.fps),
-        None => (1280, 720, 0, 30.0),
+    let (source_width, source_height, mut duration_ms, fps, codec_name) = match &probe {
+        Some(probe) => (
+            probe.width,
+            probe.height,
+            probe.duration_ms,
+            probe.fps,
+            probe.codec_name.clone(),
+        ),
+        None => (1280, 720, 0, 30.0, String::new()),
     };
     if duration_ms == 0 && config.start_ms > 0 {
         duration_ms = 0;
     }
-    let (width, height) = fit_capped(source_width, source_height, 1920, 1080);
+    // GPU-only: the codec decides whether this source exists at all. An
+    // unrecognised or unsupported codec is refused here, before a decoder
+    // process is spawned, so nothing can silently fall back to the CPU.
+    let hw_decoder = hwdecode::decoder_for_codec_name(&codec_name).ok_or_else(|| {
+        anyhow!(
+            "该视频编码不支持 GPU 硬解（{}）",
+            if codec_name.trim().is_empty() {
+                "无法探测编码"
+            } else {
+                codec_name.as_str()
+            }
+        )
+    })?;
+    let cap = decode_cap_for();
+    let (width, height) = fit_capped(source_width, source_height, cap.0, cap.1);
     let title = if !config.title.trim().is_empty() {
         config.title.clone()
     } else {
-        url.rsplit(['/', '\\']).next().unwrap_or("本地视频").to_string()
+        url.rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("本地视频")
+            .to_string()
     };
     log::line(&format!(
-        "source direct url={}{} size={}x{} -> {}x{} fps={:.3} duration_ms={} remote={}",
+        "source direct url={}{} codec={} decoder={hw_decoder} size={}x{} -> {}x{} fps={:.3} duration_ms={} remote={}",
         if remote { "" } else { "(local) " },
         short_url(url),
+        if codec_name.is_empty() { "-" } else { codec_name.as_str() },
         source_width,
         source_height,
         width,
@@ -197,6 +308,8 @@ fn resolve_direct(url: &str, config: &PlayerConfig) -> Result<ResolvedSource> {
             ),
             headers,
             duration_ms,
+            video_bitrate: 0,
+            audio_bitrate: 0,
             source_width,
             source_height,
             width,
@@ -208,6 +321,7 @@ fn resolve_direct(url: &str, config: &PlayerConfig) -> Result<ResolvedSource> {
             qn_label: "直链".to_string(),
             audio_label: "直链".to_string(),
             codec: "自动".to_string(),
+            hw_decoder: hw_decoder.to_string(),
             video_tracks: Vec::new(),
             audio_tracks: Vec::new(),
             quality_tiers: Vec::new(),
@@ -218,8 +332,8 @@ fn resolve_direct(url: &str, config: &PlayerConfig) -> Result<ResolvedSource> {
 }
 
 fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource> {
-    let runtime = o11a1::bilibili::shared_runtime()
-        .ok_or_else(|| anyhow!("network runtime unavailable"))?;
+    let runtime =
+        o11a1::bilibili::shared_runtime().ok_or_else(|| anyhow!("network runtime unavailable"))?;
     let bvid_owned = bvid.to_string();
     let account = o11a1::accounts::load();
     let logged_in = account.is_some();
@@ -238,13 +352,28 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
             .playurl(&bvid_owned, cid)
             .await
             .with_context(|| format!("playurl {bvid_owned} cid={cid}"))?;
-        let requested_qn = config.quality_qn.unwrap_or(80);
+        // GPU-only: keep exactly the representations NVDEC accepted in this
+        // process. The quality menu and the selection both read this list, so
+        // an unsupported stream can neither be shown nor switched to.
+        let tracks = supported_tracks(&info);
+        if tracks.is_empty() {
+            bail!(
+                "该视频没有 GPU 可硬解的流（{}）",
+                unsupported_codec_summary(&info)
+            );
+        }
         let requested_codec = config.quality_codecid.unwrap_or(7);
-        let track = info
-            .video_track_for(requested_qn, requested_codec)
-            .or_else(|| info.video_track_for(info.default_qn, requested_codec))
-            .or_else(|| info.video_tracks.first())
-            .ok_or_else(|| anyhow!("playurl returned no video tracks"))?;
+        let track = if let Some(height) = config.quality_height {
+            preferred_height_track(&tracks, height, requested_codec)
+        } else {
+            let requested_qn = config.quality_qn.unwrap_or(80);
+            track_for_qn(&tracks, requested_qn, requested_codec)
+                .or_else(|| track_for_qn(&tracks, info.default_qn, requested_codec))
+                .or_else(|| tracks.first().copied())
+        }
+        .ok_or_else(|| anyhow!("playurl returned no supported video tracks"))?;
+        let hw_decoder = hwdecode::decoder_for_codecid(track.codecid)
+            .ok_or_else(|| anyhow!("codec {} has no GPU decoder", track.codecid))?;
         let audio_index = match config.audio_index {
             Some(index) if index < info.audio_tracks.len() => index,
             _ => best_audio_index(&info),
@@ -280,17 +409,19 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
         if !(fps.is_finite() && fps > 1.0) {
             fps = 30.0;
         }
-        let (width, height) = fit_capped(source_width, source_height, 1920, 1080);
-        let video_tracks = video_track_infos(&info);
+        let cap = decode_cap_for();
+        let (width, height) = fit_capped(source_width, source_height, cap.0, cap.1);
+        let video_tracks = video_track_infos(&tracks);
         let audio_tracks = audio_track_infos(&info);
         let quality_tiers = quality_tier_infos(&bvid_owned, cid);
         log::line(&format!(
-            "source bilibili bvid={} cid={cid} login={} title={:?} qn={} codec={} size={}x{} -> {}x{} fps={:.3} duration_ms={} audio={} audio_index={} tracks={} tiers={} headers={}",
+            "source bilibili bvid={} cid={cid} login={} title={:?} qn={} codec={} decoder={} size={}x{} -> {}x{} fps={:.3} duration_ms={} audio={} audio_index={} tracks={} tiers={} headers={}",
             bvid_owned,
             u8::from(logged_in),
             title,
             track.id,
             o11a1::bilibili::codec_label(track.codecid),
+            hw_decoder,
             source_width,
             source_height,
             width,
@@ -314,6 +445,8 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
                 audio_url: audio.map(|track| track.url.clone()),
                 headers,
                 duration_ms,
+                video_bitrate: track.bandwidth,
+                audio_bitrate: audio.map(|track| track.bandwidth).unwrap_or(0),
                 source_width,
                 source_height,
                 width,
@@ -327,6 +460,7 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
                     .map(|track| audio_menu_label(track.id, track.bandwidth, track.vip))
                     .unwrap_or_else(|| "无音轨".to_string()),
                 codec: o11a1::bilibili::codec_label(track.codecid).to_string(),
+                hw_decoder: hw_decoder.to_string(),
                 video_tracks,
                 audio_tracks,
                 quality_tiers,
@@ -336,10 +470,7 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
         ))
     });
     let (source, session) = resolved?;
-    Ok(ResolvedSource {
-        source,
-        session,
-    })
+    Ok(ResolvedSource { source, session })
 }
 
 struct ProbeInfo {
@@ -347,6 +478,9 @@ struct ProbeInfo {
     height: u32,
     fps: f64,
     duration_ms: u64,
+    /// ffprobe `codec_name` (`h264`, `hevc`, `av1`, `vp9`). Empty when the
+    /// probe could not read it.
+    codec_name: String,
 }
 
 /// The DASH audio track the initial open prefers: highest-bitrate non-VIP
@@ -378,8 +512,88 @@ fn audio_menu_label(id: i64, bandwidth: u64, vip: bool) -> String {
     )
 }
 
-fn video_track_infos(info: &o11a1::bilibili::PlayInfo) -> Vec<VideoTrackInfo> {
+fn preferred_height_track<'a>(
+    tracks: &[&'a o11a1::bilibili::VideoTrack],
+    height: u32,
+    codec: i64,
+) -> Option<&'a o11a1::bilibili::VideoTrack> {
+    if tracks.is_empty() {
+        return None;
+    }
+    let key = |track: &&&o11a1::bilibili::VideoTrack| {
+        (
+            track.height,
+            u8::from(track.codecid == codec),
+            track.bandwidth,
+        )
+    };
+    if height == 0 {
+        return tracks.iter().max_by_key(key).copied();
+    }
+    tracks
+        .iter()
+        .filter(|track| track.height <= height)
+        .max_by_key(key)
+        .copied()
+        .or_else(|| {
+            tracks
+                .iter()
+                .min_by_key(|track| (track.height, track.bandwidth))
+                .copied()
+        })
+}
+
+/// The `PlayInfo::video_track_for` policy restricted to the streams this GPU
+/// accepted: an explicit codec wins, otherwise the smallest stream at that
+/// quality (fewer stalls at the same resolution).
+fn track_for_qn<'a>(
+    tracks: &[&'a o11a1::bilibili::VideoTrack],
+    qn: i64,
+    codec: i64,
+) -> Option<&'a o11a1::bilibili::VideoTrack> {
+    if codec != 0 {
+        if let Some(track) = tracks
+            .iter()
+            .filter(|track| track.id == qn && track.codecid == codec)
+            .max_by_key(|track| track.bandwidth)
+        {
+            return Some(*track);
+        }
+    }
+    tracks
+        .iter()
+        .filter(|track| track.id == qn)
+        .min_by_key(|track| track.bandwidth)
+        .copied()
+}
+
+/// Every playurl representation whose codec NVDEC accepted in this process.
+fn supported_tracks(info: &o11a1::bilibili::PlayInfo) -> Vec<&o11a1::bilibili::VideoTrack> {
+    hwdecode::prewarm(info.video_tracks.iter().map(|track| track.codecid));
     info.video_tracks
+        .iter()
+        .filter(|track| hwdecode::supports_codecid(track.codecid))
+        .collect()
+}
+
+/// `AVC/HEVC/AV1` list for the "nothing is decodable" error message.
+fn unsupported_codec_summary(info: &o11a1::bilibili::PlayInfo) -> String {
+    let mut labels: Vec<&str> = Vec::new();
+    for track in &info.video_tracks {
+        let label = o11a1::bilibili::codec_label(track.codecid);
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    if labels.is_empty() {
+        "播放地址未返回视频流".to_string()
+    } else {
+        format!("{} 均无 GPU 硬解", labels.join("/"))
+    }
+}
+
+fn video_track_infos(tracks: &[&o11a1::bilibili::VideoTrack]) -> Vec<VideoTrackInfo> {
+    tracks
         .iter()
         .map(|track| VideoTrackInfo {
             qn: track.id,
@@ -467,35 +681,41 @@ pub fn resolve_track_switch(
     request: TrackRequest,
     fallback_duration_ms: u64,
 ) -> Result<MediaSource> {
-    let runtime = o11a1::bilibili::shared_runtime()
-        .ok_or_else(|| anyhow!("network runtime unavailable"))?;
+    let runtime =
+        o11a1::bilibili::shared_runtime().ok_or_else(|| anyhow!("network runtime unavailable"))?;
     let info = runtime
         .block_on(session.playurl(bvid, cid))
         .with_context(|| format!("playurl {bvid} cid={cid}"))?;
-    let wanted_qn = if request.qn > 0 { request.qn } else { current_qn };
+    let wanted_qn = if request.qn > 0 {
+        request.qn
+    } else {
+        current_qn
+    };
     let wanted_codecid = if request.qn > 0 {
         request.codecid
     } else {
         current_codecid
     };
-    let track = info
-        .video_tracks
+    // GPU-only: the menu only ever shows supported rows, but the response is
+    // re-resolved here, so filter again before choosing.
+    let tracks = supported_tracks(&info);
+    let track = tracks
         .iter()
         .filter(|track| {
-            track.id == wanted_qn
-                && (wanted_codecid == 0 || track.codecid == wanted_codecid)
+            track.id == wanted_qn && (wanted_codecid == 0 || track.codecid == wanted_codecid)
         })
         .max_by_key(|track| track.bandwidth)
         .or_else(|| {
             // 音轨-only switch: keep the exact current representation.
-            info.video_tracks
+            tracks
                 .iter()
                 .filter(|track| track.id == current_qn && track.codecid == current_codecid)
                 .max_by_key(|track| track.bandwidth)
         })
+        .copied()
         .ok_or_else(|| {
             anyhow!(
-                "该画质不可用（{} · {}，可能需要大会员）",
+                "该画质不可用或没有 GPU 硬解（{} · {}）",
                 o11a1::bilibili::qn_label(wanted_qn),
                 o11a1::bilibili::codec_label(wanted_codecid)
             )
@@ -522,7 +742,8 @@ pub fn resolve_track_switch(
     if !(fps.is_finite() && fps > 1.0) {
         fps = 30.0;
     }
-    let (width, height) = fit_capped(source_width, source_height, 1920, 1080);
+    let cap = decode_cap_for();
+    let (width, height) = fit_capped(source_width, source_height, cap.0, cap.1);
     let duration_ms = if info.duration > 0 {
         info.duration * 1000
     } else {
@@ -536,6 +757,8 @@ pub fn resolve_track_switch(
         audio_url: audio.map(|track| track.url.clone()),
         headers,
         duration_ms,
+        video_bitrate: track.bandwidth,
+        audio_bitrate: audio.map(|track| track.bandwidth).unwrap_or(0),
         source_width,
         source_height,
         width,
@@ -549,7 +772,10 @@ pub fn resolve_track_switch(
             .map(|track| audio_menu_label(track.id, track.bandwidth, track.vip))
             .unwrap_or_else(|| "无音轨".to_string()),
         codec: o11a1::bilibili::codec_label(track.codecid).to_string(),
-        video_tracks: video_track_infos(&info),
+        hw_decoder: hwdecode::decoder_for_codecid(track.codecid)
+            .unwrap_or_default()
+            .to_string(),
+        video_tracks: video_track_infos(&tracks),
         audio_tracks: audio_track_infos(&info),
         quality_tiers: quality_tier_infos(bvid, cid),
         remote: true,
@@ -580,7 +806,7 @@ fn ffprobe(url: &str, headers: &[(String, String)], remote: bool) -> Option<Prob
         .arg("-select_streams")
         .arg("v:0")
         .arg("-show_entries")
-        .arg("stream=width,height,avg_frame_rate")
+        .arg("stream=codec_name,width,height,avg_frame_rate")
         .arg("-of")
         .arg("csv=p=0");
     if remote {
@@ -589,7 +815,11 @@ fn ffprobe(url: &str, headers: &[(String, String)], remote: bool) -> Option<Prob
             command.arg("-headers").arg(text);
         }
     }
-    command.arg(url).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;
@@ -597,10 +827,11 @@ fn ffprobe(url: &str, headers: &[(String, String)], remote: bool) -> Option<Prob
     let text = String::from_utf8_lossy(&output.stdout);
     let first = text.lines().find(|line| !line.trim().is_empty())?;
     let parts: Vec<&str> = first.trim().split(',').collect();
-    let width: u32 = parts.first()?.trim().parse().ok()?;
-    let height: u32 = parts.get(1)?.trim().parse().ok()?;
+    let codec_name = parts.first()?.trim().to_string();
+    let width: u32 = parts.get(1)?.trim().parse().ok()?;
+    let height: u32 = parts.get(2)?.trim().parse().ok()?;
     let fps = parts
-        .get(2)
+        .get(3)
         .and_then(|value| {
             let (num, den) = value.split_once('/')?;
             let num: f64 = num.parse().ok()?;
@@ -645,8 +876,13 @@ fn ffprobe(url: &str, headers: &[(String, String)], remote: bool) -> Option<Prob
     Some(ProbeInfo {
         width: width.max(2),
         height: height.max(2),
-        fps: if fps.is_finite() && fps > 1.0 { fps } else { 30.0 },
+        fps: if fps.is_finite() && fps > 1.0 {
+            fps
+        } else {
+            30.0
+        },
         duration_ms,
+        codec_name,
     })
 }
 

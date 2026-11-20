@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { call, cover, relativeTime } from '../api';
 import { useApp } from '../context';
 import type { DmMessage, DmPage, DmSession, MsgPage } from '../types';
-import { Empty, ErrorBox, PageHead, SkeletonGrid } from '../components/Common';
+import { Empty, ErrorBox, LoadingText, PageHead, Tabs } from '../components/Common';
 
 const TABS = ['回复我的', '@我的', '收到的赞', '私信'];
 const KINDS = ['reply', 'at', 'like', 'dm'];
@@ -96,7 +96,7 @@ export default function Messages() {
   if (!account) {
     return (
       <>
-        <PageHead title="消息" sub="回复 / @ / 收到的赞 / 私信" />
+        <PageHead eyebrow="社区" title="消息" sub="回复 / @ / 收到的赞 / 私信" />
         <div className="empty"><strong>请先登录</strong><button className="btn primary" onClick={() => navigate('member')}>去登录</button></div>
       </>
     );
@@ -104,82 +104,82 @@ export default function Messages() {
 
   return (
     <>
-      <PageHead title="消息" sub={unread ? `未读 ${unread.total}` : '回复 / @ / 收到的赞 / 私信'}>
-        <div className="tabs">
-          {TABS.map((label, index) => (
-            <button key={label} className={`tab ${tab === index ? 'active' : ''}`} onClick={() => setTab(index)}>
-              {label}
-              {index < 3 && unread ? ` ${[unread.reply, unread.at, unread.like][index]}` : ''}
-            </button>
+      <PageHead eyebrow="社区" title="消息" sub={unread ? `未读 ${unread.total}` : '回复 / @ / 收到的赞 / 私信'}>
+        <Tabs
+          tabs={TABS.map((label, index) => (
+            index < 3 && unread && [unread.reply, unread.at, unread.like][index]
+              ? `${label} ${[unread.reply, unread.at, unread.like][index]}`
+              : label
           ))}
-        </div>
+          active={tab}
+          onChange={setTab}
+        />
       </PageHead>
 
-      {loading && !items.length && !sessions.length ? <SkeletonGrid count={3} /> : error ? <ErrorBox error={error} onRetry={() => load(tab)} /> : null}
+      {loading && !items.length && !sessions.length ? <LoadingText label={tab === 3 ? '正在加载私信' : '正在加载消息'} /> : error ? <ErrorBox error={error} onRetry={() => load(tab)} /> : null}
 
-      {tab === 3 ? (
+      {!error ? (tab === 3 ? (
         thread ? (
-          <div className="card panel">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-              <button className="btn sm" onClick={() => { setThread(null); setThreadMessages([]); }}>返回会话</button>
-              <div style={{ fontWeight: 600 }}>会话 {thread.talker_id}</div>
-              <div style={{ flex: 1 }} />
-              {threadMore ? <button className="btn sm" onClick={loadEarlier}>加载更早的消息</button> : null}
+          <div className="dm-view">
+            <div className="dm-head">
+              <button type="button" className="btn sm" onClick={() => { setThread(null); setThreadMessages([]); }}>返回会话</button>
+              <div className="dm-head-title">用户 {thread.talker_id}</div>
+              <span className="dm-head-spacer" />
+              {threadMore ? <button type="button" className="btn sm" onClick={loadEarlier}>加载更早</button> : null}
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 520, overflow: 'auto', padding: '8px 2px' }}>
-              {threadMessages.map((message) => (
-                <div key={message.seqno} style={{ alignSelf: message.sender_uid === account.mid ? 'flex-end' : 'flex-start', maxWidth: '72%' }}>
-                  <div style={{
-                    padding: '8px 12px', borderRadius: 12, fontSize: 12.5, lineHeight: 1.5,
-                    background: message.sender_uid === account.mid ? 'var(--accent)' : 'var(--card-solid)',
-                    color: message.sender_uid === account.mid ? '#fff' : 'var(--text)',
-                    border: message.sender_uid === account.mid ? 'none' : '1px solid var(--card-border)',
-                  }}>{message.text || `[消息类型 ${message.msg_type}]`}</div>
-                  <div style={{ fontSize: 10, color: 'var(--text-faint)', marginTop: 3, textAlign: message.sender_uid === account.mid ? 'right' : 'left' }}>
-                    {message.timestamp ? relativeTime(message.timestamp) : ''}
+            <div className="dm-thread">
+              {threadMessages.map((message, index) => {
+                const mine = message.sender_uid === account.mid;
+                const previous = index > 0 ? threadMessages[index - 1] : null;
+                const firstOfGroup = !previous || (previous.sender_uid === account.mid) !== mine;
+                return (
+                  <div className={`dm-line ${mine ? 'mine' : ''}`} key={message.seqno}>
+                    {firstOfGroup ? <div className="dm-who">{mine ? '我' : `用户 ${thread.talker_id}`}</div> : null}
+                    <div className="dm-text">{message.text || `[消息类型 ${message.msg_type}]`}</div>
+                    <div className="dm-time">{message.timestamp ? relativeTime(message.timestamp) : ''}</div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               {!threadMessages.length ? <Empty title="这个会话还没有消息" /> : null}
             </div>
           </div>
         ) : (
-          <div className="card panel">
+          <div className="msg-list">
             {sessions.map((session) => (
               <div className="msg-row" key={session.talker_id} onClick={() => openThread(session)}>
-                <div className="avatar" style={{ display: 'grid', placeItems: 'center', fontSize: 12 }}>{session.talker_id % 100}</div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <div style={{ fontWeight: 600, fontSize: 12.5 }}>用户 {session.talker_id}</div>
-                    <div style={{ fontSize: 10.5, color: 'var(--text-faint)' }}>{relativeTime(session.at_time)}</div>
+                <div className="avatar msg-avatar">{session.talker_id % 100}</div>
+                <div className="msg-main">
+                  <div className="msg-line1">
+                    <span className="msg-name">用户 {session.talker_id}</span>
+                    <span className="msg-time">{relativeTime(session.at_time)}</span>
                   </div>
                   <div className="detail">{session.preview}</div>
                 </div>
-                {session.unread ? <span className="chip small active">{session.unread}</span> : null}
+                {session.unread ? <span className="msg-unread">{session.unread}</span> : null}
               </div>
             ))}
             {!sessions.length ? <Empty title="没有私信会话" /> : null}
           </div>
         )
       ) : (
-        <div className="card panel">
+        <div className="msg-list">
           {items.map((item: any) => (
             <div className="msg-row" key={item.id} onClick={() => item.title && window.o11a1.shell.open(item.title.startsWith('http') ? item.title : '')}>
               <img className="avatar" src={cover(item.avatar)} referrerPolicy="no-referrer" alt="" onError={(event) => { (event.target as HTMLImageElement).style.display = 'none'; }} />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <div style={{ fontWeight: 600, fontSize: 12.5 }}>{item.nickname}</div>
-                  <div style={{ color: 'var(--text-faint)', fontSize: 10.5 }}>{relativeTime(item.time)}</div>
-                  {item.count > 1 ? <span className="chip small">{item.count}</span> : null}
+              <div className="msg-main">
+                <div className="msg-line1">
+                  <span className="msg-name">{item.nickname}</span>
+                  <span className="msg-time">{relativeTime(item.time)}</span>
+                  {item.count > 1 ? <span className="msg-count">{item.count}</span> : null}
                 </div>
                 <div className="detail">{item.title || item.detail}</div>
               </div>
             </div>
           ))}
           {!items.length ? <Empty title="今天没有新消息" /> : null}
-          {hasMore ? <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 12 }}><button className="btn" onClick={() => load(tab, cursor, true)}>加载更多</button></div> : null}
+          {hasMore ? <div className="page-more"><button className="btn" onClick={() => load(tab, cursor, true)}>加载更多</button></div> : null}
         </div>
-      )}
+      )) : null}
     </>
   );
 }

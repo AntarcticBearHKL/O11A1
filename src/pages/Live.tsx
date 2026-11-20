@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { call, cover, formatCount } from '../api';
+import { call, formatCount } from '../api';
+import { CoverImage } from '../components/CoverImage';
 import { useApp } from '../context';
 import type { LiveAreaPage, LiveIndex, LiveRoom } from '../types';
-import { Empty, ErrorBox, PageHead, SkeletonGrid } from '../components/Common';
+import { Empty, ErrorBox, SkeletonGrid } from '../components/Common';
 
 const QUALITIES: Array<[number, string]> = [[10000, '原画'], [400, '蓝光'], [250, '超清'], [150, '高清'], [80, '流畅']];
 
@@ -86,7 +87,7 @@ export default function Live() {
       if (play.live_status !== 1) throw new Error(`直播状态为 ${play.live_status}，当前不可播放`);
       const url = play.flv || play.hls_fmp4 || play.hls_ts || play.hls;
       if (!url) throw new Error('没有可用的直播流');
-      await launch({ url, title: `${room?.title || '直播'} · ${room?.area_name || ''}`, cover: room?.cover });
+      await launch({ url, title: `${room?.title || '直播'} · ${room?.area_name || ''}`, cover: room?.cover, live: true });
     } catch (reason: any) { toast(reason.message, true); }
     finally { setPlaying(false); }
   };
@@ -96,11 +97,8 @@ export default function Live() {
     if (error || !room) return <ErrorBox error={error || '没有找到直播间'} onRetry={loadRoom} />;
     return (
       <>
-        <PageHead title={room.title} sub={`${room.area_name} · ${room.online ? `${formatCount(room.online)} 人气` : '未开播'}`}>
-          <button className="btn sm" onClick={() => navigate('live')}>返回直播</button>
-        </PageHead>
         <div className="card hero" style={{ marginBottom: 16 }}>
-          <img className="hero-cover" src={cover(room.cover)} referrerPolicy="no-referrer" alt="" />
+          <CoverImage className="hero-cover" src={room.cover} eager alt="" />
           <div>
             <h1 className="hero-title">{room.title}</h1>
             <div className="stats" style={{ marginBottom: 12 }}>
@@ -113,7 +111,10 @@ export default function Live() {
                 <button key={value} className={`chip small ${quality === value ? 'active' : ''}`} onClick={() => setQuality(value)}>{label}</button>
               ))}
             </div>
-            <button className="btn primary" disabled={playing || room.live_status !== 1} onClick={play}>{playing ? '连接中…' : '▶ 观看直播'}</button>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              <button className="btn primary" disabled={playing || room.live_status !== 1} onClick={play}>{playing ? '连接中…' : '▶ 观看直播'}</button>
+              <button className="btn" onClick={() => navigate('live')}>返回直播</button>
+            </div>
             <div style={{ color: 'var(--text-faint)', fontSize: 11.5, marginTop: 10 }}>直播每 30 秒刷新一次状态；切换画质会重新连接直播流。</div>
           </div>
         </div>
@@ -133,30 +134,28 @@ export default function Live() {
   const areas = index?.areas || [];
   return (
     <>
-      <PageHead title="直播" sub="推荐 / 分区 / 房间">
-        <button className="btn sm" onClick={() => { setArea(0); setRooms(index?.modules.flatMap((m) => m.rooms) || []); }}>推荐</button>
-      </PageHead>
-
-      {areas.length ? (
-        <div className="chips" style={{ marginBottom: 16 }}>
-          {areas.map((item) => (
-            <button
-              key={item.id}
-              className={`chip small ${area === item.id ? 'active' : ''}`}
-              onClick={() => { setArea(item.id); loadArea(item.id, item.parent_id, 1, false); }}
-            >
-              {item.title}
-            </button>
-          ))}
-        </div>
-      ) : null}
+      <div className="chips" style={{ marginBottom: 16 }}>
+        <button
+          className={`chip small ${area === 0 ? 'active' : ''}`}
+          onClick={() => { setArea(0); setRooms(index?.modules.flatMap((m) => m.rooms) || []); }}
+        >推荐</button>
+        {areas.map((item) => (
+          <button
+            key={item.id}
+            className={`chip small ${area === item.id ? 'active' : ''}`}
+            onClick={() => { setArea(item.id); loadArea(item.id, item.parent_id, 1, false); }}
+          >
+            {item.title}
+          </button>
+        ))}
+      </div>
 
       {loading ? <SkeletonGrid count={8} /> : error ? <ErrorBox error={error} onRetry={() => area ? loadArea(area, areas.find((item) => item.id === area)?.parent_id || 0, 1, false) : loadIndex()} /> : rooms.length ? (
         <div className="video-grid">
           {rooms.map((item, index) => (
-            <div className="video-card" key={`${item.room_id}-${index}`} onClick={() => navigate(`live?room=${item.room_id}`)}>
+            <div className="video-card" style={{ animationDelay: `${Math.min(index, 14) * 32}ms` }} key={`${item.room_id}-${index}`} onClick={() => navigate(`live?room=${item.room_id}`)}>
               <div className="cover">
-                <img src={cover(item.cover)} referrerPolicy="no-referrer" alt="" />
+                <CoverImage src={item.cover} alt="" />
                 {item.live_status === 1 ? <div className="live-badge">直播中</div> : null}
                 <div className="cover-badge">{formatCount(item.online)} 人气</div>
               </div>
@@ -173,7 +172,7 @@ export default function Live() {
       ) : <Empty title="这里暂时没有直播" />}
 
       {area && hasMore ? (
-        <div style={{ display: 'flex', justifyContent: 'center', padding: 22 }}>
+        <div className="page-more">
           <button className="btn" onClick={() => loadArea(area, areas.find((item) => item.id === area)?.parent_id || 0, page + 1, true)}>加载更多</button>
         </div>
       ) : null}

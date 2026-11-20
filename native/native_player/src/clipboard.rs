@@ -26,8 +26,8 @@ pub fn set_text(text: &str) -> Result<()> {
             EmptyClipboard().map_err(|error| anyhow!("清空剪贴板失败：{error}"))?;
             let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
             let bytes = utf16.len() * std::mem::size_of::<u16>();
-            let handle: HGLOBAL =
-                GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(|error| anyhow!("分配剪贴板内存失败：{error}"))?;
+            let handle: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, bytes)
+                .map_err(|error| anyhow!("分配剪贴板内存失败：{error}"))?;
             let pointer = GlobalLock(handle);
             if pointer.is_null() {
                 let _ = GlobalFree(Some(handle));

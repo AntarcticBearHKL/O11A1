@@ -45,7 +45,6 @@ impl Step for CommentsStep {
         StepId::Comments
     }
 
-
     fn timeout(&self) -> Duration {
         Duration::from_secs(40)
     }

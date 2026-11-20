@@ -17,6 +17,7 @@ export interface Settings {
   blocked_keywords: string[];
   blocked_regex: string[];
   player_quality: number;
+  player_quality_height: number;
   player_native_size: boolean;
   player_enhance: number;
   player_mf_decode: boolean;
@@ -50,7 +51,11 @@ export interface Settings {
   playlist_autoplay: boolean;
   playlist_random: boolean;
   loop_one: boolean;
+  /// 0 = pause at the end, 1 = loop, 2 = next item / close the window.
+  loop_mode: number;
   interp_mode: number;
+  /// 0 = follow the display refresh; otherwise a fixed interpolation target.
+  interp_hz: number;
   deepseek_key: string;
   fish_model: string;
   fish_instruction: string;
@@ -62,6 +67,8 @@ export interface Settings {
   fish_sources: number;
   audio_quality: number;
   hide_live_tab: boolean;
+  hide_pgc_tab: boolean;
+  hide_fish_tab: boolean;
   hide_hot_search: boolean;
   fish_tier: number;
   fish_step_meta: boolean;
@@ -78,6 +85,7 @@ export interface Settings {
   fish_asr_model_dir: string;
   fish_model_mirror: string;
   fish_vision_detail: string;
+  fish_frame_interval_s: number;
   pgc_sorts: Record<string, string>;
   search_tab: number;
   [key: string]: unknown;
@@ -101,8 +109,14 @@ export interface VideoCard {
   title: string;
   pic: string;
   owner: string;
+  owner_mid?: number;
   view: number;
   duration: number;
+  /// Present on region/ranking cards, so they can launch and display the same
+  /// freshness chip as a home-feed card.
+  cid?: number;
+  aid?: number;
+  pub_ts?: number;
 }
 
 export interface CardPage {
@@ -216,7 +230,10 @@ export interface HistoryItem {
 }
 
 export interface HistoryPage {
-  cursor: { id: number; time: number } | null;
+  /// The Bilibili history cursor. `view_at` is the `viewAt` to send for the
+  /// next API page; the previous `{ id, time }` shape never matched the Rust
+  /// payload and silently reloaded the first page.
+  cursor: { max: number; view_at: number; business: string } | null;
   items: HistoryItem[];
   has_more: boolean;
 }
@@ -385,6 +402,85 @@ export interface DownloadTask {
   path: string;
   error: string;
   created: number;
+}
+
+/// One row of the 养鱼 Agent transcript (`snapshot.agent.steps`). Tool rows use
+/// a watch-step id (`meta` / `subtitle` / `outline` / `comments` / `asr` /
+/// `frames`); the DeepSeek request is the `thinking` row with id `deepseek`.
+export interface FishAgentStep {
+  id: string;
+  kind: string;
+  title: string;
+  meta: string;
+  state: string;
+  detail: string;
+  ms: number;
+  bytes: number;
+  tokens: number;
+}
+
+/// The verdict card the Agent panel paints after the DeepSeek call.
+export interface FishAgentReply {
+  score: number;
+  verdict: string;
+  one_line: string;
+  reasons: string[];
+  tags: string[];
+  quote: string;
+  ms: number;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+/// One watched video as a chat transcript: prompt (cover / title / UP),
+/// process rows and the reply. `state` is `running` | `done` | `cancelled` |
+/// `error`.
+export interface FishAgent {
+  bvid: string;
+  title: string;
+  up_name: string;
+  cover: string;
+  duration_s: number;
+  instruction: string;
+  model: string;
+  state: string;
+  started_at: number;
+  updated_at: number;
+  note: string;
+  steps: FishAgentStep[];
+  reply: FishAgentReply | null;
+  tokens_in: number;
+  tokens_out: number;
+  cost_ms: number;
+  cost_bytes: number;
+  cost_tokens: number;
+}
+
+/// One tool exposed to the 养鱼 agent (`fish.tools`).
+export interface FishToolSpec {
+  id: string;
+  label: string;
+  description: string;
+  timeout_s: number;
+  /// `bilibili` | `local` | `deepseek-vision`.
+  kind: string;
+  heavy: boolean;
+  needs_key: boolean;
+}
+
+/// One manual tool invocation (`fish.tool.run`).
+export interface FishToolRun {
+  id: string;
+  label: string;
+  state: string;
+  reason: string;
+  detail: string;
+  preview: string;
+  ms: number;
+  bytes: number;
+  tokens: number;
+  bvid: string;
+  cid: number;
 }
 
 export interface FishState {

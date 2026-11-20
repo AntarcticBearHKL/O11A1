@@ -60,8 +60,7 @@ pub fn parse_time_ms(text: &str) -> Option<u64> {
         return None;
     }
     if let Ok(seconds) = text.parse::<f64>() {
-        return (seconds.is_finite() && seconds >= 0.0)
-            .then(|| (seconds * 1000.0).round() as u64);
+        return (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1000.0).round() as u64);
     }
     let mut parts = text.split(':').rev();
     let seconds: f64 = parts.next()?.parse().ok()?;

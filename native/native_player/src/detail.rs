@@ -4,6 +4,7 @@
 //! session that resolved the media, fetches `video_view` once, then serves the
 //! 信息/评论 tabs and the like/coin/favourite actions.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -37,10 +38,15 @@ pub struct InfoData {
 
 #[derive(Clone, Default)]
 pub struct CommentData {
+    pub rpid: i64,
     pub user: String,
     pub message: String,
     pub likes: u64,
+    pub ctime: i64,
+    pub pinned: bool,
+    pub reply_count: i64,
     pub avatar_url: String,
+    pub replies: Vec<CommentData>,
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +56,16 @@ pub struct CommentsData {
     pub cursor: String,
     pub end: bool,
     pub reset: bool,
+    pub hot: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct CommentRepliesData {
+    pub root_rpid: i64,
+    pub replies: Vec<CommentData>,
+    pub total: i64,
+    pub page: i64,
+    pub has_more: bool,
 }
 
 pub enum DetailRequest {
@@ -59,6 +75,10 @@ pub enum DetailRequest {
         reset: bool,
         cursor: String,
     },
+    CommentReplies {
+        root_rpid: i64,
+        page: i64,
+    },
     Like,
     Coin,
     Favorite,
@@ -67,6 +87,7 @@ pub enum DetailRequest {
 pub enum DetailEvent {
     Info(Result<InfoData, String>),
     Comments(Result<CommentsData, String>),
+    CommentReplies(Result<CommentRepliesData, String>),
     Avatars(Vec<(String, ImageData)>),
     Toast {
         text: String,
@@ -122,20 +143,21 @@ fn run(
         match request {
             DetailRequest::Info => match load_info(&session, &bvid, cid) {
                 Ok(data) => {
-                    if let Ok(state) = runtime()
-                        .ok_or_else(|| anyhow!("no runtime"))
-                        .map(|runtime| {
-                            runtime.block_on(async {
-                                let liked = session.like_state(&bvid).await.unwrap_or(0) > 0;
-                                let coined = session.coin_state(&bvid).await.unwrap_or(0) > 0;
-                                let favorited = session
-                                    .fav_state(data.aid)
-                                    .await
-                                    .map(|(fav, _)| fav)
-                                    .unwrap_or(false);
-                                (liked, coined, favorited)
+                    if let Ok(state) =
+                        runtime()
+                            .ok_or_else(|| anyhow!("no runtime"))
+                            .map(|runtime| {
+                                runtime.block_on(async {
+                                    let liked = session.like_state(&bvid).await.unwrap_or(0) > 0;
+                                    let coined = session.coin_state(&bvid).await.unwrap_or(0) > 0;
+                                    let favorited = session
+                                        .fav_state(data.aid)
+                                        .await
+                                        .map(|(fav, _)| fav)
+                                        .unwrap_or(false);
+                                    (liked, coined, favorited)
+                                })
                             })
-                        })
                     {
                         let _ = events.send(DetailEvent::States {
                             liked: state.0,
@@ -153,49 +175,49 @@ fn run(
                     let _ = events.send(DetailEvent::Info(Err(format!("{error:#}"))));
                 }
             },
-            DetailRequest::Comments {
-                hot,
-                reset,
-                cursor,
-            } => {
+            DetailRequest::Comments { hot, reset, cursor } => {
                 let Some(data) = info.as_ref() else {
                     let _ = events.send(DetailEvent::Comments(Err("视频信息尚未加载".into())));
                     continue;
                 };
                 match load_comments(&session, data.aid, hot, &cursor, reset) {
                     Ok((comments, total, next, end)) => {
-                        let avatars: Vec<(String, String)> = comments
-                            .iter()
-                            .filter(|comment| !comment.avatar_url.is_empty())
-                            .take(10)
-                            .map(|comment| (comment.avatar_url.clone(), comment.user.clone()))
-                            .collect();
+                        let urls = collect_avatar_urls(&comments);
                         let _ = events.send(DetailEvent::Comments(Ok(CommentsData {
                             comments,
                             total,
                             cursor: next,
                             end,
                             reset,
+                            hot,
                         })));
-                        if !avatars.is_empty() {
-                            if let Some(runtime) = runtime() {
-                                let mut loaded = Vec::new();
-                                for (url, _) in avatars {
-                                    if let Ok(data) = runtime.block_on(session.fetch_avatar(&url)) {
-                                        let id = IMAGE_ID.fetch_add(1, Ordering::Relaxed);
-                                        loaded.push((url, image(id, data)));
-                                    }
-                                }
-                                log::line(&format!("detail avatars loaded n={}", loaded.len()));
-                                if !loaded.is_empty() {
-                                    let _ = events.send(DetailEvent::Avatars(loaded));
-                                }
-                            }
-                        }
+                        spawn_avatars(Arc::clone(&session), urls, events.clone());
                     }
                     Err(error) => {
-                        let _ =
-                            events.send(DetailEvent::Comments(Err(format!("{error:#}"))));
+                        let _ = events.send(DetailEvent::Comments(Err(format!("{error:#}"))));
+                    }
+                }
+            }
+            DetailRequest::CommentReplies { root_rpid, page } => {
+                let Some(data) = info.as_ref() else {
+                    let _ =
+                        events.send(DetailEvent::CommentReplies(Err("视频信息尚未加载".into())));
+                    continue;
+                };
+                match load_comment_replies(&session, data.aid, root_rpid, page) {
+                    Ok((replies, total, page, has_more)) => {
+                        let urls = collect_avatar_urls(&replies);
+                        let _ = events.send(DetailEvent::CommentReplies(Ok(CommentRepliesData {
+                            root_rpid,
+                            replies,
+                            total,
+                            page,
+                            has_more,
+                        })));
+                        spawn_avatars(Arc::clone(&session), urls, events.clone());
+                    }
+                    Err(error) => {
+                        let _ = events.send(DetailEvent::CommentReplies(Err(format!("{error:#}"))));
                     }
                 }
             }
@@ -264,7 +286,9 @@ fn run(
                     .and_then(|runtime| {
                         runtime.block_on(async {
                             let folders = session.fav_folders_all(data.aid).await?;
-                            if let Some(folder) = folders.iter().find(|folder| folder.member == Some(true)) {
+                            if let Some(folder) =
+                                folders.iter().find(|folder| folder.member == Some(true))
+                            {
                                 session.fav_deal(data.aid, &[], &[folder.id]).await?;
                                 Ok(false)
                             } else if let Some(folder) = folders.first() {
@@ -301,11 +325,7 @@ fn run(
     log::line("detail worker stopped");
 }
 
-fn load_info(
-    session: &o11a1::bilibili::Session,
-    bvid: &str,
-    cid: u64,
-) -> Result<InfoData> {
+fn load_info(session: &o11a1::bilibili::Session, bvid: &str, cid: u64) -> Result<InfoData> {
     let runtime = runtime().ok_or_else(|| anyhow!("no runtime"))?;
     let detail = runtime
         .block_on(session.video_view(bvid))
@@ -326,10 +346,7 @@ fn load_info(
             duration: page.duration,
         })
         .collect();
-    let current_page = pages
-        .iter()
-        .position(|page| page.cid == cid)
-        .unwrap_or(0);
+    let current_page = pages.iter().position(|page| page.cid == cid).unwrap_or(0);
     log::line(&format!(
         "detail info bvid={bvid} aid={} owner={:?} pages={} cover={}",
         detail.aid,
@@ -366,10 +383,14 @@ fn load_comments(
         // Some payloads return a pinned shell without a member/message. An
         // empty row is worse than dropping the pin.
         if !top.user.uname.trim().is_empty() && !top.message.trim().is_empty() {
-            comments.push(comment_from(top));
+            comments.push(comment_from(top, true));
         }
     }
-    comments.extend(page.comments.into_iter().map(comment_from));
+    comments.extend(
+        page.comments
+            .into_iter()
+            .map(|comment| comment_from(comment, false)),
+    );
     log::line(&format!(
         "detail comments aid={aid} hot={} n={} total={} end={}",
         u8::from(hot),
@@ -380,15 +401,108 @@ fn load_comments(
     Ok((comments, page.total, page.cursor, page.is_end))
 }
 
-fn comment_from(comment: o11a1::bilibili::Comment) -> CommentData {
+fn load_comment_replies(
+    session: &o11a1::bilibili::Session,
+    aid: i64,
+    root_rpid: i64,
+    page: i64,
+) -> Result<(Vec<CommentData>, i64, i64, bool)> {
+    let runtime = runtime().ok_or_else(|| anyhow!("no runtime"))?;
+    let page_data = runtime
+        .block_on(session.comment_replies(aid, root_rpid, page))
+        .map_err(|error| anyhow!("comment replies: {error:#}"))?;
+    let replies: Vec<CommentData> = page_data
+        .replies
+        .into_iter()
+        .map(|reply| comment_from(reply, false))
+        .collect();
+    log::line(&format!(
+        "detail comment replies root={root_rpid} page={} n={} total={} more={}",
+        page_data.page,
+        replies.len(),
+        page_data.total,
+        u8::from(page_data.has_more)
+    ));
+    Ok((replies, page_data.total, page_data.page, page_data.has_more))
+}
+
+fn comment_from(comment: o11a1::bilibili::Comment, pinned: bool) -> CommentData {
     let mut avatar = comment.user.avatar;
     if avatar.starts_with("//") {
         avatar.insert_str(0, "https:");
     }
     CommentData {
+        rpid: comment.rpid,
         user: comment.user.uname,
         message: comment.message.replace('\n', " "),
         likes: comment.like,
+        ctime: comment.ctime,
+        pinned,
+        reply_count: comment.rcount,
         avatar_url: avatar,
+        replies: comment
+            .replies
+            .into_iter()
+            .map(|reply| comment_from(reply, false))
+            .collect(),
+    }
+}
+
+/// Unique avatar URLs for a page, top-level authors first, so the visible
+/// comments get faces before the nested previews.
+fn collect_avatar_urls(comments: &[CommentData]) -> Vec<String> {
+    fn push(comment: &CommentData, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+        if !comment.avatar_url.is_empty() && seen.insert(comment.avatar_url.clone()) {
+            out.push(comment.avatar_url.clone());
+        }
+        for reply in &comment.replies {
+            push(reply, seen, out);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for comment in comments {
+        push(comment, &mut seen, &mut out);
+    }
+    out
+}
+
+/// Avatar downloads are slow and irrelevant to the comment request queue.
+/// Run them on a short-lived thread so a sort switch or a reply request never
+/// waits behind a dozen CDN fetches.
+fn spawn_avatars(
+    session: Arc<o11a1::bilibili::Session>,
+    urls: Vec<String>,
+    events: Sender<DetailEvent>,
+) {
+    if urls.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("player-avatars".into())
+        .spawn(move || load_avatars(&session, urls, &events));
+}
+
+fn load_avatars(
+    session: &o11a1::bilibili::Session,
+    urls: Vec<String>,
+    events: &Sender<DetailEvent>,
+) {
+    if urls.is_empty() {
+        return;
+    }
+    let Some(runtime) = runtime() else {
+        return;
+    };
+    let mut loaded = Vec::new();
+    for url in urls.into_iter().take(16) {
+        if let Ok(data) = runtime.block_on(session.fetch_avatar(&url)) {
+            let id = IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+            loaded.push((url, image(id, data)));
+        }
+    }
+    log::line(&format!("detail avatars loaded n={}", loaded.len()));
+    if !loaded.is_empty() {
+        let _ = events.send(DetailEvent::Avatars(loaded));
     }
 }

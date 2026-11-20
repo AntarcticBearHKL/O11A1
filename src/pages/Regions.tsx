@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { call } from '../api';
 import { useApp } from '../context';
 import type { CardPage, VideoCard } from '../types';
-import { Empty, ErrorBox, SkeletonGrid, VideoGrid } from '../components/Common';
+import { Empty, ErrorBox, PageHead, SkeletonGrid, VideoGrid } from '../components/Common';
 
 const REGIONS: Array<[number, string]> = [
   [1, '动画'], [13, '番剧'], [167, '国创'], [3, '音乐'], [129, '舞蹈'],
@@ -50,6 +50,13 @@ export default function Regions() {
 
   return (
     <>
+      <PageHead eyebrow="探索" title="分区" sub="按分区推荐最新投稿与排行榜">
+        <div className="page-modes">
+          <button className={`chip ${mode === 0 ? 'active' : ''}`} onClick={() => setMode(0)}>最新发布</button>
+          <button className={`chip ${mode === 1 ? 'active' : ''}`} onClick={() => setMode(1)}>排行榜</button>
+        </div>
+      </PageHead>
+
       <div className="region-rail">
         <div className="region-scroll">
           {REGIONS.map(([rid, name], index) => (
@@ -58,18 +65,22 @@ export default function Regions() {
             </button>
           ))}
         </div>
-        <div className="region-modes">
-          <button className={`chip ${mode === 0 ? 'active' : ''}`} onClick={() => setMode(0)}>最新发布</button>
-          <button className={`chip ${mode === 1 ? 'active' : ''}`} onClick={() => setMode(1)}>排行榜</button>
-        </div>
       </div>
 
       {loading ? <SkeletonGrid count={8} /> : error ? <ErrorBox error={error} onRetry={() => load(1, false)} /> : items.length ? (
-        <VideoGrid items={items} onPlay={(item) => launch({ bvid: item.bvid, title: item.title, cover: item.pic, owner: item.owner, duration: item.duration }).catch((error) => toast(error.message, true))} />
+        <VideoGrid items={items} onPlay={(item, newWindow) => launch({
+          bvid: item.bvid,
+          cid: item.cid,
+          aid: item.aid,
+          title: item.title,
+          cover: item.pic,
+          owner: item.owner,
+          duration: item.duration,
+        }, newWindow).catch((error) => toast(error.message, true))} />
       ) : <Empty title="这个分区暂时没有视频" />}
 
       {mode === 0 && hasMore ? (
-        <div style={{ display: 'flex', justifyContent: 'center', padding: 22 }}>
+        <div className="page-more">
           <button className="btn" disabled={loading} onClick={() => load(page + 1, true)}>加载更多</button>
         </div>
       ) : null}

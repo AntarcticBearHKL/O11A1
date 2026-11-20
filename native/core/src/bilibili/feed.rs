@@ -176,7 +176,10 @@ impl Session {
         // The upload's own resolution is the only evidence `playurl` cannot see
         // (it reports what this account may play, not what the source has), so
         // it is kept for the tier fallback of the very next `playurl` call.
-        remember_native_height(&data.bvid, data.dimension.as_ref().map(|size| size.height).unwrap_or(0));
+        remember_native_height(
+            &data.bvid,
+            data.dimension.as_ref().map(|size| size.height).unwrap_or(0),
+        );
         Ok(detail_from_view(data))
     }
 }
@@ -246,10 +249,13 @@ impl Session {
             }
         };
         if body.code != 0 {
-            let (retry_status, retry_body) = self
-                .playurl_request(&params, true)
-                .await
-                .unwrap_or((0, PlayUrlResp { code: -1, data: None }));
+            let (retry_status, retry_body) = self.playurl_request(&params, true).await.unwrap_or((
+                0,
+                PlayUrlResp {
+                    code: -1,
+                    data: None,
+                },
+            ));
             if retry_body.code == 0 {
                 status = retry_status;
                 body = retry_body;
@@ -306,8 +312,7 @@ impl Session {
             // nothing at all, the upload's own resolution is the remaining
             // evidence. `video_view` usually ran first and left it cached, so
             // this costs no request on the normal open path.
-            let advertised =
-                !data.accept_quality.is_empty() || !data.support_formats.is_empty();
+            let advertised = !data.accept_quality.is_empty() || !data.support_formats.is_empty();
             let mut native_height = native_height_for(bvid).unwrap_or(0);
             if !advertised && native_height == 0 {
                 native_height = self
@@ -318,7 +323,8 @@ impl Session {
             }
             build_quality_tiers(&data, native_height)
         };
-        let info = build_play_info(data).ok_or_else(|| anyhow!("获取播放地址失败：未找到可用媒体流"))?;
+        let info =
+            build_play_info(data).ok_or_else(|| anyhow!("获取播放地址失败：未找到可用媒体流"))?;
         // Remember the full tier list for the 画质 menu: the playable stream
         // rows come from `info.qualities`, the locked 大会员 rows from this.
         if tiers_qa_bvid().as_deref() == Some(bvid) {
@@ -490,11 +496,7 @@ impl Session {
     ///
     /// Best-effort: three consecutive segment failures stop the scan and
     /// whatever was decoded is returned.
-    pub async fn danmaku_all(
-        &self,
-        cid: u64,
-        duration_secs: u64,
-    ) -> Vec<crate::danmaku::Danmaku> {
+    pub async fn danmaku_all(&self, cid: u64, duration_secs: u64) -> Vec<crate::danmaku::Danmaku> {
         if cid == 0 {
             return Vec::new();
         }
@@ -650,7 +652,9 @@ impl Session {
                 crate::debug_log(&format!("dm history date={date} xml_empty -> protobuf"));
             }
             Err(err) => {
-                crate::debug_log(&format!("dm history date={date} xml_err={err:#} -> protobuf"));
+                crate::debug_log(&format!(
+                    "dm history date={date} xml_err={err:#} -> protobuf"
+                ));
             }
         }
 
@@ -715,7 +719,11 @@ impl Session {
 }
 
 impl Session {
-    async fn danmaku_history_seg(&self, cid: u64, date: &str) -> Result<Vec<crate::danmaku::Danmaku>> {
+    async fn danmaku_history_seg(
+        &self,
+        cid: u64,
+        date: &str,
+    ) -> Result<Vec<crate::danmaku::Danmaku>> {
         let oid = cid.to_string();
         let response = self
             .client
@@ -795,8 +803,13 @@ impl Session {
             encode_component(content),
             encode_component(&csrf),
         );
-        self.post_form_code("dm/report/add", DM_REPORT_URL, "https://www.bilibili.com/", body)
-            .await
+        self.post_form_code(
+            "dm/report/add",
+            DM_REPORT_URL,
+            "https://www.bilibili.com/",
+            body,
+        )
+        .await
     }
 }
 
@@ -810,8 +823,13 @@ impl Session {
             encode_component(dmid),
             encode_component(&csrf),
         );
-        self.post_form_code("dm/thumbup/add", DM_THUMBUP_URL, "https://www.bilibili.com/", body)
-            .await
+        self.post_form_code(
+            "dm/thumbup/add",
+            DM_THUMBUP_URL,
+            "https://www.bilibili.com/",
+            body,
+        )
+        .await
     }
 
     // -- WBI signing --------------------------------------------------------
@@ -841,10 +859,38 @@ impl Session {
         fresh_idx_start: u64,
         on_page: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<Vec<FeedVideo>> {
+        self.homepage_feed_inner(fresh_idx_start, 0, on_page).await
+    }
+
+    /// Fetch enough recommendation pages to cover `wanted` cards. The client
+    /// uses this to ask for exactly the rows it can show at its current width;
+    /// the whole pages may overshoot, and the caller can trim the tail.
+    pub async fn homepage_feed_count(
+        &self,
+        fresh_idx_start: u64,
+        wanted: usize,
+        on_page: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<Vec<FeedVideo>> {
+        self.homepage_feed_inner(fresh_idx_start, wanted, on_page)
+            .await
+    }
+
+    async fn homepage_feed_inner(
+        &self,
+        fresh_idx_start: u64,
+        wanted: usize,
+        on_page: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<Vec<FeedVideo>> {
         let feed_started = Instant::now();
         self.wbi_keys(false).await?;
 
-        let pages = feed_pages();
+        // A requested card count needs more than the one default page; an
+        // empty request keeps the legacy BILI_FEED_PAGES behavior.
+        let pages = if wanted > 0 {
+            MAX_FEED_PAGES
+        } else {
+            feed_pages()
+        };
         let mut out: Vec<FeedVideo> = Vec::new();
         let mut fresh_idx: u64 = fresh_idx_start.max(1);
         let mut brush: u64 = fresh_idx_start.max(1);
@@ -912,10 +958,13 @@ impl Session {
                 out.len()
             ));
             on_page(page as u64 + 1, pages as u64);
+            if wanted > 0 && out.len() >= wanted {
+                break;
+            }
         }
 
         crate::debug_log(&format!(
-            "feed fetch pages={pages} total_ms={} items={}",
+            "feed fetch pages={pages} wanted={wanted} total_ms={} items={}",
             feed_started.elapsed().as_millis(),
             out.len()
         ));
@@ -1146,7 +1195,8 @@ pub fn quality_fnval() -> i64 {
         .unwrap_or(FNVAL_ALL)
 }
 
-fn playurl_params(bvid: &str, cid: u64) -> Vec<(String, String)> {    vec![
+fn playurl_params(bvid: &str, cid: u64) -> Vec<(String, String)> {
+    vec![
         ("bvid".into(), bvid.to_string()),
         ("cid".into(), cid.to_string()),
         ("qn".into(), "80".into()),
@@ -1160,7 +1210,10 @@ fn playurl_params(bvid: &str, cid: u64) -> Vec<(String, String)> {    vec![
         ("dm_img_list".into(), "[]".into()),
         ("dm_img_str".into(), random_alnum(16, 64)),
         ("dm_cover_img_str".into(), random_alnum(16, 64)),
-        ("dm_img_inter".into(), "{\"ds\":[],\"wh\":[0,0,0],\"of\":[0,0,0]}".into()),
+        (
+            "dm_img_inter".into(),
+            "{\"ds\":[],\"wh\":[0,0,0],\"of\":[0,0,0]}".into(),
+        ),
     ]
 }
 
@@ -1650,7 +1703,7 @@ mod cdn_select {
 
     /// Which kind of Bilibili CDN serves one media URL.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum CdnKind {
+    pub enum CdnKind {
         /// `upos-*-mirror*` server-side rewrite edge (best).
         Mirror,
         /// `upos-*` object storage.
@@ -1748,9 +1801,7 @@ pub enum CdnKind {
     fn url_path(url: &str) -> &str {
         match url_scheme_authority_rest(url) {
             Some((_, _, rest)) => {
-                let end = rest
-                    .find(|ch| ch == '?' || ch == '#')
-                    .unwrap_or(rest.len());
+                let end = rest.find(|ch| ch == '?' || ch == '#').unwrap_or(rest.len());
                 &rest[..end]
             }
             None => "",
@@ -1940,7 +1991,8 @@ pub enum CdnKind {
     type CdnCache = std::collections::HashMap<String, (u64, Instant)>;
 
     static CDN_CACHE: OnceLock<Mutex<CdnCache>> = OnceLock::new();
-    static CDN_BLACKLIST: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> = OnceLock::new();
+    static CDN_BLACKLIST: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
+        OnceLock::new();
 
     fn cdn_cache_cell() -> &'static Mutex<CdnCache> {
         CDN_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -1986,7 +2038,7 @@ pub enum CdnKind {
 
     /// One host's probe outcome.
     #[derive(Clone, Debug, Serialize)]
-pub struct CdnMeasurement {
+    pub struct CdnMeasurement {
         pub host: String,
         pub kind: CdnKind,
         /// Sustained bytes/s over the measurement window; `None` on failure.
@@ -1996,7 +2048,7 @@ pub struct CdnMeasurement {
 
     /// The stream URL the player should use, plus what the probe saw.
     #[derive(Clone, Debug, Serialize)]
-pub struct CdnChoice {
+    pub struct CdnChoice {
         pub url: String,
         pub host: String,
         pub kind: CdnKind,
@@ -2051,8 +2103,8 @@ pub struct CdnChoice {
         // source is already one of those (or is known dead): otherwise the
         // best measured *non-P2P* host wins even when a mcdn edge probes
         // faster, because PCDN throughput collapses under real playback.
-        let allow_p2p = cdn_rank(current_kind) >= cdn_rank(CdnKind::Mcdn)
-            || cdn_blacklisted(&current_host);
+        let allow_p2p =
+            cdn_rank(current_kind) >= cdn_rank(CdnKind::Mcdn) || cdn_blacklisted(&current_host);
         let best = measured
             .iter()
             .filter(|item| allow_p2p || cdn_rank(item.kind) < cdn_rank(CdnKind::Mcdn))
@@ -2169,7 +2221,9 @@ pub struct CdnChoice {
             let mut read_error: Option<String> = None;
 
             loop {
-                if !warming && (measured_bytes >= PROBE_MAX_BYTES || measure_start.elapsed() >= PROBE_WINDOW)
+                if !warming
+                    && (measured_bytes >= PROBE_MAX_BYTES
+                        || measure_start.elapsed() >= PROBE_WINDOW)
                 {
                     break;
                 }
@@ -2287,7 +2341,10 @@ pub struct CdnChoice {
 
             let measured_log = measured
                 .iter()
-                .filter_map(|item| item.bps.map(|bps| format!("{}:{:.1}", item.host, bps as f64 / 1e6)))
+                .filter_map(|item| {
+                    item.bps
+                        .map(|bps| format!("{}:{:.1}", item.host, bps as f64 / 1e6))
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             crate::debug_log(&format!(
@@ -2371,7 +2428,11 @@ pub struct CdnChoice {
             let cid = if detail.cid > 0 {
                 detail.cid as u64
             } else {
-                detail.pages.first().map(|page| page.cid as u64).unwrap_or(0)
+                detail
+                    .pages
+                    .first()
+                    .map(|page| page.cid as u64)
+                    .unwrap_or(0)
             };
             if cid == 0 {
                 bail!("CDN QA: {bvid} 没有可用 cid");
@@ -2468,7 +2529,8 @@ pub struct CdnChoice {
                     Ok(response) => {
                         let status = response.status().as_u16();
                         if response.status().is_success() {
-                            report.push(format!("cdn qa curated host={host} status={status} alive"));
+                            report
+                                .push(format!("cdn qa curated host={host} status={status} alive"));
                         } else {
                             report.push(format!("cdn qa curated host={host} status={status} dead"));
                         }
@@ -2753,8 +2815,17 @@ pub struct VideoCard {
     pub title: String,
     pub pic: String,
     pub owner: String,
+    /// UP主 mid, `0` when the payload omitted the owner block.
+    pub owner_mid: i64,
     pub view: u64,
     pub duration: u64,
+    /// First part cid and aid, so a discovery card can open the player with the
+    /// exact same launch payload as a home-feed card.
+    pub cid: u64,
+    pub aid: u64,
+    /// Publish time in Unix seconds, for the same freshness chip the home
+    /// feed cards use.
+    pub pub_ts: i64,
 }
 
 /// One paged card list plus its pagination state.
@@ -3082,6 +3153,15 @@ fn remember_quality_tiers(bvid: &str, cid: u64, tiers: Vec<QualityTier>) {
     cache.truncate(QUALITY_TIER_CACHE_MAX);
 }
 
+/// Drop every cached tier table. Login/logout changes which streams the
+/// account may play; without this the 画质 menu could keep an anonymous
+/// 480P-only table after the user signs in and still call 720P/1080P locked.
+pub fn clear_quality_tiers() {
+    if let Ok(mut cache) = QUALITY_TIER_CACHE.lock() {
+        cache.clear();
+    }
+}
+
 /// The tier list `playurl` saw for `bvid`/`cid`, if this process fetched it.
 /// `None` (never an invented list) when the video was not opened yet.
 pub fn quality_tiers_for(bvid: &str, cid: u64) -> Option<Vec<QualityTier>> {
@@ -3407,8 +3487,14 @@ mod track_tests {
     #[test]
     fn codec_pref_overrides_bandwidth() {
         assert_eq!(sample().video_track_for(80, 7).map(|t| t.codecid), Some(7));
-        assert_eq!(sample().video_track_for(80, 12).map(|t| t.codecid), Some(12));
-        assert_eq!(sample().video_track_for(80, 13).map(|t| t.codecid), Some(13));
+        assert_eq!(
+            sample().video_track_for(80, 12).map(|t| t.codecid),
+            Some(12)
+        );
+        assert_eq!(
+            sample().video_track_for(80, 13).map(|t| t.codecid),
+            Some(13)
+        );
     }
 
     #[test]
@@ -3576,7 +3662,10 @@ mod track_tests {
             Some(("HDR 真彩", true, false, false))
         );
 
-        let four_k_avc = info.qualities.iter().find(|q| q.qn == 120 && q.codecid == 7);
+        let four_k_avc = info
+            .qualities
+            .iter()
+            .find(|q| q.qn == 120 && q.codecid == 7);
         assert_eq!(
             four_k_avc.map(|q| (q.label.as_str(), q.fps, q.bandwidth_bps)),
             Some(("4K 超清", 60.0, 12_000_000))
@@ -3591,7 +3680,10 @@ mod track_tests {
 
         // Playback selection is unchanged: auto = lowest bitrate at the qn.
         assert_eq!(info.video_track_for(120, 0).map(|t| t.codecid), Some(12));
-        assert_eq!(info.video_track_for(120, 7).map(|t| t.bandwidth), Some(12_000_000));
+        assert_eq!(
+            info.video_track_for(120, 7).map(|t| t.bandwidth),
+            Some(12_000_000)
+        );
         assert_eq!(info.default_qn, 80);
 
         // Audio matrix: the three regular tiers plus 杜比全景声 and 无损.
@@ -3628,7 +3720,10 @@ mod track_tests {
         };
         assert!(info.qualities.is_empty());
         assert_eq!(info.video_tracks.len(), 1);
-        assert_eq!(info.video_tracks.first().map(|t| t.url.clone()), Some("https://x/durl.m4s".to_string()));
+        assert_eq!(
+            info.video_tracks.first().map(|t| t.url.clone()),
+            Some("https://x/durl.m4s".to_string())
+        );
         assert_eq!(info.video_tracks.first().map(|t| t.id), Some(0));
         assert_eq!(info.default_qn, 0);
         assert_eq!(info.duration, 125);
@@ -3663,6 +3758,31 @@ mod tier_tests {
             {"id":64,"frameRate":"29.97","baseUrl":"https://x/64"}
         ]}
     }"#;
+
+    #[test]
+    fn logged_in_1080p_tiers_are_not_locked() {
+        // A logged-in non-VIP account gets the 1080P/720P/480P streams; only
+        // the 4K tier stays locked. The menu must not mark 1080P as 大会员.
+        let tiers = build_quality_tiers(
+            &data(
+                r#"{
+                  "accept_quality":[120,80,64,32],
+                  "accept_description":["超清 4K","高清 1080P","高清 720P","清晰 480P"],
+                  "dash":{"video":[
+                    {"id":80,"frameRate":"30","width":1920,"height":1080},
+                    {"id":64,"frameRate":"30","width":1280,"height":720},
+                    {"id":32,"frameRate":"30","width":852,"height":480}
+                  ]}
+                }"#,
+            ),
+            1080,
+        );
+        let tier = |qn: i64| tiers.iter().find(|tier| tier.qn == qn).expect("tier");
+        assert!(!tier(80).locked, "1080P must be playable after login");
+        assert!(!tier(64).locked, "720P must be playable after login");
+        assert!(!tier(32).locked, "480P must be playable");
+        assert!(tier(120).locked, "4K is the only locked tier here");
+    }
 
     #[test]
     fn advertised_tiers_include_the_locked_vip_ones() {
@@ -3796,7 +3916,17 @@ mod heartbeat_tests {
 
     #[test]
     fn heartbeat_body_carries_the_position_and_the_play_flags() {
-        let body = heartbeat_body(170001, "BV1xx411c7mD", 62131, 1248, 300, 3600, 1_592_720_840, 0, "abc123");
+        let body = heartbeat_body(
+            170001,
+            "BV1xx411c7mD",
+            62131,
+            1248,
+            300,
+            3600,
+            1_592_720_840,
+            0,
+            "abc123",
+        );
         for field in [
             "aid=170001",
             "bvid=BV1xx411c7mD",
@@ -3825,7 +3955,7 @@ mod heartbeat_tests {
 #[cfg(test)]
 mod cdn_tests {
     use super::{
-        classify_cdn, cdn_rank, curated_mirror_hosts, cdn_qa_bvid, is_rewritable, rewrite_host,
+        cdn_qa_bvid, cdn_rank, classify_cdn, curated_mirror_hosts, is_rewritable, rewrite_host,
         CdnKind,
     };
 
@@ -3860,7 +3990,10 @@ mod cdn_tests {
         assert!(is_rewritable(&akam));
         // It needs its own `hdnts` token: rewriting to it would 403.
         assert_eq!(
-            rewrite_host(&url("upos-sz-mirrorali.bilivideo.com"), "upos-hz-mirrorakam.akamaized.net"),
+            rewrite_host(
+                &url("upos-sz-mirrorali.bilivideo.com"),
+                "upos-hz-mirrorakam.akamaized.net"
+            ),
             None
         );
     }
@@ -3908,10 +4041,7 @@ mod cdn_tests {
         let pcdn = "http://1.2.3.4:8080/v1/resource/abc/def?sig=1";
         assert_eq!(classify_cdn(pcdn), CdnKind::IpPort);
         assert!(!is_rewritable(pcdn));
-        assert_eq!(
-            rewrite_host(pcdn, "upos-sz-mirrorali.bilivideo.com"),
-            None
-        );
+        assert_eq!(rewrite_host(pcdn, "upos-sz-mirrorali.bilivideo.com"), None);
         assert_eq!(cdn_rank(CdnKind::IpPort), 5);
 
         let bare_ip = "http://10.0.0.7:8080/upgcxcode/1/2/x.m4s?os=mcdn";
@@ -3985,7 +4115,10 @@ mod cdn_tests {
         assert_eq!(rewrite_host(&source, "https://x.bilivideo.com/"), None);
         assert_eq!(rewrite_host("https://1.2.3.4:80/a.m4s", target), None);
         assert_eq!(
-            rewrite_host("https://upos-sz-mirrorali.bilivideo.com/v1/resource/a", target),
+            rewrite_host(
+                "https://upos-sz-mirrorali.bilivideo.com/v1/resource/a",
+                target
+            ),
             None
         );
     }
@@ -4415,7 +4548,7 @@ pub(crate) fn length_seconds(length: &str) -> u64 {
 
 #[cfg(test)]
 mod season_tests {
-    use super::{detail_from_view, ViewData, VideoDetail, SEASON_MAX_EPISODES};
+    use super::{detail_from_view, VideoDetail, ViewData, SEASON_MAX_EPISODES};
 
     /// Synthetic `x/web-interface/view` payloads only: placeholder ids, never a
     /// real BV号.

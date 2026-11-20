@@ -1,10 +1,11 @@
-//! 画质增强 — CAS (通用) and Anime4K Restore-CNN-S (番剧).
+//! 画质增强 — CAS (通用) and Anime4K Restore-CNN-S (番剧), plus the shared GPU
+//! video passes (NV12→BGRA, 插帧 blend, copy/brightness).
 //!
 //! Ported from the shipped `src/dcomp/enhance.rs`; the shaders are byte-for-byte
 //! the ones that were verified there (`shaders/enhance.hlsl`, Anime4K v4.0.1
-//! Restore-CNN-S). The only difference is where the source comes from: this
-//! player decodes NV12 on the CPU, converts to BGRA and uploads into a staging
-//! texture, so the chain always begins from a texture copy.
+//! Restore-CNN-S). The decoded picture now arrives as a D3D11 texture produced
+//! by the GPU conversion pass, so the chain samples it directly: there is no
+//! CPU staging upload and no full-frame `CopyResource` per frame.
 //!
 //! Failure policy: every entry point returns a reason; the engine logs
 //! `enhance fallback` and presents through the plain copy for the rest of the
@@ -20,11 +21,11 @@ use windows::core::PCSTR;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Buffer, ID3D11ClassLinkage, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_BUFFER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIEWPORT, ID3D11Buffer, ID3D11ClassLinkage, ID3D11Device, ID3D11DeviceContext,
-    ID3D11PixelShader, ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader,
+    D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
@@ -79,7 +80,8 @@ impl EnhanceMode {
 // ------------------------------------------------------------------ targets
 
 struct Target {
-    tex: ID3D11Texture2D,
+    /// Kept for the lifetime of `srv`/`rtv`; the views reference it.
+    _tex: ID3D11Texture2D,
     srv: ID3D11ShaderResourceView,
     rtv: ID3D11RenderTargetView,
 }
@@ -116,7 +118,7 @@ impl Target {
                 .CreateRenderTargetView(&tex, None, Some(&mut rtv))
                 .map_err(|error| anyhow!("CreateRenderTargetView {format:?}: {error}"))?;
             Ok(Self {
-                tex,
+                _tex: tex,
                 srv: srv.ok_or_else(|| anyhow!("no SRV {format:?}"))?,
                 rtv: rtv.ok_or_else(|| anyhow!("no RTV {format:?}"))?,
             })
@@ -213,14 +215,19 @@ fn compile_uncached(source: &str, entry: &str, target: &str) -> Result<Vec<u8>> 
             let get_size: unsafe extern "system" fn(*mut c_void) -> usize = vtbl(errors, 4);
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = vtbl(errors, 2);
             let size = get_size(errors);
-            let text =
-                String::from_utf8_lossy(std::slice::from_raw_parts(get_pointer(errors) as *const u8, size))
-                    .into_owned();
+            let text = String::from_utf8_lossy(std::slice::from_raw_parts(
+                get_pointer(errors) as *const u8,
+                size,
+            ))
+            .into_owned();
             release(errors);
             text
         };
         if hr < 0 || code.is_null() {
-            return Err(anyhow!("D3DCompile {entry} hr=0x{:08X} {message}", hr as u32));
+            return Err(anyhow!(
+                "D3DCompile {entry} hr=0x{:08X} {message}",
+                hr as u32
+            ));
         }
         let get_pointer: unsafe extern "system" fn(*mut c_void) -> *const c_void = vtbl(code, 3);
         let get_size: unsafe extern "system" fn(*mut c_void) -> usize = vtbl(code, 4);
@@ -298,10 +305,7 @@ pub struct EnhancePipeline {
     width: u32,
     height: u32,
     vertex: ID3D11VertexShader,
-    brightness: ID3D11PixelShader,
     dims: ID3D11Buffer,
-    /// CPU frame staging -> shader-readable copy.
-    source: Target,
     /// The luma-clamped picture, the CNN's MAIN input.
     color: Target,
     /// Intermediate RGBA16F convolution targets.
@@ -328,7 +332,6 @@ impl EnhancePipeline {
                 .map_err(|error| anyhow!("CreateVertexShader: {error}"))?;
             vertex.ok_or_else(|| anyhow!("CreateVertexShader: no shader"))?
         };
-        let brightness = pixel_shader(device, ENHANCE_HLSL, "brightness_main")?;
         let initial = [0f32; 8];
         let dims = unsafe {
             let description = D3D11_BUFFER_DESC {
@@ -350,10 +353,9 @@ impl EnhancePipeline {
                 .map_err(|error| anyhow!("CreateBuffer: {error}"))?;
             buffer.ok_or_else(|| anyhow!("CreateBuffer: no buffer"))?
         };
-        let source = Target::new(device, width, height, DXGI_FORMAT_B8G8R8A8_UNORM)?;
         let color = Target::new(device, width, height, DXGI_FORMAT_B8G8R8A8_UNORM)?;
         log::line(&format!(
-            "enhance pipeline size={width}x{height} source=BGRA8 conv=RGBA16F"
+            "enhance pipeline size={width}x{height} source=GPU-BGRA8 conv=RGBA16F"
         ));
         Ok(Self {
             device: device.clone(),
@@ -361,9 +363,7 @@ impl EnhancePipeline {
             width,
             height,
             vertex,
-            brightness,
             dims,
-            source,
             color,
             conv: Vec::new(),
             chain: None,
@@ -380,12 +380,15 @@ impl EnhancePipeline {
         self.frames = 0;
         let chain = build_chain(&self.device, mode)?;
         for index in 0..chain.conv_targets() {
-            self.conv.push(Target::new(
-                &self.device,
-                self.width,
-                self.height,
-                DXGI_FORMAT_R16G16B16A16_FLOAT,
-            ).map_err(|error| anyhow!("conv target {index}: {error}"))?);
+            self.conv.push(
+                Target::new(
+                    &self.device,
+                    self.width,
+                    self.height,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                )
+                .map_err(|error| anyhow!("conv target {index}: {error}"))?,
+            );
         }
         log::line(&format!(
             "enhance mode={} label={} passes={}",
@@ -441,13 +444,17 @@ impl EnhancePipeline {
                 MaxDepth: 1.0,
             };
             self.context.RSSetViewports(Some(&[viewport]));
-            self.context.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
-            self.context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context
+                .OMSetRenderTargets(Some(&[Some(target.clone())]), None);
+            self.context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             self.context.IASetInputLayout(None);
             self.context.VSSetShader(&self.vertex, None);
             self.context.PSSetShader(shader, None);
-            self.context.VSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
-            self.context.PSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
+            self.context
+                .VSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
+            self.context
+                .PSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
             self.context.PSSetShaderResources(0, Some(&views));
             self.context.Draw(3, 0);
             let empty: Vec<Option<ID3D11ShaderResourceView>> =
@@ -456,20 +463,18 @@ impl EnhancePipeline {
         }
     }
 
-    /// Run one frame's chain. `staging` is the CPU-written BGRA texture, `back`
-    /// is the current swapchain backbuffer view.
+    /// Run one frame's chain. `source` is the GPU-converted BGRA picture (the
+    /// NV12→BGRA pass or the interpolation blend), `back` is the current
+    /// swapchain backbuffer view.
     pub fn draw(
         &mut self,
         mode: EnhanceMode,
         brightness: f32,
-        staging: &ID3D11Texture2D,
+        source: &ID3D11ShaderResourceView,
         back: &ID3D11RenderTargetView,
     ) -> Result<()> {
         if mode == EnhanceMode::Off {
             return Err(anyhow!("enhance draw called with Off"));
-        }
-        unsafe {
-            self.context.CopyResource(&self.source.tex, staging);
         }
         self.ensure_chain(mode)?;
         let result = {
@@ -479,7 +484,7 @@ impl EnhancePipeline {
             match chain {
                 Chain::Cas { cas } => {
                     self.set_dims(CAS_STRENGTH, brightness);
-                    self.pass_to(cas, &[&self.source.srv], back);
+                    self.pass_to(cas, &[source], back);
                     Ok(())
                 }
                 Chain::Anime4k {
@@ -494,19 +499,23 @@ impl EnhancePipeline {
                         self.set_dims(0.0, brightness);
                         // Clamp_Highlights: a 5x5 luma max in two sweeps, then
                         // clamp every pixel to its local ceiling.
-                        self.pass_to(stats_x, &[&self.source.srv], &self.conv[0].rtv);
+                        self.pass_to(stats_x, &[source], &self.conv[0].rtv);
                         // stats_y reads the first sweep through t1 as well as
                         // t0; the same view is bound twice, as upstream does.
-                        self.pass_to(stats_y, &[&self.conv[0].srv, &self.conv[0].srv], &self.conv[1].rtv);
-                        self.pass_to(apply, &[&self.source.srv, &self.conv[1].srv], &self.color.rtv);
+                        self.pass_to(
+                            stats_y,
+                            &[&self.conv[0].srv, &self.conv[0].srv],
+                            &self.conv[1].rtv,
+                        );
+                        self.pass_to(
+                            apply,
+                            &[source, &self.conv[1].srv],
+                            &self.color.rtv,
+                        );
                         self.pass_to(&restore[0], &[&self.color.srv], &self.conv[0].rtv);
                         self.pass_to(&restore[1], &[&self.conv[0].srv], &self.conv[1].rtv);
                         self.pass_to(&restore[2], &[&self.conv[1].srv], &self.conv[2].rtv);
-                        self.pass_to(
-                            &restore[3],
-                            &[&self.color.srv, &self.conv[2].srv],
-                            back,
-                        );
+                        self.pass_to(&restore[3], &[&self.color.srv, &self.conv[2].srv], back);
                         Ok(())
                     }
                 }
@@ -516,7 +525,8 @@ impl EnhancePipeline {
         // Present refuses a bound render target.
         unsafe {
             self.context.OMSetRenderTargets(None, None);
-            self.context.PSSetShaderResources(0, Some(&[None, None, None, None, None, None, None, None]));
+            self.context
+                .PSSetShaderResources(0, Some(&[None, None, None, None, None, None, None, None]));
         }
         if result.is_ok() {
             if self.frames == 0 {
@@ -532,26 +542,175 @@ impl EnhancePipeline {
         }
         result
     }
+}
 
-    /// 关闭 enhancement but still apply the brightness multiplier through the
-    /// video pixel shader. The staging texture is copied to the shader-readable
-    /// source first, exactly like the enhance chains' entry point.
-    pub fn draw_brightness(
-        &mut self,
-        staging: &ID3D11Texture2D,
-        back: &ID3D11RenderTargetView,
-        brightness: f32,
-    ) -> Result<()> {
+/// The shared video pixel passes that sit in front of 画质增强 / Present.
+///
+/// Every pass is a full-viewport triangle over textures of the surface's own
+/// size, so all of them are exact point loads (`Load`) with no sampler and no
+/// scaling filter. The only CPU work per frame is the NV12 upload into two
+/// dynamic planes.
+pub struct VideoPasses {
+    context: ID3D11DeviceContext,
+    width: u32,
+    height: u32,
+    vertex: ID3D11VertexShader,
+    /// `brightness_main`: the no-enhance path (brightness multiplier included).
+    copy: ID3D11PixelShader,
+    /// `blend_main`: two pictures + weight (插帧).
+    blend: ID3D11PixelShader,
+    /// `nv12_main`: Y + UV planes -> BGRA.
+    nv12: ID3D11PixelShader,
+    dims: ID3D11Buffer,
+}
+
+impl VideoPasses {
+    pub fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let width = width.max(2);
+        let height = height.max(2);
+        let vs_code = compile(ENHANCE_HLSL, "vs_main", "vs_5_0")?;
+        let vertex = unsafe {
+            let mut vertex: Option<ID3D11VertexShader> = None;
+            device
+                .CreateVertexShader(&vs_code, None::<&ID3D11ClassLinkage>, Some(&mut vertex))
+                .map_err(|error| anyhow!("CreateVertexShader (video passes): {error}"))?;
+            vertex.ok_or_else(|| anyhow!("CreateVertexShader (video passes): no shader"))?
+        };
+        let copy = pixel_shader(device, ENHANCE_HLSL, "brightness_main")?;
+        let blend = pixel_shader(device, ENHANCE_HLSL, "blend_main")?;
+        let nv12 = pixel_shader(device, ENHANCE_HLSL, "nv12_main")?;
+        let initial = [0.0f32; 8];
+        let dims = unsafe {
+            let description = D3D11_BUFFER_DESC {
+                ByteWidth: 32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: initial.as_ptr() as *const c_void,
+                SysMemPitch: 0,
+                SysMemSlicePitch: 0,
+            };
+            let mut buffer: Option<ID3D11Buffer> = None;
+            device
+                .CreateBuffer(&description, Some(&data), Some(&mut buffer))
+                .map_err(|error| anyhow!("CreateBuffer (video passes): {error}"))?;
+            buffer.ok_or_else(|| anyhow!("CreateBuffer (video passes): no buffer"))?
+        };
+        log::line(&format!(
+            "video passes size={width}x{height} nv12=ps_5_0 blend=ps_5_0 copy=ps_5_0"
+        ));
+        Ok(Self {
+            context: context.clone(),
+            width,
+            height,
+            vertex,
+            copy,
+            blend,
+            nv12,
+            dims,
+        })
+    }
+
+    fn set_extra(&self, x: f32) {
+        let packed = [
+            self.width.saturating_sub(1) as f32,
+            self.height.saturating_sub(1) as f32,
+            self.width as f32,
+            self.height as f32,
+            x,
+            1.0,
+            0.0,
+            0.0,
+        ];
         unsafe {
-            self.context.CopyResource(&self.source.tex, staging);
+            self.context.UpdateSubresource(
+                &self.dims,
+                0,
+                None,
+                packed.as_ptr() as *const c_void,
+                0,
+                0,
+            );
         }
-        self.set_dims(brightness, 1.0);
-        self.pass_to(&self.brightness, &[&self.source.srv], back);
+    }
+
+    fn pass(
+        &self,
+        shader: &ID3D11PixelShader,
+        inputs: &[&ID3D11ShaderResourceView],
+        target: &ID3D11RenderTargetView,
+    ) {
+        let views: Vec<Option<ID3D11ShaderResourceView>> =
+            inputs.iter().map(|view| Some((*view).clone())).collect();
         unsafe {
-            self.context.OMSetRenderTargets(None, None);
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: self.width as f32,
+                Height: self.height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.context.RSSetViewports(Some(&[viewport]));
             self.context
-                .PSSetShaderResources(0, Some(&[None, None, None, None]));
+                .OMSetRenderTargets(Some(&[Some(target.clone())]), None);
+            self.context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context.IASetInputLayout(None);
+            self.context.VSSetShader(&self.vertex, None);
+            self.context.PSSetShader(shader, None);
+            self.context
+                .VSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
+            self.context
+                .PSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
+            self.context.PSSetShaderResources(0, Some(&views));
+            self.context.Draw(3, 0);
+            let empty: Vec<Option<ID3D11ShaderResourceView>> =
+                inputs.iter().map(|_| None).collect();
+            self.context.PSSetShaderResources(0, Some(&empty));
         }
-        Ok(())
+    }
+
+    /// Y (R8) + UV (R8G8) -> BGRA picture.
+    pub fn convert_nv12(
+        &self,
+        y: &ID3D11ShaderResourceView,
+        uv: &ID3D11ShaderResourceView,
+        target: &ID3D11RenderTargetView,
+    ) {
+        self.set_extra(0.0);
+        self.pass(&self.nv12, &[y, uv], target);
+    }
+
+    /// `weight` is the weight of `b` in `0..=1`.
+    pub fn blend(
+        &self,
+        a: &ID3D11ShaderResourceView,
+        b: &ID3D11ShaderResourceView,
+        weight: f32,
+        target: &ID3D11RenderTargetView,
+    ) {
+        self.set_extra(weight.clamp(0.0, 1.0));
+        self.pass(&self.blend, &[a, b], target);
+    }
+
+    /// Opaque copy with the brightness multiplier (关闭 enhancement path).
+    pub fn copy(
+        &self,
+        source: &ID3D11ShaderResourceView,
+        brightness: f32,
+        target: &ID3D11RenderTargetView,
+    ) {
+        self.set_extra(brightness.clamp(0.4, 2.0));
+        self.pass(&self.copy, &[source], target);
     }
 }

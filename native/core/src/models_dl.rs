@@ -227,9 +227,8 @@ fn cpp_spec(model: &ModelInfo) -> Option<&'static crate::fishwatch::asr::models:
 /// checks before it starts a run.
 fn verify_downloaded(root: &Path, model: &ModelInfo) -> Result<()> {
     if let Some(spec) = cpp_spec(model) {
-        crate::fishwatch::asr::models::verify(root, spec).with_context(|| {
-            format!("校验 {} 失败（文件已保留，可删除后重下）", model.name)
-        })?;
+        crate::fishwatch::asr::models::verify(root, spec)
+            .with_context(|| format!("校验 {} 失败（文件已保留，可删除后重下）", model.name))?;
     }
     Ok(())
 }
@@ -308,8 +307,7 @@ pub fn delete(root: &Path, name: &str) -> Result<u64> {
     for path in [model_path(root, model), part_path(root, model)] {
         let len = file_len(&path);
         if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("删除失败：{}", path.display()))?;
+            std::fs::remove_file(&path).with_context(|| format!("删除失败：{}", path.display()))?;
             freed += len;
         }
     }
@@ -375,10 +373,16 @@ fn host_name(host: &str) -> &'static str {
 pub enum Event {
     /// 到了 1 Hz 的回报点。
     Progress,
-    Done { bytes: u64 },
+    Done {
+        bytes: u64,
+    },
     /// 用户取消（或窗口关了）：`.part` 保留。
-    Paused { kept: u64 },
-    Failed { error: String },
+    Paused {
+        kept: u64,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// 一次下载的结局。
@@ -508,8 +512,7 @@ pub fn download(
         return Ok(Outcome::Done { bytes: partial });
     }
 
-    let runtime = crate::bilibili::shared_runtime()
-        .ok_or_else(|| anyhow!("网络运行时不可用"))?;
+    let runtime = crate::bilibili::shared_runtime().ok_or_else(|| anyhow!("网络运行时不可用"))?;
     let client = reqwest::Client::builder()
         .user_agent(crate::bilibili::UA)
         .connect_timeout(Duration::from_secs(30))
@@ -581,11 +584,7 @@ pub fn download(
                     slot.take();
                 }
                 if !size_ok(bytes, total) {
-                    let reason = format!(
-                        "体积不对：{} != {}",
-                        size_text(bytes),
-                        size_text(total)
-                    );
+                    let reason = format!("体积不对：{} != {}", size_text(bytes), size_text(total));
                     crate::debug_log(&format!(
                         "models dl failed name={} err={reason}",
                         model.name
@@ -608,10 +607,7 @@ pub fn download(
                     });
                     return Err(err);
                 }
-                crate::debug_log(&format!(
-                    "models dl done name={} bytes={bytes}",
-                    model.name
-                ));
+                crate::debug_log(&format!("models dl done name={} bytes={bytes}", model.name));
                 sink(Event::Done { bytes });
                 return Ok(Outcome::Done { bytes });
             }
@@ -620,10 +616,7 @@ pub fn download(
                 if let Ok(mut slot) = JOB.lock() {
                     slot.take();
                 }
-                crate::debug_log(&format!(
-                    "models dl cancel name={} kept={kept}",
-                    model.name
-                ));
+                crate::debug_log(&format!("models dl cancel name={} kept={kept}", model.name));
                 sink(Event::Paused { kept });
                 return Ok(Outcome::Paused { kept });
             }
@@ -692,10 +685,7 @@ async fn attempt_once(
 
     let mut request = client.get(url);
     if have > 0 {
-        request = request.header(
-            reqwest::header::RANGE,
-            format!("bytes={have}-"),
-        );
+        request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
     }
     let response = request
         .send()
@@ -780,10 +770,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "o11a1-models-dl-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("o11a1-models-dl-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
@@ -797,7 +785,10 @@ mod tests {
         // one the folder package used to carry).
         assert_eq!(info("small").map(|model| model.bytes), Some(487_601_967));
         assert_eq!(info("medium").map(|model| model.bytes), Some(1_533_763_059));
-        assert_eq!(info("small").map(|model| model.file), Some("ggml-small.bin"));
+        assert_eq!(
+            info("small").map(|model| model.file),
+            Some("ggml-small.bin")
+        );
         assert!(info("large").is_none());
         for model in MODELS {
             assert_eq!(model.size_text(), size_text(model.bytes));
@@ -874,7 +865,10 @@ mod tests {
         assert_eq!(rows[0].state, State::Installed);
         assert!(rows[0].verified);
         assert_eq!(rows[1].state, State::Missing);
-        assert_eq!(largest_installed(&dir).map(|model| model.name), Some("tiny"));
+        assert_eq!(
+            largest_installed(&dir).map(|model| model.name),
+            Some("tiny")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -908,7 +902,10 @@ mod tests {
         assert_eq!(freed, 100);
         assert!(!part_path(&dir, small).exists());
         assert!(!model_path(&dir, small).exists());
-        assert!(!marker.exists(), "deleting a model invalidates its .ok marker");
+        assert!(
+            !marker.exists(),
+            "deleting a model invalidates its .ok marker"
+        );
         assert!(delete(&dir, "nope").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

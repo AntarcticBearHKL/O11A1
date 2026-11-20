@@ -53,11 +53,8 @@ fn assign_to_job(child: &Child) {
         return;
     };
     unsafe {
-        let Ok(process) = OpenProcess(
-            PROCESS_SET_QUOTA | PROCESS_TERMINATE,
-            false,
-            child.id(),
-        ) else {
+        let Ok(process) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id())
+        else {
             return;
         };
         let _ = AssignProcessToJobObject(job, process);
@@ -348,7 +345,14 @@ fn run_task(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            set_status(&inner, &id, "error", 0.0, "", &format!("启动 ffmpeg 失败：{error}"));
+            set_status(
+                &inner,
+                &id,
+                "error",
+                0.0,
+                "",
+                &format!("启动 ffmpeg 失败：{error}"),
+            );
             return;
         }
     };
@@ -356,7 +360,10 @@ fn run_task(
     let stderr = child.stderr.take();
     let mut last_save = Instant::now();
     if let Some(stderr) = stderr {
-        for line in BufReader::new(stderr).lines().map_while(std::result::Result::ok) {
+        for line in BufReader::new(stderr)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
             if cancel.load(Ordering::SeqCst) {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -391,7 +398,14 @@ fn run_task(
     match child.wait() {
         Ok(status) if status.success() => {
             if let Err(error) = std::fs::rename(&part, &path) {
-                set_status(&inner, &id, "error", 0.0, "", &format!("重命名失败：{error}"));
+                set_status(
+                    &inner,
+                    &id,
+                    "error",
+                    0.0,
+                    "",
+                    &format!("重命名失败：{error}"),
+                );
                 return;
             }
             set_status(&inner, &id, "done", 100.0, "", "");
@@ -408,7 +422,14 @@ fn run_task(
             let _ = std::fs::remove_file(&part);
         }
         Err(error) => {
-            set_status(&inner, &id, "error", 0.0, "", &format!("等待 ffmpeg 失败：{error}"));
+            set_status(
+                &inner,
+                &id,
+                "error",
+                0.0,
+                "",
+                &format!("等待 ffmpeg 失败：{error}"),
+            );
         }
     }
 }
@@ -509,19 +530,42 @@ fn load_tasks() -> Vec<Task> {
                 status = "error".to_string();
             }
             Task {
-                id: row.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-                bvid: row.get("bvid").and_then(Value::as_str).unwrap_or_default().to_string(),
+                id: row
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                bvid: row
+                    .get("bvid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 cid: row.get("cid").and_then(Value::as_u64).unwrap_or(0),
-                title: row.get("title").and_then(Value::as_str).unwrap_or_default().to_string(),
-                cover: row.get("cover").and_then(Value::as_str).unwrap_or_default().to_string(),
+                title: row
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                cover: row
+                    .get("cover")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 status,
                 progress: row.get("progress").and_then(Value::as_f64).unwrap_or(0.0),
                 speed: String::new(),
-                path: row.get("path").and_then(Value::as_str).unwrap_or_default().to_string(),
+                path: row
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 error: if row.get("status").and_then(Value::as_str) == Some("running") {
                     "上次运行被中断".to_string()
                 } else {
-                    row.get("error").and_then(Value::as_str).unwrap_or_default().to_string()
+                    row.get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
                 },
                 created: row.get("created").and_then(Value::as_u64).unwrap_or(0),
                 cancel: Arc::new(AtomicBool::new(false)),

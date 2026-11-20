@@ -226,7 +226,8 @@ pub const CPP_SMALL_SPEC: ModelSpec = ModelSpec {
     engine: "whisper.cpp",
     dir: "whisper.cpp",
     files: CPP_SMALL,
-};pub const CPP_TURBO_SPEC: ModelSpec = ModelSpec {
+};
+pub const CPP_TURBO_SPEC: ModelSpec = ModelSpec {
     id: "turbo",
     engine: "whisper.cpp",
     dir: "whisper.cpp",
@@ -245,9 +246,7 @@ pub fn spec(model: &str, engine: &str) -> Option<&'static ModelSpec> {
     match (model.trim(), engine.trim()) {
         ("small", "faster-whisper") | ("small", "auto") | ("small", "") => Some(&FW_SMALL_SPEC),
         ("turbo", "faster-whisper") | ("turbo", "auto") | ("turbo", "") => Some(&FW_TURBO_SPEC),
-        ("medium", "faster-whisper") | ("medium", "auto") | ("medium", "") => {
-            Some(&FW_MEDIUM_SPEC)
-        }
+        ("medium", "faster-whisper") | ("medium", "auto") | ("medium", "") => Some(&FW_MEDIUM_SPEC),
         ("small", "whisper.cpp") => Some(&CPP_SMALL_SPEC),
         ("turbo", "whisper.cpp") => Some(&CPP_TURBO_SPEC),
         ("medium", "whisper.cpp") => Some(&CPP_MEDIUM_SPEC),
@@ -335,8 +334,8 @@ pub fn verify(root: &Path, spec: &ModelSpec) -> Result<()> {
     let dir = spec.path(root);
     for file in spec.files {
         let path = dir.join(file.name);
-        let meta = std::fs::metadata(&path)
-            .with_context(|| format!("缺少模型文件 {}", path.display()))?;
+        let meta =
+            std::fs::metadata(&path).with_context(|| format!("缺少模型文件 {}", path.display()))?;
         if meta.len() != file.size {
             return Err(anyhow!(
                 "{} 体积不对：{} != {}",
@@ -384,11 +383,7 @@ pub struct Progress {
 
 /// Download (or resume) one model from the official host, falling back to the
 /// mirror like [`download_with`] with [`crate::models_dl::Mirror::Auto`].
-pub fn download(
-    root: &Path,
-    spec: &ModelSpec,
-    progress: &mut dyn FnMut(Progress),
-) -> Result<()> {
+pub fn download(root: &Path, spec: &ModelSpec, progress: &mut dyn FnMut(Progress)) -> Result<()> {
     download_with(
         root,
         spec,
@@ -442,12 +437,7 @@ pub fn download_with(
                 done += file.size;
                 progress(Progress {
                     fraction: done as f32 / total as f32,
-                    text: format!(
-                        "{} · {} · {} 已校验",
-                        spec.id,
-                        human_bytes(done),
-                        file.name
-                    ),
+                    text: format!("{} · {} · {} 已校验", spec.id, human_bytes(done), file.name),
                 });
                 continue;
             }
@@ -513,10 +503,7 @@ pub fn download_with(
         });
         crate::debug_log(&format!(
             "fish model file done={} bytes={} sha256={} expected={} ok=1",
-            file.name,
-            file.size,
-            file.sha256,
-            file.sha256
+            file.name, file.size, file.sha256, file.sha256
         ));
     }
     verify(root, spec)?;
@@ -587,11 +574,7 @@ fn download_file_from(
                 return Ok(());
             }
         }
-        return Err(anyhow!(
-            "下载 {} 失败：HTTP {}",
-            file.name,
-            status.as_u16()
-        ));
+        return Err(anyhow!("下载 {} 失败：HTTP {}", file.name, status.as_u16()));
     }
     if !appending {
         have = 0;
@@ -677,7 +660,10 @@ mod tests {
             &CPP_TURBO_SPEC,
         ] {
             assert!(!spec.files.is_empty());
-            assert_eq!(spec.files[0].name.contains("model.bin") || spec.files[0].name.contains("ggml"), true);
+            assert_eq!(
+                spec.files[0].name.contains("model.bin") || spec.files[0].name.contains("ggml"),
+                true
+            );
             let total = spec.total_bytes();
             // tiny is 74 MB; every other shipped tier is well past 100 MB.
             assert!(total > 70_000_000, "{} total {total}", spec.id);
@@ -698,7 +684,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("whisper.cpp 没有 {} 档", model.name));
             assert_eq!(cpp.primary().name, model.file, "{}", model.name);
             assert_eq!(cpp.primary().size, model.bytes, "{}", model.name);
-            assert_eq!(cpp.path(&PathBuf::from("root")), PathBuf::from("root/whisper.cpp"));
+            assert_eq!(
+                cpp.path(&PathBuf::from("root")),
+                PathBuf::from("root/whisper.cpp")
+            );
         }
     }
 
@@ -722,9 +711,18 @@ mod tests {
 
     #[test]
     fn spec_resolution_prefers_faster_whisper_for_auto() {
-        assert_eq!(spec("small", "auto").map(|spec| spec.engine), Some("faster-whisper"));
-        assert_eq!(spec("turbo", "whisper.cpp").map(|spec| spec.dir), Some("whisper.cpp"));
-        assert_eq!(spec("medium", "faster-whisper").map(|spec| spec.id), Some("medium"));
+        assert_eq!(
+            spec("small", "auto").map(|spec| spec.engine),
+            Some("faster-whisper")
+        );
+        assert_eq!(
+            spec("turbo", "whisper.cpp").map(|spec| spec.dir),
+            Some("whisper.cpp")
+        );
+        assert_eq!(
+            spec("medium", "faster-whisper").map(|spec| spec.id),
+            Some("medium")
+        );
         assert!(spec("large", "auto").is_none());
     }
 
@@ -837,7 +835,10 @@ mod tests {
             assert_eq!(meta.len(), file.size);
             eprintln!(
                 "verified {} bytes={} sha256={} expected={}",
-                file.name, meta.len(), file.sha256, file.sha256
+                file.name,
+                meta.len(),
+                file.sha256,
+                file.sha256
             );
         }
         eprintln!(
@@ -857,9 +858,13 @@ mod tests {
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::paths::root().join("models/whisper"));
         eprintln!("model root={}", root.display());
-        let target = CPP_SMALL_SPEC.path(&root).join(CPP_SMALL_SPEC.primary().name);
+        let target = CPP_SMALL_SPEC
+            .path(&root)
+            .join(CPP_SMALL_SPEC.primary().name);
         if target.exists() {
-            let size = std::fs::metadata(&target).map(|meta| meta.len()).unwrap_or(0);
+            let size = std::fs::metadata(&target)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
             eprintln!("already present {} bytes={size}", target.display());
         }
         let started = Instant::now();
@@ -889,4 +894,3 @@ mod tests {
         );
     }
 }
-

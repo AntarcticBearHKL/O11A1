@@ -17,12 +17,15 @@ export interface LaunchOptions {
   epId?: number;
 }
 
-export async function launchPlayer(options: LaunchOptions): Promise<void> {
-  await window.o11a1.player.launch(options);
+/// Left-click reuses the most recently focused player window (the shell
+/// decides); `newWindow` (right-click) always opens a fresh one.
+export async function launchPlayer(options: LaunchOptions, newWindow = false): Promise<void> {
+  await window.o11a1.player.launch(options, newWindow);
 }
 
-/// Resolve one PGC episode: combined durl first, then DASH video + audio as a
-/// fallback for episodes where `fnval=1` returns no durl.
+/// Resolve one PGC episode as a direct stream. Only used when a season's data
+/// has no `bvid`; normal episodes launch through `bvid`/`cid` like any video,
+/// which keeps the DASH quality menu and cid-based danmaku.
 export async function resolvePgcSource(epId: number, cid: number): Promise<{ url: string; audioUrl?: string }> {
   const combined = await call<any>('pgc.playurl', { epId, cid });
   if (combined.code !== 0) throw new Error(combined.message || `播放失败（code=${combined.code}）`);

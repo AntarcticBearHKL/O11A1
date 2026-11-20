@@ -7,9 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::fishwatch::cost::{human_ms, human_tokens};
-use crate::fishwatch::steps::StepReport;
 #[cfg(test)]
 use crate::fishwatch::steps::StepId;
+use crate::fishwatch::steps::StepReport;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct StepRecord {
@@ -80,7 +80,9 @@ impl Evidence {
 
     #[cfg(test)]
     pub fn has_channel(&self, id: StepId) -> bool {
-        self.channel_list().iter().any(|channel| channel == id.as_str())
+        self.channel_list()
+            .iter()
+            .any(|channel| channel == id.as_str())
     }
 
     fn step(&self, id: &str) -> Option<&StepRecord> {
@@ -253,7 +255,9 @@ mod tests {
             evidence.line(),
             "字幕 87% · 评论 20 条 · 未跑 ASR · 4.2s · 3.1k tok"
         );
-        assert!(evidence.detail().contains("语音转写 · skipped · ASR 未开启"));
+        assert!(evidence
+            .detail()
+            .contains("语音转写 · skipped · ASR 未开启"));
     }
 
     #[test]
@@ -270,7 +274,10 @@ mod tests {
             ],
             ..Evidence::default()
         };
-        assert_eq!(evidence.line(), "ASR 93% · 评论 8 条 · 画面 40 帧 · 65.0s · 15.4k tok");
+        assert_eq!(
+            evidence.line(),
+            "ASR 93% · 评论 8 条 · 画面 40 帧 · 65.0s · 15.4k tok"
+        );
         evidence.steps.retain(|step| step.id != "frames");
         assert!(!evidence.line().contains("画面"));
     }
@@ -300,4 +307,3 @@ mod tests {
         assert!(restored.has_channel(StepId::Subtitle));
     }
 }
-

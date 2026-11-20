@@ -4,7 +4,6 @@
 //! shared cookie [`Jar`], a desktop Chrome `User-Agent` and a
 //! `Referer: https://www.bilibili.com/` default header.
 
-
 use anyhow::{anyhow, bail, Result};
 use hmac::{Hmac, Mac};
 use serde::de::DeserializeOwned;

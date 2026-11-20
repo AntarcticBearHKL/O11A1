@@ -17,8 +17,7 @@ const LIVE_AREA_SIGNED_PATH: &str = "second/getList";
 
 const LIVE_ROOM_URL: &str = "https://api.live.bilibili.com/room/v1/Room/get_info";
 
-const LIVE_PLAY_URL: &str =
-    "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo";
+const LIVE_PLAY_URL: &str = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo";
 
 const LIVE_REFERER: &str = "https://live.bilibili.com/";
 
@@ -253,7 +252,15 @@ impl Session {
     /// the 24 area entrances.
     pub async fn live_index(&self) -> Result<LiveIndex> {
         let params = [("platform", "web".to_string())];
-        let body = self.live_json(LIVE_INDEX_URL, &params.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>()).await?;
+        let body = self
+            .live_json(
+                LIVE_INDEX_URL,
+                &params
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         let code = live_i64(&body, "code");
         if code != 0 {
             bail!("直播首页加载失败（code={code}）");
@@ -371,8 +378,10 @@ impl Session {
         }
 
         if source.is_empty() {
-            let owned: Vec<(String, String)> =
-                params.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+            let owned: Vec<(String, String)> = params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect();
             match self
                 .wbi_call_referer::<serde_json::Value>(
                     LIVE_AREA_URL,
@@ -411,8 +420,7 @@ impl Session {
             .filter_map(live_area_room_from)
             .take(LIVE_AREA_PAGE)
             .collect();
-        let has_more =
-            code == 0 && (has_more_field || rooms.len() >= LIVE_AREA_PAGE);
+        let has_more = code == 0 && (has_more_field || rooms.len() >= LIVE_AREA_PAGE);
         let elapsed_ms = started.elapsed().as_millis();
         crate::debug_log(&format!(
             "live area parent={parent_area_id} area={area_id} page={page} n={} ms={elapsed_ms} source={source} code={code} signed={}",

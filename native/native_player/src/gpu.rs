@@ -9,31 +9,36 @@
 use std::ffi::c_void;
 
 use anyhow::{anyhow, Result};
-use windows::core::{Interface, IUnknown, BOOL};
+use windows::core::{IUnknown, Interface, BOOL};
 use windows::Win32::Foundation::{HANDLE, HWND, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
-    ID3D11Texture2D, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE, DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE, DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1, IDXGISwapChain2,
-    DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT_DO_NOT_WAIT, DXGI_SCALING_STRETCH,
+    DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_PRESENT_DO_NOT_WAIT, DXGI_SCALING_STRETCH,
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
     DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows::Win32::System::Threading::{WaitForSingleObject, THREAD_PRIORITY_HIGHEST};
 use windows_numerics::Matrix3x2;
 
-use crate::enhance::{EnhanceMode, EnhancePipeline};
+#[cfg(test)]
+use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
+
+use crate::enhance::{EnhanceMode, EnhancePipeline, VideoPasses};
+use crate::interp::{self, Signature};
 use crate::log;
 
 pub struct Gpu {
@@ -61,9 +66,10 @@ impl Gpu {
                 Some(&mut context),
             )?;
             let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice returned no device"))?;
-            let context = context.ok_or_else(|| anyhow!("D3D11CreateDevice returned no context"))?;
-            // The pacer thread does a full-frame CPU copy per present; highest
-            // priority keeps it from being preempted by ordinary UI work.
+            let context =
+                context.ok_or_else(|| anyhow!("D3D11CreateDevice returned no context"))?;
+            // The pacer does one GPU submission per output tick; highest
+            // priority keeps it ahead of ordinary UI work.
             let _ = windows::Win32::System::Threading::SetThreadPriority(
                 windows::Win32::System::Threading::GetCurrentThread(),
                 THREAD_PRIORITY_HIGHEST,
@@ -105,9 +111,11 @@ impl Gpu {
                 },
             };
             let unknown: IUnknown = self.device.cast()?;
-            let swap = self
-                .factory
-                .CreateSwapChainForComposition(&unknown, &description, None::<&IDXGIOutput>)?;
+            let swap = self.factory.CreateSwapChainForComposition(
+                &unknown,
+                &description,
+                None::<&IDXGIOutput>,
+            )?;
             let mut waiter = 0isize;
             if waitable {
                 let swap2: IDXGISwapChain2 = swap.cast()?;
@@ -164,25 +172,125 @@ impl AspectMode {
     }
 }
 
-/// The video layer: composition swapchain + the staging texture a BGRA frame is
-/// written into. Frames are always the decoded picture size; DirectComposition
-/// scales them into the window.
-pub struct VideoSurface {
-    pub swap: IDXGISwapChain1,
-    pub waiter: isize,
-    pub staging: ID3D11Texture2D,
-    pub width: u32,
-    pub height: u32,
-    pub presents: u64,
-    failures: u64,
+/// One decoded picture living entirely on the GPU: the NV12 planes stay as two
+/// shader-readable textures so a 4K frame costs a 1.5 bytes/pixel upload
+/// instead of the old 4 bytes/pixel BGRA conversion, and the BGRA picture the
+/// enhance/blend passes consume is produced by `nv12_main`.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuFrame {
+    pub slot: usize,
+    pub ts_ms: u64,
+    /// Coarse luma fingerprint for scene-cut detection (no readback).
+    pub signature: Signature,
 }
 
-impl VideoSurface {
-    pub fn new(gpu: &Gpu, width: u32, height: u32) -> Result<Self> {
+struct Plane {
+    y: ID3D11Texture2D,
+    uv: ID3D11Texture2D,
+    y_srv: ID3D11ShaderResourceView,
+    uv_srv: ID3D11ShaderResourceView,
+}
+
+struct Picture {
+    /// Kept alive by `srv`/`rtv`; held so the pool owns the resource.
+    _tex: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+    rtv: ID3D11RenderTargetView,
+}
+
+/// A small ring of decoded pictures plus the GPU passes that turn them into
+/// presentation-ready textures. The engine keeps at most two live frames
+/// (`cur` and `next`), so four slots make a dropped frame's slot reusable
+/// without ever recycling a picture the pacer still needs.
+const FRAME_SLOTS: usize = 4;
+
+struct FramePool {
+    width: u32,
+    height: u32,
+    planes: Vec<Plane>,
+    pictures: Vec<Picture>,
+    /// Result of the 插帧 blend for the current tick.
+    mix: Picture,
+    next: usize,
+    passes: VideoPasses,
+}
+
+impl FramePool {
+    fn new(gpu: &Gpu, width: u32, height: u32) -> Result<Self> {
         let width = width.max(2) & !1;
         let height = height.max(2) & !1;
-        let (swap, waiter) = gpu.create_swapchain(width, height, DXGI_ALPHA_MODE_IGNORE, true)?;
-        let staging = unsafe {
+        let mut planes = Vec::with_capacity(FRAME_SLOTS);
+        let mut pictures = Vec::with_capacity(FRAME_SLOTS);
+        for _ in 0..FRAME_SLOTS {
+            planes.push(Plane::new(&gpu.device, width, height)?);
+            pictures.push(Picture::new(&gpu.device, width, height)?);
+        }
+        let mix = Picture::new(&gpu.device, width, height)?;
+        let passes = VideoPasses::new(&gpu.device, &gpu.context, width, height)?;
+        log::line(&format!(
+            "video frames slots={FRAME_SLOTS} size={width}x{height} nv12=R8+R8G8 picture=BGRA"
+        ));
+        Ok(Self {
+            width,
+            height,
+            planes,
+            pictures,
+            mix,
+            next: 0,
+            passes,
+        })
+    }
+
+    /// Upload one packed NV12 frame and convert it to BGRA on the GPU.
+    fn upload(&mut self, gpu: &Gpu, nv12: &[u8], ts_ms: u64) -> Result<GpuFrame> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let needed = width * height * 3 / 2;
+        if nv12.len() < needed {
+            return Err(anyhow!(
+                "video frame {} bytes, need {needed} for {width}x{height} NV12",
+                nv12.len()
+            ));
+        }
+        let slot = self.next;
+        self.next = (self.next + 1) % self.planes.len();
+        let plane = &self.planes[slot];
+        upload_plane(&gpu.context, &plane.y, &nv12[..width * height], width, height)?;
+        upload_plane(
+            &gpu.context,
+            &plane.uv,
+            &nv12[width * height..],
+            width,
+            height / 2,
+        )?;
+        self.passes
+            .convert_nv12(&plane.y_srv, &plane.uv_srv, &self.pictures[slot].rtv);
+        Ok(GpuFrame {
+            slot,
+            ts_ms,
+            signature: interp::luma_signature(nv12, width, height),
+        })
+    }
+}
+
+impl Plane {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let y = plane_texture(device, width, height, DXGI_FORMAT_R8_UNORM)?;
+        let uv = plane_texture(device, width / 2, height / 2, DXGI_FORMAT_R8G8_UNORM)?;
+        let y_srv = shader_view(device, &y)?;
+        let uv_srv = shader_view(device, &uv)?;
+        Ok(Self {
+            y,
+            uv,
+            y_srv,
+            uv_srv,
+        })
+    }
+}
+
+impl Picture {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let tex = unsafe {
             let description = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
@@ -193,25 +301,140 @@ impl VideoSurface {
                     Count: 1,
                     Quality: 0,
                 },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
                 MiscFlags: 0,
             };
             let mut texture: Option<ID3D11Texture2D> = None;
-            gpu.device.CreateTexture2D(&description, None, Some(&mut texture))?;
-            texture.ok_or_else(|| anyhow!("video staging texture missing"))?
+            device.CreateTexture2D(&description, None, Some(&mut texture))?;
+            texture.ok_or_else(|| anyhow!("video picture texture missing"))?
         };
-        log::line(&format!("video surface swapchain={width}x{height} flip-seq alpha=ignore waitable=1"));
+        let srv = shader_view(device, &tex)?;
+        let rtv = unsafe {
+            let mut view: Option<ID3D11RenderTargetView> = None;
+            device.CreateRenderTargetView(&tex, None, Some(&mut view))?;
+            view.ok_or_else(|| anyhow!("video picture RTV missing"))?
+        };
+        Ok(Self {
+            _tex: tex,
+            srv,
+            rtv,
+        })
+    }
+}
+
+/// A plane texture the decoder's bytes are uploaded into.
+fn plane_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> Result<ID3D11Texture2D> {
+    unsafe {
+        let description = D3D11_TEXTURE2D_DESC {
+            Width: width.max(1),
+            Height: height.max(1),
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&description, None, Some(&mut texture))
+            .map_err(|error| anyhow!("CreateTexture2D {format:?}: {error}"))?;
+        texture.ok_or_else(|| anyhow!("CreateTexture2D {format:?}: no texture"))
+    }
+}
+
+fn shader_view(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+) -> Result<ID3D11ShaderResourceView> {
+    unsafe {
+        let mut view: Option<ID3D11ShaderResourceView> = None;
+        device
+            .CreateShaderResourceView(texture, None, Some(&mut view))
+            .map_err(|error| anyhow!("CreateShaderResourceView: {error}"))?;
+        view.ok_or_else(|| anyhow!("CreateShaderResourceView: no view"))
+    }
+}
+
+/// Upload `rows` rows of `pitch` bytes into a plane. `UpdateSubresource` lets
+/// the driver schedule the copy; the previous Map + row-by-row loop cost more
+/// CPU time than the actual decode at 4K.
+fn upload_plane(
+    context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+    source: &[u8],
+    pitch: usize,
+    rows: usize,
+) -> Result<()> {
+    if source.len() < pitch.saturating_mul(rows) {
+        return Err(anyhow!("plane upload source too short"));
+    }
+    unsafe {
+        context.UpdateSubresource(
+            texture,
+            0,
+            None,
+            source.as_ptr() as *const c_void,
+            pitch as u32,
+            0,
+        );
+    }
+    Ok(())
+}
+
+/// The video layer: composition swapchain plus a GPU frame pool. Frames are
+/// always the decoded picture size; DirectComposition scales them into the
+/// window and the UI/danmaku layers sit above.
+pub struct VideoSurface {
+    pub swap: IDXGISwapChain1,
+    pub waiter: isize,
+    /// Decoded picture size (the pool's size). Public for diagnostics.
+    #[allow(dead_code)]
+    pub width: u32,
+    #[allow(dead_code)]
+    pub height: u32,
+    pub presents: u64,
+    failures: u64,
+    pool: FramePool,
+}
+
+impl VideoSurface {
+    pub fn new(gpu: &Gpu, width: u32, height: u32) -> Result<Self> {
+        let width = width.max(2) & !1;
+        let height = height.max(2) & !1;
+        let (swap, waiter) = gpu.create_swapchain(width, height, DXGI_ALPHA_MODE_IGNORE, true)?;
+        let pool = FramePool::new(gpu, width, height)?;
+        log::line(&format!(
+            "video surface swapchain={width}x{height} flip-seq alpha=ignore waitable=1 gpu=1"
+        ));
         Ok(Self {
             swap,
             waiter,
-            staging,
             width,
             height,
             presents: 0,
             failures: 0,
+            pool,
         })
+    }
+
+    /// Upload a decoded NV12 picture and convert it to BGRA on the GPU. The
+    /// returned handle is a slot in the ring; the engine keeps at most two, so
+    /// no release bookkeeping is needed.
+    pub fn upload(&mut self, gpu: &Gpu, nv12: &[u8], ts_ms: u64) -> Result<GpuFrame> {
+        self.pool.upload(gpu, nv12, ts_ms)
     }
 
     pub fn wait_frame(&self) -> bool {
@@ -219,67 +442,93 @@ impl VideoSurface {
         result == WAIT_OBJECT_0
     }
 
-    /// Upload one opaque BGRA frame into the staging texture. The caller has
-    /// already converted NV12 into exactly `width*height*4` bytes.
-    pub fn stage(&self, gpu: &Gpu, bgra: &[u8]) -> Result<()> {
-        let expected = self.width as usize * self.height as usize * 4;
-        if bgra.len() < expected {
-            return Err(anyhow!(
-                "video frame {} bytes, expected {expected}",
-                bgra.len()
-            ));
-        }
-        unsafe {
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            gpu.context
-                .Map(&self.staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped))?;
-            let pitch = mapped.RowPitch as usize;
-            let row = self.width as usize * 4;
-            let destination = mapped.pData as *mut u8;
-            for y in 0..self.height as usize {
-                std::ptr::copy_nonoverlapping(
-                    bgra.as_ptr().add(y * row),
-                    destination.add(y * pitch),
-                    row,
-                );
-            }
-            gpu.context.Unmap(&self.staging, 0);
-        }
-        Ok(())
-    }
-
-    /// Returns `(enhanced, presented)`. `enhanced` is false when an enhancement
-    /// pass failed and the plain copy was used (the caller then switches its
-    /// mode to Off); `presented` counts a real `S_OK` from `Present` only.
-    ///
-    /// `brightness` is applied by the video pixel shader, after the optional
-    /// enhance chain, so the UI and danmaku layers are never affected.
-    pub fn present(
+    /// Present one decoded picture. Returns `(enhanced, presented)`.
+    pub fn present_frame(
         &mut self,
         gpu: &Gpu,
         enhance: &mut Option<EnhancePipeline>,
         mode: &mut EnhanceMode,
+        frame: &GpuFrame,
+        brightness: f32,
+    ) -> Result<(bool, bool)> {
+        let source = self.pool.pictures[frame.slot].srv.clone();
+        self.present_source(gpu, enhance, mode, &source, brightness)
+    }
+
+    /// Blend two decoded pictures on the GPU (插帧) and present the result.
+    /// `weight` is the weight of `b` in `0..=256`.
+    pub fn present_blend(
+        &mut self,
+        gpu: &Gpu,
+        enhance: &mut Option<EnhancePipeline>,
+        mode: &mut EnhanceMode,
+        a: &GpuFrame,
+        b: &GpuFrame,
+        weight: u16,
+        brightness: f32,
+    ) -> Result<(bool, bool)> {
+        let first = self.pool.pictures[a.slot].srv.clone();
+        let second = self.pool.pictures[b.slot].srv.clone();
+        let weight = weight.min(256) as f32 / 256.0;
+        // The common path (画质增强 关闭, brightness 1.0) can blend straight
+        // into the backbuffer: one 4K pass per output tick instead of a blend
+        // plus a copy, which matters on the 120 Hz grid.
+        if *mode == EnhanceMode::Off && (brightness - 1.0).abs() <= 0.0005 {
+            let signaled = self.wait_frame();
+            let back: ID3D11Texture2D = unsafe { self.swap.GetBuffer(0)? };
+            let mut view: Option<ID3D11RenderTargetView> = None;
+            unsafe {
+                gpu.device
+                    .CreateRenderTargetView(&back, None, Some(&mut view))?;
+            }
+            let view = view.ok_or_else(|| anyhow!("no backbuffer RTV"))?;
+            self.pool
+                .passes
+                .blend(&first, &second, weight, &view);
+            unsafe {
+                gpu.context.OMSetRenderTargets(None, None);
+            }
+            drop(view);
+            drop(back);
+            let presented = self.present_raw(signaled)?;
+            return Ok((false, presented));
+        }
+        self.pool
+            .passes
+            .blend(&first, &second, weight, &self.pool.mix.rtv);
+        let source = self.pool.mix.srv.clone();
+        self.present_source(gpu, enhance, mode, &source, brightness)
+    }
+
+    /// `brightness` is applied by the video pixel shader, after the optional
+    /// enhance chain, so the UI and danmaku layers are never affected.
+    fn present_source(
+        &mut self,
+        gpu: &Gpu,
+        enhance: &mut Option<EnhancePipeline>,
+        mode: &mut EnhanceMode,
+        source: &ID3D11ShaderResourceView,
         brightness: f32,
     ) -> Result<(bool, bool)> {
         // Wait until the compositor has room for this frame. The upload has
-        // already happened (`stage`), so the copy is overlapped with the
+        // already happened (`upload`), so the copy is overlapped with the
         // previous composition interval.
         let signaled = self.wait_frame();
         let back: ID3D11Texture2D = unsafe { self.swap.GetBuffer(0)? };
         let brightness = brightness.clamp(0.4, 2.0);
+        let mut view: Option<ID3D11RenderTargetView> = None;
+        unsafe {
+            gpu.device
+                .CreateRenderTargetView(&back, None, Some(&mut view))?;
+        }
+        let view = view.ok_or_else(|| anyhow!("no backbuffer RTV"))?;
         let mut enhanced = false;
         if *mode != EnhanceMode::Off {
             let result = (|| -> Result<()> {
                 let pipeline = enhance
                     .as_mut()
                     .ok_or_else(|| anyhow!("enhance pipeline unavailable"))?;
-                let mut view: Option<ID3D11RenderTargetView> = None;
-                unsafe {
-                    gpu.device
-                        .CreateRenderTargetView(&back, None, Some(&mut view))?;
-                }
-                let view = view.ok_or_else(|| anyhow!("no backbuffer RTV"))?;
-                pipeline.draw(*mode, brightness, &self.staging, &view)
+                pipeline.draw(*mode, brightness, source, &view)
             })();
             match result {
                 Ok(()) => enhanced = true,
@@ -293,35 +542,17 @@ impl VideoSurface {
                 }
             }
         }
-        if !enhanced && (brightness - 1.0).abs() > 0.0005 {
-            if let Some(pipeline) = enhance.as_mut() {
-                let result = (|| -> Result<()> {
-                    let mut view: Option<ID3D11RenderTargetView> = None;
-                    unsafe {
-                        gpu.device
-                            .CreateRenderTargetView(&back, None, Some(&mut view))?;
-                    }
-                    let view = view.ok_or_else(|| anyhow!("no backbuffer RTV"))?;
-                    pipeline.draw_brightness(&self.staging, &view, brightness)
-                })();
-                match result {
-                    Ok(()) => enhanced = true,
-                    Err(error) => log::line(&format!(
-                        "brightness fallback brightness={brightness:.2} reason={error:#}"
-                    )),
-                }
-            }
-        }
         if !enhanced {
-            unsafe {
-                gpu.context.CopyResource(&back, &self.staging);
-            }
+            // Plain path: one GPU copy that also carries the brightness
+            // multiplier, so no enhancement failure can leave a black surface.
+            self.pool.passes.copy(source, brightness, &view);
         }
         unsafe {
             gpu.context.OMSetRenderTargets(None, None);
         }
         // Flip-model swapchains refuse Present while a reference to the back
         // buffer is held; release it first.
+        drop(view);
         drop(back);
         let presented = self.present_raw(signaled)?;
         Ok((enhanced, presented))
@@ -360,7 +591,9 @@ impl VideoSurface {
             if self.failures <= 3 || self.failures % 120 == 0 {
                 log::line(&format!(
                     "present-fail hr=0x{:08X} count={} signaled={}",
-                    hr.0 as u32, self.failures, u8::from(signaled)
+                    hr.0 as u32,
+                    self.failures,
+                    u8::from(signaled)
                 ));
             }
             Ok(false)
@@ -368,7 +601,7 @@ impl VideoSurface {
     }
 }
 
-/// DirectComposition device, target and the two visuals.
+/// DirectComposition device, target and the three layered visuals.
 pub struct Composition {
     device: IDCompositionDevice,
     target: IDCompositionTarget,
@@ -415,13 +648,7 @@ impl Composition {
     /// Scale the decoded picture into the window with independent axes and
     /// place its top-left at (`x`, `y`) in window pixels. Fill mode uses a
     /// uniform scale larger than the client; the root clip crops the overflow.
-    pub fn set_video_transform(
-        &self,
-        x: f32,
-        y: f32,
-        scale_x: f32,
-        scale_y: f32,
-    ) -> Result<()> {
+    pub fn set_video_transform(&self, x: f32, y: f32, scale_x: f32, scale_y: f32) -> Result<()> {
         unsafe {
             let matrix = Matrix3x2 {
                 M11: scale_x,
@@ -438,8 +665,9 @@ impl Composition {
     }
 
     /// Swap the video layer's swapchain content in place (a 画质 switch that
-    /// changes the decoded picture size rebuilds the swapchain). The rest of the
-    /// composition tree is untouched, so the UI/danmaku layers keep their order.
+    /// changes the decoded picture size rebuilds the swapchain). The rest of
+    /// the composition tree is untouched, so the UI/danmaku layers keep their
+    /// order.
     pub fn set_video_content(&self, video: &IDXGISwapChain1) -> Result<()> {
         unsafe {
             let content: IUnknown = video.cast()?;
@@ -486,7 +714,17 @@ impl Drop for Composition {
 
 /// Present a UI swapchain without waiting (the next state change redraws).
 pub fn present_ui(swap: &IDXGISwapChain1) -> bool {
-    unsafe { swap.Present(0, DXGI_PRESENT_DO_NOT_WAIT).0 == 0 }
+    // UI is a composition layer above the video; present on the monitor's
+    // vblank so the toolbar, sidebar and every animation share the display's
+    // own 120 Hz cadence instead of racing and dropping queued frames.
+    unsafe { swap.Present(1, DXGI_PRESENT(0)).0 == 0 }
+}
+
+/// Present a UI swapchain and wait for room in the composition queue. Used
+/// once when the sidebar lane is pre-drawn outside the window: the window may
+/// only grow after DWM actually has those pixels.
+pub fn present_ui_sync(swap: &IDXGISwapChain1) -> bool {
+    unsafe { swap.Present(0, DXGI_PRESENT(0)).0 == 0 }
 }
 
 /// Position and independent scales for one aspect mode.
@@ -504,11 +742,21 @@ pub fn video_transform(
     match aspect {
         AspectMode::Fit => {
             let scale = (cw / vw).min(ch / vh).max(0.0001);
-            ((cw - vw * scale) * 0.5, (ch - vh * scale) * 0.5, scale, scale)
+            (
+                (cw - vw * scale) * 0.5,
+                (ch - vh * scale) * 0.5,
+                scale,
+                scale,
+            )
         }
         AspectMode::Fill => {
             let scale = (cw / vw).max(ch / vh).max(0.0001);
-            ((cw - vw * scale) * 0.5, (ch - vh * scale) * 0.5, scale, scale)
+            (
+                (cw - vw * scale) * 0.5,
+                (ch - vh * scale) * 0.5,
+                scale,
+                scale,
+            )
         }
         AspectMode::Stretch => (0.0, 0.0, cw / vw, ch / vh),
     }
@@ -577,5 +825,197 @@ mod tests {
         assert!(close(y, 0.0));
         assert!(close(w, 1000.0));
         assert!(close(h, 1000.0));
+    }
+
+    /// Read the pool's BGRA picture back to the CPU. Tests only: the player
+    /// never maps a decoded picture.
+    fn read_picture(gpu: &Gpu, picture: &Picture, width: u32, height: u32) -> Vec<[u8; 4]> {
+        unsafe {
+            let description = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging: Option<ID3D11Texture2D> = None;
+            gpu.device
+                .CreateTexture2D(&description, None, Some(&mut staging))
+                .expect("staging texture");
+            let staging = staging.expect("staging texture");
+            gpu.context.CopyResource(&staging, &picture._tex);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context
+                .Map(
+                    &staging,
+                    0,
+                    windows::Win32::Graphics::Direct3D11::D3D11_MAP_READ,
+                    0,
+                    Some(&mut mapped),
+                )
+                .expect("map staging");
+            let mut pixels = Vec::with_capacity((width * height) as usize);
+            let start = mapped.pData as *const u8;
+            for row in 0..height as usize {
+                let row_start = start.add(row * mapped.RowPitch as usize);
+                for col in 0..width as usize {
+                    let p = row_start.add(col * 4);
+                    pixels.push([*p, *p.add(1), *p.add(2), *p.add(3)]);
+                }
+            }
+            gpu.context.Unmap(&staging, 0);
+            pixels
+        }
+    }
+
+    #[test]
+    fn gpu_frame_pool_converts_a_real_4k_nv12_dump() {
+        let Some(path) = std::env::var_os("O11A1_NV12_DUMP") else {
+            return;
+        };
+        let Ok(data) = std::fs::read(&path) else {
+            return;
+        };
+        let (width, height) = (3840u32, 2160u32);
+        if data.len() != (width * height * 3 / 2) as usize {
+            return;
+        }
+        let gpu = Gpu::new().expect("gpu");
+        let mut pool = FramePool::new(&gpu, width, height).expect("frame pool");
+        let frame = pool.upload(&gpu, &data, 0).expect("upload");
+        // Upload sanity: the Y texture must hold the dump's luma plane.
+        let y_rows = read_r8(&gpu, &pool.planes[frame.slot].y, width, height);
+        let y_plane = &data[..(width * height) as usize];
+        let y_mismatch = y_rows
+            .iter()
+            .zip(y_plane.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(y_mismatch, 0, "Y plane upload mismatch");
+        // Diagnostic: copy the luma plane through the same pass machinery.
+        pool.passes
+            .copy(&pool.planes[frame.slot].y_srv, 1.0, &pool.pictures[frame.slot].rtv);
+        let grey = read_picture(&gpu, &pool.pictures[frame.slot], width, height);
+        eprintln!("copy pass corner {:?}", grey[0]);
+        // And re-run the real conversion.
+        pool.passes.convert_nv12(
+            &pool.planes[frame.slot].y_srv,
+            &pool.planes[frame.slot].uv_srv,
+            &pool.pictures[frame.slot].rtv,
+        );
+        let pixels = read_picture(&gpu, &pool.pictures[frame.slot], width, height);
+        let mut bgra = Vec::with_capacity(pixels.len() * 3);
+        for pixel in &pixels {
+            bgra.extend_from_slice(&pixel[..3]);
+        }
+        let out = std::path::PathBuf::from(&path).with_extension("bgra");
+        std::fs::write(&out, bgra).expect("write bgra");
+        // The dump's top-left corner is dark: no all-white regression.
+        let corner = pixels[0];
+        let centre = pixels[(height / 2 * width + width / 2) as usize];
+        eprintln!("corner {corner:?} centre {centre:?} wrote {}", out.display());
+        assert!(
+            corner[0] < 200 && corner[1] < 200 && corner[2] < 200,
+            "corner {corner:?}"
+        );
+        assert!(
+            centre[0] < 250 || centre[1] < 250 || centre[2] < 250,
+            "centre {centre:?}"
+        );
+    }
+
+    fn read_r8(gpu: &Gpu, texture: &ID3D11Texture2D, width: u32, height: u32) -> Vec<u8> {
+        unsafe {
+            let description = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging: Option<ID3D11Texture2D> = None;
+            gpu.device
+                .CreateTexture2D(&description, None, Some(&mut staging))
+                .expect("staging");
+            let staging = staging.expect("staging");
+            gpu.context.CopyResource(&staging, texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context
+                .Map(
+                    &staging,
+                    0,
+                    windows::Win32::Graphics::Direct3D11::D3D11_MAP_READ,
+                    0,
+                    Some(&mut mapped),
+                )
+                .expect("map");
+            let mut rows = Vec::with_capacity((width * height) as usize);
+            let start = mapped.pData as *const u8;
+            for row in 0..height as usize {
+                let row_start = start.add(row * mapped.RowPitch as usize);
+                for col in 0..width as usize {
+                    rows.push(*row_start.add(col));
+                }
+            }
+            gpu.context.Unmap(&staging, 0);
+            rows
+        }
+    }
+
+    #[test]
+    fn gpu_frame_pool_converts_nv12_and_blends_on_the_gpu() {
+        let gpu = match Gpu::new() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skipping GPU test: {error:#}");
+                return;
+            }
+        };
+        let (width, height) = (64u32, 36u32);
+        let mut pool = FramePool::new(&gpu, width, height).expect("frame pool");
+
+        // BT.709 limited white: Y=235, chroma neutral.
+        let mut white = vec![128u8; (width * height * 3 / 2) as usize];
+        white[..(width * height) as usize].fill(235);
+        let white_frame = pool.upload(&gpu, &white, 10).expect("upload white");
+        let pixels = read_picture(&gpu, &pool.pictures[white_frame.slot], width, height);
+        let centre = pixels[(height / 2 * width + width / 2) as usize];
+        assert!(centre[0] >= 250 && centre[1] >= 250 && centre[2] >= 250, "{centre:?}");
+        assert_eq!(centre[3], 255);
+
+        // Limited black stays black.
+        let mut black = vec![128u8; (width * height * 3 / 2) as usize];
+        black[..(width * height) as usize].fill(16);
+        let black_frame = pool.upload(&gpu, &black, 20).expect("upload black");
+        let pixels = read_picture(&gpu, &pool.pictures[black_frame.slot], width, height);
+        let centre = pixels[(height / 2 * width + width / 2) as usize];
+        assert!(centre[0] <= 2 && centre[1] <= 2 && centre[2] <= 2, "{centre:?}");
+
+        // A half-way blend of the two pictures is mid grey.
+        pool.passes.blend(
+            &pool.pictures[white_frame.slot].srv,
+            &pool.pictures[black_frame.slot].srv,
+            0.5,
+            &pool.mix.rtv,
+        );
+        let pixels = read_picture(&gpu, &pool.mix, width, height);
+        let centre = pixels[(height / 2 * width + width / 2) as usize];
+        assert!((centre[0] as i32 - 128).abs() <= 2, "{centre:?}");
     }
 }

@@ -70,7 +70,9 @@ impl Transcriber for WhisperCpp {
         let prefix = self
             .work_dir
             .join(format!("cpp-{}-{}", std::process::id(), mono_id()));
-        let log_path = self.work_dir.join(format!("cpp-{}.log", std::process::id()));
+        let log_path = self
+            .work_dir
+            .join(format!("cpp-{}.log", std::process::id()));
         let _ = std::fs::remove_file(prefix.with_extension("json"));
         let started = std::time::Instant::now();
         let mut command = proc::command(&self.binary);
@@ -111,8 +113,8 @@ impl Transcriber for WhisperCpp {
         let json_path = prefix.with_extension("json");
         let text = std::fs::read_to_string(&json_path)
             .with_context(|| format!("读取 whisper-cli 结果失败：{}", json_path.display()))?;
-        let parsed: CppOutput =
-            serde_json::from_str(&text).map_err(|err| anyhow!("whisper-cli JSON 解析失败：{err}"))?;
+        let parsed: CppOutput = serde_json::from_str(&text)
+            .map_err(|err| anyhow!("whisper-cli JSON 解析失败：{err}"))?;
         let segments: Vec<Segment> = parsed
             .transcription
             .into_iter()
@@ -124,7 +126,9 @@ impl Transcriber for WhisperCpp {
             })
             .collect();
         if segments.is_empty() {
-            return Err(anyhow!("whisper-cli 没有转写出任何句子（可能是纯音乐或静音）"));
+            return Err(anyhow!(
+                "whisper-cli 没有转写出任何句子（可能是纯音乐或静音）"
+            ));
         }
         let audio_seconds = segments
             .last()
@@ -166,7 +170,8 @@ fn cuda_archs(systeminfo: &str) -> String {
     }
 }
 
-fn mono_id() -> u128 {    std::time::SystemTime::now()
+fn mono_id() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or(0)

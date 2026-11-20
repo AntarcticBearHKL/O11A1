@@ -181,7 +181,9 @@ fn up_page_cached(mid: i64, order: UpOrder, page: u32) -> Option<(Vec<FeedVideo>
 
 fn up_page_store(mid: i64, order: UpOrder, page: u32, items: &[FeedVideo], has_more: bool) {
     if let Ok(mut guard) = up_cache().lock() {
-        guard.pages.retain(|_, (at, _, _)| at.elapsed() < UP_PAGE_TTL);
+        guard
+            .pages
+            .retain(|_, (at, _, _)| at.elapsed() < UP_PAGE_TTL);
         let key = (mid, order, page);
         if !guard.pages.contains_key(&key) && guard.pages.len() >= UP_PAGE_MAX {
             let oldest = guard
@@ -211,7 +213,9 @@ fn up_card_cached(mid: i64) -> Option<(String, String, u64, u64)> {
 
 fn up_card_store(mid: i64, name: &str, avatar: &str, fans: u64, videos: u64) {
     if let Ok(mut guard) = up_cache().lock() {
-        guard.cards.retain(|_, (at, _, _, _, _)| at.elapsed() < UP_CARD_TTL);
+        guard
+            .cards
+            .retain(|_, (at, _, _, _, _)| at.elapsed() < UP_CARD_TTL);
         if !guard.cards.contains_key(&mid) && guard.cards.len() >= UP_CARD_MAX {
             let oldest = guard
                 .cards
@@ -306,7 +310,11 @@ pub(crate) fn videoshot_from(data: ShotData) -> Result<VideoShot> {
     // 首位是重复的 0 哨兵：`[0,0,5,10,…]` -> `[0,5,10,…]`。没有哨兵的视频
     // （首两个时间不同）原样使用。
     let mut times: Vec<f32> = if data.index.len() >= 2 && data.index[0] == data.index[1] {
-        data.index.iter().skip(1).map(|value| *value as f32).collect()
+        data.index
+            .iter()
+            .skip(1)
+            .map(|value| *value as f32)
+            .collect()
     } else {
         data.index.iter().map(|value| *value as f32).collect()
     };
@@ -365,11 +373,7 @@ impl Session {
 
         let vip_text = match &data.vip {
             Some(v) => {
-                let label = v
-                    .label
-                    .as_ref()
-                    .map(|l| l.text.clone())
-                    .unwrap_or_default();
+                let label = v.label.as_ref().map(|l| l.text.clone()).unwrap_or_default();
                 if !label.is_empty() {
                     label
                 } else if v.status == 1 {
@@ -458,7 +462,13 @@ impl Session {
     /// normal answer (the page keeps `code`/`message` for display), so only
     /// HTTP/JSON failures are `Err`.
     pub async fn vip_privilege_my_page(&self) -> Result<VipMyPage> {
-        let text = self.client.get(VIP_PRIVILEGE_URL).send().await?.text().await?;
+        let text = self
+            .client
+            .get(VIP_PRIVILEGE_URL)
+            .send()
+            .await?
+            .text()
+            .await?;
         let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .map_err(|err| anyhow!("会员状态响应解析失败：{err}"))?;
         let page = vip_my_page_from(&value);
@@ -475,7 +485,11 @@ impl Session {
     /// exactly as the server sends it. No cookie is required.
     pub async fn vip_privilege_catalog(&self) -> Result<Vec<VipPrivilegeGroup>> {
         let body: VipCatalogResp = self
-            .get_query_json(VIP_PRIVILEGE_CATALOG_URL, &[], Some("https://www.bilibili.com/"))
+            .get_query_json(
+                VIP_PRIVILEGE_CATALOG_URL,
+                &[],
+                Some("https://www.bilibili.com/"),
+            )
             .await?;
         if body.code != 0 {
             let message = body.message.trim();
@@ -676,15 +690,7 @@ impl Session {
     ) -> Result<i64> {
         let csrf = self.csrf_cookie()?;
         let body = heartbeat_body(
-            aid,
-            bvid,
-            cid,
-            played_s,
-            watched_s,
-            duration_s,
-            start_ts,
-            play_type,
-            &csrf,
+            aid, bvid, cid, played_s, watched_s, duration_s, start_ts, play_type, &csrf,
         );
         let referer = format!("https://www.bilibili.com/video/{bvid}");
         let (code, message) = self
@@ -807,8 +813,14 @@ impl Session {
         crate::debug_log(&format!(
             "fav picker mid={mid} rid={rid} n={} known={} member={}",
             folders.len(),
-            folders.iter().filter(|folder| folder.member.is_some()).count(),
-            folders.iter().filter(|folder| folder.member == Some(true)).count()
+            folders
+                .iter()
+                .filter(|folder| folder.member.is_some())
+                .count(),
+            folders
+                .iter()
+                .filter(|folder| folder.member == Some(true))
+                .count()
         ));
         Ok(folders)
     }
@@ -1385,8 +1397,9 @@ impl Session {
     pub async fn space_info(&self, mid: i64) -> Result<UpInfo> {
         let params = vec![("mid".to_string(), mid.to_string())];
         let referer = format!("https://space.bilibili.com/{mid}");
-        let (_, mut resp): (u16, SpaceInfoResp) =
-            self.wbi_call_referer(SPACE_INFO_URL, &params, false, None).await?;
+        let (_, mut resp): (u16, SpaceInfoResp) = self
+            .wbi_call_referer(SPACE_INFO_URL, &params, false, None)
+            .await?;
         if resp.code == -352 {
             resp = self
                 .wbi_call_referer(SPACE_INFO_URL, &params, true, Some(&referer))
@@ -1616,12 +1629,7 @@ impl Session {
                         let fans = data.card.fans;
                         let videos = data.archive_count;
                         up_card_store(mid, &name, &normalize_url(&data.card.face), fans, videos);
-                        return Ok((
-                            name,
-                            normalize_url(&data.card.face),
-                            fans,
-                            videos,
-                        ));
+                        return Ok((name, normalize_url(&data.card.face), fans, videos));
                     }
                 }
             } else {
@@ -1746,13 +1754,7 @@ impl Session {
 impl Session {
     /// The per-category unread counts behind the 消息 badge.
     pub async fn msg_unread(&self) -> Result<MsgUnread> {
-        let body: MsgUnreadResp = self
-            .client
-            .get(MSG_UNREAD_URL)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let body: MsgUnreadResp = self.client.get(MSG_UNREAD_URL).send().await?.json().await?;
         if body.code != 0 {
             bail!("获取消息未读失败（code={}）", body.code);
         }
@@ -1928,7 +1930,8 @@ impl Session {
             ("order", "desc".to_string()),
             ("order_type", String::new()),
         ];
-        self.relation_page(RELATION_FOLLOWINGS_URL, &params, pn).await
+        self.relation_page(RELATION_FOLLOWINGS_URL, &params, pn)
+            .await
     }
 }
 
@@ -2240,7 +2243,11 @@ impl VipMyPage {
         if self.code != 0 {
             return String::new();
         }
-        let label = if self.is_vip { "大会员" } else { "非大会员" };
+        let label = if self.is_vip {
+            "大会员"
+        } else {
+            "非大会员"
+        };
         if !self.is_vip {
             // A non-member's `state=0` rows are the catalogue of what a
             // membership *would* unlock, not claimable coupons.
@@ -2742,8 +2749,8 @@ pub(super) struct SpiData {
 #[cfg(test)]
 mod comment_tests {
     use super::{
-        comment_page_from, comment_reply_page_from, CommentPage, CommentReplyPage, CommentReplyResp,
-        CommentResp,
+        comment_page_from, comment_reply_page_from, CommentPage, CommentReplyPage,
+        CommentReplyResp, CommentResp,
     };
 
     /// A realistic `x/v2/reply/wbi/main` body: a pinned comment, two top-level
@@ -2934,8 +2941,8 @@ mod comment_tests {
 #[cfg(test)]
 mod fav_tests {
     use super::{
-        fav_cache, fav_folders_from, fav_page_from, fav_qa_picks, FavFolder,
-        FavFoldersResp, FavListResp, RelatedResp, FAV_RELATED_MAX,
+        fav_cache, fav_folders_from, fav_page_from, fav_qa_picks, FavFolder, FavFoldersResp,
+        FavListResp, RelatedResp, FAV_RELATED_MAX,
     };
     use crate::bilibili::feed::related_from;
 
@@ -3562,12 +3569,18 @@ pub(super) struct ArchivePageInfo {
 pub(crate) struct CardItem {
     #[serde(default)]
     bvid: String,
+    #[serde(default, alias = "id")]
+    aid: i64,
+    #[serde(default)]
+    cid: u64,
     #[serde(default)]
     title: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
     pic: String,
     #[serde(default)]
     duration: u64,
+    #[serde(default)]
+    pubdate: i64,
     #[serde(default)]
     owner: Option<CardOwner>,
     #[serde(default)]
@@ -3578,6 +3591,8 @@ pub(crate) struct CardItem {
 struct CardOwner {
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    mid: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -4494,7 +4509,9 @@ fn vip_catalog_from(data: Vec<VipGroupRaw>) -> Vec<VipPrivilegeGroup> {
                 })
                 .collect(),
         })
-        .filter(|group: &VipPrivilegeGroup| !group.name.trim().is_empty() || !group.items.is_empty())
+        .filter(|group: &VipPrivilegeGroup| {
+            !group.name.trim().is_empty() || !group.items.is_empty()
+        })
         .collect()
 }
 
@@ -4671,7 +4688,10 @@ fn comment_from(raw: CommentRaw) -> Comment {
             uname: member.uname,
             avatar: normalize_url(&member.avatar),
         },
-        message: raw.content.map(|content| content.message).unwrap_or_default(),
+        message: raw
+            .content
+            .map(|content| content.message)
+            .unwrap_or_default(),
         like: raw.like,
         ctime: raw.ctime,
         rcount: raw.rcount,
@@ -4729,13 +4749,21 @@ fn comment_reply_page_from(data: CommentReplyData, pn: i64) -> CommentReplyPage 
 }
 
 pub(crate) fn card_from(item: CardItem) -> VideoCard {
+    let (owner, owner_mid) = match item.owner {
+        Some(owner) => (owner.name, owner.mid),
+        None => (String::new(), 0),
+    };
     VideoCard {
         bvid: item.bvid,
         title: item.title,
         pic: normalize_url(&item.pic),
-        owner: item.owner.map(|owner| owner.name).unwrap_or_default(),
+        owner,
+        owner_mid,
         view: item.stat.as_ref().map(|stat| stat.view).unwrap_or(0),
         duration: item.duration,
+        cid: item.cid,
+        aid: item.aid.max(0) as u64,
+        pub_ts: item.pubdate,
     }
 }
 
@@ -4750,10 +4778,7 @@ pub(crate) fn square_to_hot(item: SquareItem) -> HotSearch {
     } else {
         item.show_name
     };
-    HotSearch {
-        keyword,
-        show_name,
-    }
+    HotSearch { keyword, show_name }
 }
 
 #[cfg(test)]
@@ -4956,11 +4981,7 @@ mod message_pagination_tests {
             vec![("id", "11".to_string()), ("like_time", "22".to_string())]
         );
         assert!(msg_cursor_params(MsgKind::Reply, None).is_empty());
-        assert!(msg_cursor_params(
-            MsgKind::Reply,
-            Some(MsgCursor { id: 0, time: 22 })
-        )
-        .is_empty());
+        assert!(msg_cursor_params(MsgKind::Reply, Some(MsgCursor { id: 0, time: 22 })).is_empty());
     }
 
     #[test]
@@ -5390,4 +5411,3 @@ mod message_pagination_tests {
         });
     }
 }
-

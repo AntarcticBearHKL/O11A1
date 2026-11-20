@@ -188,10 +188,7 @@ impl Session {
 
 impl Session {
     /// WBI-signed search call with one retry after refreshing the keys.
-    async fn search_data<T: DeserializeOwned>(
-        &self,
-        params: &[(String, String)],
-    ) -> Result<T> {
+    async fn search_data<T: DeserializeOwned>(&self, params: &[(String, String)]) -> Result<T> {
         self.search_data_referer::<T>(params, None).await
     }
 }
@@ -224,8 +221,7 @@ impl Session {
             }
             bail!("搜索失败：{message}（code={}）", resp.code);
         }
-        resp.data
-            .ok_or_else(|| anyhow!("搜索失败：响应缺少 data"))
+        resp.data.ok_or_else(|| anyhow!("搜索失败：响应缺少 data"))
     }
 
     // -- Video detail -------------------------------------------------------
@@ -239,10 +235,7 @@ impl Session {
         if term.is_empty() {
             return Ok(Vec::new());
         }
-        let params = [
-            ("term", term.to_string()),
-            ("main_ver", "v1".to_string()),
-        ];
+        let params = [("term", term.to_string()), ("main_ver", "v1".to_string())];
         let body: SuggestResp = self.get_query_json(SUGGEST_URL, &params, None).await?;
         let tags = body.result.map(|result| result.tag).unwrap_or_default();
         let mut out: Vec<String> = Vec::new();
@@ -578,7 +571,10 @@ struct LiveSearchData {
 /// PGC / 直播 tabs would print 「没有找到相关番剧」 for a request the site never
 /// answered.
 fn check_search_voucher(voucher: Option<&str>) -> Result<()> {
-    if voucher.map(|value| !value.trim().is_empty()).unwrap_or(false) {
+    if voucher
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
         bail!("搜索被 B站 风控拦截，请稍后重试（或登录后再搜）");
     }
     Ok(())
@@ -838,24 +834,24 @@ fn hotword_to_hot(item: HotwordItem) -> HotSearch {
     } else {
         item.show_name
     };
-    HotSearch {
-        keyword,
-        show_name,
-    }
+    HotSearch { keyword, show_name }
 }
 
 #[cfg(test)]
 mod search_kind_tests {
     use super::{
-        highlight_title, live_from_search, media_from_search, SearchHitPage,
-        SearchKind, SearchLiveItem, SearchMediaItem, SEARCH_TAB_BANGUMI, SEARCH_TAB_FILM,
-        SEARCH_TAB_LIVE, SEARCH_TAB_USER, SEARCH_TAB_VIDEO,
+        highlight_title, live_from_search, media_from_search, SearchHitPage, SearchKind,
+        SearchLiveItem, SearchMediaItem, SEARCH_TAB_BANGUMI, SEARCH_TAB_FILM, SEARCH_TAB_LIVE,
+        SEARCH_TAB_USER, SEARCH_TAB_VIDEO,
     };
 
     #[test]
     fn tabs_map_to_the_four_distinct_endpoints() {
         assert_eq!(SearchKind::from_tab(SEARCH_TAB_VIDEO), SearchKind::Video);
-        assert_eq!(SearchKind::from_tab(SEARCH_TAB_BANGUMI), SearchKind::Bangumi);
+        assert_eq!(
+            SearchKind::from_tab(SEARCH_TAB_BANGUMI),
+            SearchKind::Bangumi
+        );
         assert_eq!(SearchKind::from_tab(SEARCH_TAB_FILM), SearchKind::Film);
         assert_eq!(SearchKind::from_tab(SEARCH_TAB_LIVE), SearchKind::Live);
         assert_eq!(SearchKind::from_tab(SEARCH_TAB_USER), SearchKind::User);

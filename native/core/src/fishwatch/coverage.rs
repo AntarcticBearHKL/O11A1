@@ -130,7 +130,6 @@ pub fn compute(gathered: &Gathered, steps: &[StepReport]) -> Coverage {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,7 +173,10 @@ mod tests {
                 text: "后半".to_string(),
             },
         ];
-        let reports = vec![StepReport::ok(StepId::Subtitle), StepReport::ok(StepId::Comments)];
+        let reports = vec![
+            StepReport::ok(StepId::Subtitle),
+            StepReport::ok(StepId::Comments),
+        ];
         let coverage = compute(&material, &reports);
         assert_eq!(coverage.percent(), 80);
         assert!(coverage.note.contains("官方字幕覆盖 80%"));
@@ -183,7 +185,10 @@ mod tests {
     #[test]
     fn a_missing_transcript_is_a_blind_spot_not_zero_confidence() {
         let material = gathered(100);
-        let reports = vec![StepReport::ok(StepId::Meta), StepReport::ok(StepId::Comments)];
+        let reports = vec![
+            StepReport::ok(StepId::Meta),
+            StepReport::ok(StepId::Comments),
+        ];
         let coverage = compute(&material, &reports);
         assert_eq!(coverage.percent(), 0);
         assert!(coverage.note.contains("未取到口播"));
@@ -200,7 +205,10 @@ mod tests {
         let reports = vec![StepReport::ok(StepId::Frames)];
         let coverage = compute(&material, &reports);
         assert!(coverage.visual_fraction > 0.99);
-        assert_eq!(coverage.fraction, 0.0, "frames never inflate speech coverage");
+        assert_eq!(
+            coverage.fraction, 0.0,
+            "frames never inflate speech coverage"
+        );
         assert!(coverage.note.contains("不代表完整观看"));
     }
 
@@ -216,10 +224,12 @@ mod tests {
             count: 3,
             sample: "哈哈哈".to_string(),
         }];
-        let reports = vec![StepReport::ok(StepId::Meta), StepReport::ok(StepId::Comments)];
+        let reports = vec![
+            StepReport::ok(StepId::Meta),
+            StepReport::ok(StepId::Comments),
+        ];
         let coverage = compute(&material, &reports);
         assert!(coverage.note.contains("未取到口播"));
         assert!(!coverage.note.contains("没有拿到评论"));
     }
 }
-

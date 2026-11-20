@@ -1,8 +1,18 @@
+﻿import fs from 'fs';
 import WebSocket from 'ws';
 
-const expression = process.argv[2];
+const args = process.argv.slice(2);
+let expression;
+let targetArg;
+if (args[0] === '--file') {
+  expression = fs.readFileSync(args[1], 'utf8');
+  targetArg = args[2];
+} else {
+  expression = args[0];
+  targetArg = args[1];
+}
 const targets = await (await fetch(`http://127.0.0.1:${process.env.CDP_PORT || 9222}/json`)).json();
-const page = targets.find((t) => t.type === 'page' && (process.argv[3] === 'main' ? !t.url.includes('#/player') : process.argv[3] ? t.url.includes(process.argv[3]) : !t.url.includes('devtools')));
+const page = targets.find((t) => t.type === 'page' && (targetArg === 'main' ? !t.url.includes('#/player') : targetArg ? t.url.includes(targetArg) : !t.url.includes('devtools')));
 if (!page) throw new Error('no page target: ' + JSON.stringify(targets.map((t) => t.title)));
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 let id = 0;

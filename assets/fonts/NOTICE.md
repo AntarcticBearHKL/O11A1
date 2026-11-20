@@ -1,41 +1,30 @@
-# Bundled UI font — `O11A1 Round`
+# Bundled UI fonts
 
-`O11A1Round-Regular.ttf` / `O11A1Round-Bold.ttf` are the app's single UI face.
-They are the **regular and bold weights of Resource Han Rounded CN (资源圆体 CN)
-v0.990**, subset and slightly modified; the family is renamed because a modified
-OFL font must not carry the upstream family name.
+The app ships **Chill Round Gothic (寒蝉圆黑体)** as the single UI typeface,
+including the native player and danmaku overlay. It is a rounded cut of Source
+Han Sans SC, so one family covers both the renderer and the DirectWrite player.
 
-## Upstream
+## Chill Round Gothic
 
-- **Resource Han Rounded CN 0.990** — a rounded derivative of Source Han Sans,
-  by Cyano Hao. <https://github.com/CyanoHao/Resource-Han-Rounded>
-  Licensed under the SIL Open Font License 1.1, see `OFL-License.txt`
-  (it carries Adobe's Reserved Font Name `Source`, which this file does not use).
-- Nine symbol glyphs the upstream face does not have — `▭ ▮ ▯ ▴ ▸ ▾ ◂ ✕ ✗`
-  (U+25AD U+25AE U+25AF U+25B4 U+25B8 U+25BE U+25C2 U+2715 U+2717) — were copied
-  from **Noto Sans Symbols 2** (Copyright 2022 The Noto Project Authors),
-  also SIL OFL 1.1, see `OFL-NotoSansSymbols2.txt`.
+- Upstream: **ChillRoundGothic** by Warren2060 — <https://github.com/Warren2060/ChillRoundGothic>
+- Files: `ChillRoundGothic_Regular.ttf` (400), `ChillRoundGothic_Medium.ttf`
+  (500), `ChillRoundGothic_Bold.ttf` (700)
+- Registered family name: `Chill Round Gothic` (the fonts share the typographic
+  family from name ID 16; the individual files name their weights separately)
+- License: SIL Open Font License 1.1, see `ChillRoundGothic-OFL.txt`
+- Coverage: 27,183 cmap entries, a rounded Source Han Sans SC derivative that
+  covers the common simplified set including 巽.
 
-## What was changed
+The files are unmodified upstream releases. Browser and DirectWrite both resolve
+the family by its Latin name; the CSS family and the native player use the same
+string so the two renderers cannot drift apart.
 
-1. Subset to what a Chinese desktop client can be asked to draw: full CJK
-   Unified Ideographs (U+4E00–9FFF), ASCII/Latin-1/Extended-A, general
-   punctuation, arrows, geometric shapes, box drawing, circled numbers, kana,
-   CJK symbols and punctuation, half/full-width forms. GB2312 (6763 chars) and
-   every non-ASCII character in `ui/` and `src/` are covered — 0 missing.
-2. Vertical metrics pinned the way the previous UI face had them:
-   `fsSelection |= USE_TYPO_METRICS` with `sTypoAscender/Descender/LineGap =
-   880 / -120 / 0`, i.e. a 1.000 em line box. Every `Text` in `ui/app.slint`
-   keeps the line height it was laid out against; the CJK glyph bounds (max
-   yMax 856, min yMin -95) sit inside it with room to spare.
-3. Family renamed to `O11A1 Round`.
+## Where the files live
 
-## Why the family name is not the upstream one
-
-OFL 1.1 §3: a modified version may not use a Reserved Font Name, and should not
-be distributed under the original name without permission. Renaming also keeps
-the app's embedded face from ever resolving against a user-installed build of
-the same family with a different weight set.
-
-Rebuild: `build_fonts.py` (fontTools; the same pyftsubset call is documented in
-the header of that script). Binary size: 10.60 MB + 10.10 MB.
+- `public/fonts/` — source for the renderer; Vite copies it to `dist/fonts/`.
+- `assets/fonts/` — local development copy and licenses; its `.ttf` files are
+  excluded from the packaged asar (`!assets/fonts/*.ttf`) so the fonts are not
+  shipped three times.
+- `runtime/assets/fonts/` — copied from `public/fonts/` by
+  `scripts/build-engine.ps1`; the native player loads them privately with
+  `AddFontResourceExW` and never installs them system-wide.

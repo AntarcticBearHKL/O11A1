@@ -31,8 +31,9 @@ pub struct QueueEntry {
 
 /// Danmaku, playback and window-appearance preferences.
 ///
-/// `danmaku_font`: 0 = 小, 1 = 标准, 2 = 大. `danmaku_speed`: scroll-speed
-/// percent (50..=200). `danmaku_area`: the top percentage of the video that
+/// `danmaku_font`: font scale percent (50..=150, default 100; old 0/1/2
+/// values migrate to 85/100/120). `danmaku_speed`: scroll-speed percent
+/// (50..=200). `danmaku_area`: the top percentage of the video that
 /// danmaku may occupy (25 / 50 / 75 / 100). `player_speed`: playback speed times
 /// 1000 (1000 = 1.0x). `glass_transparency`: the main window's frosted-glass
 /// tint, percent (0 = fully opaque tint, 100 = no tint; default 45).
@@ -86,11 +87,18 @@ pub struct Settings {
     /// (4K/8K are only opened from the 画质 menu).
     #[serde(default = "default_player_quality")]
     pub player_quality: i64,
-    /// Decode at the source's own resolution instead of the picture the window
-    /// actually shows. `false` (default) asks the decoder for the window-sized
-    /// picture — a 1080p source in a 1216×684 window decodes 1216×684, which is
-    /// a third of the pipe bytes and the same picture on screen. `true` is the
-    /// "原始分辨率" switch: the old behaviour, at the old cost.
+    /// Preferred opening resolution as a track height (`0` = highest available,
+    /// otherwise 2160 / 1440 / 1080 / 720 / 480 / 360). The source selector
+    /// takes the highest stream at or below this height and falls back to the
+    /// lowest stream when the video has nothing that small. This is the
+    /// "默认画质" setting; `player_quality` above remains the qn preference for
+    /// the downloader and the legacy open path.
+    #[serde(default = "default_player_quality_height")]
+    pub player_quality_height: u32,
+    /// Decode at the source's own resolution (up to 4K) instead of the 1080p
+    /// `false` cap. 4K sources look sharpest with this on, but the CPU
+    /// NV12→BGRA pass and the frame pipe grow with the picture: on a 6-core
+    /// desktop a 4K60 source measured ~15 fps at 4K and ~58 fps at 1080p.
     #[serde(default)]
     pub player_native_size: bool,
     /// 画质增强档位：`0` = 关闭, `1` = 通用（AMD CAS 锐化）, `2` = 番剧（Anime4K CNN）。
@@ -275,6 +283,11 @@ pub struct Settings {
     /// 自动播放 / 随机播放 switches above.
     #[serde(default = "default_loop_one")]
     pub loop_one: bool,
+    /// 播放结束行为：0 = 原地暂停, 1 = 循环播放, 2 = 下一首 / 关闭窗口.
+    /// Legacy [`Self::loop_one`] is migrated on load; new files keep both in
+    /// sync so older consumers still read the boolean correctly.
+    #[serde(default = "default_loop_mode")]
+    pub loop_mode: u8,
     /// 帧插值模式：0 = 关闭, 1 = CPU（线性混合）。未知值在加载时归一为 0。
     /// 见 [`normalise_interp_mode`]。
     #[serde(default)]
@@ -284,6 +297,12 @@ pub struct Settings {
     /// 继续改值。
     #[serde(default)]
     pub interp_mode_rev: u32,
+    /// 插帧目标帧率：`0` = 跟随显示器刷新率；`30..=240` = 固定目标
+    /// （界面提供 60 / 90 / 120 / 144）。实际输出可能低于目标：上屏由
+    /// 显示器/合成器节奏决定，混合速度由 CPU 决定，pacer 丢弃迟到的 tick
+    /// 而不是补帧。见 [`normalise_interp_hz`]。
+    #[serde(default)]
+    pub interp_hz: u32,
     /// DeepSeek API key（`sk-...`），养鱼引擎用它替用户看视频。空串 = 未配置，
     /// 此时引擎只报 `NeedsKey`、不发任何网络请求。界面上只显示
     /// [`mask_key`] 的脱敏结果。
@@ -332,6 +351,14 @@ pub struct Settings {
     /// [`normalise_hide_live_tab`]。
     #[serde(default)]
     pub hide_live_tab: bool,
+    /// 防干扰：隐藏首页工具栏的「番剧」入口。默认关闭；隐藏后底栏按钮重新
+    /// 左对齐填充，不再留下空位。见 [`normalise_hide_pgc_tab`]。
+    #[serde(default)]
+    pub hide_pgc_tab: bool,
+    /// 防干扰：隐藏首页工具栏的「大肥鱼」入口。默认关闭；隐藏后其余按钮
+    /// 依次向前补位。见 [`normalise_hide_fish_tab`]。
+    #[serde(default)]
+    pub hide_fish_tab: bool,
     /// 防干扰：搜索框展开时不显示热搜列表。默认关闭 = 空输入显示热搜。
     /// 打开后空输入直接显示联想（没有联想就什么都不显示），不再出现一块空白
     /// 的热搜面板。见 [`normalise_hide_hot_search`]。
@@ -364,7 +391,7 @@ pub struct Settings {
     /// `gpu` | `cpu`。见 [`normalise_fish_asr_device`]。
     #[serde(default = "default_fish_asr_device")]
     pub fish_asr_device: String,
-    /// `small` | `turbo` | `medium`。见 [`normalise_fish_asr_model`]。
+    /// 语音识别固定 tiny；旧值在加载时经 [`normalise_fish_asr_model`] 折回。
     #[serde(default = "default_fish_asr_model")]
     pub fish_asr_model: String,
     /// whisper.cpp / faster-whisper 的线程数（`1..=FISH_ASR_THREADS_MAX`）。
@@ -380,6 +407,10 @@ pub struct Settings {
     /// DeepSeek 视觉的图片精度：`low`（先缩到 512×512，省 token）或 `original`。
     #[serde(default = "default_fish_vision_detail")]
     pub fish_vision_detail: String,
+    /// 自动看片的画面间隔（秒）：`0` = 自动（约 30 张/片），否则按用户选择的
+    /// 固定间隔抽帧并拼图。见 [`normalise_fish_frame_interval`]。
+    #[serde(default = "default_fish_frame_interval")]
+    pub fish_frame_interval_s: u32,
     /// 番剧索引的排序，按 season_type 分别记住：`{"1": "follows", "4": "score"}`
     /// （键是 `pgc_season_type` 的十进制 season_type，值是 [`PGC_SORT_KEYS`] 之一）。
     /// 缺省 = 该分区沿用 B站 的「追番人数」排序（`order=3`），即改动前的行为。
@@ -506,6 +537,14 @@ pub const PLAYLIST_MAX: usize = 200;
 /// Legacy 循环模式：0 = 手动, 1 = 自动, 2 = 随机. Only used to migrate an old
 /// `settings.json`; new files store the two switches instead.
 pub const PLAY_MODES: [u32; 3] = [0, 1, 2];
+/// 播放结束行为：原地暂停 / 循环播放 / 下一首或关闭窗口 / 下一分P.
+pub const LOOP_PAUSE: u8 = 0;
+pub const LOOP_ONE: u8 = 1;
+pub const LOOP_NEXT: u8 = 2;
+pub const LOOP_NEXT_PART: u8 = 3;
+pub const LOOP_MODES: [u8; 4] = [LOOP_PAUSE, LOOP_ONE, LOOP_NEXT, LOOP_NEXT_PART];
+/// Display order of the four-row loop menu: 循环 / 继续 / 下一分P / 暂停.
+pub const LOOP_MENU_ORDER: [u8; 4] = [LOOP_ONE, LOOP_NEXT, LOOP_NEXT_PART, LOOP_PAUSE];
 /// [`Settings::playlist_mode_rev`] 的当前世代。0 = 旧 `play_mode`，1 = 两个开关。
 pub const PLAYLIST_MODE_REV: u32 = 1;
 /// 帧插值模式：0 = 关闭, 1 = CPU（线性混合）.
@@ -573,7 +612,20 @@ fn default_opacity() -> u32 {
 }
 
 fn default_font() -> u32 {
-    1
+    100
+}
+
+/// Font scale in percent. The three pre-slider values (0/1/2) migrate to the
+/// 85 / 100 / 120 scales they used to select; anything outside 50–150 is
+/// clamped. Once written back the file only holds percentages.
+pub fn normalise_danmaku_font(value: u32) -> u32 {
+    match value {
+        0 => 85,
+        1 => 100,
+        2 => 120,
+        3..=49 => 100,
+        value => value.clamp(50, 150),
+    }
 }
 
 fn default_danmaku_speed() -> u32 {
@@ -625,6 +677,15 @@ pub fn normalise_player_quality(qn: i64) -> i64 {
     } else {
         qn
     }
+}
+
+/// Default opening height: `0` means the highest stream the source offers.
+fn default_player_quality_height() -> u32 {
+    0
+}
+
+pub fn normalise_player_quality_height(height: u32) -> u32 {
+    height.min(4320)
 }
 
 /// 背景透明度 default: 45 % see-through. The window tint keeps 55 % alpha
@@ -794,6 +855,34 @@ pub fn default_loop_one() -> bool {
     false
 }
 
+/// 播放结束默认「下一首 / 关闭窗口」，保持旧行为.
+pub fn default_loop_mode() -> u8 {
+    LOOP_NEXT
+}
+
+/// Unknown loop modes fall back to the default end-of-video behaviour.
+pub fn normalise_loop_mode(mode: u8) -> u8 {
+    if LOOP_MODES.contains(&mode) {
+        mode
+    } else {
+        default_loop_mode()
+    }
+}
+
+/// Resolve the new three-way mode from a settings file.
+///
+/// Files written before `loop_mode` existed only have the `loop_one` boolean.
+/// For those, `true` means 循环播放 and `false` means the old next/close
+/// behaviour. Once `loop_mode` is present it wins, so a stored 原地暂停 (`0`)
+/// survives a reload.
+pub fn resolve_loop_mode(mode: u8, legacy_loop_one: bool) -> u8 {
+    if mode == default_loop_mode() && legacy_loop_one {
+        LOOP_ONE
+    } else {
+        normalise_loop_mode(mode)
+    }
+}
+
 /// Normalise a legacy 循环模式 value.
 ///
 /// Accepts exactly the three offered modes ([`PLAY_MODES`]); anything else
@@ -832,6 +921,25 @@ pub fn normalise_interp_mode(value: u8) -> u8 {
     }
 }
 
+/// 插帧目标帧率的界面选项：`0` = 跟随显示器，其余为固定 Hz。
+pub const INTERP_HZ_OPTIONS: [u32; 5] = [0, 60, 90, 120, 144];
+/// 固定插帧目标允许的最小值。
+pub const INTERP_HZ_MIN: u32 = 30;
+/// 固定插帧目标允许的最大值（与 native_player 的安全上限一致）。
+pub const INTERP_HZ_MAX: u32 = 240;
+
+/// Normalise the requested interpolation target. `0` means "follow the display
+/// refresh"; a fixed target must sit inside [`INTERP_HZ_MIN`]..=[`INTERP_HZ_MAX`].
+/// Anything else falls back to following the display rather than silently
+/// picking a rate the user did not ask for.
+pub fn normalise_interp_hz(value: u32) -> u32 {
+    if value == 0 || (INTERP_HZ_MIN..=INTERP_HZ_MAX).contains(&value) {
+        value
+    } else {
+        0
+    }
+}
+
 /// 把旧编号的 [`Settings::interp_mode`] 迁移到 [`INTERP_MODE_REV`]。
 ///
 /// f237 删掉了 GPU 光流这一档，菜单只剩 关闭 / CPU。旧文件的 `2` 是块匹配
@@ -845,7 +953,10 @@ pub fn migrate_interp_mode(value: u8) -> (u8, Option<(u8, u8)>) {
         2 | 3 => 1,
         other => other,
     };
-    (normalise_interp_mode(migrated), (migrated != value).then_some((value, migrated)))
+    (
+        normalise_interp_mode(migrated),
+        (migrated != value).then_some((value, migrated)),
+    )
 }
 
 fn default_fish_model() -> String {
@@ -892,7 +1003,7 @@ pub fn default_fish_asr_device() -> String {
 }
 
 pub fn default_fish_asr_model() -> String {
-    "small".to_string()
+    "tiny".to_string()
 }
 
 pub fn default_fish_asr_threads() -> u32 {
@@ -906,6 +1017,20 @@ pub fn default_fish_model_mirror() -> String {
 
 pub fn default_fish_vision_detail() -> String {
     "low".to_string()
+}
+
+pub fn default_fish_frame_interval() -> u32 {
+    0
+}
+
+/// `0` keeps automatic sampling; any other value is clamped into the same
+/// `2..=3600` seconds range the frame lab offers.
+pub fn normalise_fish_frame_interval(value: u32) -> u32 {
+    if value == 0 {
+        0
+    } else {
+        value.clamp(2, 3_600)
+    }
 }
 
 /// Normalise the 看片力度 tier: `0..=4` presets and `5` custom; anything else
@@ -936,13 +1061,10 @@ pub fn normalise_fish_asr_device(value: &str) -> String {
     }
 }
 
-pub fn normalise_fish_asr_model(value: &str) -> String {
-    let trimmed = value.trim();
-    if FISH_ASR_MODELS.contains(&trimmed) {
-        trimmed.to_string()
-    } else {
-        default_fish_asr_model()
-    }
+/// 语音识别固定使用 tiny 模型：磁盘里旧的 `small` / `medium` 等值在加载时
+/// 统一折回 tiny，设置页也只提供 tiny 的模型下载。
+pub fn normalise_fish_asr_model(_value: &str) -> String {
+    default_fish_asr_model()
 }
 
 /// Threads: 0 means "unset" and falls back to the default; anything else is
@@ -1034,8 +1156,7 @@ pub fn normalise_fish_time(value: &str) -> String {
     let (Some(hour), Some(minute), None) = (parts.next(), parts.next(), parts.next()) else {
         return default_fish_feed_time();
     };
-    let (Ok(hour), Ok(minute)) = (hour.trim().parse::<u32>(), minute.trim().parse::<u32>())
-    else {
+    let (Ok(hour), Ok(minute)) = (hour.trim().parse::<u32>(), minute.trim().parse::<u32>()) else {
         return default_fish_feed_time();
     };
     if hour > 23 || minute > 59 {
@@ -1093,6 +1214,26 @@ pub fn normalise_hide_live_tab(value: bool) -> bool {
     value
 }
 
+/// 隐藏番剧默认关闭：工具栏保持完整的入口顺序。
+pub fn default_hide_pgc_tab() -> bool {
+    false
+}
+
+/// Normalise the 防干扰 隐藏番剧 switch (see [`normalise_hide_live_tab`]).
+pub fn normalise_hide_pgc_tab(value: bool) -> bool {
+    value
+}
+
+/// 隐藏大肥鱼默认关闭：工具栏保持完整的入口顺序。
+pub fn default_hide_fish_tab() -> bool {
+    false
+}
+
+/// Normalise the 防干扰 隐藏大肥鱼 switch (see [`normalise_hide_live_tab`]).
+pub fn normalise_hide_fish_tab(value: bool) -> bool {
+    value
+}
+
 /// 隐藏搜索热搜默认关闭：空输入时热搜面板照旧出现。
 pub fn default_hide_hot_search() -> bool {
     false
@@ -1122,7 +1263,14 @@ pub fn audio_tier_name(id: u32) -> &'static str {
 /// degrade to `sk-…` instead of revealing themselves.
 pub fn mask_key(key: &str) -> String {
     let key = key.trim();
-    let last: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let last: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     if key.chars().count() <= 8 || last.chars().count() < 4 {
         "sk-…".to_string()
     } else {
@@ -1283,8 +1431,11 @@ impl Default for Settings {
             blocked_keywords: Vec::new(),
             blocked_regex: Vec::new(),
             player_quality: default_player_quality(),
-            // f176: decode at the stream's own size unless the owner opts out.
-            player_native_size: true,
+            player_quality_height: default_player_quality_height(),
+            // Decode at 1080p unless the owner explicitly asks for the
+            // source's own size: 4K native is a sharpness-for-frame-rate
+            // trade on a CPU conversion path.
+            player_native_size: false,
             player_enhance: 0,
             // f212: the composite picture path is the shipped default (the
             // two entries that used to miss the video layer are fixed);
@@ -1324,8 +1475,10 @@ impl Default for Settings {
             playlist_random: default_playlist_random(),
             playlist_mode_rev: PLAYLIST_MODE_REV,
             loop_one: default_loop_one(),
+            loop_mode: default_loop_mode(),
             interp_mode: 0,
             interp_mode_rev: INTERP_MODE_REV,
+            interp_hz: 0,
             deepseek_key: String::new(),
             fish_model: default_fish_model(),
             fish_instruction: default_fish_instruction(),
@@ -1337,6 +1490,8 @@ impl Default for Settings {
             fish_sources: default_fish_sources(),
             audio_quality: 0,
             hide_live_tab: default_hide_live_tab(),
+            hide_pgc_tab: default_hide_pgc_tab(),
+            hide_fish_tab: default_hide_fish_tab(),
             hide_hot_search: default_hide_hot_search(),
             fish_tier: default_fish_tier(),
             fish_step_meta: true,
@@ -1353,6 +1508,7 @@ impl Default for Settings {
             fish_asr_model_dir: String::new(),
             fish_model_mirror: default_fish_model_mirror(),
             fish_vision_detail: default_fish_vision_detail(),
+            fish_frame_interval_s: default_fish_frame_interval(),
             pgc_sorts: BTreeMap::new(),
             search_tab: 0,
         }
@@ -1392,11 +1548,12 @@ pub fn load() -> Settings {
     // has no `playlist_mode_rev`; map its value once and write the marker back.
     let playlist_migration = (settings.playlist_mode_rev < PLAYLIST_MODE_REV)
         .then(|| migrate_playlist_mode(settings.play_mode));
+    let loop_mode = resolve_loop_mode(settings.loop_mode, settings.loop_one);
     let (playlist, playlist_current) =
         normalise_playlist_state(settings.playlist, settings.playlist_current);
     let loaded = Settings {
         danmaku_opacity: settings.danmaku_opacity.min(100),
-        danmaku_font: settings.danmaku_font.min(2),
+        danmaku_font: normalise_danmaku_font(settings.danmaku_font),
         danmaku_speed: settings.danmaku_speed.clamp(50, 200),
         danmaku_area: clamp_area(settings.danmaku_area),
         block_scroll: settings.block_scroll,
@@ -1406,6 +1563,7 @@ pub fn load() -> Settings {
         blocked_keywords: settings.blocked_keywords,
         blocked_regex: settings.blocked_regex,
         player_quality: normalise_player_quality(settings.player_quality),
+        player_quality_height: normalise_player_quality_height(settings.player_quality_height),
         player_native_size: settings.player_native_size,
         // Unknown tiers (a hand-edited file, a build from another branch) load as
         // 关闭 rather than as a tier number the menu cannot name; the removed
@@ -1444,19 +1602,17 @@ pub fn load() -> Settings {
         prefetch_connections: normalise_prefetch_connections(settings.prefetch_connections),
         preload_enabled: settings.preload_enabled,
         preload_comments: normalise_preload_comments(settings.preload_comments),
-        preload_bandwidth_mbps: normalise_preload_bandwidth_mbps(
-            settings.preload_bandwidth_mbps,
-        ),
+        preload_bandwidth_mbps: normalise_preload_bandwidth_mbps(settings.preload_bandwidth_mbps),
         net_threads: normalise_net_threads(settings.net_threads),
         playlist,
         playlist_current,
         play_mode: normalise_play_mode(settings.play_mode),
         playlist_autoplay: playlist_migration
             .map_or(settings.playlist_autoplay, |(autoplay, _)| autoplay),
-        playlist_random: playlist_migration
-            .map_or(settings.playlist_random, |(_, random)| random),
+        playlist_random: playlist_migration.map_or(settings.playlist_random, |(_, random)| random),
         playlist_mode_rev: PLAYLIST_MODE_REV,
-        loop_one: settings.loop_one,
+        loop_one: loop_mode == LOOP_ONE,
+        loop_mode,
         interp_mode: interp_migration.map_or_else(
             || normalise_interp_mode(settings.interp_mode),
             |(mode, _)| mode,
@@ -1466,6 +1622,7 @@ pub fn load() -> Settings {
         } else {
             settings.interp_mode_rev
         },
+        interp_hz: normalise_interp_hz(settings.interp_hz),
         deepseek_key: settings.deepseek_key.trim().to_string(),
         fish_model: normalise_fish_model(&settings.fish_model),
         fish_instruction: normalise_fish_instruction(&settings.fish_instruction),
@@ -1477,6 +1634,8 @@ pub fn load() -> Settings {
         fish_sources: normalise_fish_sources(settings.fish_sources),
         audio_quality: normalise_audio_quality(settings.audio_quality),
         hide_live_tab: normalise_hide_live_tab(settings.hide_live_tab),
+        hide_pgc_tab: normalise_hide_pgc_tab(settings.hide_pgc_tab),
+        hide_fish_tab: normalise_hide_fish_tab(settings.hide_fish_tab),
         hide_hot_search: normalise_hide_hot_search(settings.hide_hot_search),
         fish_tier: normalise_fish_tier(settings.fish_tier),
         fish_step_meta: settings.fish_step_meta,
@@ -1493,6 +1652,7 @@ pub fn load() -> Settings {
         fish_asr_model_dir: settings.fish_asr_model_dir.trim().to_string(),
         fish_model_mirror: normalise_fish_model_mirror(&settings.fish_model_mirror),
         fish_vision_detail: normalise_fish_vision_detail(&settings.fish_vision_detail),
+        fish_frame_interval_s: normalise_fish_frame_interval(settings.fish_frame_interval_s),
         pgc_sorts: normalise_pgc_sorts(settings.pgc_sorts),
         search_tab: normalise_search_tab(settings.search_tab),
     };
@@ -1515,6 +1675,13 @@ pub fn load() -> Settings {
     if settings.player_enhance == 3 {
         crate::debug_log("settings migrate player_enhance 3 -> 1");
     }
+    let font_migration = settings.danmaku_font != loaded.danmaku_font;
+    if font_migration {
+        crate::debug_log(&format!(
+            "settings migrate danmaku_font {} -> {}",
+            settings.danmaku_font, loaded.danmaku_font
+        ));
+    }
     // The migration marker must reach disk, or the next start would re-read the
     // legacy numbering and shuffle the mode again.
     if loaded.theme != stored_theme
@@ -1522,6 +1689,7 @@ pub fn load() -> Settings {
         || playlist_migration.is_some()
         || removed_interp_120
         || settings.player_enhance != loaded.player_enhance
+        || font_migration
     {
         let _ = save(&loaded);
     }
@@ -1716,11 +1884,20 @@ impl ContinueStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn danmaku_font_migrates_from_three_chips_to_percent() {
+        assert_eq!(normalise_danmaku_font(0), 85);
+        assert_eq!(normalise_danmaku_font(1), 100);
+        assert_eq!(normalise_danmaku_font(2), 120);
+        assert_eq!(normalise_danmaku_font(50), 50);
+        assert_eq!(normalise_danmaku_font(150), 150);
+        assert_eq!(normalise_danmaku_font(151), 150);
+        assert_eq!(normalise_danmaku_font(3), 100);
+        assert_eq!(default_font(), 100);
+    }
+
     fn temp_continue_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "o11a1-continue-{}-{tag}.json",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("o11a1-continue-{}-{tag}.json", std::process::id()))
     }
 
     #[test]
@@ -1865,7 +2042,8 @@ mod tests {
     }
 
     #[test]
-    fn close_action_accepts_every_offered_value() {        for value in CLOSE_ACTIONS {
+    fn close_action_accepts_every_offered_value() {
+        for value in CLOSE_ACTIONS {
             assert_eq!(normalise_close_action(value), value);
         }
     }
@@ -2128,7 +2306,32 @@ mod tests {
         assert!(defaults.playlist_autoplay);
         assert!(!defaults.playlist_random);
         assert!(!defaults.loop_one);
+        assert_eq!(defaults.loop_mode, LOOP_NEXT);
         assert_eq!(defaults.playlist_mode_rev, PLAYLIST_MODE_REV);
+    }
+
+    #[test]
+    fn loop_menu_order_is_loop_continue_part_pause() {
+        assert_eq!(LOOP_MENU_ORDER, [LOOP_ONE, LOOP_NEXT, LOOP_NEXT_PART, LOOP_PAUSE]);
+    }
+
+    #[test]
+    fn loop_mode_accepts_the_four_menu_values() {
+        for mode in LOOP_MODES {
+            assert_eq!(normalise_loop_mode(mode), mode);
+        }
+        for mode in [4u8, 5, 99, u8::MAX] {
+            assert_eq!(normalise_loop_mode(mode), LOOP_NEXT);
+        }
+    }
+
+    #[test]
+    fn legacy_loop_one_migrates_to_the_loop_menu() {
+        assert_eq!(resolve_loop_mode(LOOP_NEXT, true), LOOP_ONE);
+        assert_eq!(resolve_loop_mode(LOOP_NEXT, false), LOOP_NEXT);
+        // A real pause selection must not be overwritten by the legacy bool.
+        assert_eq!(resolve_loop_mode(LOOP_PAUSE, false), LOOP_PAUSE);
+        assert_eq!(resolve_loop_mode(LOOP_ONE, false), LOOP_ONE);
     }
 
     #[test]
@@ -2171,6 +2374,7 @@ mod tests {
             playlist_autoplay: false,
             playlist_random: false,
             loop_one: true,
+            loop_mode: LOOP_ONE,
             ..Settings::default()
         };
         let encoded = serde_json::to_string(&settings)?;
@@ -2182,6 +2386,7 @@ mod tests {
         assert!(!decoded.playlist_autoplay);
         assert!(!decoded.playlist_random);
         assert!(decoded.loop_one);
+        assert_eq!(decoded.loop_mode, LOOP_ONE);
         assert_eq!(decoded.playlist_mode_rev, PLAYLIST_MODE_REV);
         Ok(())
     }
@@ -2287,6 +2492,18 @@ mod tests {
     }
 
     #[test]
+    fn interp_hz_keeps_fixed_targets_and_rejects_absurd_values() {
+        assert_eq!(normalise_interp_hz(0), 0);
+        for hz in INTERP_HZ_OPTIONS.into_iter().filter(|hz| *hz != 0) {
+            assert_eq!(normalise_interp_hz(hz), hz);
+        }
+        assert_eq!(normalise_interp_hz(INTERP_HZ_MIN), INTERP_HZ_MIN);
+        assert_eq!(normalise_interp_hz(INTERP_HZ_MAX), INTERP_HZ_MAX);
+        assert_eq!(normalise_interp_hz(INTERP_HZ_MIN - 1), 0);
+        assert_eq!(normalise_interp_hz(INTERP_HZ_MAX + 1), 0);
+    }
+
+    #[test]
     fn interp_mode_rejects_corrupt_and_future_values() {
         // 0..=1 are implemented (off / CPU); the retired GPU `2`, the oldest
         // hardware-flow `3` and anything else are not.
@@ -2336,8 +2553,7 @@ mod tests {
     /// load (serde ignores it) and must not write it back.
     #[test]
     fn interp_120_is_ignored_and_dropped_on_save() -> Result<()> {
-        let loaded: Settings =
-            serde_json::from_str(r#"{ "interp_mode": 1, "interp_120": true }"#)?;
+        let loaded: Settings = serde_json::from_str(r#"{ "interp_mode": 1, "interp_120": true }"#)?;
         assert_eq!(loaded.interp_mode, 1);
         let encoded = serde_json::to_string(&loaded)?;
         assert!(!encoded.contains("interp_120"));
@@ -2446,8 +2662,14 @@ mod tests {
     fn fish_model_and_instruction_never_stay_blank() {
         assert_eq!(normalise_fish_model("  "), "deepseek-flash");
         assert_eq!(normalise_fish_model("deepseek-chat"), "deepseek-flash");
-        assert_eq!(normalise_fish_model("deepseek-reasoner"), "deepseek-reasoner");
-        assert_eq!(normalise_fish_instruction("   "), default_fish_instruction());
+        assert_eq!(
+            normalise_fish_model("deepseek-reasoner"),
+            "deepseek-reasoner"
+        );
+        assert_eq!(
+            normalise_fish_instruction("   "),
+            default_fish_instruction()
+        );
         assert_eq!(normalise_fish_instruction(" 只看教程 "), "只看教程");
     }
 
@@ -2465,16 +2687,24 @@ mod tests {
     fn guard_switches_default_off() {
         let defaults = Settings::default();
         assert!(!defaults.hide_live_tab);
+        assert!(!defaults.hide_pgc_tab);
+        assert!(!defaults.hide_fish_tab);
         assert!(!defaults.hide_hot_search);
         assert!(!default_hide_live_tab());
+        assert!(!default_hide_pgc_tab());
+        assert!(!default_hide_fish_tab());
         assert!(!default_hide_hot_search());
         // A settings.json written before 防干扰 existed: the missing fields take
         // the serde default, so both switches come up off (the pre-change app).
         let legacy = r#"{ "page_size": 36, "theme": 2 }"#;
         let decoded = serde_json::from_str::<Settings>(legacy).expect("legacy file parses");
         assert_eq!(decoded.hide_live_tab, default_hide_live_tab());
+        assert_eq!(decoded.hide_pgc_tab, default_hide_pgc_tab());
+        assert_eq!(decoded.hide_fish_tab, default_hide_fish_tab());
         assert_eq!(decoded.hide_hot_search, default_hide_hot_search());
         assert!(!decoded.hide_live_tab);
+        assert!(!decoded.hide_pgc_tab);
+        assert!(!decoded.hide_fish_tab);
         assert!(!decoded.hide_hot_search);
     }
 
@@ -2482,6 +2712,8 @@ mod tests {
     fn guard_switches_keep_both_boolean_states() {
         for value in [false, true] {
             assert_eq!(normalise_hide_live_tab(value), value);
+            assert_eq!(normalise_hide_pgc_tab(value), value);
+            assert_eq!(normalise_hide_fish_tab(value), value);
             assert_eq!(normalise_hide_hot_search(value), value);
         }
     }
@@ -2490,16 +2722,28 @@ mod tests {
     fn guard_switches_round_trip_through_json() -> Result<()> {
         let settings = Settings {
             hide_live_tab: true,
+            hide_pgc_tab: true,
+            hide_fish_tab: true,
             hide_hot_search: true,
             ..Settings::default()
         };
         let encoded = serde_json::to_string(&settings)?;
         assert!(encoded.contains("\"hide_live_tab\":true"), "{encoded}");
+        assert!(encoded.contains("\"hide_pgc_tab\":true"), "{encoded}");
+        assert!(encoded.contains("\"hide_fish_tab\":true"), "{encoded}");
         assert!(encoded.contains("\"hide_hot_search\":true"), "{encoded}");
         let decoded = serde_json::from_str::<Settings>(&encoded)?;
         assert!(
             normalise_hide_live_tab(decoded.hide_live_tab),
             "隐藏直播 survives a round trip"
+        );
+        assert!(
+            normalise_hide_pgc_tab(decoded.hide_pgc_tab),
+            "隐藏番剧 survives a round trip"
+        );
+        assert!(
+            normalise_hide_fish_tab(decoded.hide_fish_tab),
+            "隐藏大肥鱼 survives a round trip"
         );
         assert!(
             normalise_hide_hot_search(decoded.hide_hot_search),
@@ -2508,6 +2752,14 @@ mod tests {
         let encoded_default = serde_json::to_string(&Settings::default())?;
         assert!(
             encoded_default.contains("\"hide_live_tab\":false"),
+            "{encoded_default}"
+        );
+        assert!(
+            encoded_default.contains("\"hide_pgc_tab\":false"),
+            "{encoded_default}"
+        );
+        assert!(
+            encoded_default.contains("\"hide_fish_tab\":false"),
             "{encoded_default}"
         );
         assert!(
@@ -2541,29 +2793,35 @@ mod tests {
     }
 
     #[test]
-    fn asr_settings_default_to_small_gpu_and_normalise() {
+    fn asr_settings_default_to_tiny_gpu_and_normalise() {
         let defaults = Settings::default();
         assert!(!defaults.fish_asr_enabled);
         assert_eq!(defaults.fish_asr_engine, "auto");
         assert_eq!(defaults.fish_asr_device, "gpu");
-        assert_eq!(defaults.fish_asr_model, "small");
+        assert_eq!(defaults.fish_asr_model, "tiny");
         assert_eq!(defaults.fish_asr_threads, 4);
         assert_eq!(defaults.fish_vision_detail, "low");
+        assert_eq!(defaults.fish_frame_interval_s, 0);
+        assert_eq!(normalise_fish_frame_interval(0), 0);
+        assert_eq!(normalise_fish_frame_interval(1), 2);
+        assert_eq!(normalise_fish_frame_interval(30), 30);
+        assert_eq!(normalise_fish_frame_interval(9_999), 3_600);
         for engine in FISH_ASR_ENGINES {
             assert_eq!(normalise_fish_asr_engine(engine), engine);
         }
         for device in FISH_ASR_DEVICES {
             assert_eq!(normalise_fish_asr_device(device), device);
         }
+        // Only tiny is allowed: every other stored model folds back to it.
         for model in FISH_ASR_MODELS {
-            assert_eq!(normalise_fish_asr_model(model), model);
+            assert_eq!(normalise_fish_asr_model(model), "tiny");
         }
         for detail in FISH_VISION_DETAILS {
             assert_eq!(normalise_fish_vision_detail(detail), detail);
         }
         assert_eq!(normalise_fish_asr_engine("nope"), "auto");
         assert_eq!(normalise_fish_asr_device("tpu"), "gpu");
-        assert_eq!(normalise_fish_asr_model("large"), "small");
+        assert_eq!(normalise_fish_asr_model("large"), "tiny");
         assert_eq!(normalise_fish_vision_detail("high"), "low");
         assert_eq!(normalise_fish_asr_threads(0), 4);
         assert_eq!(normalise_fish_asr_threads(99), FISH_ASR_THREADS_MAX);
@@ -2583,8 +2841,8 @@ mod tests {
             };
             assert_eq!(normalise_fish_model_mirror(bad), expected);
         }
-        let legacy = serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#)
-            .expect("legacy settings");
+        let legacy =
+            serde_json::from_str::<Settings>(r#"{ "page_size": 36 }"#).expect("legacy settings");
         assert_eq!(legacy.fish_model_mirror, "auto");
     }
 
@@ -2601,9 +2859,10 @@ mod tests {
             fish_asr_enabled: true,
             fish_asr_engine: "faster-whisper".to_string(),
             fish_asr_device: "cpu".to_string(),
-            fish_asr_model: "medium".to_string(),
+            fish_asr_model: "tiny".to_string(),
             fish_asr_threads: 8,
             fish_vision_detail: "original".to_string(),
+            fish_frame_interval_s: 45,
             ..Settings::default()
         };
         let encoded = serde_json::to_string(&settings)?;
@@ -2613,9 +2872,10 @@ mod tests {
         assert!(!decoded.fish_step_subtitle);
         assert_eq!(decoded.fish_asr_engine, "faster-whisper");
         assert_eq!(decoded.fish_asr_device, "cpu");
-        assert_eq!(decoded.fish_asr_model, "medium");
+        assert_eq!(decoded.fish_asr_model, "tiny");
         assert_eq!(decoded.fish_asr_threads, 8);
         assert_eq!(decoded.fish_vision_detail, "original");
+        assert_eq!(decoded.fish_frame_interval_s, 45);
         Ok(())
     }
 }

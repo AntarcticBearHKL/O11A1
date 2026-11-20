@@ -59,15 +59,8 @@ fn system_is_dark() -> Option<bool> {
     let mut key: isize = 0;
     // SAFETY: `sub_key` is a NUL-terminated UTF-16 buffer that outlives the
     // call; `key` is only used after a success status.
-    let opened = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            sub_key.as_ptr(),
-            0,
-            KEY_READ,
-            &mut key,
-        )
-    };
+    let opened =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub_key.as_ptr(), 0, KEY_READ, &mut key) };
     if opened != ERROR_SUCCESS {
         return None;
     }

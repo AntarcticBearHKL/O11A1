@@ -13,7 +13,7 @@ use std::process::{Child, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -22,7 +22,10 @@ use crate::proc;
 
 /// One decoded picture on the pipe. `ts_ms` is on the media timeline.
 pub struct DecodedFrame {
-    pub data: Vec<u8>,
+    /// Shared so the reader can recycle the buffer once the engine drops the
+    /// last reference. At 4K a fresh 12 MB allocation per frame costs enough
+    /// page faults to starve the 60 fps deadline.
+    pub data: Arc<Vec<u8>>,
     pub ts_ms: u64,
 }
 
@@ -80,28 +83,66 @@ impl FrameQueue {
         self.ready.notify_all();
     }
 
-    /// Take the newest frame whose timestamp is due at `now_ms` (with
-    /// `tolerance_ms` of look-ahead) and discard every older due frame. `None`
-    /// means the queue has nothing presentable yet.
-    pub fn take_due(&self, now_ms: u64, tolerance_ms: u64) -> Option<DecodedFrame> {
+    /// Take the oldest frame that is due, presenting the queue strictly in
+    /// order. The audio clock updates in coarse steps, so a single step can
+    /// make two pictures due at once; taking the *newest* threw the older one
+    /// away and read as a stutter. When the picture is already more than
+    /// `max_lag_ms` behind the clock, the queue jumps to the newest due frame
+    /// instead, so latency can never accumulate.
+    pub fn take_due_in_order(
+        &self,
+        now_ms: u64,
+        tolerance_ms: u64,
+        max_lag_ms: u64,
+    ) -> Option<DecodedFrame> {
         let mut inner = self.inner.lock().ok()?;
+        let front_ts = inner.frames.front().map(|frame| frame.ts_ms)?;
         let horizon = now_ms.saturating_add(tolerance_ms);
-        let mut newest: Option<DecodedFrame> = None;
-        while let Some(front) = inner.frames.front() {
-            if front.ts_ms > horizon {
-                break;
-            }
-            if newest.is_some() {
-                inner.dropped = inner.dropped.saturating_add(1);
-            }
-            newest = inner.frames.pop_front();
+        if front_ts > horizon {
+            return None;
         }
-        let freed = newest.is_some();
+        let frame = if now_ms.saturating_sub(front_ts) > max_lag_ms {
+            let mut newest: Option<DecodedFrame> = None;
+            while let Some(front) = inner.frames.front() {
+                if front.ts_ms > horizon {
+                    break;
+                }
+                if newest.is_some() {
+                    inner.dropped = inner.dropped.saturating_add(1);
+                }
+                newest = inner.frames.pop_front();
+            }
+            newest
+        } else {
+            inner.frames.pop_front()
+        };
+        let freed = frame.is_some();
         drop(inner);
         if freed {
             self.space.notify_all();
         }
-        newest
+        frame
+    }
+
+    /// Take the oldest frame when it is at or before `horizon_ms`. Unlike
+    /// [`Self::take_due`], this keeps the queue in order and returns one frame
+    /// at a time, so the interpolation scheduler can hold the next source
+    /// picture while it generates the ticks in between.
+    pub fn take_front_until(&self, horizon_ms: u64) -> Option<DecodedFrame> {
+        let mut inner = self.inner.lock().ok()?;
+        let due = inner
+            .frames
+            .front()
+            .map(|frame| frame.ts_ms <= horizon_ms)?;
+        if !due {
+            return None;
+        }
+        let frame = inner.frames.pop_front();
+        drop(inner);
+        if frame.is_some() {
+            self.space.notify_all();
+        }
+        frame
     }
 
     /// Take the first frame regardless of timestamp (the post-seek preview: the
@@ -118,7 +159,10 @@ impl FrameQueue {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|inner| inner.frames.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .map(|inner| inner.frames.len())
+            .unwrap_or(0)
     }
 
     /// Timestamp of the oldest queued frame, for stall diagnostics.
@@ -161,6 +205,14 @@ pub struct VideoSpec {
     /// Playback speed: the reader admits `fps * speed` frames per second so a
     /// 1.5×/2× session is not starved by its own pacing.
     pub speed: f64,
+    /// Stable identity for the disk cache. `None` keeps the original URL
+    /// (local files, live streams and direct sources the cache could not
+    /// range-probe).
+    pub cache_key: Option<String>,
+    /// The GPU decoder this stream must use (`h264_cuvid`, `hevc_cuvid`,
+    /// `av1_cuvid`, `vp9_cuvid`). Empty means no GPU path exists and the
+    /// session is refused — there is no software fallback.
+    pub hw_decoder: String,
 }
 
 /// One running ffmpeg video decoder + its reader.
@@ -175,21 +227,46 @@ pub struct VideoDecoder {
     pub gate: Arc<AtomicBool>,
     pub queue: Arc<FrameQueue>,
     pub generation: u64,
+    /// Last stderr lines from ffmpeg, so a hardware decoder that refuses a
+    /// profile can be reported instead of a generic "decoder ended".
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl VideoDecoder {
-    pub fn spawn(spec: &VideoSpec, start_ms: u64, generation: u64, gate_open: bool) -> Result<Self> {
+    /// PID of the child ffmpeg process, used for the live network read
+    /// counter in the debug HUD.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn spawn(
+        spec: &VideoSpec,
+        start_ms: u64,
+        generation: u64,
+        gate_open: bool,
+    ) -> Result<Self> {
+        if spec.hw_decoder.trim().is_empty() {
+            return Err(anyhow!("this stream has no GPU decoder"));
+        }
         let target_w = spec.width.max(2) & !1;
         let target_h = spec.height.max(2) & !1;
         let frame_bytes = target_w as usize * target_h as usize * 3 / 2;
+        let url = if spec.remote {
+            spec.cache_key
+                .as_deref()
+                .and_then(|key| crate::mediacache::cached_url(&spec.url, &spec.headers, key))
+                .unwrap_or_else(|| spec.url.clone())
+        } else {
+            spec.url.clone()
+        };
+        let cached = url != spec.url;
+        let scale = target_w != spec.source_width || target_h != spec.source_height;
         let mut command = proc::command("ffmpeg.exe");
         command
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
             .arg("-nostdin")
-            .arg("-threads")
-            .arg("0")
             .arg("-probesize")
             .arg("1000000")
             .arg("-analyzeduration")
@@ -203,15 +280,36 @@ impl VideoDecoder {
                 command.arg("-headers").arg(headers);
             }
         }
+        // GPU-only: the decoder runs on NVDEC (CUDA). There is deliberately no
+        // `-c:v <software decoder>` behind this: an unsupported stream fails
+        // instead of dragging the CPU pipeline back in. `hwdownload` is the one
+        // unavoidable copy — ffmpeg is an external process, so the frame has to
+        // cross the pipe — but the 1.5 bytes/pixel NV12 upload replaces the old
+        // 4 bytes/pixel BGRA conversion and the 4K NV12→BGRA loop is gone.
+        command
+            .arg("-hwaccel")
+            .arg("cuda")
+            .arg("-hwaccel_output_format")
+            .arg("cuda")
+            .arg("-c:v")
+            .arg(&spec.hw_decoder);
         if start_ms > 0 {
             command.arg("-ss").arg(proc::seconds(start_ms));
         }
-        command.arg("-i").arg(&spec.url).arg("-an").arg("-sn").arg("-dn");
-        if target_w != spec.source_width || target_h != spec.source_height {
-            command
-                .arg("-vf")
-                .arg(format!("scale={target_w}:{target_h}:flags=bilinear"));
-        }
+        command
+            .arg("-i")
+            .arg(&url)
+            .arg("-an")
+            .arg("-sn")
+            .arg("-dn");
+        command.arg("-vf").arg(if scale {
+            // Scale on the GPU before the download: the 1080p decode cap then
+            // moves 3 MB/frame over the pipe instead of downloading 4K and
+            // resizing on the CPU.
+            format!("scale_cuda={target_w}:{target_h},hwdownload,format=nv12")
+        } else {
+            "hwdownload,format=nv12".to_string()
+        });
         command
             .arg("-fps_mode")
             .arg("passthrough")
@@ -224,13 +322,16 @@ impl VideoDecoder {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         log::line(&format!(
-            "decoder spawn gen={generation} start_ms={start_ms} size={target_w}x{target_h} frame_bytes={frame_bytes} fps={:.3} remote={}",
+            "decoder spawn gen={generation} start_ms={start_ms} size={target_w}x{target_h} frame_bytes={frame_bytes} fps={:.3} remote={} cached={} hw={} scale={}",
             spec.fps,
-            spec.remote
+            spec.remote,
+            u8::from(cached),
+            spec.hw_decoder,
+            u8::from(scale)
         ));
         let mut child = command
             .spawn()
-            .with_context(|| format!("spawn ffmpeg for {}", spec.url))?;
+            .with_context(|| format!("spawn ffmpeg for {url}"))?;
         let stdout = child
             .stdout
             .take()
@@ -239,18 +340,20 @@ impl VideoDecoder {
         let queue = FrameQueue::new(6);
         let stop = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(AtomicBool::new(gate_open));
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         let frame_period = {
             let fps = if spec.fps.is_finite() && spec.fps > 1.0 {
                 spec.fps
             } else {
                 30.0
             };
-            let speed = if spec.speed.is_finite() && spec.speed > 0.1 {
+            let speed = if spec.speed.is_finite() && spec.speed > 0.0 {
                 spec.speed
             } else {
                 1.0
             };
-            Duration::from_secs_f64(1.0 / (fps.min(240.0) * speed.clamp(0.25, 4.0)))
+            let speed = crate::speed::clamp(speed as f32) as f64;
+            Duration::from_secs_f64(1.0 / (fps.min(240.0) * speed))
         };
         let reader = {
             let queue = queue.clone();
@@ -259,12 +362,21 @@ impl VideoDecoder {
             std::thread::Builder::new()
                 .name(format!("player-video-{generation}"))
                 .spawn(move || {
-                    read_frames(stdout, queue, stop, gate, frame_bytes, start_ms, frame_period)
+                    read_frames(
+                        stdout,
+                        queue,
+                        stop,
+                        gate,
+                        frame_bytes,
+                        start_ms,
+                        frame_period,
+                    )
                 })
                 .context("spawn video reader")?
         };
         let stderr_thread = stderr.map(|stderr| {
             let generation = generation;
+            let tail_out = stderr_tail.clone();
             std::thread::Builder::new()
                 .name(format!("player-video-err-{generation}"))
                 .spawn(move || {
@@ -283,8 +395,11 @@ impl VideoDecoder {
                     if !tail.is_empty() {
                         log::line(&format!(
                             "decoder stderr gen={generation} [{}]",
-                            tail.into_iter().collect::<Vec<_>>().join(" | ")
+                            tail.iter().cloned().collect::<Vec<_>>().join(" | ")
                         ));
+                    }
+                    if let Ok(mut stored) = tail_out.lock() {
+                        *stored = tail;
                     }
                 })
                 .ok()
@@ -297,7 +412,21 @@ impl VideoDecoder {
             gate,
             queue,
             generation,
+            stderr_tail,
         })
+    }
+
+    /// The last ffmpeg error lines, used to explain a failed hardware decode.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| {
+                tail.iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_default()
     }
 
     /// Ask the child to stop, close its pipe and join both threads. Safe to call
@@ -324,6 +453,31 @@ impl Drop for VideoDecoder {
     }
 }
 
+/// Bytes read by one process (network + local file), used by the debug HUD
+/// to show the live ffmpeg download rate rather than a bitrate estimate.
+pub fn process_read_bytes(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetProcessIoCounters, OpenProcess, IO_COUNTERS, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut counters = IO_COUNTERS::default();
+        let ok = GetProcessIoCounters(handle, &mut counters).is_ok();
+        let _ = CloseHandle(handle);
+        ok.then_some(counters.ReadTransferCount)
+    }
+}
+
+/// Windows pipes deliver data in `ReadFile`-sized chunks, and a single huge
+/// read is pathologically slow (a 12 MB ask measured ~10 fps while 64 KB asks
+/// reached ~1.1 GB/s for the same 4K NV12 stream). The reader therefore fills
+/// one frame with fixed-size reads instead of `read_exact` on the whole slice.
+const READ_CHUNK: usize = 64 * 1024;
+
 fn read_frames(
     mut stdout: ChildStdout,
     queue: Arc<FrameQueue>,
@@ -333,32 +487,66 @@ fn read_frames(
     start_ms: u64,
     frame_period: Duration,
 ) {
-    let mut buffer = vec![0u8; frame_bytes];
+    // Reusable frame buffers. A buffer is free once only this list holds it;
+    // the engine drops its reference when it presents/replaces the picture.
+    let mut pool: Vec<Arc<Vec<u8>>> = Vec::new();
     let mut index: u64 = 0;
-    let mut next_admit = Instant::now();
+    let mut window_start = std::time::Instant::now();
+    let mut window_frames: u64 = 0;
     loop {
         if stop.load(Ordering::SeqCst) || queue.is_closed() {
             break;
         }
-        match stdout.read_exact(&mut buffer) {
-            Ok(()) => {}
-            Err(error) => {
-                if !stop.load(Ordering::SeqCst) {
-                    log::line(&format!(
-                        "decoder eof after {index} frames reason={error}"
-                    ));
+        let mut buffer = match pool.iter().position(|slot| Arc::strong_count(slot) == 1) {
+            Some(free) => pool.swap_remove(free),
+            None => Arc::new(vec![0u8; frame_bytes]),
+        };
+        let target = Arc::get_mut(&mut buffer).expect("free buffer must be unique");
+        let mut filled = 0usize;
+        let mut eof: Option<String> = None;
+        while filled < frame_bytes {
+            let want = (frame_bytes - filled).min(READ_CHUNK);
+            match stdout.read(&mut target[filled..filled + want]) {
+                Ok(0) => {
+                    eof = Some("eof".to_string());
+                    break;
                 }
-                break;
+                Ok(read) => filled += read,
+                Err(error) => {
+                    eof = Some(error.to_string());
+                    break;
+                }
             }
         }
-        let ts_ms = start_ms.saturating_add(
-            (index as f64 * frame_period.as_secs_f64() * 1000.0).round() as u64,
-        );
+        if let Some(reason) = eof {
+            if !stop.load(Ordering::SeqCst) {
+                log::line(&format!("decoder eof after {index} frames reason={reason}"));
+            }
+            break;
+        }
+        let ts_ms = start_ms
+            .saturating_add((index as f64 * frame_period.as_secs_f64() * 1000.0).round() as u64);
+        // Hand the frame over without a full-frame copy: the buffer goes back
+        // to the pool once the engine is done with it.
         queue.push(DecodedFrame {
             data: buffer.clone(),
             ts_ms,
         });
+        pool.push(buffer);
         index = index.saturating_add(1);
+        window_frames = window_frames.saturating_add(1);
+        // Hardware decode throughput, reported once a second: the pacer can
+        // only blend what this pipe delivers, so this is the first number to
+        // look at when 4K interpolation feels short.
+        if window_start.elapsed() >= Duration::from_secs(1) {
+            log::line(&format!(
+                "decoder read fps={:.1} frames={index} queue={}",
+                window_frames as f64 / window_start.elapsed().as_secs_f64(),
+                queue.len()
+            ));
+            window_start = std::time::Instant::now();
+            window_frames = 0;
+        }
         // A closed gate (pause, a seek waiting for the new picture, or the
         // startup audio warm-up) stops admission after this frame. The pipe's
         // backpressure then holds ffmpeg itself, so nothing is decoded ahead
@@ -369,27 +557,56 @@ fn read_frames(
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        // Admission pacing: at most one frame per source period. If the
-        // presentation thread ever fell far behind, reset the grid instead of
-        // bursting a catch-up (the queue drops the oldest anyway).
-        next_admit += frame_period;
-        let now = Instant::now();
-        if next_admit > now {
-            let mut wait = next_admit - now;
-            while !wait.is_zero() {
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                let chunk = wait.min(Duration::from_millis(5));
-                std::thread::sleep(chunk);
-                wait = match wait.checked_sub(chunk) {
-                    Some(rest) => rest,
-                    None => Duration::ZERO,
-                };
-            }
-        } else if now.duration_since(next_admit) > frame_period * 4 {
-            next_admit = now;
-        }
+        // Keep the ring fed so the presenter can look one source frame ahead.
+        // `push` itself blocks once all six slots are occupied.
     }
     queue.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ts_ms: u64) -> DecodedFrame {
+        DecodedFrame {
+            data: Arc::new(Vec::new()),
+            ts_ms,
+        }
+    }
+
+    #[test]
+    fn due_frames_are_taken_in_order_when_the_clock_steps() {
+        let queue = FrameQueue::new(8);
+        for ts in [0u64, 16, 33, 50] {
+            queue.push(frame(ts));
+        }
+        // A coarse audio-clock step makes 0 and 16 due together: the older
+        // picture is presented first and 16 follows on the next loop turn.
+        assert_eq!(queue.take_due_in_order(20, 8, 50).map(|f| f.ts_ms), Some(0));
+        assert_eq!(queue.take_due_in_order(20, 8, 50).map(|f| f.ts_ms), Some(16));
+        assert_eq!(queue.take_due_in_order(20, 8, 50).map(|f| f.ts_ms), None);
+        assert_eq!(queue.dropped(), 0);
+    }
+
+    #[test]
+    fn a_late_picture_jumps_to_the_newest_due_frame() {
+        let queue = FrameQueue::new(8);
+        for ts in [0u64, 16, 33, 50] {
+            queue.push(frame(ts));
+        }
+        // 120 ms behind: skip straight to the newest frame <= 128 ms.
+        assert_eq!(
+            queue.take_due_in_order(120, 8, 40).map(|f| f.ts_ms),
+            Some(50)
+        );
+        assert_eq!(queue.dropped(), 3);
+    }
+
+    #[test]
+    fn nothing_is_due_before_the_first_picture() {
+        let queue = FrameQueue::new(8);
+        queue.push(frame(500));
+        assert!(queue.take_due_in_order(100, 8, 40).is_none());
+        assert_eq!(queue.len(), 1);
+    }
 }

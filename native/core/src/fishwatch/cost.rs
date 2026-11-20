@@ -4,7 +4,6 @@
 //! `bytes` from the bytes a step actually pulled, and `tokens` from DeepSeek's
 //! own `usage` block. A step that reports 0 really spent 0 of that unit.
 
-
 use crate::fishwatch::steps::StepReport;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -22,7 +21,6 @@ impl CostBook {
         self.bytes = self.bytes.saturating_add(report.bytes);
         self.tokens = self.tokens.saturating_add(report.tokens);
     }
-
 }
 
 /// `4.2s` / `820ms`.

@@ -96,10 +96,12 @@ impl Session {
     /// Region / availability gate for one episode. Never errors on a non-zero
     /// API code - the code IS the answer, and the caller shows it.
     pub async fn pgc_gate(&self, ep_id: i64, cid: u64) -> Result<PgcGate> {
-        self.pgc_playurl_with(ep_id, cid, "16").await.map(|play| PgcGate {
-            code: play.code,
-            message: play.message,
-        })
+        self.pgc_playurl_with(ep_id, cid, "16")
+            .await
+            .map(|play| PgcGate {
+                code: play.code,
+                message: play.message,
+            })
     }
 }
 
@@ -312,9 +314,11 @@ impl PgcSeason {
     }
 
     pub fn all_episodes(&self) -> impl Iterator<Item = &PgcEpisode> {
-        self.episodes
-            .iter()
-            .chain(self.sections.iter().flat_map(|section| section.episodes.iter()))
+        self.episodes.iter().chain(
+            self.sections
+                .iter()
+                .flat_map(|section| section.episodes.iter()),
+        )
     }
 }
 
@@ -908,7 +912,11 @@ fn season_from(raw: PgcSeasonRaw) -> PgcSeason {
         title: raw.title,
         cover: normalize_url(&raw.cover),
         evaluate: raw.evaluate,
-        score: raw.rating.as_ref().map(|rating| rating.score).unwrap_or(0.0),
+        score: raw
+            .rating
+            .as_ref()
+            .map(|rating| rating.score)
+            .unwrap_or(0.0),
         score_count: raw.rating.map(|rating| rating.count).unwrap_or(0),
         areas: raw
             .areas
@@ -956,9 +964,7 @@ fn season_from(raw: PgcSeasonRaw) -> PgcSeason {
 /// same id as a string.
 fn season_i64(value: Option<&serde_json::Value>) -> i64 {
     match value {
-        Some(serde_json::Value::Number(number)) => {
-            number.as_i64().unwrap_or(0).max(0)
-        }
+        Some(serde_json::Value::Number(number)) => number.as_i64().unwrap_or(0).max(0),
         Some(serde_json::Value::String(text)) => text.trim().parse::<i64>().unwrap_or(0).max(0),
         _ => 0,
     }
@@ -988,7 +994,9 @@ fn season_str(value: Option<&serde_json::Value>) -> String {
     }
 }
 
-fn season_obj(value: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+fn season_obj(
+    value: Option<&serde_json::Value>,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
     value.and_then(serde_json::Value::as_object)
 }
 
@@ -1368,11 +1376,7 @@ struct RawPoint {
 /// and transcript cues are kept even when there is no summary at all.
 fn conclusion_from(data: ConclusionData) -> Conclusion {
     let model = data.model_result.unwrap_or_default();
-    let summary = model
-        .summary
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let summary = model.summary.unwrap_or_default().trim().to_string();
     let outline = model
         .outline
         .unwrap_or_default()
@@ -1710,7 +1714,10 @@ mod playurl_tests {
         assert_eq!(play.video.len(), 2);
         assert_eq!(play.audio.len(), 1);
         assert_eq!(play.video[0].id, 32);
-        assert_eq!(play.video[0].base_url, "https://upos.example.com/v-30032.m4s");
+        assert_eq!(
+            play.video[0].base_url,
+            "https://upos.example.com/v-30032.m4s"
+        );
         assert_eq!(
             play.video[0].backup_urls,
             vec!["https://mirror.example.com/v-30032.m4s".to_string()]
@@ -1723,7 +1730,10 @@ mod playurl_tests {
         assert_eq!(play.video[0].height, 480);
         assert!((play.video[0].frame_rate - 25.0).abs() < f64::EPSILON);
         assert_eq!(play.video[1].id, 80);
-        assert_eq!(play.video[1].base_url, "https://upos.example.com/v-30080.m4s");
+        assert_eq!(
+            play.video[1].base_url,
+            "https://upos.example.com/v-30080.m4s"
+        );
         assert_eq!(play.video[1].bandwidth, 1234567);
         assert_eq!(play.video[1].codecid, 12);
         assert_eq!(play.video[1].mime_type, "video/mp4");
@@ -1771,4 +1781,3 @@ mod playurl_tests {
         assert!(!play.is_playable());
     }
 }
-

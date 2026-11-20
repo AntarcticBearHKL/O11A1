@@ -14,29 +14,32 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use regex::Regex;
 use windows::core::{w, Interface};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS,
-    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_BRUSH_PROPERTIES, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, ID2D1Bitmap1,
-    ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
-    ID2D1SolidColorBrush,
+    D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
+    ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_BRUSH_PROPERTIES, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_MULTI_THREADED,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGISurface, IDXGISwapChain1};
+use windows::Win32::Graphics::Dxgi::{
+    IDXGISurface, IDXGISwapChain1, DXGI_PRESENT_DO_NOT_WAIT,
+};
 use windows_numerics::Matrix3x2;
 
-use crate::gpu::{present_ui, Gpu};
+use crate::gpu::Gpu;
 use crate::log;
 use crate::overlay::Rect;
 
@@ -170,11 +173,8 @@ impl DanmakuSettings {
                 }
             })
             .collect();
-        let font_scale = match stored.danmaku_font {
-            0 => 0.85,
-            2 => 1.2,
-            _ => 1.0,
-        };
+        let font_scale =
+            o11a1::settings::normalise_danmaku_font(stored.danmaku_font) as f32 / 100.0;
         let area_percent = o11a1::settings::clamp_area(stored.danmaku_area);
         let font_sizes = font_sizes(window_height, font_scale);
         let settings = Self {
@@ -279,10 +279,7 @@ pub fn fetch_with_session(
         .filter(|entry| !entry.text.trim().is_empty())
         .map(convert_item)
         .collect();
-    log::line(&format!(
-        "danmaku fetch ok cid={cid} n={}",
-        items.len()
-    ));
+    log::line(&format!("danmaku fetch ok cid={cid} n={}", items.len()));
     if items.len() <= 64 {
         let times: Vec<String> = items
             .iter()
@@ -390,21 +387,17 @@ impl DanmakuModel {
         self.reseed(self.last_position);
     }
 
-    /// Update the allowed band after a window/video resize. Comments in flight
-    /// are cleared; the next ones are placed against the new geometry.
+    /// Update the allowed band after a window/video resize. Active comments
+    /// stay on screen and are reprojected into the new geometry; only their
+    /// lane/font metrics are recomputed, never their identity or spawn state.
     pub fn relayout(&mut self, band: Band) {
-        self.band = band;
-        self.settings.font_sizes = font_sizes(band.window_height, self.settings.font_scale);
-        self.row_height = self.settings.font_sizes[2] * 1.32 + 2.0;
-        let area_height = (band.height * self.settings.area_percent as f32 / 100.0).max(1.0);
-        self.rows = ((area_height / self.row_height).floor() as usize).clamp(1, 64);
-        self.scroll_ms = 8000.0 * 100.0 / self.settings.speed_percent.clamp(50, 200) as f32;
-        self.place();
-        self.active.clear();
-        self.reseed(self.last_position);
+        self.reflow(band, self.last_position);
     }
 
-    /// Apply the 弹幕设置 popup values without rebuilding the player.
+    /// Apply the 弹幕设置 popup values without rebuilding the player. Active
+    /// comments stay on screen: their font, row, speed and blocking are
+    /// recomputed in place, so the change is visible immediately instead of
+    /// clearing and respawning the whole layer.
     pub fn reconfigure(
         &mut self,
         opacity: f32,
@@ -422,7 +415,60 @@ impl DanmakuModel {
         self.settings.block_scroll = block_scroll;
         self.settings.block_top = block_top;
         self.settings.block_bottom = block_bottom;
-        self.relayout(self.band);
+        self.relayout_live();
+    }
+
+    fn relayout_live(&mut self) {
+        self.reflow(self.band, self.last_position);
+    }
+
+    /// Recompute geometry and placement without dropping active comments.
+    /// Used by fullscreen/window resizes and by live settings changes: the
+    /// comments currently on screen are the only thing that proves the switch
+    /// was smooth, so they must not be cleared and respawned.
+    fn reflow(&mut self, band: Band, position: u64) {
+        let old_scroll = self.scroll_ms.max(1.0);
+        self.band = band;
+        self.settings.font_sizes = font_sizes(band.window_height, self.settings.font_scale);
+        self.row_height = self.settings.font_sizes[2] * 1.32 + 2.0;
+        let area_height = (band.height * self.settings.area_percent as f32 / 100.0).max(1.0);
+        self.rows = ((area_height / self.row_height).floor() as usize).clamp(1, 64);
+        self.scroll_ms = 8000.0 * 100.0 / self.settings.speed_percent.clamp(50, 200) as f32;
+        self.last_position = position;
+        self.place();
+        let new_scroll = self.scroll_ms.max(1.0);
+        let rows = self.rows.max(1);
+        let previous = std::mem::take(&mut self.active);
+        for mut active in previous {
+            let Some(item) = self.items.get(active.index) else {
+                continue;
+            };
+            if self.settings.blocked(item) {
+                continue;
+            }
+            // A live change must not silently drop comments already on screen.
+            // When the new layout leaves no scheduled lane for this item, keep
+            // it on its old lane clamped into the new area.
+            let row = self
+                .placed
+                .get(active.index)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| active.row.min((rows - 1) as u32));
+            active.row = row;
+            if matches!(item.mode, 1..=3) {
+                // Preserve the current on-screen progress: convert the elapsed
+                // fraction against the old duration, then rebuild start/end
+                // around the new one. The comment keeps moving from where it is
+                // instead of jumping backwards or blinking out.
+                let elapsed = position.saturating_sub(active.start_ms) as f32;
+                let fraction = (elapsed / old_scroll).clamp(0.0, 1.0);
+                let elapsed_new = (fraction * new_scroll).round() as u64;
+                active.start_ms = position.saturating_sub(elapsed_new);
+                active.end_ms = active.start_ms.saturating_add(new_scroll as u64);
+            }
+            self.active.push(active);
+        }
     }
 
     pub fn set_density(&mut self, density: bool) {
@@ -563,9 +609,7 @@ impl DanmakuModel {
             }
             keep
         });
-        while self.cursor < self.items.len()
-            && self.items[self.cursor].progress_ms <= position_ms
-        {
+        while self.cursor < self.items.len() && self.items[self.cursor].progress_ms <= position_ms {
             let index = self.cursor;
             self.cursor += 1;
             let item = &self.items[index];
@@ -628,8 +672,7 @@ impl DanmakuModel {
             let (x, y) = match item.mode {
                 1..=3 => {
                     let elapsed = position_ms.saturating_sub(active.start_ms) as f32;
-                    let x = self.band.left
-                        + self.band.width
+                    let x = self.band.left + self.band.width
                         - (self.band.width + width) * (elapsed / self.scroll_ms.max(1.0));
                     (x, self.band.top + row * self.row_height + 2.0)
                 }
@@ -754,6 +797,7 @@ pub struct DanmakuOverlay {
     width: u32,
     height: u32,
     pub frames: u64,
+    present_failures: u64,
 }
 
 impl DanmakuOverlay {
@@ -764,16 +808,25 @@ impl DanmakuOverlay {
         font_sizes: [f32; 3],
         opacity: f32,
     ) -> Result<Self> {
-        let (swap, _) = gpu.create_swapchain(
-            width,
-            height,
-            DXGI_ALPHA_MODE_PREMULTIPLIED,
-            false,
-        )?;
+        let (swap, _waiter) =
+            gpu.create_swapchain(width, height, DXGI_ALPHA_MODE_PREMULTIPLIED, false)?;
+        Self::from_swap(&gpu.device, swap, width, height, font_sizes, opacity)
+    }
+
+    /// Build the D2D side on the thread that will own it, from a swapchain
+    /// already attached to the composition tree.
+    pub fn from_swap(
+        device: &ID3D11Device,
+        swap: IDXGISwapChain1,
+        width: u32,
+        height: u32,
+        font_sizes: [f32; 3],
+        opacity: f32,
+    ) -> Result<Self> {
         unsafe {
             let d2d_factory: ID2D1Factory1 =
-                D2D1CreateFactory::<ID2D1Factory1>(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice = gpu.device.cast()?;
+                D2D1CreateFactory::<ID2D1Factory1>(D2D1_FACTORY_TYPE_MULTI_THREADED, None)?;
+            let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice = device.cast()?;
             let d2d_device = d2d_factory.CreateDevice(&dxgi)?;
             let d2d = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             d2d.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
@@ -795,6 +848,7 @@ impl DanmakuOverlay {
                 width: width.max(1),
                 height: height.max(1),
                 frames: 0,
+                present_failures: 0,
             };
             overlay.set_fonts(font_sizes)?;
             overlay.set_opacity(opacity)?;
@@ -805,9 +859,13 @@ impl DanmakuOverlay {
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        if width == self.width && height == self.height {
+        // Grow-only, like the UI layer: a smaller client is simply clipped by
+        // the window. This keeps sidebar open/close away from ResizeBuffers.
+        if width <= self.width && height <= self.height {
             return Ok(());
         }
+        let width = width.max(self.width);
+        let height = height.max(self.height);
         unsafe {
             let _ = self.d2d.SetTarget(None::<&ID2D1Image>);
             self.swap.ResizeBuffers(
@@ -842,7 +900,8 @@ impl DanmakuOverlay {
         self.layouts.clear();
     }
 
-    pub fn set_opacity(&mut self, opacity: f32) -> Result<()> {        let opacity = opacity.clamp(0.0, 1.0);
+    pub fn set_opacity(&mut self, opacity: f32) -> Result<()> {
+        let opacity = opacity.clamp(0.0, 1.0);
         if (opacity - self.opacity).abs() < 0.0001 && self.shadow.is_some() {
             return Ok(());
         }
@@ -886,8 +945,9 @@ impl DanmakuOverlay {
                 ),
                 colorContext: ManuallyDrop::new(None),
             };
-            let bitmap: ID2D1Bitmap1 =
-                self.d2d.CreateBitmapFromDxgiSurface(&surface, Some(&properties))?;
+            let bitmap: ID2D1Bitmap1 = self
+                .d2d
+                .CreateBitmapFromDxgiSurface(&surface, Some(&properties))?;
             let image: ID2D1Image = bitmap.cast()?;
             self.d2d.SetTarget(&image);
             self.d2d.BeginDraw();
@@ -939,8 +999,21 @@ impl DanmakuOverlay {
             drop(image);
             drop(bitmap);
         }
-        let _ = present_ui(&self.swap);
-        self.frames = self.frames.saturating_add(1);
+        let present = unsafe {
+            self.swap
+                .Present(0, DXGI_PRESENT_DO_NOT_WAIT)
+        };
+        if present.0 == 0 {
+            self.frames = self.frames.saturating_add(1);
+        } else {
+            self.present_failures = self.present_failures.saturating_add(1);
+            if self.present_failures <= 5 || self.present_failures % 240 == 0 {
+                log::line(&format!(
+                    "danmaku present failed hr={present:?} failures={}",
+                    self.present_failures
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -953,8 +1026,12 @@ impl DanmakuOverlay {
         };
         let utf16: Vec<u16> = item.text.encode_utf16().take(512).collect();
         let layout = unsafe {
-            self.dwrite
-                .CreateTextLayout(&utf16, format, 4096.0, self.font_sizes[item.bucket] * 2.4)?
+            self.dwrite.CreateTextLayout(
+                &utf16,
+                format,
+                4096.0,
+                self.font_sizes[item.bucket] * 2.4,
+            )?
         };
         if self.layouts.len() > 1024 {
             self.layouts.clear();
@@ -990,7 +1067,7 @@ impl DanmakuOverlay {
 fn text_format(dwrite: &IDWriteFactory, size: f32) -> Result<IDWriteTextFormat> {
     unsafe {
         let format = dwrite.CreateTextFormat(
-            crate::overlay::player_font_family(),
+            crate::overlay::danmaku_font_family(),
             None,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1102,13 +1179,91 @@ mod tests {
             },
             band(),
         );
-        model.set_items(vec![item(0, "first"), item(10, "second"), item(9000, "late")]);
+        model.set_items(vec![
+            item(0, "first"),
+            item(10, "second"),
+            item(9000, "late"),
+        ]);
         // The second comment must take another lane because the first is still
         // entering; the late one may reuse lane 0.
         assert!(model.placed[0].is_some());
         assert!(model.placed[1].is_some());
         assert_ne!(model.placed[0], model.placed[1]);
         assert_eq!(model.placed[2], Some(0));
+    }
+
+    #[test]
+    fn settings_changes_keep_active_comments_on_screen() {
+        let mut model = DanmakuModel::new(
+            DanmakuSettings {
+                opacity: 1.0,
+                font_scale: 1.0,
+                speed_percent: 100,
+                area_percent: 100,
+                block_scroll: false,
+                block_top: false,
+                block_bottom: false,
+                blocked_senders: Vec::new(),
+                keywords: Vec::new(),
+                regexes: Vec::new(),
+                font_sizes: font_sizes(1080, 1.0),
+            },
+            band(),
+        );
+        model.set_items(vec![item(0, "first"), item(200, "second")]);
+        model.reseed(0);
+        model.update(300);
+        let before = model.active_count();
+        assert!(before > 0, "setup must have active comments");
+        model.reconfigure(0.7, 1.2, 60, 50, false, false, false);
+        assert_eq!(model.settings.font_scale, 1.2);
+        assert_eq!(model.active_count(), before, "active comments survive settings");
+        assert!(
+            model.frame(400).iter().any(|render| render.text == "first"),
+            "the comment currently on screen is redrawn with the new layout"
+        );
+    }
+
+    #[test]
+    fn speed_change_keeps_an_active_comment_at_its_screen_position() {
+        let mut model = DanmakuModel::new(
+            DanmakuSettings {
+                opacity: 1.0,
+                font_scale: 1.0,
+                speed_percent: 100,
+                area_percent: 100,
+                block_scroll: false,
+                block_top: false,
+                block_bottom: false,
+                blocked_senders: Vec::new(),
+                keywords: Vec::new(),
+                regexes: Vec::new(),
+                font_sizes: font_sizes(720, 1.0),
+            },
+            band(),
+        );
+        model.set_items(vec![item(0, "first"), item(200, "second")]);
+        model.reseed(0);
+        model.update(3000);
+        let before = model
+            .frame(3000)
+            .into_iter()
+            .find(|render| render.text == "first")
+            .expect("setup must have the first comment on screen")
+            .x;
+        // Doubling the speed must keep the picture stable at the instant of the
+        // change; the comment then travels faster from here.
+        model.reconfigure(1.0, 1.0, 200, 100, false, false, false);
+        let after = model
+            .frame(3000)
+            .into_iter()
+            .find(|render| render.text == "first")
+            .expect("the active comment survives the speed change")
+            .x;
+        assert!(
+            (before - after).abs() < 1.0,
+            "comment jumped from x={before} to x={after} on a speed change"
+        );
     }
 
     #[test]
@@ -1232,9 +1387,18 @@ mod tests {
         let mut press = LongPress::default();
         press.down(start, 100.0, 100.0);
         assert!(press.active());
-        assert!(!press.due(start + Duration::from_millis(499), Duration::from_millis(500)));
-        assert!(press.due(start + Duration::from_millis(500), Duration::from_millis(500)));
-        assert!(!press.due(start + Duration::from_millis(900), Duration::from_millis(500)));
+        assert!(!press.due(
+            start + Duration::from_millis(499),
+            Duration::from_millis(500)
+        ));
+        assert!(press.due(
+            start + Duration::from_millis(500),
+            Duration::from_millis(500)
+        ));
+        assert!(!press.due(
+            start + Duration::from_millis(900),
+            Duration::from_millis(500)
+        ));
         assert!(!press.active());
 
         press.down(start, 100.0, 100.0);

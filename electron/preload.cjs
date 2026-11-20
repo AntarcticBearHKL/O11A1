@@ -22,6 +22,8 @@ contextBridge.exposeInMainWorld('o11a1', {
     show: () => ipcRenderer.invoke('window:show'),
     quit: () => ipcRenderer.invoke('app:quit'),
     startDrag: () => ipcRenderer.invoke('window:start-drag'),
+    beginDrag: () => ipcRenderer.invoke('window:begin-drag'),
+    endDrag: () => ipcRenderer.invoke('window:end-drag'),
     fullscreen: (on) => ipcRenderer.invoke('window:fullscreen', on),
     isFullscreen: () => ipcRenderer.invoke('window:isFullscreen'),
     topmost: (on) => ipcRenderer.invoke('window:topmost', on),
@@ -35,7 +37,7 @@ contextBridge.exposeInMainWorld('o11a1', {
     error: (title, message) => ipcRenderer.invoke('dialog:error', title, message),
   },
   player: {
-    launch: (options) => ipcRenderer.invoke('player:launch', options),
+    launch: (options, newWindow) => ipcRenderer.invoke('player:launch', options, !!newWindow),
     options: () => ipcRenderer.invoke('player:options'),
     open: (options) => ipcRenderer.invoke('player:open', options),
     rect: (rect) => ipcRenderer.invoke('player:rect', rect),
@@ -73,5 +75,4 @@ contextBridge.exposeInMainWorld('o11a1', {
   accountChanged: (callback) => on('account:changed', callback),
   settingsChanged: (callback) => on('settings:changed', callback),
   engineStatusChanged: (callback) => on('engine:status', callback),
-  onHudToggle: (callback) => on('app:hud-toggle', callback),
 });

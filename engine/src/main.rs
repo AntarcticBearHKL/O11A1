@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -80,8 +80,95 @@ struct App {
     /// At most three native video windows, keyed by the Electron window id.
     players: Mutex<HashMap<String, Player>>,
     fish: Mutex<Option<Arc<FishEngine>>>,
+    /// One interactive frame-lab job at a time. The built sheets stay cached so
+    /// "让 AI 细看" reuses the extraction instead of downloading again.
+    frames: std::sync::Mutex<FrameJob>,
     downloads: Downloads,
     events: broadcast::Sender<Value>,
+}
+
+struct FrameJob {
+    generation: u64,
+    running: bool,
+    kind: String,
+    stage: String,
+    message: String,
+    pct: u32,
+    current: usize,
+    total: usize,
+    started: Instant,
+    error: String,
+    result: Option<Value>,
+    cancel: Option<Arc<AtomicBool>>,
+    lab: Option<o11a1::fishwatch::frames::lab::BuiltLab>,
+}
+
+impl Default for FrameJob {
+    fn default() -> Self {
+        FrameJob {
+            generation: 0,
+            running: false,
+            kind: String::new(),
+            stage: String::new(),
+            message: String::new(),
+            pct: 0,
+            current: 0,
+            total: 0,
+            started: Instant::now(),
+            error: String::new(),
+            result: None,
+            cancel: None,
+            lab: None,
+        }
+    }
+}
+
+fn frame_progress(
+    app: Arc<App>,
+    kind: &'static str,
+    generation: u64,
+) -> impl Fn(o11a1::fishwatch::frames::lab::LabProgress) + Send + Sync + 'static {
+    move |progress| {
+        if let Ok(mut job) = app.frames.lock() {
+            if job.generation != generation {
+                return;
+            }
+            job.kind = kind.to_string();
+            job.stage = progress.stage;
+            job.message = progress.message;
+            job.pct = progress.pct;
+            job.current = progress.current;
+            job.total = progress.total;
+        }
+    }
+}
+
+fn frame_finish(
+    app: &App,
+    generation: u64,
+    result: Result<Value, String>,
+    lab: Option<o11a1::fishwatch::frames::lab::BuiltLab>,
+) {
+    if let Ok(mut job) = app.frames.lock() {
+        if job.generation != generation {
+            return;
+        }
+        job.running = false;
+        match result {
+            Ok(value) => {
+                job.stage = "done".to_string();
+                job.pct = 100;
+                job.result = Some(value);
+                if lab.is_some() {
+                    job.lab = lab;
+                }
+            }
+            Err(error) => {
+                job.stage = "error".to_string();
+                job.error = error;
+            }
+        }
+    }
 }
 
 impl App {
@@ -116,7 +203,11 @@ impl App {
 
     async fn player_snapshot(&self, id: &str) -> Value {
         let mut guard = self.players.lock().await;
-        if guard.get(id).map(|player| !player.is_open()).unwrap_or(false) {
+        if guard
+            .get(id)
+            .map(|player| !player.is_open())
+            .unwrap_or(false)
+        {
             if let Some(mut player) = guard.remove(id) {
                 player.close();
             }
@@ -193,8 +284,10 @@ fn player_json(id: &str, player: &Player) -> Value {
         "position": player.position_ms(),
         "duration": player.duration_ms(),
         "ended": player.ended(),
+        "loopMode": player.loop_mode(),
         "fps": player.fps(),
         "danmaku": player.danmaku_count(),
+        "settingsRevision": player.settings_revision(),
         "mini": player.is_mini(),
         "audioOnly": player.is_audio_only(),
         "topmost": player.is_topmost(),
@@ -207,6 +300,7 @@ fn player_json(id: &str, player: &Player) -> Value {
         "enhance": player.enhance().as_u8(),
         "clickSeq": player.click_seq(),
         "doubleClickSeq": player.double_click_seq(),
+        "focusSeq": player.focus_seq(),
         "moveSeq": player.move_seq(),
         "longPressSeq": player.long_press_seq(),
     })
@@ -234,6 +328,7 @@ async fn main() -> Result<()> {
         session_error: Mutex::new(None),
         players: Mutex::new(HashMap::new()),
         fish: Mutex::new(None),
+        frames: std::sync::Mutex::new(FrameJob::default()),
         downloads: Downloads::new(),
         events,
     });
@@ -278,6 +373,7 @@ async fn main() -> Result<()> {
         let app = app.clone();
         tokio::spawn(async move {
             let mut counters: HashMap<String, (u64, u64, u64)> = HashMap::new();
+            let mut settings_revisions: HashMap<String, u64> = HashMap::new();
             loop {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let states = app.player_snapshots().await;
@@ -296,6 +392,35 @@ async fn main() -> Result<()> {
                         .unwrap_or("default")
                         .to_string();
                     live.insert(id.clone());
+                    // A native window writes player preferences straight to
+                    // settings.json. When its revision moves, refresh the
+                    // sidecar's snapshot, apply 插帧 / 画质增强 to the other
+                    // open windows, and tell every renderer, so no UI keeps a
+                    // stale value and the next video starts with the same
+                    // choice.
+                    let revision = state
+                        .get("settingsRevision")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let previous = settings_revisions.insert(id.clone(), revision).unwrap_or(0);
+                    if revision > previous {
+                        let previous_settings = app.settings.lock().await.clone();
+                        let loaded = settings::load();
+                        let interp_changed = loaded.interp_mode != previous_settings.interp_mode
+                            || loaded.interp_hz != previous_settings.interp_hz;
+                        let enhance_changed =
+                            loaded.player_enhance != previous_settings.player_enhance;
+                        *app.settings.lock().await = loaded.clone();
+                        if interp_changed {
+                            apply_interp_settings(&app, &loaded).await;
+                        }
+                        if enhance_changed {
+                            apply_enhance_settings(&app, &loaded).await;
+                        }
+                        let mut public = loaded;
+                        public.deepseek_key.clear();
+                        app.emit("settings.changed", json!(public));
+                    }
                     let click = state.get("clickSeq").and_then(Value::as_u64).unwrap_or(0);
                     let double = state
                         .get("doubleClickSeq")
@@ -326,6 +451,7 @@ async fn main() -> Result<()> {
                     app.emit("player.state", state);
                 }
                 counters.retain(|id, _| live.contains(id));
+                settings_revisions.retain(|id, _| live.contains(id));
             }
         });
     }
@@ -388,6 +514,26 @@ async fn serve(stream: TcpStream, app: Arc<App>) -> Result<()> {
     Ok(())
 }
 
+/// Push the interpolation mode and target to every open player, so changing
+/// either in the settings page also applies to a window that is already
+/// playing. The values are the user's choice; nothing is lowered here.
+async fn apply_interp_settings(app: &Arc<App>, settings: &Settings) {
+    let players = app.players.lock().await;
+    for player in players.values() {
+        player.set_interp_hz(settings.interp_hz);
+        player.set_interp(InterpMode::from_u8(settings.interp_mode as u8));
+    }
+}
+
+/// Push the global 画质增强 choice to every open player, so a native-menu or
+/// settings-page change applies to the picture that is already playing.
+async fn apply_enhance_settings(app: &Arc<App>, settings: &Settings) {
+    let players = app.players.lock().await;
+    for player in players.values() {
+        player.set_enhance(EnhanceMode::from_u8(settings.player_enhance as u8));
+    }
+}
+
 async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
     match method {
         "app.ping" => Ok(json!("pong")),
@@ -404,7 +550,15 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         }
 
         // ---- settings ------------------------------------------------------
-        "settings.get" => rv(app.public_settings().await),
+        "settings.get" => {
+            // The native player writes loop_mode (and other player prefs)
+            // straight to settings.json, so refresh memory before answering.
+            let loaded = settings::load();
+            *app.settings.lock().await = loaded.clone();
+            let mut public = loaded;
+            public.deepseek_key.clear();
+            rv(public)
+        }
         "settings.save" => {
             let mut settings: Settings = serde_json::from_value(params).map_err(e)?;
             // The renderer never receives the key, so an empty field means
@@ -414,11 +568,15 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             }
             settings::save(&settings).map_err(e)?;
             *app.settings.lock().await = settings.clone();
+            apply_interp_settings(app, &settings).await;
+            apply_enhance_settings(app, &settings).await;
             settings.deepseek_key.clear();
             Ok(json!(settings))
         }
         "settings.patch" => {
-            let mut current = app.settings.lock().await.clone();
+            // Start from the file: a native player may have saved loop_mode
+            // since the sidecar last read settings into memory.
+            let mut current = settings::load();
             let mut base = serde_json::to_value(&current).map_err(e)?;
             if let (Some(target), Some(patch)) = (base.as_object_mut(), params.as_object()) {
                 for (key, value) in patch {
@@ -426,9 +584,18 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                 }
             }
             let cloud_changed = params.get("ai_on").is_some() || params.get("ai_level").is_some();
+            let interp_changed =
+                params.get("interp_hz").is_some() || params.get("interp_mode").is_some();
+            let enhance_changed = params.get("player_enhance").is_some();
             current = serde_json::from_value(base).map_err(e)?;
             settings::save(&current).map_err(e)?;
             *app.settings.lock().await = current.clone();
+            if interp_changed {
+                apply_interp_settings(app, &current).await;
+            }
+            if enhance_changed {
+                apply_enhance_settings(app, &current).await;
+            }
             if cloud_changed {
                 if let Some(session) = app.session.lock().await.clone() {
                     let _ = session
@@ -509,6 +676,9 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                     vip: user.vip_status,
                 };
                 accounts::save(&account).map_err(e)?;
+                // The account just gained 720P/1080P streams; never let a
+                // tier table fetched before login shadow them.
+                o11a1::bilibili::clear_quality_tiers();
                 let token = accounts::to_token(&account);
                 let new_session = Session::from_token(&token).await.map_err(e)?;
                 *app.session.lock().await = Some(Arc::new(new_session));
@@ -524,6 +694,7 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             let session = app.session().await?;
             let _ = session.logout().await;
             accounts::clear();
+            o11a1::bilibili::clear_quality_tiers();
             *app.account.lock().await = None;
             let anonymous = Session::new().await.map_err(e)?;
             *app.session.lock().await = Some(Arc::new(anonymous));
@@ -535,15 +706,29 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         "feed.home" => {
             let session = app.session().await?;
             let fresh = unum(&params, "fresh");
-            let items = session
-                .homepage_feed_from(fresh, &|_, _| {})
-                .await
-                .map_err(e)?;
+            let count = num(&params, "count").clamp(0, 240) as usize;
+            let mut items = if count > 0 {
+                session
+                    .homepage_feed_count(fresh, count, &|_, _| {})
+                    .await
+                    .map_err(e)?
+            } else {
+                session
+                    .homepage_feed_from(fresh, &|_, _| {})
+                    .await
+                    .map_err(e)?
+            };
+            if count > 0 && items.len() > count {
+                items.truncate(count);
+            }
             rv(items)
         }
         "search.suggest" => {
             let session = app.session().await?;
-            rv(session.search_suggest(&text(&params, "term")).await.map_err(e)?)
+            rv(session
+                .search_suggest(&text(&params, "term"))
+                .await
+                .map_err(e)?)
         }
         "search.hot" => {
             let session = app.session().await?;
@@ -584,7 +769,10 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         // ---- video ---------------------------------------------------------
         "video.detail" => {
             let session = app.session().await?;
-            rv(session.video_view(&text(&params, "bvid")).await.map_err(e)?)
+            rv(session
+                .video_view(&text(&params, "bvid"))
+                .await
+                .map_err(e)?)
         }
         "video.related" => {
             let session = app.session().await?;
@@ -784,7 +972,10 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         "user.follow" => {
             let session = app.session().await?;
             session
-                .relation_modify(num(&params, "mid"), if flag(&params, "follow") { 1 } else { 2 })
+                .relation_modify(
+                    num(&params, "mid"),
+                    if flag(&params, "follow") { 1 } else { 2 },
+                )
                 .await
                 .map_err(e)?;
             Ok(json!(null))
@@ -794,6 +985,12 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         "favorites.folders" => {
             let session = app.session().await?;
             rv(session.fav_folders().await.map_err(e)?)
+        }
+        "favorites.folders.all" => {
+            // The 收藏 page shows every folder, including the default one and
+            // empty folders; the recommendation stream simply skips empty ones.
+            let session = app.session().await?;
+            rv(session.fav_folders_all(0).await.map_err(e)?)
         }
         "favorites.list" => {
             let session = app.session().await?;
@@ -865,10 +1062,7 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                     break;
                 }
             }
-            let removed = session
-                .fav_batch_delete(media_id, &aids)
-                .await
-                .map_err(e)?;
+            let removed = session.fav_batch_delete(media_id, &aids).await.map_err(e)?;
             Ok(json!(removed))
         }
 
@@ -877,10 +1071,7 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             let session = app.session().await?;
             let max = num(&params, "max");
             let view_at = num(&params, "viewAt");
-            rv(session
-                .history(max, view_at, "")
-                .await
-                .map_err(e)?)
+            rv(session.history(max, view_at, "").await.map_err(e)?)
         }
         "history.delete" => {
             let session = app.session().await?;
@@ -1125,6 +1316,7 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                     "fish_asr_threads": settings.fish_asr_threads,
                     "fish_model_mirror": settings.fish_model_mirror,
                     "fish_vision_detail": settings.fish_vision_detail,
+                    "fish_frame_interval_s": settings.fish_frame_interval_s,
                     "deepseek_set": !settings.deepseek_key.trim().is_empty(),
                     "step_meta": settings.fish_step_meta,
                     "step_subtitle": settings.fish_step_subtitle,
@@ -1134,6 +1326,233 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                     "step_frames": settings.fish_step_frames,
                 }
             }))
+        }
+        "fish.tools" => Ok(json!(o11a1::fishwatch::tool_catalog())),
+        "fish.feed.next" => {
+            let session = app.session().await?;
+            let items = session
+                .homepage_feed_from(0, &|_, _| {})
+                .await
+                .map_err(e)?;
+            let engine = fish_engine(app).await?;
+            let next = items
+                .into_iter()
+                .find(|item| !engine.is_watched(&item.bvid).unwrap_or(false));
+            Ok(json!(next))
+        }
+        "fish.follows" => {
+            let account = app
+                .account
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| "未登录，无法读取关注列表".to_string())?;
+            let session = app.session().await?;
+            let page = unum(&params, "page").max(1) as i64;
+            let list = session.followings(account.mid, page).await.map_err(e)?;
+            Ok(json!(list))
+        }
+        "fish.up.videos" => {
+            let session = app.session().await?;
+            let mid = num(&params, "mid");
+            if mid == 0 {
+                return Err("缺少 mid".to_string());
+            }
+            let page = unum(&params, "page").max(1).min(u32::MAX as u64) as u32;
+            let (items, has_more) = session
+                .up_videos(mid, bili::UpOrder::Newest, page)
+                .await
+                .map_err(e)?;
+            Ok(json!({ "mid": mid, "page": page, "items": items, "has_more": has_more }))
+        }
+        "fish.watched.check" => {
+            let engine = fish_engine(app).await?;
+            let bvid = text(&params, "bvid");
+            let watched = engine.is_watched(&bvid).map_err(e)?;
+            Ok(json!({ "bvid": bvid, "watched": watched }))
+        }
+        "fish.watched.mark" => {
+            let engine = fish_engine(app).await?;
+            let bvid = text(&params, "bvid");
+            engine.mark_watched(&bvid, "manual").map_err(e)?;
+            Ok(json!({ "bvid": bvid, "watched": true }))
+        }
+        "fish.video.meta" => {
+            let session = app.session().await?;
+            let bvid = text(&params, "bvid");
+            let bvid = bvid.trim();
+            if bvid.is_empty() {
+                return Err("缺少 bvid".to_string());
+            }
+            let info = session.fish_meta(bvid).await.map_err(e)?;
+            Ok(json!({
+                "bvid": bvid,
+                "cid": info.cid,
+                "aid": info.aid,
+                "title": info.title,
+                "up_name": info.up_name,
+                "cover": info.cover,
+                "duration_s": info.duration_s,
+                "view": info.view,
+            }))
+        }
+        "fish.frames.start" => {
+            let session = app.session().await?;
+            let settings = app.settings_snapshot().await;
+            let mut config = o11a1::fish::watch_config(&settings);
+            config.online = true;
+            let bvid = text(&params, "bvid");
+            if bvid.trim().is_empty() {
+                return Err("缺少 bvid".to_string());
+            }
+            let interval = unum(&params, "interval");
+            let cancel = Arc::new(AtomicBool::new(false));
+            let generation;
+            {
+                let mut job = app.frames.lock().map_err(|_| "画面任务锁失败".to_string())?;
+                if let Some(previous) = job.cancel.take() {
+                    previous.store(true, Ordering::Relaxed);
+                }
+                if let Some(old) = job.lab.take() {
+                    let _ = std::fs::remove_dir_all(old.dir);
+                }
+                generation = job.generation.wrapping_add(1);
+                *job = FrameJob {
+                    generation,
+                    running: true,
+                    kind: "build".to_string(),
+                    stage: "meta".to_string(),
+                    message: "准备抽帧…".to_string(),
+                    started: Instant::now(),
+                    cancel: Some(cancel.clone()),
+                    ..FrameJob::default()
+                };
+            }
+            let app2 = app.clone();
+            tokio::spawn(async move {
+                let progress = frame_progress(app2.clone(), "build", generation);
+                let built = o11a1::fishwatch::frames::lab::build(
+                    &config,
+                    &session,
+                    &bvid,
+                    interval,
+                    Some(&progress),
+                    cancel,
+                )
+                .await;
+                match built {
+                    Ok(built) => match o11a1::fishwatch::frames::lab::build_view(&built)
+                        .and_then(|view| serde_json::to_value(view).map_err(Into::into))
+                    {
+                        Ok(view) => frame_finish(&app2, generation, Ok(view), Some(built)),
+                        Err(error) => frame_finish(&app2, generation, Err(e(error)), None),
+                    },
+                    Err(error) => frame_finish(&app2, generation, Err(e(error)), None),
+                }
+            });
+            Ok(json!({ "started": true }))
+        }
+        "fish.frames.observe" => {
+            let settings = app.settings_snapshot().await;
+            let config = o11a1::fish::watch_config(&settings);
+            let lab_id = text(&params, "labId");
+            let focus = text(&params, "focus");
+            let built = {
+                let job = app.frames.lock().map_err(|_| "画面任务锁失败".to_string())?;
+                job.lab
+                    .clone()
+                    .ok_or_else(|| "还没有拼图，请先生成画面".to_string())?
+            };
+            if !lab_id.is_empty() && built.lab_id != lab_id {
+                return Err("拼图已过期，请重新生成".to_string());
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            let generation;
+            {
+                let mut job = app.frames.lock().map_err(|_| "画面任务锁失败".to_string())?;
+                if let Some(previous) = job.cancel.take() {
+                    previous.store(true, Ordering::Relaxed);
+                }
+                generation = job.generation.wrapping_add(1);
+                job.generation = generation;
+                job.running = true;
+                job.kind = "observe".to_string();
+                job.stage = "vision".to_string();
+                job.message = "准备让 AI 细看拼图…".to_string();
+                job.pct = 0;
+                job.current = 0;
+                job.total = built.sheets.len();
+                job.started = Instant::now();
+                job.error.clear();
+                job.result = None;
+                job.cancel = Some(cancel.clone());
+            }
+            let app2 = app.clone();
+            tokio::spawn(async move {
+                let progress = frame_progress(app2.clone(), "observe", generation);
+                let observed = o11a1::fishwatch::frames::lab::observe_standalone(
+                    &config,
+                    &built,
+                    &focus,
+                    Some(&progress),
+                    cancel,
+                )
+                .await;
+                match observed {
+                    Ok(observed) => frame_finish(
+                        &app2,
+                        generation,
+                        Ok(o11a1::fishwatch::frames::lab::observation_view(&observed)),
+                        None,
+                    ),
+                    Err(error) => frame_finish(&app2, generation, Err(e(error)), None),
+                }
+            });
+            Ok(json!({ "started": true }))
+        }
+        "fish.frames.status" => {
+            let job = app.frames.lock().map_err(|_| "画面任务锁失败".to_string())?;
+            Ok(json!({
+                "running": job.running,
+                "kind": job.kind,
+                "stage": job.stage,
+                "message": job.message,
+                "pct": job.pct,
+                "current": job.current,
+                "total": job.total,
+                "elapsed_ms": job.started.elapsed().as_millis() as u64,
+                "error": job.error,
+                "has_result": job.result.is_some(),
+                "has_lab": job.lab.is_some(),
+            }))
+        }
+        "fish.frames.result" => {
+            let job = app.frames.lock().map_err(|_| "画面任务锁失败".to_string())?;
+            Ok(job.result.clone().unwrap_or(Value::Null))
+        }
+        "fish.frames.cancel" => {
+            if let Ok(mut job) = app.frames.lock() {
+                if let Some(cancel) = &job.cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                job.message = "正在取消…".to_string();
+            }
+            Ok(json!(true))
+        }
+        "fish.tool.run" => {
+            let session = app.session().await?;
+            let settings = app.settings_snapshot().await;
+            let config = o11a1::fish::watch_config(&settings);
+            let result = o11a1::fish::run_tool(
+                session,
+                config,
+                &text(&params, "id"),
+                &text(&params, "bvid"),
+                params.get("cid").and_then(Value::as_u64).unwrap_or(0),
+            )
+            .await
+            .map_err(e)?;
+            Ok(json!(result))
         }
         "fish.start" => {
             let engine = fish_engine(app).await?;
@@ -1171,11 +1590,10 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         "fish.asr.status" => {
             let settings = app.settings_snapshot().await;
             let config = o11a1::fish::watch_config(&settings);
-            let text = tokio::task::spawn_blocking(move || {
-                o11a1::fishwatch::asr::status_text(&config)
-            })
-            .await
-            .map_err(e)?;
+            let text =
+                tokio::task::spawn_blocking(move || o11a1::fishwatch::asr::status_text(&config))
+                    .await
+                    .map_err(e)?;
             Ok(json!(text))
         }
         "fish.models" => {
@@ -1199,9 +1617,7 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             });
             Ok(json!(null))
         }
-        "fish.models.cancel" => {
-            Ok(json!(o11a1::models_dl::cancel()))
-        }
+        "fish.models.cancel" => Ok(json!(o11a1::models_dl::cancel())),
         "fish.models.delete" => {
             let settings = app.settings_snapshot().await;
             let root = o11a1::models_dl::root_dir(&settings.fish_asr_model_dir);
@@ -1220,6 +1636,7 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             }
         }
         "player.open" => open_player(app, params).await,
+        "player.replace" => replace_player(app, params).await,
         "player.close" => {
             let id = player_id(&params);
             let mut guard = app.players.lock().await;
@@ -1368,6 +1785,50 @@ async fn fish_engine(app: &Arc<App>) -> Rpc<Arc<FishEngine>> {
     Ok(engine)
 }
 
+/// Shared by `player.open` and `player.replace`: the config a card or the
+/// queue asks the native player for. `host` is only set on the first open.
+fn config_from_params(
+    params: &Value,
+    settings: &o11a1::settings::Settings,
+    host: Option<PlayerHost>,
+) -> PlayerConfig {
+    let quality = opt_i64(params, "quality")
+        .or_else(|| (settings.player_quality > 0).then_some(settings.player_quality));
+    PlayerConfig {
+        bvid: Some(text(params, "bvid")).filter(|value| !value.is_empty()),
+        cid: params.get("cid").and_then(Value::as_u64),
+        direct_url: Some(text(params, "url")).filter(|value| !value.is_empty()),
+        direct_audio_url: Some(text(params, "audioUrl")).filter(|value| !value.is_empty()),
+        title: text(params, "title"),
+        start_ms: unum(params, "startMs"),
+        quality_qn: quality,
+        quality_height: Some(settings.player_quality_height),
+        quality_codecid: (settings.codec_pref > 0).then_some(settings.codec_pref as i64),
+        audio_index: params
+            .get("audioIndex")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        host,
+        is_live: params.get("live").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+/// Load another video into an existing native window. The window keeps its
+/// rectangle, size and chrome; only the media session is swapped.
+async fn replace_player(app: &Arc<App>, params: Value) -> Rpc<Value> {
+    let id = player_id(&params);
+    let settings = settings::load();
+    let config = config_from_params(&params, &settings, None);
+    {
+        let guard = app.players.lock().await;
+        let Some(player) = guard.get(&id) else {
+            return Err("播放器窗口未创建".to_string());
+        };
+        player.replace_source(config);
+    }
+    Ok(app.player_snapshot(&id).await)
+}
+
 async fn open_player(app: &Arc<App>, params: Value) -> Rpc<Value> {
     let id = player_id(&params);
     {
@@ -1379,7 +1840,14 @@ async fn open_player(app: &Arc<App>, params: Value) -> Rpc<Value> {
             return Err("最多同时打开 3 个播放器窗口".to_string());
         }
     }
-    let settings = app.settings_snapshot().await;
+    // The native player writes player prefs (default quality, loop mode, …)
+    // straight to settings.json. Reload before opening so the next video uses
+    // the newly chosen default even though the sidecar's memory predates it.
+    let settings = {
+        let loaded = settings::load();
+        *app.settings.lock().await = loaded.clone();
+        loaded
+    };
     let host = params.get("host").map(|host| PlayerHost {
         parent: host.get("parent").and_then(Value::as_i64).unwrap_or(0) as isize,
         x: host.get("x").and_then(Value::as_i64).unwrap_or(0) as i32,
@@ -1387,29 +1855,20 @@ async fn open_player(app: &Arc<App>, params: Value) -> Rpc<Value> {
         width: host.get("width").and_then(Value::as_u64).unwrap_or(960) as u32,
         height: host.get("height").and_then(Value::as_u64).unwrap_or(540) as u32,
     });
-    let quality = opt_i64(&params, "quality")
-        .or_else(|| (settings.player_quality > 0).then_some(settings.player_quality));
-    let config = PlayerConfig {
-        bvid: Some(text(&params, "bvid")).filter(|value| !value.is_empty()),
-        cid: params.get("cid").and_then(Value::as_u64),
-        direct_url: Some(text(&params, "url")).filter(|value| !value.is_empty()),
-        direct_audio_url: Some(text(&params, "audioUrl")).filter(|value| !value.is_empty()),
-        title: text(&params, "title"),
-        start_ms: unum(&params, "startMs"),
-        quality_qn: quality,
-        quality_codecid: (settings.codec_pref > 0).then_some(settings.codec_pref as i64),
-        audio_index: params.get("audioIndex").and_then(Value::as_u64).map(|v| v as usize),
-        host,
-    };
+    let is_live = params.get("live").and_then(Value::as_bool).unwrap_or(false);
+    let config = config_from_params(&params, &settings, host);
     let player = tokio::task::spawn_blocking(move || Player::open(config))
         .await
         .map_err(e)?
         .map_err(e)?;
-    if settings.interp_mode > 0 {
-        player.set_interp(InterpMode::from_u8(settings.interp_mode as u8));
-    }
-    if settings.player_enhance > 0 {
-        player.set_enhance(EnhanceMode::from_u8(settings.player_enhance as u8));
+    if !is_live {
+        player.set_interp_hz(settings.interp_hz);
+        if settings.interp_mode > 0 {
+            player.set_interp(InterpMode::from_u8(settings.interp_mode as u8));
+        }
+        if settings.player_enhance > 0 {
+            player.set_enhance(EnhanceMode::from_u8(settings.player_enhance as u8));
+        }
     }
     let default_speed = settings.player_speed as f64 / 1000.0;
     if (default_speed - 1.0).abs() > 0.001 {
@@ -1447,6 +1906,7 @@ async fn player_command(app: &Arc<App>, params: Value) -> Rpc<Value> {
         "volume" => player.set_volume(value.as_u64().unwrap_or(80) as u8),
         "speed" => player.set_speed(value.as_f64().unwrap_or(1.0)),
         "interp" => player.set_interp(InterpMode::from_u8(value.as_u64().unwrap_or(0) as u8)),
+        "interp_hz" => player.set_interp_hz(value.as_u64().unwrap_or(0) as u32),
         "enhance" => player.set_enhance(EnhanceMode::from_u8(value.as_u64().unwrap_or(0) as u8)),
         "danmaku" => player.set_danmaku_visible(value.as_bool().unwrap_or(true)),
         "aspect" => player.set_aspect(native_player::AspectMode::from_u8(

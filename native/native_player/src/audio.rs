@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -32,7 +32,8 @@ const RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
 const BYTES_PER_SAMPLE: u16 = 2;
 const CHUNK_MS: u64 = 20;
-const CHUNK_BYTES: usize = (RATE as usize * CHUNK_MS as usize / 1000) * CHANNELS as usize * BYTES_PER_SAMPLE as usize;
+const CHUNK_BYTES: usize =
+    (RATE as usize * CHUNK_MS as usize / 1000) * CHANNELS as usize * BYTES_PER_SAMPLE as usize;
 const BUFFERS: usize = 4;
 /// The reader may run this many chunks ahead (160 ms). Everything beyond is
 /// backpressure into ffmpeg, which is exactly what we want.
@@ -75,14 +76,34 @@ impl AudioEngine {
         start_ms: u64,
         speed: f64,
         volume: u8,
+        cache_key: Option<String>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let clock = Arc::new(AudioClock::default());
         clock.position_ms.store(start_ms, Ordering::SeqCst);
         let thread_clock = clock.clone();
+        let url = if remote {
+            cache_key
+                .as_deref()
+                .and_then(|key| crate::mediacache::cached_url(&url, &headers, key))
+                .unwrap_or(url)
+        } else {
+            url
+        };
         let thread = std::thread::Builder::new()
             .name("player-audio".into())
-            .spawn(move || audio_thread(rx, thread_clock, url, headers, remote, start_ms, speed, volume))
+            .spawn(move || {
+                audio_thread(
+                    rx,
+                    thread_clock,
+                    url,
+                    headers,
+                    remote,
+                    start_ms,
+                    speed,
+                    volume,
+                )
+            })
             .ok();
         Self { tx, clock, thread }
     }
@@ -146,9 +167,8 @@ impl Session {
             command.arg("-ss").arg(proc::seconds(target_ms));
         }
         command.arg("-i").arg(url).arg("-vn").arg("-sn").arg("-dn");
-        if (speed - 1.0).abs() > 0.001 {
-            let rate = speed.clamp(0.5, 2.0);
-            command.arg("-af").arg(format!("atempo={rate:.4}"));
+        if let Some(filter) = crate::speed::atempo(speed) {
+            command.arg("-af").arg(filter);
         }
         command
             .arg("-f")
@@ -321,7 +341,8 @@ fn audio_thread(
             let header = &mut wave_headers[index];
             header.lpData = windows::core::PSTR(buffers[index].as_mut_ptr());
             header.dwBufferLength = CHUNK_BYTES as u32;
-            let result = waveOutPrepareHeader(handle, header, std::mem::size_of::<WAVEHDR>() as u32);
+            let result =
+                waveOutPrepareHeader(handle, header, std::mem::size_of::<WAVEHDR>() as u32);
             if result != 0 {
                 log::line(&format!("audio prepare failed index={index} mmr={result}"));
                 clock.available.store(false, Ordering::SeqCst);
@@ -378,8 +399,11 @@ fn audio_thread(
                     let _ = waveOutSetVolume(Some(handle), packed_volume(volume));
                 }
             }
-            Ok(AudioCommand::Seek { target_ms, speed: new_speed }) => {
-                speed = new_speed.clamp(0.5, 2.0);
+            Ok(AudioCommand::Seek {
+                target_ms,
+                speed: new_speed,
+            }) => {
+                speed = crate::speed::clamp(new_speed as f32) as f64;
                 base_ms = target_ms;
                 restart_session(
                     &mut session,
@@ -405,7 +429,8 @@ fn audio_thread(
         // command/timeout tick.
         if let Some(current) = session.as_mut() {
             for index in 0..BUFFERS {
-                let is_free = wave_headers[index].dwFlags & windows::Win32::Media::Audio::WHDR_DONE != 0;
+                let is_free =
+                    wave_headers[index].dwFlags & windows::Win32::Media::Audio::WHDR_DONE != 0;
                 if !is_free {
                     continue;
                 }
@@ -529,7 +554,10 @@ fn restart_session(
     match Session::spawn(url, headers, remote, *base_ms, speed) {
         Ok(new_session) => *session = Some(new_session),
         Err(error) => {
-            log::line(&format!("audio seek failed target_ms={} err={error:#}", *base_ms));
+            log::line(&format!(
+                "audio seek failed target_ms={} err={error:#}",
+                *base_ms
+            ));
             *session = None;
         }
     }

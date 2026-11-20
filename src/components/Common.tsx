@@ -1,5 +1,8 @@
-import React from 'react';
-import { cover, formatCount, formatDuration } from '../api';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { formatCount, formatDuration } from '../api';
+import { CoverImage } from './CoverImage';
+import { useApp } from '../context';
 import type { FeedVideo, VideoCard } from '../types';
 
 export function Spinner({ label }: { label?: string }) {
@@ -14,8 +17,9 @@ export function Spinner({ label }: { label?: string }) {
 export function Empty({ title, hint }: { title: string; hint?: string }) {
   return (
     <div className="empty">
+      <span className="empty-mark" aria-hidden="true" />
       <strong>{title}</strong>
-      {hint || null}
+      {hint ? <span className="empty-hint">{hint}</span> : null}
     </div>
   );
 }
@@ -23,6 +27,7 @@ export function Empty({ title, hint }: { title: string; hint?: string }) {
 export function ErrorBox({ error, onRetry }: { error: string; onRetry?: () => void }) {
   return (
     <div className="error">
+      <span className="empty-mark" aria-hidden="true" />
       <strong>加载失败</strong>
       <div style={{ maxWidth: 620, margin: '0 auto 14px', wordBreak: 'break-word' }}>{error}</div>
       {onRetry ? <button className="btn primary" onClick={onRetry}>重试</button> : null}
@@ -30,24 +35,46 @@ export function ErrorBox({ error, onRetry }: { error: string; onRetry?: () => vo
   );
 }
 
-export function PageHead({ children }: { title?: string; sub?: string; children?: React.ReactNode }) {
-  // The old native shell identifies the page by the active bottom tab only:
-  // no per-page title strip. Keep the functional row (tabs / chips / actions)
-  // when a page actually needs one.
+/**
+ * Top strip for page-local controls only. Editorial titles, eyebrows and
+ * subtitles are deliberately not rendered: content leads, tabs/filters stay.
+ * Callers may still pass title/sub for context, but they are ignored.
+ */
+export function PageHead({ children }: {
+  title?: string;
+  sub?: string;
+  eyebrow?: string;
+  children?: React.ReactNode;
+}) {
   if (!children) return null;
-  return <div className="page-tools">{children}</div>;
+  return (
+    <header className="page-head">
+      <div className="page-actions">{children}</div>
+    </header>
+  );
 }
 
 export function SkeletonGrid({ count = 8 }: { count?: number }) {
   return (
     <div className="video-grid">
       {Array.from({ length: count }).map((_, index) => (
-        <div className="skeleton-card" key={index}>
+        <div className="skeleton-card" key={index} style={{ animationDelay: `${Math.min(index, 10) * 45}ms` }}>
           <div className="skeleton thumb" />
           <div className="skeleton line" style={{ width: '88%' }} />
           <div className="skeleton line" style={{ width: '55%' }} />
         </div>
       ))}
+    </div>
+  );
+}
+
+/// Text-only loading state for lists that are not video grids (messages,
+/// replies and private conversations).
+export function LoadingText({ label = '正在加载' }: { label?: string }) {
+  return (
+    <div className="loading-text" role="status" aria-live="polite">
+      <span>{label}</span>
+      <span className="loading-dots" aria-hidden="true"><i /><i /><i /></span>
     </div>
   );
 }
@@ -68,17 +95,6 @@ export function freshness(ts: number | undefined | null): string {
   return `${Math.floor(age / (365 * day))}年前`;
 }
 
-/// Play-count rarity dot: gray ≤9.9k, green 10k, blue 100k, purple 500k,
-/// orange ≥1M. The number itself stays hidden, as on the old home cards.
-export function rarityColor(view: number | undefined | null): string {
-  const value = Number(view || 0);
-  if (value >= 1_000_000) return 'rgba(235, 122, 77, 0.88)';
-  if (value >= 500_000) return 'rgba(148, 107, 225, 0.82)';
-  if (value >= 100_000) return 'rgba(71, 140, 235, 0.82)';
-  if (value >= 10_000) return 'rgba(51, 168, 115, 0.78)';
-  return 'rgba(140, 158, 184, 0.52)';
-}
-
 function durationSeconds(value: number | string | undefined | null): number {
   if (typeof value === 'number') return Math.max(0, value);
   const text = String(value || '').trim();
@@ -87,61 +103,250 @@ function durationSeconds(value: number | string | undefined | null): number {
   return text.split(':').reduce((total, part) => total * 60 + (Number(part) || 0), 0);
 }
 
+/// Freshness tints for the publish-time chip. The scale runs warm → cool as the
+/// upload ages, so the hue underlines the text instead of fighting it.
+/// ≤1d coral, ≤7d amber, ≤30d teal, ≤90d blue, ≤1y violet, older slate.
+export function freshnessColor(ts: number | undefined | null): string {
+  if (!ts || Number(ts) <= 0) return '#8a909b';
+  const age = Math.max(0, Date.now() / 1000 - Number(ts));
+  const day = 86400;
+  if (age < day) return '#d97862';
+  if (age < day * 7) return '#c9984f';
+  if (age < day * 30) return '#4f9a83';
+  if (age < day * 90) return '#5c84c6';
+  if (age < day * 365) return '#8a78b8';
+  return '#8a909b';
+}
+
+/// Exact publish time for the publish-time tooltip: local date plus a 24h
+/// clock, so the card's relative freshness chip can stay short.
+function exactPublishTime(ts: number | undefined | null): string {
+  if (!ts || Number(ts) <= 0) return '发布时间未知';
+  const date = new Date(Number(ts) * 1000);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+type CardTipKind = 'title' | 'trail';
+
+interface CardTipState {
+  kind: CardTipKind;
+  anchor: DOMRect;
+}
+
+/**
+ * Flat warm-paper hover tip for a video card. It is portal-rendered so the
+ * grid's cover clipping and the title's two-line clamp cannot cut it off, and
+ * it is clamped to the viewport with a flip below the anchor when the card sits
+ * near the top edge. No native `title` tooltip is used for these targets.
+ */
+function CardTooltip({ tip, item, onClose }: {
+  tip: CardTipState;
+  item: any;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState({ left: 0, top: 0, ready: false });
+  const view = Number(item.view ?? item.play ?? 0);
+  const fresh = item.trailing || freshness(item.pub_ts);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const margin = 12;
+    const { anchor } = tip;
+    const left = Math.max(
+      margin,
+      Math.min(anchor.left + anchor.width / 2 - width / 2, window.innerWidth - margin - width),
+    );
+    let top = anchor.top - height - 10;
+    if (top < margin) top = Math.min(anchor.bottom + 10, window.innerHeight - margin - height);
+    setBox({ left, top, ready: true });
+  }, [tip]);
+
+  useEffect(() => {
+    const close = () => onClose();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={ref}
+      className={`card-tip card-tip-${tip.kind}`}
+      role="tooltip"
+      style={{
+        left: box.left,
+        top: box.top,
+        visibility: box.ready ? 'visible' : 'hidden',
+      }}
+    >
+      {tip.kind === 'title' ? (
+        <div className="card-tip-text">{item.title}</div>
+      ) : (
+        <>
+          <div className="card-tip-time">{exactPublishTime(item.pub_ts)}</div>
+          <div className="card-tip-foot">
+            <span>{view > 0 ? `${formatCount(view)} 播放` : '暂无播放数据'}</span>
+            {fresh ? <span className="card-tip-dot">·</span> : null}
+            {fresh ? <span>{fresh}</span> : null}
+          </div>
+        </>
+      )}
+    </div>,
+    document.body,
+  );
+}
+
+function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigate }: {
+  item: any;
+  index: number;
+  onPlay: (item: any, newWindow?: boolean) => void;
+  getProgress?: (item: any) => number | undefined;
+  renderAction?: (item: any) => React.ReactNode;
+  navigate: (to: string) => void;
+}) {
+  const [tip, setTip] = useState<CardTipState | null>(null);
+  const closeTip = useCallback(() => setTip(null), []);
+  const showTip = (kind: CardTipKind) => (event: React.MouseEvent<HTMLElement>) => {
+    setTip({ kind, anchor: event.currentTarget.getBoundingClientRect() });
+  };
+  const hideTip = () => setTip(null);
+
+  const author = item.owner || item.author || item.uname || '';
+  const authorMid = Number(item.owner_mid || item.author_mid || item.mid || item.up_mid || 0) || 0;
+  const fresh = item.fresh || freshness(item.pub_ts);
+  const trailing = item.trailing || fresh;
+  const view = Number(item.view ?? item.play ?? 0);
+  const meta = item.meta || (view > 0 ? `${formatCount(view)} 播放` : '');
+  const seconds = durationSeconds(item.duration);
+  const hideTime = item.hideTime === true;
+  const badge = hideTime ? '' : (item.badge || (seconds > 0 ? formatDuration(seconds) : ''));
+  const progress = getProgress ? Number(getProgress(item) || 0) : 0;
+  const watch = typeof item.watchProgress === 'number' && Number.isFinite(item.watchProgress)
+    ? Math.max(0, Math.min(1, item.watchProgress))
+    : null;
+  const watchPercent = watch === null ? 0 : Math.round(watch * 100);
+
+  return (
+    <div
+      className="video-card"
+      style={{ animationDelay: `${Math.min(index, 14) * 32}ms` }}
+      role="button"
+      tabIndex={0}
+      onClick={() => {
+        setTip(null);
+        onPlay(item);
+      }}
+      onContextMenu={(event) => {
+        // Right-click always opens a new player window; left-click replaces
+        // the video in the most recently focused one.
+        event.preventDefault();
+        setTip(null);
+        onPlay(item, true);
+      }}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onPlay(item);
+        }
+      }}
+    >
+      <div className="cover">
+        <CoverImage src={item.pic || item.cover} alt="" eager={index < 24} />
+        {badge ? <div className="cover-badge">{badge}</div> : null}
+        {progress > 0 ? <div className="video-progress"><span style={{ width: `${Math.min(100, progress * 100)}%` }} /></div> : null}
+        {renderAction ? <div className="card-action" onClick={(event) => event.stopPropagation()}>{renderAction(item)}</div> : null}
+      </div>
+      <div className="body">
+        <div
+          className="video-title"
+          onMouseEnter={showTip('title')}
+          onMouseLeave={hideTip}
+        >{item.title}</div>
+        <div className="video-meta">
+          {author ? (
+            authorMid ? (
+              <span
+                className="video-author link"
+                role="link"
+                tabIndex={0}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setTip(null);
+                  navigate(`user/${authorMid}`);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' && event.key !== ' ') return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  navigate(`user/${authorMid}`);
+                }}
+              >{author}</span>
+            ) : (
+              <span className="video-author">{author}</span>
+            )
+          ) : (
+            <span className="video-author">{meta}</span>
+          )}
+          {watch !== null ? (
+            <span className="video-watch" title={`已看 ${watchPercent}%`}>
+              <span className="video-watch-track">
+                <span className="video-watch-fill" style={{ width: `${watchPercent}%` }} />
+              </span>
+              <span className="video-watch-text">{watchPercent}%</span>
+            </span>
+          ) : author && trailing ? (
+            <span
+              className="video-trail"
+              style={{ ['--trail' as any]: item.pub_ts ? freshnessColor(item.pub_ts) : '#8a909b' }}
+              onMouseEnter={showTip('trail')}
+              onMouseLeave={hideTip}
+            >
+              {!item.trailing && fresh ? <i /> : null}
+              {trailing}
+            </span>
+          ) : null}
+        </div>
+      </div>
+      {tip ? <CardTooltip tip={tip} item={item} onClose={closeTip} /> : null}
+    </div>
+  );
+}
+
 export function VideoGrid({ items, onPlay, getProgress, renderAction }: {
   items: Array<FeedVideo | VideoCard | Record<string, any>>;
-  onPlay: (item: any) => void;
+  onPlay: (item: any, newWindow?: boolean) => void;
   getProgress?: (item: any) => number | undefined;
   renderAction?: (item: any) => React.ReactNode;
 }) {
+  const { navigate } = useApp();
   if (!items.length) return <Empty title="这里还没有内容" hint="试试刷新或换个关键词" />;
   return (
     <div className="video-grid">
-      {items.map((item: any, index: number) => {
-        const author = item.owner || item.author || item.uname || '';
-        const fresh = item.fresh || freshness(item.pub_ts);
-        const trailing = item.trailing || fresh;
-        const view = Number(item.view ?? item.play ?? 0);
-        const meta = item.meta || (view > 0 ? `${formatCount(view)} 播放` : '');
-        const seconds = durationSeconds(item.duration);
-        const badge = item.badge || (seconds > 0 ? formatDuration(seconds) : '');
-        const progress = getProgress ? Number(getProgress(item) || 0) : 0;
-        return (
-          <div
-            className="video-card"
-            key={`${item.bvid || item.title}-${item.cid || ''}-${index}`}
-            role="button"
-            tabIndex={0}
-            title={item.title}
-            onClick={() => onPlay(item)}
-            onKeyDown={(event) => {
-              if (event.target !== event.currentTarget) return;
-              if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault();
-                onPlay(item);
-              }
-            }}
-          >
-            <div className="cover">
-              <img src={cover(item.pic || item.cover)} alt="" loading="lazy" referrerPolicy="no-referrer" />
-              {badge ? <div className="cover-badge">{badge}</div> : null}
-              {progress > 0 ? <div className="video-progress"><span style={{ width: `${Math.min(100, progress * 100)}%` }} /></div> : null}
-              {renderAction ? <div className="card-action" onClick={(event) => event.stopPropagation()}>{renderAction(item)}</div> : null}
-            </div>
-            <div className="body">
-              <div className="video-title">{item.title}</div>
-              <div className="video-meta">
-                <span className="video-author">{author || meta}</span>
-                {author && trailing ? (
-                  <span className="video-trail">
-                    {!item.trailing && fresh ? <i style={{ background: rarityColor(view) }} /> : null}
-                    {trailing}
-                  </span>
-                ) : null}
-              </div>
-            </div>
-          </div>
-        );
-      })}
+      {items.map((item: any, index: number) => (
+        <VideoCardItem
+          key={`${item.bvid || item.title}-${item.cid || ''}-${index}`}
+          item={item}
+          index={index}
+          onPlay={onPlay}
+          getProgress={getProgress}
+          renderAction={renderAction}
+          navigate={navigate}
+        />
+      ))}
     </div>
   );
 }
@@ -162,11 +367,19 @@ export function SettingsRow({ name, desc, children }: { name: string; desc?: str
   );
 }
 
+/**
+ * Page tabs. Every tab is its own standalone pill; there is no shared
+ * segmented track, so each label reads as an individual button.
+ */
 export function Tabs({ tabs, active, onChange }: { tabs: string[]; active: number; onChange: (index: number) => void }) {
   return (
     <div className="tabs">
       {tabs.map((label, index) => (
-        <button key={label} className={`tab ${active === index ? 'active' : ''}`} onClick={() => onChange(index)}>{label}</button>
+        <button
+          key={label}
+          className={`tab ${active === index ? 'active' : ''}`}
+          onClick={() => onChange(index)}
+        >{label}</button>
       ))}
     </div>
   );
@@ -174,11 +387,11 @@ export function Tabs({ tabs, active, onChange }: { tabs: string[]; active: numbe
 
 export function Pagination({ page, hasMore, loading, onMore }: { page: number; hasMore: boolean; loading: boolean; onMore: () => void }) {
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', padding: '22px 0' }}>
+    <div className="page-more">
       {hasMore ? (
         <button className="btn" disabled={loading} onClick={onMore}>{loading ? '加载中…' : `加载更多（第 ${page + 1} 页）`}</button>
       ) : (
-        <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>已经到底了</span>
+        <span>已经到底了</span>
       )}
     </div>
   );

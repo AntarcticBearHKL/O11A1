@@ -19,14 +19,17 @@
 //!                     audio_next,comments_more,hover,hover2,sleep,
 //!                     sleep_short,fault,retry,stall,dm_menu,dm_hold,dm_like,
 //!                     dm_report,dm_report_one,dm_block,dm_copy,dm_undo,dm_history,
-//!                     dm_history_date,dm_history_close
+//!                     dm_history_date,dm_history_close,seek_end,
+//!                     loop_menu,loop_pause,loop_one,loop_next
 //!   BILI_PLAYER_SHOT  screenshot path for the `shot` QA action
 //!   BILI_PLAYER_SIZE  client size, default 1000x600
 
 use native_player::{parse_time_ms, Player, PlayerConfig};
 
 fn main() {
-    if let Err(error) = run() {
+    let result = run();
+    native_player::unload_player_fonts();
+    if let Err(error) = result {
         eprintln!("native_player: {error:#}");
         std::process::exit(1);
     }
@@ -44,6 +47,9 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             "--url" => config.direct_url = args.next(),
+            "--audio-url" | "--audioUrl" => {
+                config.direct_audio_url = args.next();
+            }
             "--title" => config.title = args.next().unwrap_or_default(),
             "--start" => {
                 if let Some(value) = args.next() {
@@ -59,7 +65,7 @@ fn run() -> anyhow::Result<()> {
             "-h" | "--help" => {
                 println!(
                     "native_player [--bvid BV…] [--cid N] [--url URL_OR_FILE]\n\
-                     \x20             [--title TEXT] [--start seconds|mm:ss] [--quality qn]\n\
+                     \x20             [--audio-url URL] [--title TEXT] [--start seconds|mm:ss] [--quality qn]\n\
                      Environment: BILI_OPEN_BVID, BILI_PLAYER_URL, BILI_PLAYER_SECONDS,\n\
                      BILI_PLAYER_QA, BILI_PLAYER_SHOT, BILI_PLAYER_SIZE, BILI_PLAYER_VOLUME,\n\
                      BILI_PLAYER_MINI"

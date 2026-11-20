@@ -22,26 +22,26 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 
 use crate::audio::{AudioCommand, AudioEngine};
 use crate::clipboard;
-use crate::convert;
 use crate::danmaku::{
     convert_item, Band, DanmakuHit, DanmakuItem, DanmakuModel, DanmakuOverlay, DanmakuSettings,
     LongPress,
 };
 use crate::decode::{DecodedFrame, VideoDecoder, VideoSpec};
-use crate::detail::{DetailEvent, DetailRequest};
+use crate::detail::{CommentData, DetailEvent, DetailRequest};
 use crate::enhance::{EnhanceMode, EnhancePipeline};
 use crate::format::{clamp_seek, format_time};
-use crate::gpu::{AspectMode, Composition, Gpu, VideoSurface};
+use crate::gpu::{AspectMode, Composition, Gpu, GpuFrame, VideoSurface};
 use crate::heartbeat::{Beat, Heartbeat};
 use crate::interp::{self, InterpMode};
 use crate::log;
 use crate::overlay::{
-    dm_menu_rect, dm_menu_row, dm_report_rect, dm_report_row, AudioRowUi, CommentUi,
-    DanmakuMenuUi, ImageData, InfoUi, Overlay, PageUi, QualityRowUi, Rect, SettingsMenu,
-    SidebarTab, StoryboardCellUi, ToastUi, UiModel, UndoToastUi, DM_MENU_BLOCK, DM_MENU_COPY,
-    DM_MENU_LIKE, DM_MENU_REPORT, DM_MENU_LABELS, DM_REPORT_LABELS, SETTINGS_ROWS,
-    TB_COMMENTS, TB_DANMAKU, TB_ENHANCE, TB_INFO, TB_INTERP, TB_PERF, TB_SERIES,
-    TB_SETTINGS, TB_VOLUME,
+    dm_menu_rect, dm_menu_row, dm_report_rect, dm_report_row, settings_menu_height, AudioRowUi,
+    ChoiceRowUi, CommentUi, DanmakuMenuUi, ImageData, InfoUi, Overlay, PageUi, QualityRowUi, Rect,
+    ReplyUi,
+    SettingsMenu, SidebarTab, StoryboardCellUi, ToastUi, UiModel, UndoToastUi, DM_MENU_BLOCK,
+    DM_MENU_COPY, DM_MENU_LABELS, DM_MENU_LIKE, DM_MENU_REPORT, DM_REPORT_LABELS, HEAT_BUCKETS,
+    PERFORMANCE_CONTENT_H, SETTINGS_ROWS, TB_COMMENTS, TB_DANMAKU, TB_INFO, TB_MUTE, TB_PERF,
+    TB_PRECISION, TB_SERIES, TB_SETTINGS, TB_SPEED, DEFAULT_QUALITY_HEIGHTS, quality_height_label,
 };
 use crate::source::{MediaSource, TrackRequest};
 use crate::state::{PlayerState, SaveDebouncer, SAVE_DEBOUNCE};
@@ -51,7 +51,34 @@ use crate::PlayerConfig;
 
 const DEFAULT_WINDOW: (u32, u32) = (1000, 600);
 const START_AUDIO_WAIT_MS: u64 = 1_200;
+/// Keep one source picture ready ahead of the presentation clock so 60 Hz
+/// ticks can be built between source frames.
+const INTERP_LOOKAHEAD_MS: u64 = 220;
+/// Mean luma difference at which a tick is treated as a scene cut. A blend
+/// across two shots is the source of the old white "flash"; show the nearest
+/// real picture instead.
+const INTERP_CUT_DIFF: u32 = 52;
+/// A/B spans up to this length keep their decoded pictures in memory. Short
+/// loops then replay from the cache instead of spawning a new decoder at A on
+/// every pass. Longer spans use the background prefetch decoder.
+const AB_CACHE_MAX_MS: u64 = 2_000;
+/// Hard ceiling for the A/B frame cache (decoded NV12 bytes).
+const AB_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Decoded pictures for one A/B pass, captured while the first pass plays.
+struct AbCache {
+    a: u64,
+    b: u64,
+    frames: Vec<DecodedFrame>,
+    bytes: usize,
+    ready: bool,
+    disabled: bool,
+}
 const AV_DRIFT_MS: u64 = 200;
+/// If the picture is this far behind the device clock and has not presented
+/// for a while, restart the video at the audio position instead of letting a
+/// gradual drift become permanent.
+const AV_RESYNC_MS: u64 = 800;
 /// Hold time for 屏蔽该用户 on a comment (left button).
 const LONG_PRESS: Duration = Duration::from_millis(500);
 /// Movement that turns a hold into a drag and cancels the long-press.
@@ -68,9 +95,14 @@ pub enum Command {
     Pause,
     TogglePlay,
     Seek(u64),
+    /// Replace the video shown by this window (the window, its size and its
+    /// state stay; a card left-click reuses the most recently focused player).
+    LoadSource(crate::PlayerConfig),
     SetVolume(u8),
     SetSpeed(f64),
     SetInterp(InterpMode),
+    /// 0 = follow the display refresh, otherwise a fixed target in Hz.
+    SetInterpHZ(u32),
     SetEnhance(EnhanceMode),
     SetDanmaku(bool),
     ToggleDanmaku,
@@ -86,14 +118,22 @@ pub enum Command {
     Screenshot,
     CycleSpeed(i32),
     /// Reposition/resize the Electron-hosted popup (physical pixels).
-    SetRect { x: i32, y: i32, width: u32, height: u32 },
+    SetRect {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
     /// Show/hide the Electron-hosted popup.
     SetVisible(bool),
     /// Hovered seek time (ms) for the native storyboard thumbnail; `None`
     /// clears the preview.
     Preview(Option<u64>),
     /// Show a locally sent danmaku immediately.
-    SendDanmaku { text: String, mode: u32 },
+    SendDanmaku {
+        text: String,
+        mode: u32,
+    },
     Close,
 }
 
@@ -121,10 +161,16 @@ pub struct SharedState {
     /// True after the decoder reached the natural end of the stream. The shell
     /// uses it to advance the persistent play queue.
     pub ended: AtomicBool,
+    /// End-of-video behaviour mirrored for the Electron queue: 0 pause,
+    /// 1 loop, 2 next / close.
+    pub loop_mode: AtomicU8,
     /// Hosted-window input counters. Electron polls these and turns them into
     /// play/pause and fullscreen actions; the native overlay is not drawn.
     pub click_seq: AtomicU64,
     pub double_click_seq: AtomicU64,
+    /// Bumped when this native window becomes active. The shell targets the
+    /// player with the newest value for card replacements.
+    pub focus_seq: AtomicU64,
     /// Coalesced mouse-move counter used to reveal fullscreen controls.
     pub move_seq: AtomicU64,
     /// Right-clicked danmaku under the pointer, consumed by the Electron UI.
@@ -132,6 +178,10 @@ pub struct SharedState {
     /// 500 ms left-press on a danmaku, consumed by the Electron UI.
     pub long_press_hits: std::sync::Mutex<std::collections::VecDeque<DanmakuHit>>,
     pub long_press_seq: AtomicU64,
+    /// Bumped whenever this window writes danmaku settings to the global
+    /// settings file. The engine watches it and re-broadcasts the resulting
+    /// settings so every UI stays in sync with the native popup.
+    pub settings_revision: AtomicU64,
 }
 
 impl SharedState {
@@ -145,17 +195,21 @@ impl SharedState {
         self.enhance.store(engine.enhance.as_u8(), Ordering::SeqCst);
         self.danmaku_visible
             .store(engine.danmaku_visible, Ordering::SeqCst);
-        self.danmaku_total
-            .store(engine.danmaku.total().min(u32::MAX as usize) as u32, Ordering::SeqCst);
+        self.danmaku_total.store(
+            engine.danmaku.total().min(u32::MAX as usize) as u32,
+            Ordering::SeqCst,
+        );
         self.mini.store(engine.mini, Ordering::SeqCst);
         self.aspect.store(engine.aspect.as_u8(), Ordering::SeqCst);
         self.topmost
             .store(window::is_topmost(engine.hwnd), Ordering::SeqCst);
-        self.brightness_milli
-            .store((engine.brightness * 1000.0).round() as u32, Ordering::SeqCst);
-        self.audio_only
-            .store(engine.audio_only, Ordering::SeqCst);
+        self.brightness_milli.store(
+            (engine.brightness * 1000.0).round() as u32,
+            Ordering::SeqCst,
+        );
+        self.audio_only.store(engine.audio_only, Ordering::SeqCst);
         self.ended.store(engine.ended, Ordering::SeqCst);
+        self.loop_mode.store(engine.loop_mode, Ordering::SeqCst);
         self.speed_milli
             .store((engine.speed * 1000.0).round() as u32, Ordering::SeqCst);
     }
@@ -212,6 +266,35 @@ pub fn run(
     shared.closed.store(true, Ordering::SeqCst);
 }
 
+/// One frame-ruler notch is 12 logical pixels. Dragging the ruler left
+/// (negative delta) advances playback; a wobble shorter than one notch is zero.
+fn tuner_steps(delta_px: f32, notch_px: f32) -> i64 {
+    if notch_px <= 0.0 {
+        return 0;
+    }
+    (-delta_px / notch_px).trunc() as i64
+}
+
+/// One wheel notch is 120 units and moves the volume 5%. Precision touchpads
+/// and free-spinning wheels send fractions of a notch; those accumulate so a
+/// slow scroll still moves the volume instead of rounding every event away.
+/// A direction reversal drops the leftover of the other direction so the first
+/// notch back responds immediately.
+fn wheel_volume_step(accum: &mut f32, direction: &mut f32, delta: i32) -> i32 {
+    let sign = delta.signum() as f32;
+    if sign == 0.0 {
+        return 0;
+    }
+    if *direction != 0.0 && sign != *direction {
+        *accum = 0.0;
+    }
+    *direction = sign;
+    *accum += delta as f32 * 5.0 / 120.0;
+    let step = (*accum).trunc() as i32;
+    *accum -= step as f32;
+    step
+}
+
 struct Engine {
     source: MediaSource,
     /// The open request, kept so a failed initial resolve can be retried.
@@ -220,6 +303,15 @@ struct Engine {
     loading: bool,
     /// A resolve worker is in flight and its result is expected on `source_rx`.
     source_pending: bool,
+    /// The replace request that produced the in-flight resolve (initial opens
+    /// keep their config in `open_config`). Used to retry a failed swap.
+    pending_replace: Option<PlayerConfig>,
+    /// A newer card click while a resolve was in flight: run it as soon as the
+    /// current answer lands, so the last click always wins.
+    queued_replace: Option<PlayerConfig>,
+    /// The last replacement that failed; the error card's retry re-runs it
+    /// instead of restarting the old video.
+    failed_replace: Option<PlayerConfig>,
     source_rx: Receiver<std::result::Result<crate::DeferredOpen, String>>,
     source_tx: Sender<std::result::Result<crate::DeferredOpen, String>>,
     requested_start_ms: u64,
@@ -230,6 +322,9 @@ struct Engine {
     events: Arc<window::WindowEvents>,
     /// Electron-hosted video-only popup: no native chrome, no input handling.
     external: bool,
+    /// Live stream: interpolation/enhancement are forced off and the settings
+    /// tab shows a live-specific list.
+    is_live: bool,
     /// True while the external storyboard thumbnail is on screen.
     external_preview_visible: bool,
     /// Press start for the Electron-hosted long-press gesture: start time,
@@ -245,12 +340,16 @@ struct Engine {
     danmaku_tx: Sender<Vec<DanmakuItem>>,
     danmaku_visible: bool,
     danmaku_band: Band,
-    last_danmaku_draw: Instant,
+    next_danmaku_draw: Instant,
     /// The unfiltered live fetch, kept so the 历史 view can be closed (or a
     /// blocked sender undone) without another network round-trip.
     live_danmaku: Vec<DanmakuItem>,
     /// Right-click comment menu and its hover/like/report/block state.
     dm_menu: Option<DanmakuMenuUi>,
+    /// Right press that opened the menu: start point + whether it moved far
+    /// enough to count as a drag selection. Releasing after a drag activates
+    /// the row under the pointer; a plain click leaves the menu open.
+    dm_menu_drag: Option<(f32, f32, bool)>,
     /// Armed left long-press (tracker + the comment captured at press time).
     dm_long: Option<(LongPress, DanmakuHit)>,
     /// `dmid`s with a thumb-up request in flight (duplicate clicks ignored).
@@ -275,6 +374,12 @@ struct Engine {
     state_save: SaveDebouncer,
     enhance_pipeline: Option<EnhancePipeline>,
     decoder: Option<VideoDecoder>,
+    /// A decoder pre-rolled at A while the current pass approaches B. It is
+    /// swapped in at the loop point so the picture never reloads.
+    loop_prefetch: Option<VideoDecoder>,
+    /// Wheel notches only move a preview; the actual seek happens once the
+    /// wheel has been idle for a moment.
+    pending_wheel_seek: Option<(u64, Instant)>,
     audio: Option<AudioEngine>,
     /// `None` when a begin/first frame is still outstanding.
     client: (u32, u32),
@@ -295,23 +400,36 @@ struct Engine {
     first_frame_at: Option<Instant>,
     seek_in_flight: bool,
     seek_target: u64,
+    /// Media timestamp where the current decode session began (0, a seek
+    /// target, or the A point of an AB loop). Drives the perf loading grid.
+    stream_start_ms: u64,
     generation: u64,
     session_started: Instant,
     audio_master: bool,
     last_drift_log: Option<Instant>,
     last_stall_log: Option<Instant>,
+    /// Last hard A/V resync; throttled so a slow decoder cannot thrash seeks.
+    last_av_resync: Option<Instant>,
     ended: bool,
     last_frame_ts: u64,
 
     // Audio/UI settings.
     volume: u8,
     muted: bool,
-    /// 单曲循环: restart in the same window when the stream ends.
-    loop_one: bool,
+    /// End-of-video behaviour: 0 pause, 1 loop, 2 next / close.
+    loop_mode: u8,
     speed: f32,
     interp: InterpMode,
     enhance: EnhanceMode,
+    /// Requested interpolation grid: 0 follows the display refresh, otherwise
+    /// a fixed target in Hz (bounded by `INTERP_MAX_OUT_HZ`).
+    interp_hz: u32,
     interp_out_hz: Option<u32>,
+    /// Refresh rate of the monitor under the player window, refreshed once a
+    /// second. The 插帧 menu and the danmaku cadence follow this monitor, not
+    /// the primary display.
+    monitor_hz: u32,
+    monitor_check_at: Instant,
     stats: bool,
     aspect: AspectMode,
     ontop: bool,
@@ -323,35 +441,118 @@ struct Engine {
     sleep_deadline: Option<Instant>,
     sleep_choice: u32,
 
-    // Display state.
-    cur: Option<Vec<u8>>,
-    prev: Option<Vec<u8>>,
-    blend_buffer: Vec<u8>,
+    // Display state. Pictures live in the video surface's GPU frame ring;
+    // only the slot/timestamp/signature travel through the engine.
+    cur: Option<GpuFrame>,
+    cur_ts_ms: u64,
+    next: Option<GpuFrame>,
     last_source_present: Option<Instant>,
-    blend_at: Option<Instant>,
+    next_tick_at: Option<Instant>,
     out_period: Duration,
 
     // Counters.
     presents_window: u64,
     fps: f32,
     fps_window_start: Instant,
+    /// Danmaku layer presents per second, sampled over the same 1 s window as
+    /// the video FPS. The layer is independent of the video grid.
+    danmaku_fps: f32,
+    danmaku_frames_prev: u64,
+    /// Successful overlay presents per second (toolbar, sidebar, HUD and all
+    /// animations share this counter).
+    ui_fps: f32,
+    ui_presents_prev: u64,
+    /// Average overlay draw cost in the current 1 s window (diagnostic).
+    ui_draw_us_total: u64,
+    ui_draw_count: u64,
     generated: u64,
     blend_us_total: u64,
     blend_count: u64,
     last_blend_us: u32,
+    interp_ticks: u32,
+    interp_blends: u32,
+    interp_cuts: u32,
 
     // UI.
     ui_dirty: bool,
-    last_ui_draw: Instant,
+    /// Absolute deadline for the next regular overlay frame. Using a fixed
+    /// 120 Hz grid (monitor refresh) keeps loop overhead and requestAnimation
+    /// style jitter from stretching the interval to ~9.5 ms.
+    next_ui_draw: Instant,
     status: String,
     drag_preview: Option<u64>,
     dragging: bool,
-    /// Left press on the picture: a small move drags the frameless window,
-    /// a clean release keeps the old play/pause click.
+    /// Right-click precision seek panel (heatmap + A/B loop + frame wheel).
+    precision_open: bool,
+    precision_dragging: bool,
+    /// 0 = toolbar, 1 = precision panel. A 360 ms time-based morph so the
+    /// paper card visibly grows into the panel and back instead of popping.
+    precision_anim: f32,
+    /// Value and start time of the current morph. Retoggling mid-flight
+    /// reverses from wherever the card currently is.
+    precision_morph_from: f32,
+    precision_morph_start: Instant,
+    /// Frame-step dropdown in the precision panel.
+    precision_step_open: bool,
+    /// Speed panel (the second bottom-panel mode) and its live drag value.
+    speed_open: bool,
+    /// Left button is down on the speed wheel: press x and the stop it
+    /// started from. The wheel is relative, like the frame wheel.
+    speed_drag: Option<(f32, f32)>,
+    /// Value shown while the wheel is dragged or still turning. It becomes
+    /// the real playback speed on release / after the wheel idle.
+    speed_preview: f32,
+    /// Stop shown in the selection window while the pointer drags. It equals
+    /// `speed_preview` at rest and freezes at the drag's start stop so the
+    /// labels scroll with the finger.
+    speed_base: f32,
+    /// Debounce for wheel notches: one session restart after the wheel stops.
+    speed_commit_at: Option<Instant>,
+    /// Which bottom panel the morph card is showing: 0 toolbar, 1 precision,
+    /// 2 speed. Sticky through the close animation so the content can fade.
+    panel: u8,
+    /// Wheel volume accumulator in percent. A standard notch is 120 units and
+    /// moves 5%; precision touchpads send much smaller deltas, so they build up
+    /// here instead of being rounded away to nothing.
+    wheel_volume_accum: f32,
+    /// Last wheel direction (-1 / 0 / 1); a reversal drops the stale remainder
+    /// so the first notch of the new direction responds immediately.
+    wheel_volume_dir: f32,
+    /// Keep the right-edge volume bar on screen for a moment after a notch.
+    volume_wheel_until: Option<Instant>,
+    /// Horizontal drag on the frame ruler: (start_x, start_ms). The preview
+    /// follows the total displacement and the real seek happens once on release.
+    tuner_drag: Option<(f32, u64)>,
+    /// Visual ruler displacement from the wheel centre, in pixels. It follows
+    /// the finger without a cap for the whole drag and returns to zero after
+    /// release; the draw pass derives the visible tick range from this value.
+    tuner_offset: f32,
+    /// One-shot 0..1 pulse for a wheel notch. The bead leaves the centre, peaks
+    /// and comes back, so the wheel never keeps a permanent offset.
+    tuner_pulse: f32,
+    tuner_pulse_dir: f32,
+    ab_a: Option<u64>,
+    ab_b: Option<u64>,
+    /// At B with a prefetch decoder still warming: hold the last picture for a
+    /// short grace period instead of tearing down the decoder and reloading.
+    ab_swap_wait: Option<(u64, Instant)>,
+    /// Decoded A–B pictures captured on the first pass. When ready, every
+    /// following pass replays from memory without opening a decoder.
+    ab_cache: Option<AbCache>,
+    ab_cache_playing: bool,
+    ab_cache_cursor: usize,
+    frame_step: u64,
+    heatmap: [u8; HEAT_BUCKETS],
+    /// Left press on the picture: a small move drags the frameless window.
+    /// A clean release has no transport action; spacebar owns play/pause.
     window_drag_arm: Option<(i32, i32)>,
+    /// Left press on the sidebar background: dragging moves the whole window,
+    /// so the lane travels with the picture instead of feeling detached. A
+    /// clean click never toggles playback and never closes the sidebar.
+    sidebar_drag_arm: Option<(i32, i32)>,
     popup_drag: Option<u8>,
-    /// 增强 tier list opened from the toolbar.
-    enhance_open: bool,
+    /// End-of-video menu opened from the loop cell.
+    loop_menu_open: bool,
     mini: bool,
     mini_saved: Option<MiniSaved>,
     mini_hint_until: Option<Instant>,
@@ -362,10 +563,17 @@ struct Engine {
     last_mouse_activity: Instant,
     pointer: Option<(f32, f32)>,
     sidebar_open: bool,
-    /// Windowed mode already grew the outer window by the strip width.
+    /// Windowed mode already grew the outer window by the sidebar lane.
     sidebar_extra: bool,
     sidebar_tab: SidebarTab,
     sidebar_scroll: f32,
+    sidebar_scroll_target: f32,
+    /// Cached height of the info description; `-1` means measure again.
+    info_scroll_height: f32,
+    info_scroll_width: f32,
+    /// The queue prefetcher runs once per player window; it waits for the
+    /// active entry's own cache and then fills the following entries.
+    playlist_prefetch_started: bool,
     danmaku_popup: bool,
     /// 发送弹幕 input and its in-flight post.
     dm_input: String,
@@ -380,23 +588,60 @@ struct Engine {
     comments_loading: bool,
     comments_end: bool,
     comments_cursor: String,
+    /// 0 = 最热, 1 = 最新, eased every loop so the sort pill glides.
+    comments_sort_mix: f32,
+    /// Fade/slide entrance for a freshly replaced comment page.
+    comments_enter: f32,
+    /// Invalidates the overlay's measured comment rows.
+    comments_generation: u64,
+    /// The sort was changed while the previous page was in flight; reload the
+    /// new sort as soon as that response arrives.
+    comments_reload_pending: bool,
+    /// Last update of the comment easing clocks.
+    comments_anim_last: Instant,
     detail_tx: Sender<DetailRequest>,
     detail_rx: Receiver<DetailEvent>,
     avatars: std::collections::HashMap<String, ImageData>,
     switch_rx: Option<Receiver<Result<MediaSource, String>>>,
     switch_target: Option<usize>,
+    /// When the pending 分P resolve started, so a hung playurl cannot leave
+    /// the window on the loading card forever.
+    switch_started: Option<Instant>,
+    /// Page the selection was on before an optimistic 分P switch, and the
+    /// playback position to restore if playurl fails.
+    switch_from_page: Option<usize>,
+    switch_resume_ms: u64,
+    /// Page being resolved/opened right now. The loading card names it and the
+    /// selection moves on click, before playurl answers.
+    page_loading: Option<usize>,
     track_rx: Option<Receiver<Result<MediaSource, String>>>,
     track_kind: Option<&'static str>,
     settings_menu: Option<SettingsMenu>,
+    /// Persistent opening quality (height, 0 = highest available).
+    quality_height_pref: u32,
     liked: bool,
     coined: bool,
     favorited: bool,
     toast: Option<ToastUi>,
     toast_until: Option<Instant>,
-    ui_ms: f32,
     queue_len: usize,
     dropped: u64,
     audio_ms: u64,
+    /// Live ffmpeg child read rate for the debug HUD (bytes per second).
+    net_pid: u32,
+    net_read: u64,
+    net_at: Instant,
+    net_bps: f64,
+    /// Read baseline when the current decoder PID started, used to estimate
+    /// the downloaded lead in seconds.
+    net_base_read: u64,
+    net_base_pos: u64,
+    /// Global cache download counter at the previous one-second sample.
+    cache_net_read: u64,
+    net_lead_s: f64,
+    /// Media cache progress for the current source (0 for direct/local).
+    cache_done: u64,
+    cache_total: u64,
     // History heartbeat.
     aid: u64,
     heartbeat: Option<Heartbeat>,
@@ -417,6 +662,10 @@ struct Engine {
     had_first_frame: bool,
     stalled: bool,
     stall_until: Option<Instant>,
+    /// Audio was paused because the picture ran dry; resume it on the next
+    /// presented frame. Keeping the device clock stopped is what preserves
+    /// lip-sync when the network cannot feed the video cache fast enough.
+    stall_audio_paused: bool,
     error: Option<String>,
     danmaku_opacity: u32,
     danmaku_font: u32,
@@ -466,6 +715,7 @@ struct HistoryPayload {
 
 enum QaKind {
     Seek,
+    SeekEnd,
     Pause,
     Play,
     Interp,
@@ -485,13 +735,16 @@ enum QaKind {
     AudioOnly,
     SpeedUp,
     SpeedDown,
+    SpeedPanel,
     Sidebar,
     SidebarInfo,
+    InfoCopy,
     SidebarEpisodes,
     SidebarComments,
     SidebarPerformance,
     SidebarSettings,
     DanmakuPopup,
+    DanmakuLive,
     DmMenu,
     DmHold,
     DmLike,
@@ -520,6 +773,17 @@ enum QaKind {
     Hover2,
     Sleep,
     SleepShort,
+    Precision,
+    AbA,
+    AbB,
+    AbClear,
+    LoopMenu,
+    LoopPause,
+    LoopOne,
+    LoopNext,
+    LoopPart,
+    InterpMenu,
+    EnhanceMenu,
     Fault,
     Retry,
     Stall,
@@ -552,6 +816,10 @@ impl Engine {
         let host = config.host.clone();
         let title = format!("O11A1 · {}", source.title);
         let external = host.is_some();
+        let is_live = config.is_live;
+        if is_live {
+            log::line("live mode: interpolation and enhancement disabled");
+        }
         let (hwnd, events) = match &host {
             Some(host) => window::create_hosted(
                 HWND(host.parent as *mut _),
@@ -561,10 +829,12 @@ impl Engine {
                 host.height,
             )?,
             None => {
-                let (client_w, client_h) = window_size();
+                let (client_w, client_h) = window_size(&state);
                 window::create(&title, client_w, client_h)?
             }
         };
+        // Shift-resize needs the source aspect inside the window proc.
+        events.set_video_aspect(source.source_width, source.source_height);
         // Apply 置顶 before the composition tree is built; the state is also
         // read back so the UI reflects the measured window style, not a wish.
         if state.topmost {
@@ -572,13 +842,20 @@ impl Engine {
                 log::line(&format!("player state topmost failed: {error:#}"));
             }
         }
-        let initial_aspect = AspectMode::from_u8(state.aspect);
+        // The picture is locked to its source aspect; window mismatch is
+        // filled with the window background instead of stretching.
+        let initial_aspect = AspectMode::Fit;
         let client = window::client_size(hwnd);
         let scale = window::dpi_scale(hwnd);
+        // Allocate the composition layers to the whole monitor. The sidebar
+        // lane is then already inside a live swapchain, so opening it only
+        // changes the layout and the window rectangle, never the buffers.
+        let monitor = window::monitor_size(hwnd);
+        let surface = (monitor.0.max(client.0), monitor.1.max(client.1));
         let gpu = Gpu::new().context("create D3D11 device")?;
         let video = VideoSurface::new(&gpu, source.width, source.height)
             .context("create video swapchain")?;
-        let mut overlay = Overlay::new(&gpu, client.0, client.1, scale)
+        let mut overlay = Overlay::new(&gpu, client.0, client.1, surface.0, surface.1, scale)
             .context("create overlay swapchain")?;
         if external {
             overlay.clear().context("clear hosted overlay")?;
@@ -586,52 +863,46 @@ impl Engine {
         let danmaku_settings = DanmakuSettings::load(client.1);
         let danmaku_fonts = danmaku_settings.font_sizes;
         let danmaku_opacity = danmaku_settings.opacity;
-        let mut danmaku_layer = DanmakuOverlay::new(
-            &gpu,
-            client.0,
-            client.1,
-            danmaku_fonts,
-            danmaku_opacity,
-        )
-        .context("create danmaku swapchain")?;
-        let composition = Composition::new(hwnd, &gpu, &video.swap, &danmaku_layer.swap, &overlay.swap)
-            .context("create DirectComposition tree")?;
+        let mut danmaku_layer =
+            DanmakuOverlay::new(&gpu, surface.0, surface.1, danmaku_fonts, danmaku_opacity)
+                .context("create danmaku swapchain")?;
+        let composition =
+            Composition::new(hwnd, &gpu, &video.swap, &danmaku_layer.swap, &overlay.swap)
+                .context("create DirectComposition tree")?;
         composition.set_root_clip(client.0, client.1)?;
-        let (x, y, sx, sy) = crate::gpu::video_transform(
-            client.0 as f32,
-            client.1 as f32,
-            source.width,
-            source.height,
-            initial_aspect,
-        );
+        let (x, y, picture_w, picture_h) =
+            overlay
+                .layout
+                .stage_video_bounds(source.width, source.height, initial_aspect);
+        let sx = picture_w / source.width.max(2) as f32;
+        let sy = picture_h / source.height.max(2) as f32;
         composition.set_video_transform(x, y, sx, sy)?;
-        let band = danmaku_band(client, &overlay.layout, &source, false, initial_aspect);
+        let band = danmaku_band(&overlay.layout, &source, false, initial_aspect);
         let danmaku = DanmakuModel::new(danmaku_settings, band);
-        danmaku_layer.clear().context("clear danmaku layer")?;
-        let danmaku_env = std::env::var("BILI_PLAYER_DANMAKU")
-            .ok()
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "off" | "false" | "no"
-                )
-            });
+        let danmaku_env = std::env::var("BILI_PLAYER_DANMAKU").ok().map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            )
+        });
         let danmaku_visible = danmaku_env.unwrap_or(state.danmaku_visible);
 
-        let enhance_pipeline = match EnhancePipeline::new(&gpu.device, &gpu.context, source.width, source.height) {
-            Ok(pipeline) => Some(pipeline),
-            Err(error) => {
-                log::line(&format!(
-                    "enhance fallback at startup reason={error:#}"
-                ));
-                None
-            }
-        };
+        let enhance_pipeline =
+            match EnhancePipeline::new(&gpu.device, &gpu.context, source.width, source.height) {
+                Ok(pipeline) => Some(pipeline),
+                Err(error) => {
+                    log::line(&format!("enhance fallback at startup reason={error:#}"));
+                    None
+                }
+            };
 
         let duration_ms = source.duration_ms;
         let start_ms = clamp_seek(requested_start_ms, duration_ms);
-        let display_hz = interp::display_refresh_hz();
-        let interp_out_hz = interp::interp_plan(display_hz, source.fps);
+        // The saved interpolation rate is validated against the monitor the
+        // window actually opened on. Querying a NULL device fails on some
+        // multi-monitor drivers and silently reports 60 Hz.
+        let display_hz = interp::display_refresh_hz_for_window(hwnd);
+        let interp_out_hz = interp::interp_plan(display_hz, source.fps, 0);
         let out_hz = interp_out_hz.unwrap_or_else(|| {
             if source.fps.is_finite() && source.fps > 1.0 {
                 source.fps.round().clamp(1.0, 240.0) as u32
@@ -650,23 +921,22 @@ impl Engine {
             .and_then(|value| value.parse::<u8>().ok());
         let volume = volume_env.unwrap_or(state.volume).min(100);
         let muted = volume_env.is_none() && state.muted;
-        let speed = if state.speed.is_finite() {
-            state.speed.clamp(0.5, 2.0)
-        } else {
-            1.0
-        };
+        let speed = crate::speed::clamp(state.speed);
         state.volume = volume;
         state.muted = muted;
         state.speed = speed;
-        state.aspect = initial_aspect.as_u8();
+        state.aspect = AspectMode::Fit.as_u8();
+        let initial_stats = state.stats;
         let stored_settings = o11a1::settings::load();
         let source_title = source.title.clone();
+        let source_id = source.bvid.clone().unwrap_or_default();
         let light_sidebar = !o11a1::theme::resolve(stored_settings.theme);
-        let player_keys = if stored_settings.player_keys.len() == o11a1::settings::PLAYER_KEY_ACTIONS {
-            stored_settings.player_keys.clone()
-        } else {
-            o11a1::settings::default_player_keys()
-        };
+        let player_keys =
+            if stored_settings.player_keys.len() == o11a1::settings::PLAYER_KEY_ACTIONS {
+                stored_settings.player_keys.clone()
+            } else {
+                o11a1::settings::default_player_keys()
+            };
         let player_keys_hint = player_keys_summary(&player_keys);
         log::line(&format!(
             "theme mode={} light_sidebar={}",
@@ -679,11 +949,9 @@ impl Engine {
             player_keys_hint
         ));
         let heartbeat = match (&session, &source.bvid, source.cid) {
-            (Some(session), Some(bvid), Some(cid)) => Some(Heartbeat::spawn(
-                session.clone(),
-                bvid.clone(),
-                cid,
-            )),
+            (Some(session), Some(bvid), Some(cid)) => {
+                Some(Heartbeat::spawn(session.clone(), bvid.clone(), cid))
+            }
             _ => None,
         };
         let qa = parse_qa(duration_ms);
@@ -701,6 +969,9 @@ impl Engine {
             open_config: config,
             loading,
             source_pending: loading,
+            pending_replace: None,
+            queued_replace: None,
+            failed_replace: None,
             source_rx,
             source_tx,
             requested_start_ms,
@@ -710,6 +981,7 @@ impl Engine {
             hwnd,
             events,
             external,
+            is_live,
             external_preview_visible: false,
             external_press: None,
             gpu,
@@ -718,13 +990,14 @@ impl Engine {
             composition,
             danmaku_layer,
             danmaku,
+            next_danmaku_draw: Instant::now(),
             danmaku_rx,
             danmaku_tx,
             danmaku_visible,
             danmaku_band: band,
-            last_danmaku_draw: Instant::now(),
             live_danmaku: Vec::new(),
             dm_menu: None,
+            dm_menu_drag: None,
             dm_long: None,
             dm_thumb_inflight: HashSet::new(),
             dm_action_tx: dm_action_tx.clone(),
@@ -744,6 +1017,8 @@ impl Engine {
             state_save: SaveDebouncer::default(),
             enhance_pipeline,
             decoder: None,
+            loop_prefetch: None,
+            pending_wheel_seek: None,
             audio: None,
             client,
             scale,
@@ -760,22 +1035,27 @@ impl Engine {
             first_frame_at: None,
             seek_in_flight: false,
             seek_target: start_ms,
+            stream_start_ms: start_ms,
             generation: 1,
             session_started: Instant::now(),
             audio_master: false,
             last_drift_log: None,
             last_stall_log: None,
+            last_av_resync: None,
             ended: false,
             last_frame_ts: start_ms,
             volume,
             muted,
-            loop_one: stored_settings.loop_one,
+            loop_mode: stored_settings.loop_mode,
             speed,
             interp: InterpMode::Off,
             enhance: EnhanceMode::Off,
+            interp_hz: 0,
             interp_out_hz,
-            stats: false,
-            aspect: initial_aspect,
+            monitor_hz: display_hz,
+            monitor_check_at: Instant::now(),
+            stats: initial_stats,
+            aspect: AspectMode::Fit,
             ontop: window::is_topmost(hwnd),
             brightness: initial_brightness,
             audio_only: initial_audio_only,
@@ -785,20 +1065,29 @@ impl Engine {
             sleep_deadline: None,
             sleep_choice: 0,
             cur: None,
-            prev: None,
-            blend_buffer: Vec::new(),
+            cur_ts_ms: 0,
+            next: None,
             last_source_present: None,
-            blend_at: None,
+            next_tick_at: None,
             out_period: Duration::from_secs_f64(1.0 / out_hz.max(1) as f64),
             presents_window: 0,
             fps: 0.0,
             fps_window_start: Instant::now(),
+            danmaku_fps: 0.0,
+            danmaku_frames_prev: 0,
+            ui_fps: 0.0,
+            ui_presents_prev: 0,
+            ui_draw_us_total: 0,
+            ui_draw_count: 0,
             generated: 0,
             blend_us_total: 0,
             blend_count: 0,
             last_blend_us: 0,
+            interp_ticks: 0,
+            interp_blends: 0,
+            interp_cuts: 0,
             ui_dirty: true,
-            last_ui_draw: Instant::now(),
+            next_ui_draw: Instant::now(),
             status: if loading {
                 "正在打开视频…".to_string()
             } else {
@@ -806,9 +1095,37 @@ impl Engine {
             },
             drag_preview: None,
             dragging: false,
+            precision_open: false,
+            precision_dragging: false,
+            precision_anim: 0.0,
+            precision_morph_from: 0.0,
+            precision_morph_start: Instant::now(),
+            precision_step_open: false,
+            speed_open: false,
+            speed_drag: None,
+            speed_preview: crate::speed::snap(speed),
+            speed_base: crate::speed::snap(speed),
+            speed_commit_at: None,
+            panel: 0,
+            wheel_volume_accum: 0.0,
+            wheel_volume_dir: 0.0,
+            volume_wheel_until: None,
+            tuner_drag: None,
+            tuner_offset: 0.0,
+            tuner_pulse: 0.0,
+            tuner_pulse_dir: 0.0,
+            ab_a: None,
+            ab_b: None,
+            ab_swap_wait: None,
+            ab_cache: None,
+            ab_cache_playing: false,
+            ab_cache_cursor: 0,
+            frame_step: 1,
+            heatmap: [0; HEAT_BUCKETS],
             window_drag_arm: None,
+            sidebar_drag_arm: None,
             popup_drag: None,
-            enhance_open: false,
+            loop_menu_open: false,
             mini: false,
             mini_saved: None,
             mini_hint_until: None,
@@ -820,12 +1137,17 @@ impl Engine {
             sidebar_extra: false,
             sidebar_tab: SidebarTab::Info,
             sidebar_scroll: 0.0,
+            sidebar_scroll_target: 0.0,
+            info_scroll_height: -1.0,
+            info_scroll_width: 0.0,
+            playlist_prefetch_started: false,
             danmaku_popup: false,
             dm_input: String::new(),
             dm_input_focus: false,
             dm_send_rx: None,
             info: Some(InfoUi {
                 title: source_title.clone(),
+                video_id: source_id,
                 owner: String::new(),
                 views: 0,
                 pubdate: 0,
@@ -842,23 +1164,42 @@ impl Engine {
             comments_loading: false,
             comments_end: false,
             comments_cursor: String::new(),
+            comments_sort_mix: 0.0,
+            comments_enter: 1.0,
+            comments_generation: 0,
+            comments_reload_pending: false,
+            comments_anim_last: Instant::now(),
             detail_tx,
             detail_rx,
             avatars: std::collections::HashMap::new(),
             switch_rx: None,
             switch_target: None,
+            switch_started: None,
+            switch_from_page: None,
+            switch_resume_ms: 0,
+            page_loading: None,
             track_rx: None,
             track_kind: None,
             settings_menu: None,
+            quality_height_pref: stored_settings.player_quality_height,
             liked: false,
             coined: false,
             favorited: false,
             toast: None,
             toast_until: None,
-            ui_ms: 0.0,
             queue_len: 0,
             dropped: 0,
             audio_ms: 0,
+            net_pid: 0,
+            net_read: 0,
+            net_at: Instant::now(),
+            net_bps: 0.0,
+            net_base_read: 0,
+            net_base_pos: 0,
+            cache_net_read: 0,
+            net_lead_s: 0.0,
+            cache_done: 0,
+            cache_total: 0,
             aid: 0,
             heartbeat,
             heartbeat_started: false,
@@ -876,9 +1217,10 @@ impl Engine {
             had_first_frame: false,
             stalled: false,
             stall_until: None,
+            stall_audio_paused: false,
             error: None,
             danmaku_opacity: stored_settings.danmaku_opacity.min(100),
-            danmaku_font: stored_settings.danmaku_font.min(2),
+            danmaku_font: o11a1::settings::normalise_danmaku_font(stored_settings.danmaku_font),
             danmaku_speed: stored_settings.danmaku_speed.clamp(50, 200),
             danmaku_area: o11a1::settings::clamp_area(stored_settings.danmaku_area),
             block_scroll: stored_settings.block_scroll,
@@ -915,21 +1257,37 @@ impl Engine {
         // The comment layer follows the display, not the 60 fps video grid.
         // 120 Hz panels therefore get 120 Hz scrolling comments.
         log::line(&format!(
-            "danmaku cadence hz={} independent=1",
-            crate::interp::display_refresh_hz().clamp(30, 120)
+            "danmaku cadence hz={} independent=1 monitor={}hz",
+            engine.monitor_hz.clamp(30, 120),
+            engine.monitor_hz
         ));
         if loading {
             log::line("player window ready; waiting for the resolved source");
         } else {
             engine.open_sessions(start_ms, false)?;
+            engine.start_playlist_prefetch();
         }
         let start_mini = std::env::var("BILI_PLAYER_MINI")
-            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "on" | "true" | "yes"
+                )
+            })
             .unwrap_or(false);
         if start_mini {
             engine.set_mini(true);
         }
         engine.draw_ui()?;
+        // The first present on a freshly created composition tree can still be
+        // a partially rasterised surface (toolbar only, no loading card). Let
+        // it settle, draw a second complete frame, and only then reveal the
+        // window so no empty frame flashes between the click and the player.
+        std::thread::sleep(std::time::Duration::from_millis(32));
+        engine.draw_ui()?;
+        if !external {
+            window::show_player(engine.hwnd);
+        }
         Ok(engine)
     }
 
@@ -946,16 +1304,22 @@ impl Engine {
             height: self.source.height,
             fps: self.source.fps,
             speed: self.speed as f64,
+            cache_key: if self.is_live {
+                None
+            } else {
+                crate::source::media_cache_key(&self.source, false)
+            },
+            hw_decoder: self.source.hw_decoder.clone(),
         }
     }
 
-    fn open_sessions(&mut self, start_ms: u64, gate_open: bool) -> Result<()> {
-        self.generation = self.generation.saturating_add(1);
-        let generation = self.generation;
-        let decoder = VideoDecoder::spawn(&self.video_spec(), start_ms, generation, gate_open)
-            .with_context(|| format!("open video decoder at {start_ms} ms"))?;
-        self.decoder = Some(decoder);
+    /// Audio is useful up to 2×; above that the atempo chain cannot keep the
+    /// media clock moving and would drag the picture below the selected speed.
+    fn audio_speed_allowed(&self) -> bool {
+        self.speed <= 2.0
+    }
 
+    fn spawn_audio_at(&mut self, start_ms: u64) {
         let audio_url = self
             .source
             .audio_url
@@ -971,13 +1335,127 @@ impl Engine {
             start_ms,
             self.speed as f64,
             if self.muted { 0 } else { self.volume },
+            if self.is_live || self.source.audio_url.is_none() {
+                None
+            } else {
+                crate::source::media_cache_key(&self.source, true)
+            },
         );
+        // Starts paused until the picture's first frame is ready; the
+        // seek/start state machine resumes both together.
+        audio.send(AudioCommand::Pause);
         self.audio = Some(audio);
-        // Every session starts paused until the picture's first frame is ready
-        // and the seek/start state machine resumes both together. Without this
-        // a slow HEVC seek let the sound run ~2 s ahead of the picture.
-        if let Some(audio) = &self.audio {
-            audio.send(AudioCommand::Pause);
+    }
+
+    /// Fill the disk cache for the entries after the current one. The active
+    /// entry's cache is drained first, so queue prefetch never competes with
+    /// the picture the user is watching.
+    fn start_playlist_prefetch(&mut self) {
+        log::line(&format!(
+            "playlist prefetch check started={} live={} bvid={:?}",
+            u8::from(self.playlist_prefetch_started),
+            u8::from(self.is_live),
+            self.source.bvid
+        ));
+        if self.playlist_prefetch_started || self.is_live {
+            return;
+        }
+        let Some(current) = self
+            .source
+            .bvid
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            log::line("playlist prefetch skipped: no current bvid");
+            return;
+        };
+        let settings = o11a1::settings::load();
+        let Some(index) = settings
+            .playlist
+            .iter()
+            .position(|entry| entry.bvid == current)
+        else {
+            log::line("playlist prefetch skipped: current not in queue");
+            return;
+        };
+        let entries: Vec<(String, u64)> = settings
+            .playlist
+            .iter()
+            .skip(index + 1)
+            .filter(|entry| !entry.bvid.trim().is_empty())
+            .map(|entry| (entry.bvid.clone(), entry.cid))
+            .collect();
+        if entries.is_empty() {
+            log::line("playlist prefetch skipped: no entries after current");
+            return;
+        }
+        log::line(&format!(
+            "playlist prefetch queued current_index={} entries={}",
+            index,
+            entries.len()
+        ));
+        self.playlist_prefetch_started = true;
+        let quality_height = settings.player_quality_height;
+        let codec = if settings.codec_pref > 0 {
+            Some(settings.codec_pref as i64)
+        } else {
+            None
+        };
+        let active_video = crate::source::media_cache_key(&self.source, false);
+        let active_audio = crate::source::media_cache_key(&self.source, true);
+        let _ = std::thread::Builder::new()
+            .name("playlist-prefetch".into())
+            .spawn(move || {
+                if let Some(key) = active_video {
+                    crate::mediacache::wait_for_key(&key);
+                }
+                if let Some(key) = active_audio {
+                    crate::mediacache::wait_for_key(&key);
+                }
+                log::line("playlist prefetch active-cache ready");
+                for (bvid, cid) in entries {
+                    log::line(&format!("playlist prefetch resolve start bvid={bvid} cid={cid}"));
+                    let config = PlayerConfig {
+                        bvid: Some(bvid.clone()),
+                        cid: (cid > 0).then_some(cid),
+                        quality_height: Some(quality_height),
+                        quality_codecid: codec,
+                        ..Default::default()
+                    };
+                    match crate::source::resolve(&config) {
+                        Ok(resolved) => {
+                            let ok = crate::mediacache::prefetch_source(&resolved.source);
+                            log::line(&format!(
+                                "playlist prefetch bvid={bvid} cid={cid} ok={}",
+                                u8::from(ok)
+                            ));
+                        }
+                        Err(error) => log::line(&format!(
+                            "playlist prefetch resolve failed bvid={bvid} err={error:#}"
+                        )),
+                    }
+                }
+            });
+    }
+
+    fn open_sessions(&mut self, start_ms: u64, gate_open: bool) -> Result<()> {
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+        let decoder = VideoDecoder::spawn(&self.video_spec(), start_ms, generation, gate_open)
+            .with_context(|| format!("open video decoder at {start_ms} ms"))?;
+        self.decoder = Some(decoder);
+
+        // Above 2× the sound is unintelligible and its reader becomes the
+        // bottleneck: at 10× the audio clock only reached ~4.7× and dragged
+        // the picture with it. Run these speeds video-only and let the wall
+        // clock drive the timeline.
+        if let Some(mut audio) = self.audio.take() {
+            audio.stop();
+        }
+        if self.audio_speed_allowed() {
+            self.spawn_audio_at(start_ms);
+        } else {
+            log::line(&format!("audio skipped at speed={:.2}", self.speed));
         }
         self.session_started = Instant::now();
         self.shared.position_ms.store(start_ms, Ordering::SeqCst);
@@ -986,6 +1464,7 @@ impl Engine {
     }
 
     fn stop_sessions(&mut self) {
+        self.stall_audio_paused = false;
         if let Some(mut decoder) = self.decoder.take() {
             decoder.stop();
         }
@@ -995,19 +1474,30 @@ impl Engine {
     }
 
     fn restart_at(&mut self, target_ms: u64) -> Result<()> {
+        self.drop_loop_prefetch();
+        self.stall_audio_paused = false;
+        self.ab_swap_wait = None;
+        self.ab_cache_playing = false;
+        self.ab_cache_cursor = 0;
+        self.pending_wheel_seek = None;
         let target = clamp_seek(target_ms, self.duration_ms);
         let was_playing = self.requested_play;
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         self.danmaku.reseed(target);
-        if let Err(error) = self.danmaku_layer.clear() {
-            log::line(&format!("danmaku clear on seek failed: {error:#}"));
-        }
+        let _ = self.danmaku_layer.clear();
         log::line(&format!(
             "danmaku seek reset target_ms={target} gen={generation} active=0"
         ));
         if let Some(mut decoder) = self.decoder.take() {
             decoder.stop();
+        }
+        if self.speed > 2.0 {
+            if let Some(mut audio) = self.audio.take() {
+                audio.stop();
+            }
+        } else if self.audio.is_none() {
+            self.spawn_audio_at(target);
         }
         if let Some(audio) = &self.audio {
             // The old session's `ready` flag must not let the new picture
@@ -1035,13 +1525,16 @@ impl Engine {
         self.ended = false;
         self.playing = false;
         self.seek_target = target;
+        self.stream_start_ms = target;
         self.position_ms = target;
         self.base_ms = target;
         self.anchor = None;
         self.paused_at = target;
         self.audio_master = false;
         self.first_frame_at = None;
-        self.blend_at = None;
+        self.next = None;
+        self.cur_ts_ms = target;
+        self.next_tick_at = None;
         self.gate(false);
         self.status = "定位中…".to_string();
         self.ui_dirty = true;
@@ -1097,7 +1590,771 @@ impl Engine {
         self.wall_position()
     }
 
+    /// ---------------------------------------------------------- precision seek
+
+    fn open_precision(&mut self) {
+        self.heatmap = build_heatmap(self.danmaku.items(), self.duration_ms);
+        if self.speed_open {
+            self.commit_speed_preview();
+            self.speed_open = false;
+            self.speed_drag = None;
+            self.speed_commit_at = None;
+        }
+        self.panel = 1;
+        self.precision_open = true;
+        self.precision_dragging = false;
+        self.precision_morph_from = self.precision_anim;
+        self.precision_morph_start = Instant::now();
+        self.precision_step_open = false;
+        self.tuner_drag = None;
+        self.tuner_offset = 0.0;
+        self.tuner_pulse = 0.0;
+        self.tuner_pulse_dir = 0.0;
+        // The precision panel replaces the toolbar, so any floating menu from
+        // the toolbar is closed before the morph starts.
+        self.close_dm_menu();
+        self.loop_menu_open = false;
+        self.danmaku_popup = false;
+        self.dm_input_focus = false;
+        self.settings_menu = None;
+        self.chrome_shown = true;
+        self.ui_dirty = true;
+        self.note_activity();
+        log::line("precision seek opened");
+    }
+
+    /// Toolbar button entry: open the precision panel, or return to the
+    /// ordinary toolbar if it is already visible.
+    fn toggle_precision(&mut self) {
+        if self.precision_open {
+            self.close_precision();
+        } else {
+            self.open_precision();
+        }
+    }
+
+    fn close_precision(&mut self) {
+        if !self.precision_open {
+            return;
+        }
+        self.precision_open = false;
+        self.precision_dragging = false;
+        self.precision_morph_from = self.precision_anim;
+        self.precision_morph_start = Instant::now();
+        self.precision_step_open = false;
+        self.tuner_drag = None;
+        self.tuner_offset = 0.0;
+        self.tuner_pulse = 0.0;
+        self.tuner_pulse_dir = 0.0;
+        self.drag_preview = None;
+        self.chrome_shown = true;
+        self.last_mouse_activity = Instant::now();
+        self.ui_dirty = true;
+        log::line("precision seek closed");
+    }
+
+    /// --------------------------------------------------------------- speed
+
+    fn open_speed(&mut self) {
+        if self.precision_open {
+            self.precision_open = false;
+            self.precision_dragging = false;
+            self.precision_step_open = false;
+            self.drag_preview = None;
+            self.tuner_drag = None;
+            self.tuner_offset = 0.0;
+            self.tuner_pulse = 0.0;
+            self.tuner_pulse_dir = 0.0;
+        }
+        self.panel = 2;
+        self.speed_open = true;
+        self.speed_drag = None;
+        self.speed_preview = crate::speed::snap(self.speed);
+        self.speed_base = self.speed_preview;
+        self.speed_commit_at = None;
+        self.tuner_offset = 0.0;
+        self.tuner_pulse = 0.0;
+        self.tuner_pulse_dir = 0.0;
+        self.precision_morph_from = self.precision_anim;
+        self.precision_morph_start = Instant::now();
+        self.close_dm_menu();
+        self.loop_menu_open = false;
+        self.danmaku_popup = false;
+        self.dm_input_focus = false;
+        self.settings_menu = None;
+        self.chrome_shown = true;
+        self.ui_dirty = true;
+        self.note_activity();
+        log::line(&format!("speed panel opened speed={:.2}", self.speed));
+    }
+
+    fn toggle_speed(&mut self) {
+        if self.speed_open {
+            self.close_speed();
+        } else {
+            self.open_speed();
+        }
+    }
+
+    fn close_speed(&mut self) {
+        if !self.speed_open {
+            return;
+        }
+        self.commit_speed_preview();
+        self.speed_open = false;
+        self.speed_drag = None;
+        self.speed_commit_at = None;
+        self.tuner_offset = 0.0;
+        self.tuner_pulse = 0.0;
+        self.tuner_pulse_dir = 0.0;
+        self.precision_morph_from = self.precision_anim;
+        self.precision_morph_start = Instant::now();
+        self.chrome_shown = true;
+        self.last_mouse_activity = Instant::now();
+        self.ui_dirty = true;
+        log::line("speed panel closed");
+    }
+
+    /// Update the value shown in the panel without restarting the decoder.
+    /// The wheel only has discrete stops, so every preview lands on one.
+    fn preview_speed(&mut self, value: f32) {
+        self.speed_preview = crate::speed::snap(value);
+        self.ui_dirty = true;
+    }
+
+    /// Scroll the reel under the fixed selection window. Dragging left moves
+    /// toward faster stops: the reel travels left and faster labels come in
+    /// from the right. Every stop is one equal gap; the fractional travel is
+    /// kept in `tuner_offset` so labels glide until release, when the chosen
+    /// stop settles exactly in the window.
+    fn drag_speed(&mut self, start_x: f32, start_speed: f32, x: f32) {
+        let gap = crate::speed::WHEEL_GAP * self.overlay.layout.scale;
+        let steps = (start_x - x) / gap;
+        let target = crate::speed::from_index(
+            crate::speed::index_of(start_speed) as i32 + steps.round() as i32,
+        );
+        self.preview_speed(target);
+        self.speed_base = start_speed;
+        self.tuner_offset = -steps * gap;
+        self.tuner_pulse = 0.0;
+    }
+
+    fn commit_speed_preview(&mut self) {
+        let speed = crate::speed::snap(self.speed_preview);
+        self.speed_preview = speed;
+        self.speed_base = speed;
+        if (speed - self.speed).abs() < 0.001 {
+            self.ui_dirty = true;
+            return;
+        }
+        self.set_speed(speed as f64);
+    }
+
+    fn poll_pending_speed(&mut self) {
+        let Some(at) = self.speed_commit_at else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        self.speed_commit_at = None;
+        self.commit_speed_preview();
+    }
+
+    fn handle_speed_click(&mut self, px: f32, py: f32) -> bool {
+        let layout = self.overlay.layout;
+        if layout.speed_wheel.contains(px, py) {
+            self.speed_drag = Some((px, self.speed_preview));
+            self.speed_base = self.speed_preview;
+            self.speed_commit_at = None;
+            self.tuner_offset = 0.0;
+            self.tuner_pulse = 0.0;
+            return true;
+        }
+        layout.speed_panel.contains(px, py)
+    }
+
+    /// A and B are the only loop controls: once both points are set the
+    /// player always loops that span. There is no separate enable switch.
+    fn ab_range(&self) -> Option<(u64, u64)> {
+        match (self.ab_a, self.ab_b) {
+            (Some(a), Some(b)) if b > a => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    fn drop_loop_prefetch(&mut self) {
+        if let Some(mut decoder) = self.loop_prefetch.take() {
+            decoder.stop();
+            log::line("ab prefetch dropped");
+        }
+    }
+
+    /// While the current pass approaches B, start decoding at A in the
+    /// background. The warmed queue is swapped in at the loop point, so the
+    /// picture never tears down the decoder or re-opens the source.
+    fn poll_ab_prefetch(&mut self) {
+        if self.ab_cache_playing
+            || self
+                .ab_cache
+                .as_ref()
+                .map(|cache| cache.ready)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        if !self.requested_play || self.ended {
+            return;
+        }
+        let Some((a, b)) = self.ab_range() else {
+            return;
+        };
+        if b <= a || self.loop_prefetch.is_some() {
+            return;
+        }
+        // While the first pass is still seeking/starting at A, the clock can
+        // still read the old position. The seek target is already A, so warm
+        // the next pass from there instead of waiting for playback to resume.
+        let position = if self.seek_in_flight {
+            self.seek_target
+        } else {
+            self.position_now()
+        };
+        if position < a || position >= b {
+            return;
+        }
+        // Start the next pass as soon as the current one enters A–B. Short
+        // loops then get the whole span as load budget instead of the old
+        // 1.2 s tail (and loops under 1.6 s no longer skip prefetch entirely).
+        let generation = self.generation.wrapping_add(1);
+        match VideoDecoder::spawn(&self.video_spec(), a, generation, true) {
+            Ok(decoder) => {
+                self.loop_prefetch = Some(decoder);
+                log::line(&format!(
+                    "ab prefetch spawn a={a} b={b} position={position} gen={generation}"
+                ));
+            }
+            Err(error) => {
+                log::line(&format!("ab prefetch failed a={a} err={error:#}"));
+            }
+        }
+    }
+
+    /// Reset the presentation clock and audio/danmaku to A for another pass.
+    /// Shared by the prefetch swap and the cached A–B replay.
+    fn reset_loop_clock(&mut self, a: u64) {
+        self.danmaku.reseed(a);
+        let _ = self.danmaku_layer.clear();
+        if let Some(audio) = &self.audio {
+            audio.clock.ready.store(false, Ordering::SeqCst);
+            audio.clock.playing.store(false, Ordering::SeqCst);
+            audio.clock.position_ms.store(a, Ordering::SeqCst);
+            audio.send(AudioCommand::Seek {
+                target_ms: a,
+                speed: self.speed as f64,
+            });
+        }
+        self.position_ms = a;
+        self.base_ms = a;
+        self.paused_at = a;
+        self.seek_target = a;
+        self.stream_start_ms = a;
+        self.seek_in_flight = false;
+        self.starting = false;
+        self.ended = false;
+        self.playing = self.requested_play;
+        self.audio_master = false;
+        self.anchor = Some(Instant::now());
+        self.cur_ts_ms = a;
+        self.next = None;
+        self.next_tick_at = Some(Instant::now());
+        self.gate(self.playing);
+        self.status.clear();
+        self.shared.position_ms.store(a, Ordering::SeqCst);
+        self.ui_dirty = true;
+        self.sync_shared();
+    }
+
+    fn swap_loop_prefetch(&mut self, a: u64) -> bool {
+        self.ab_swap_wait = None;
+        let Some(mut prefetch) = self.loop_prefetch.take() else {
+            return false;
+        };
+        if prefetch.queue.len() == 0 {
+            // Keep the warming decoder for the grace wait instead of throwing
+            // it away and reloading the video.
+            self.loop_prefetch = Some(prefetch);
+            log::line("ab prefetch not ready");
+            return false;
+        }
+        if let Some(mut old) = self.decoder.take() {
+            old.stop();
+        }
+        self.generation = prefetch.generation;
+        self.decoder = Some(prefetch);
+        self.reset_loop_clock(a);
+        log::line(&format!(
+            "ab loop swapped prefetched decoder a={a} gen={}",
+            self.generation
+        ));
+        true
+    }
+
+    fn cache_ab_frame(&mut self, frame: &DecodedFrame) {
+        if self.ab_cache_playing {
+            return;
+        }
+        let Some((a, b)) = self.ab_range() else {
+            self.ab_cache = None;
+            return;
+        };
+        if b <= a || b - a > AB_CACHE_MAX_MS {
+            self.ab_cache = None;
+            return;
+        }
+        let span_changed = self
+            .ab_cache
+            .as_ref()
+            .map(|cache| cache.a != a || cache.b != b)
+            .unwrap_or(true);
+        if span_changed {
+            self.ab_cache = Some(AbCache {
+                a,
+                b,
+                frames: Vec::new(),
+                bytes: 0,
+                ready: false,
+                disabled: false,
+            });
+        }
+        let Some(cache) = self.ab_cache.as_mut() else {
+            return;
+        };
+        if cache.disabled
+            || cache.ready
+            || frame.ts_ms < a
+            || frame.ts_ms >= b
+            || cache
+                .frames
+                .last()
+                .map(|last| frame.ts_ms <= last.ts_ms)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        if cache.bytes.saturating_add(frame.data.len()) > AB_CACHE_MAX_BYTES {
+            cache.disabled = true;
+            cache.frames.clear();
+            cache.bytes = 0;
+            log::line("ab cache disabled: size cap");
+            return;
+        }
+        cache.bytes += frame.data.len();
+        cache.frames.push(DecodedFrame {
+            data: frame.data.clone(),
+            ts_ms: frame.ts_ms,
+        });
+        if frame.ts_ms.saturating_add(50) >= b {
+            cache.ready = true;
+            log::line(&format!(
+                "ab cache ready a={a} b={b} frames={} bytes={}",
+                cache.frames.len(),
+                cache.bytes
+            ));
+        }
+    }
+
+    fn start_ab_cache_loop(&mut self, a: u64) -> bool {
+        let ready = self
+            .ab_cache
+            .as_ref()
+            .map(|cache| cache.ready && !cache.frames.is_empty())
+            .unwrap_or(false);
+        if !ready {
+            return false;
+        }
+        self.ab_cache_playing = true;
+        self.ab_cache_cursor = 0;
+        self.ab_swap_wait = None;
+        self.drop_loop_prefetch();
+        self.gate(false);
+        self.reset_loop_clock(a);
+        // The cached pass does not consume the live decoder; keep its gate
+        // closed so it cannot decode past B in the background.
+        self.gate(false);
+        log::line(&format!("ab cache replay start a={a}"));
+        true
+    }
+
+    fn reset_ab_cache(&mut self) {
+        self.ab_cache = None;
+        self.ab_cache_playing = false;
+        self.ab_cache_cursor = 0;
+    }
+
+    fn take_ab_cache_frame(&mut self, horizon_ms: u64) -> Option<DecodedFrame> {
+        let cache = self.ab_cache.as_mut()?;
+        while self.ab_cache_cursor < cache.frames.len() {
+            let frame = &cache.frames[self.ab_cache_cursor];
+            if frame.ts_ms > horizon_ms {
+                return None;
+            }
+            let out = DecodedFrame {
+                data: frame.data.clone(),
+                ts_ms: frame.ts_ms,
+            };
+            self.ab_cache_cursor += 1;
+            return Some(out);
+        }
+        None
+    }
+
+    fn set_ab_a(&mut self) {
+        self.drop_loop_prefetch();
+        self.ab_swap_wait = None;
+        let was_cache = self.ab_cache_playing;
+        self.reset_ab_cache();
+        if was_cache {
+            let at = self.position_now();
+            self.seek(at);
+        }
+        let at = self.position_now();
+        self.ab_a = Some(at);
+        if self.ab_b.map(|b| b <= at).unwrap_or(false) {
+            self.ab_b = None;
+        }
+        self.ui_dirty = true;
+        log::line(&format!("ab a={at} range={:?}", self.ab_range()));
+    }
+
+    fn set_ab_b(&mut self) {
+        self.drop_loop_prefetch();
+        self.ab_swap_wait = None;
+        let was_cache = self.ab_cache_playing;
+        self.reset_ab_cache();
+        if was_cache {
+            let at = self.position_now();
+            self.seek(at);
+        }
+        let at = self.position_now();
+        if let Some(a) = self.ab_a {
+            if at <= a {
+                self.show_toast("B 必须晚于 A", true);
+                return;
+            }
+        }
+        self.ab_b = Some(at);
+        if let Some((a, b)) = self.ab_range() {
+            // B was just stamped at the playhead (or beyond it): jump back to A
+            // so the promised A–B loop starts immediately.
+            if self.position_now() >= b {
+                self.seek(a);
+            }
+            log::line(&format!("ab range start a={a} b={b}"));
+        }
+        self.ui_dirty = true;
+        log::line(&format!("ab b={at} range={:?}", self.ab_range()));
+    }
+
+    fn clear_ab(&mut self) {
+        self.drop_loop_prefetch();
+        self.ab_swap_wait = None;
+        let was_cache = self.ab_cache_playing;
+        self.reset_ab_cache();
+        if was_cache {
+            let at = self.position_now();
+            self.seek(at);
+        }
+        self.ab_a = None;
+        self.ab_b = None;
+        self.pending_wheel_seek = None;
+        self.ui_dirty = true;
+        log::line("ab cleared");
+    }
+
+    /// Quantize a frame nudge against the source frame rate. The preview is
+    /// shown immediately; the caller decides when to issue the decoder seek.
+    fn nudge_frames(&mut self, frames: i64) -> Option<u64> {
+        let fps = if self.source.fps > 1.0 {
+            self.source.fps
+        } else {
+            30.0
+        };
+        let frame_ms = 1000.0 / fps;
+        // While a previous detent's seek is still in flight, keep stacking
+        // against its target. Reading the old clock for every fast wheel notch
+        // would make most of them land on the same position.
+        let current = self.drag_preview.unwrap_or_else(|| {
+            if self.seek_in_flight {
+                self.seek_target
+            } else {
+                self.position_now()
+            }
+        });
+        let index = (current as f64 / frame_ms).round() + frames as f64;
+        let target = self.clamp_position((index.max(0.0) * frame_ms).round() as u64);
+        self.drag_preview = Some(target);
+        self.ui_dirty = true;
+        Some(target)
+    }
+
+    fn sidebar_max_scroll(&mut self) -> f32 {
+        let layout = self.overlay.layout;
+        let s = layout.scale;
+        let content = layout.sidebar_content;
+        let viewport = content.height().max(1.0);
+        match self.sidebar_tab {
+            SidebarTab::Comments => {
+                let list_h = self.overlay.comments_list_height();
+                let list_viewport = (viewport - layout.comments_header.height()).max(1.0);
+                (list_h - list_viewport).max(0.0)
+            }
+            SidebarTab::Episodes => {
+                let pages = self
+                    .pages
+                    .len()
+                    .max(self.info.as_ref().map(|info| info.pages.len()).unwrap_or(0));
+                let rows = pages as f32 * 52.0 * s;
+                (52.0 * s + rows - (viewport - 8.0 * s)).max(0.0)
+            }
+            SidebarTab::Settings => {
+                let rows = SETTINGS_ROWS as f32 * 48.0 * s;
+                let count = self.settings_menu_len();
+                let menu_h = if count > 0 {
+                    settings_menu_height(s, count)
+                } else {
+                    0.0
+                };
+                (rows + menu_h - (viewport - 8.0 * s)).max(0.0)
+            }
+            SidebarTab::Performance => (PERFORMANCE_CONTENT_H * s - viewport).max(0.0),
+            SidebarTab::Info => {
+                let description = self
+                    .info
+                    .as_ref()
+                    .map(|info| info.description.trim())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("暂无简介");
+                let width = layout.info_description.width();
+                if self.info_scroll_height < 0.0
+                    || (self.info_scroll_width - width).abs() > 0.5
+                {
+                    self.info_scroll_height =
+                        self.overlay.info_description_height(description, width);
+                    self.info_scroll_width = width;
+                }
+                let bottom = layout.info_description.top + self.info_scroll_height + 16.0 * s;
+                (bottom - content.bottom).max(0.0)
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn animate_sidebar_scroll(&mut self) {
+        if !self.sidebar_open {
+            return;
+        }
+        let max = self.sidebar_max_scroll();
+        self.sidebar_scroll_target = self.sidebar_scroll_target.clamp(0.0, max);
+        let diff = self.sidebar_scroll_target - self.sidebar_scroll;
+        if diff.abs() > 0.35 {
+            self.sidebar_scroll += diff * 0.24;
+            self.ui_dirty = true;
+        } else if self.sidebar_scroll != self.sidebar_scroll_target {
+            self.sidebar_scroll = self.sidebar_scroll_target;
+            self.ui_dirty = true;
+        }
+    }
+
+    fn enforce_ab_loop(&mut self) {
+        if self.ab_cache_playing {
+            return;
+        }
+        if self.seek_in_flight
+            || self.dragging
+            || self.precision_dragging
+            || self.tuner_drag.is_some()
+            || !self.playing
+        {
+            return;
+        }
+        let Some((a, b)) = self.ab_range() else {
+            return;
+        };
+        if let Some((wait_a, since)) = self.ab_swap_wait {
+            if wait_a != a {
+                self.ab_swap_wait = None;
+            } else if self
+                .loop_prefetch
+                .as_ref()
+                .map(|decoder| decoder.queue.len() > 0)
+                .unwrap_or(false)
+            {
+                // The next pass has its first frame: swap without a reload.
+                self.swap_loop_prefetch(a);
+                return;
+            } else if since.elapsed() >= Duration::from_millis(600) {
+                self.ab_swap_wait = None;
+                self.drop_loop_prefetch();
+                log::line("ab loop wait timeout; falling back to seek");
+                self.seek(a);
+                return;
+            } else {
+                return;
+            }
+        }
+        if self.position_ms < a || self.position_ms >= b {
+            if self
+                .ab_cache
+                .as_ref()
+                .map(|cache| cache.ready)
+                .unwrap_or(false)
+                && self.start_ab_cache_loop(a)
+            {
+                return;
+            }
+            if self.swap_loop_prefetch(a) {
+                return;
+            }
+            if self.loop_prefetch.is_some() {
+                // The prefetch is spawned but its first frame is not ready yet.
+                // Hold the last picture for a short grace instead of tearing
+                // down the decoder, which is what showed as a reload at A.
+                self.ab_swap_wait = Some((a, Instant::now()));
+                self.gate(false);
+                if let Some(audio) = &self.audio {
+                    audio.send(AudioCommand::Pause);
+                }
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "ab loop waiting for prefetch a={a} position={}",
+                    self.position_ms
+                ));
+                return;
+            }
+            self.seek(a);
+        }
+    }
+
+    /// Ease the toolbar↔bottom-panel morph and the frame wheel's glide. Runs
+    /// every loop turn; marks the UI dirty while either is still moving, so
+    /// the 16 ms redraw path stays active for the whole animation.
+    fn advance_precision_anim(&mut self) {
+        let target = if self.precision_open || self.speed_open {
+            1.0
+        } else {
+            0.0
+        };
+        let progress = (self.precision_morph_start.elapsed().as_secs_f32() / 0.36).clamp(0.0, 1.0);
+        let next = self.precision_morph_from + (target - self.precision_morph_from) * progress;
+        if (next - self.precision_anim).abs() > 0.0001 {
+            self.precision_anim = next;
+            self.ui_dirty = true;
+        }
+        if progress >= 1.0 && self.precision_anim != target {
+            self.precision_anim = target;
+            self.ui_dirty = true;
+        }
+        if self.tuner_pulse > 0.0 {
+            self.tuner_pulse = (self.tuner_pulse + 0.12).min(1.0);
+            let travel = 12.0 * self.scale;
+            self.tuner_offset =
+                self.tuner_pulse_dir * travel * (std::f32::consts::PI * self.tuner_pulse).sin();
+            if self.tuner_pulse >= 1.0 {
+                self.tuner_pulse = 0.0;
+                self.tuner_offset = 0.0;
+            }
+            self.ui_dirty = true;
+        } else if self.tuner_drag.is_none() && self.speed_drag.is_none() {
+            let glide = -self.tuner_offset;
+            if glide.abs() > 0.05 {
+                self.tuner_offset += glide * 0.42;
+                self.ui_dirty = true;
+            } else if self.tuner_offset != 0.0 {
+                self.tuner_offset = 0.0;
+                self.ui_dirty = true;
+            }
+        }
+        // Keep the panel kind through the close animation so its content can
+        // fade with the card; only forget it once the toolbar is fully back.
+        if !self.precision_open && !self.speed_open && self.precision_anim <= 0.0001 && self.panel != 0
+        {
+            self.panel = 0;
+            self.ui_dirty = true;
+        }
+    }
+
+    fn handle_precision_click(&mut self, px: f32, py: f32) -> bool {
+        let layout = self.overlay.layout;
+        if self.precision_step_open {
+            for (index, rect) in layout.precision_step_rows.iter().enumerate() {
+                if rect.contains(px, py) {
+                    self.frame_step = [1u64, 2, 5, 10][index];
+                    self.precision_step_open = false;
+                    self.ui_dirty = true;
+                    return true;
+                }
+            }
+            if layout.precision_step.contains(px, py) {
+                self.precision_step_open = false;
+                self.ui_dirty = true;
+                return true;
+            }
+            if layout.precision_step_menu.contains(px, py) {
+                self.precision_step_open = false;
+                self.ui_dirty = true;
+                return true;
+            }
+            // Clicking anywhere else closes the select and still reaches the
+            // control underneath in this same click.
+            self.precision_step_open = false;
+            self.ui_dirty = true;
+        }
+        if layout.precision_step.contains(px, py) {
+            self.precision_step_open = true;
+            self.ui_dirty = true;
+            return true;
+        }
+        if layout.precision_a.contains(px, py) {
+            self.set_ab_a();
+            return true;
+        }
+        if layout.precision_b.contains(px, py) {
+            self.set_ab_b();
+            return true;
+        }
+        if layout.precision_clear.contains(px, py) {
+            self.clear_ab();
+            return true;
+        }
+        if layout.precision_wheel.contains(px, py) {
+            let start = self.drag_preview.unwrap_or_else(|| self.position_now());
+            self.tuner_drag = Some((px, start));
+            self.tuner_offset = 0.0;
+            self.tuner_pulse = 0.0;
+            self.precision_dragging = false;
+            self.pending_wheel_seek = None;
+            self.drag_preview = Some(start);
+            self.ui_dirty = true;
+            return true;
+        }
+        if layout.precision_track.contains(px, py) {
+            self.precision_dragging = true;
+            if self.duration_ms > 0 {
+                let fraction = ((px - layout.precision_track.left)
+                    / layout.precision_track.width().max(1.0))
+                .clamp(0.0, 1.0);
+                self.drag_preview = Some((fraction as f64 * self.duration_ms as f64) as u64);
+                self.ui_dirty = true;
+            }
+            return true;
+        }
+        layout.precision.contains(px, py)
+    }
+
     fn pause(&mut self) {
+        self.drop_loop_prefetch();
+        self.pending_wheel_seek = None;
         self.requested_play = false;
         if self.seek_in_flight {
             if let Some(audio) = &self.audio {
@@ -1149,6 +2406,7 @@ impl Engine {
         self.ended = false;
         self.on_playback_started();
         self.gate(true);
+        self.enforce_ab_loop();
         if let Some(audio) = &self.audio {
             audio.send(AudioCommand::Resume);
         }
@@ -1164,6 +2422,25 @@ impl Engine {
         } else {
             self.play();
         }
+    }
+
+    /// The wheel only moves the preview. Once the notches stop for a beat, the
+    /// engine commits one real seek instead of tearing the decoder down for
+    /// every notch.
+    fn poll_pending_wheel_seek(&mut self) {
+        let Some((target, at)) = self.pending_wheel_seek else {
+            return;
+        };
+        if at.elapsed() < Duration::from_millis(280) {
+            return;
+        }
+        self.pending_wheel_seek = None;
+        self.drag_preview = None;
+        log::line(&format!(
+            "wheel preview commit target_ms={target} idle_ms={}",
+            at.elapsed().as_millis()
+        ));
+        self.seek(target);
     }
 
     fn seek(&mut self, target_ms: u64) {
@@ -1186,6 +2463,12 @@ impl Engine {
 
     fn toggle_mute(&mut self) {
         self.muted = !self.muted;
+        // Unmuting a zero-volume stream would still be silent; give it back a
+        // usable level. Wheel volume remains the only continuous control.
+        if !self.muted && self.volume == 0 {
+            self.volume = 50;
+            self.shared.volume.store(self.volume, Ordering::SeqCst);
+        }
         if let Some(audio) = &self.audio {
             audio.send(AudioCommand::SetVolume(if self.muted {
                 0
@@ -1209,13 +2492,9 @@ impl Engine {
             self.danmaku.reseed(self.position_now());
         } else {
             self.danmaku.clear();
-            if let Err(error) = self.danmaku_layer.clear() {
-                log::line(&format!("danmaku clear failed: {error:#}"));
-            }
+            let _ = self.danmaku_layer.clear();
         }
-        self.shared
-            .danmaku_visible
-            .store(visible, Ordering::SeqCst);
+        self.shared.danmaku_visible.store(visible, Ordering::SeqCst);
         self.state_changed();
         self.ui_dirty = true;
         log::line(&format!("danmaku visible={}", u8::from(visible)));
@@ -1246,6 +2525,35 @@ impl Engine {
         self.state_save.mark(Instant::now(), SAVE_DEBOUNCE);
     }
 
+    /// Remember the client size after a manual resize. Stored in 96-DPI units
+    /// so the same logical window size survives a monitor with different
+    /// scaling.
+    fn remember_window_size(&mut self, width: u32, height: u32) {
+        if self.external {
+            // The hosted window follows the Electron viewport.
+            return;
+        }
+        let scale = window::dpi_scale(self.hwnd).max(0.1);
+        let inset = if self.sidebar_open
+            && !self.fullscreen
+            && !self.mini
+            && !window::is_maximized(self.hwnd)
+        {
+            self.sidebar_delta().max(0) as u32
+        } else {
+            0
+        };
+        let width = width.saturating_sub(inset);
+        let width = ((width as f32 / scale).round() as u32).clamp(320, 16_384);
+        let height = ((height as f32 / scale).round() as u32).clamp(180, 16_384);
+        self.state.window_width = Some(width);
+        self.state.window_height = Some(height);
+        self.state_changed();
+        log::line(&format!(
+            "player window size remembered logical={width}x{height} scale={scale:.2}"
+        ));
+    }
+
     fn persist_state(&mut self) {
         self.state.volume = self.volume;
         self.state.muted = self.muted;
@@ -1255,6 +2563,7 @@ impl Engine {
         self.state.audio_only = self.audio_only;
         self.state.topmost = self.ontop;
         self.state.danmaku_visible = self.danmaku_visible;
+        self.state.stats = self.stats;
         match self.state.save() {
             Ok(()) => log::line(&format!(
                 "player state saved path={} volume={} muted={} speed={:.2} aspect={} brightness={:.2} audio_only={} ontop={} danmaku={} qn={:?} codecid={:?} audio_index={:?}",
@@ -1278,6 +2587,48 @@ impl Engine {
     fn tick_player_state(&mut self) {
         if self.state_save.due(Instant::now()) {
             self.persist_state();
+        }
+    }
+
+    /// Follow the monitor under the player window. Moving the window between a
+    /// 120 Hz and a 60 Hz screen rebuilds the interpolation plan and the 插帧
+    /// menu; a fixed target that the new panel cannot pace falls back to 自动.
+    fn tick_monitor_refresh(&mut self) {
+        if self.monitor_check_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.monitor_check_at = Instant::now();
+        let hz = self.monitor_refresh_hz();
+        if hz == self.monitor_hz {
+            return;
+        }
+        let previous = self.monitor_hz;
+        self.monitor_hz = hz;
+        log::line(&format!(
+            "display monitor refresh changed from={previous} to={hz} interp_hz={}",
+            self.interp_hz
+        ));
+        if self.interp_hz != 0 && !interp::level_supported(self.interp_hz, hz) {
+            log::line(&format!(
+                "interp target={} unsupported on {}hz, following auto",
+                self.interp_hz, hz
+            ));
+            self.set_interp_hz(0);
+        } else {
+            self.set_interp_hz(self.interp_hz);
+        }
+        self.ui_dirty = true;
+    }
+
+    /// Drop the wheel volume capsule once its short reveal has elapsed. The
+    /// main loop runs continuously while video plays, so the capsule leaves on
+    /// time even if the mouse never moves again.
+    fn tick_volume_wheel(&mut self) {
+        if let Some(until) = self.volume_wheel_until {
+            if Instant::now() >= until {
+                self.volume_wheel_until = None;
+                self.ui_dirty = true;
+            }
         }
     }
 
@@ -1320,6 +2671,7 @@ impl Engine {
     }
 
     fn close_dm_menu(&mut self) {
+        self.dm_menu_drag = None;
         if self.dm_menu.take().is_some() {
             self.ui_dirty = true;
             log::line("danmaku menu closed");
@@ -1360,10 +2712,7 @@ impl Engine {
                         if let Some(menu) = self.dm_menu.as_mut() {
                             menu.submenu = true;
                             self.ui_dirty = true;
-                            log::line(&format!(
-                                "danmaku menu report submenu dmid={}",
-                                menu.dmid
-                            ));
+                            log::line(&format!("danmaku menu report submenu dmid={}", menu.dmid));
                         }
                     }
                     DM_MENU_BLOCK => {
@@ -1390,7 +2739,30 @@ impl Engine {
             Err(error) => self.show_toast(&format!("复制失败：{error:#}"), true),
         }
         self.ui_dirty = true;
-        log::line(&format!("danmaku copy content len={}", text.chars().count()));
+        log::line(&format!(
+            "danmaku copy content len={}",
+            text.chars().count()
+        ));
+    }
+
+    /// Copy the current video's BV / av id from the info sidebar.
+    fn copy_video_id(&mut self) {
+        let id = self
+            .info
+            .as_ref()
+            .map(|info| info.video_id.trim().to_string())
+            .unwrap_or_default();
+        if id.is_empty() {
+            self.show_toast("没有可复制的视频 ID", true);
+            self.ui_dirty = true;
+            return;
+        }
+        match clipboard::set_text(&id) {
+            Ok(()) => self.show_toast("已复制视频 ID", false),
+            Err(error) => self.show_toast(&format!("复制失败：{error:#}"), true),
+        }
+        self.ui_dirty = true;
+        log::line(&format!("video id copy id={id}"));
     }
 
     fn thumbup_danmaku(&mut self) {
@@ -1657,13 +3029,14 @@ impl Engine {
     }
 
     fn poll_history(&mut self) {
-        let dates = self.history_dates_rx.as_ref().and_then(|rx| match rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                Some(Err("历史弹幕日期线程已结束".to_string()))
-            }
-        });
+        let dates = self
+            .history_dates_rx
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("历史弹幕日期线程已结束".to_string())),
+            });
         if let Some(result) = dates {
             self.history_dates_rx = None;
             self.history_dates_loading = false;
@@ -1784,7 +3157,6 @@ impl Engine {
         self.qa_history_pick = None;
     }
 
-
     // ---------------------------------------------------------- 历史 heartbeat
 
     fn watched_seconds(&self) -> u64 {
@@ -1883,11 +3255,30 @@ impl Engine {
     }
 
     fn apply_danmaku_ui(&mut self) {
-        let font_scale = match self.danmaku_font {
-            0 => 0.85,
-            2 => 1.2,
-            _ => 1.0,
-        };
+        self.apply_danmaku_ui_inner(true);
+    }
+
+    /// New video in the same window: the popup's values live in the global
+    /// settings file, so reload them instead of keeping whatever the previous
+    /// source happened to have in memory.
+    fn reload_danmaku_settings(&mut self) {
+        let stored = o11a1::settings::load();
+        self.danmaku_opacity = stored.danmaku_opacity.min(100);
+        self.danmaku_font = o11a1::settings::normalise_danmaku_font(stored.danmaku_font);
+        self.danmaku_speed = stored.danmaku_speed.clamp(50, 200);
+        self.danmaku_area = o11a1::settings::clamp_area(stored.danmaku_area);
+        self.block_scroll = stored.block_scroll;
+        self.block_top = stored.block_top;
+        self.block_bottom = stored.block_bottom;
+        self.apply_danmaku_ui_inner(false);
+        log::line(&format!(
+            "danmaku settings reloaded opacity={} font={} speed={} area={}",
+            self.danmaku_opacity, self.danmaku_font, self.danmaku_speed, self.danmaku_area
+        ));
+    }
+
+    fn apply_danmaku_ui_inner(&mut self, persist: bool) {
+        let font_scale = self.danmaku_font as f32 / 100.0;
         self.danmaku.reconfigure(
             self.danmaku_opacity as f32 / 100.0,
             font_scale,
@@ -1897,25 +3288,41 @@ impl Engine {
             self.block_top,
             self.block_bottom,
         );
-        if let Err(error) = self.danmaku_layer.set_opacity(self.danmaku_opacity as f32 / 100.0) {
-            log::line(&format!("danmaku opacity failed: {error:#}"));
-        }
+        // The model's metrics changed, but the Direct2D layer owns the text
+        // formats and the opacity brush: refresh both before the immediate
+        // redraw or the active comments keep the old size / alpha.
         if let Err(error) = self.danmaku_layer.set_fonts(self.danmaku.font_sizes()) {
-            log::line(&format!("danmaku fonts failed: {error:#}"));
+            log::line(&format!("danmaku live font update failed: {error:#}"));
         }
-        if let Err(error) = self.danmaku_layer.clear() {
-            log::line(&format!("danmaku settings clear failed: {error:#}"));
+        if let Err(error) = self
+            .danmaku_layer
+            .set_opacity(self.danmaku.settings().opacity)
+        {
+            log::line(&format!("danmaku live opacity update failed: {error:#}"));
         }
-        let mut stored = o11a1::settings::load();
-        stored.danmaku_opacity = self.danmaku_opacity;
-        stored.danmaku_font = self.danmaku_font;
-        stored.danmaku_speed = self.danmaku_speed;
-        stored.danmaku_area = self.danmaku_area;
-        stored.block_scroll = self.block_scroll;
-        stored.block_top = self.block_top;
-        stored.block_bottom = self.block_bottom;
-        if let Err(error) = o11a1::settings::save(&stored) {
-            log::line(&format!("danmaku settings save failed: {error:#}"));
+        // A settings change must be instantaneous: keep the active comments
+        // and redraw them with the new opacity / font / placement instead of
+        // clearing the layer and waiting for respawns.
+        self.redraw_danmaku_now();
+        if persist {
+            let mut stored = o11a1::settings::load();
+            stored.danmaku_opacity = self.danmaku_opacity;
+            stored.danmaku_font = self.danmaku_font;
+            stored.danmaku_speed = self.danmaku_speed;
+            stored.danmaku_area = self.danmaku_area;
+            stored.block_scroll = self.block_scroll;
+            stored.block_top = self.block_top;
+            stored.block_bottom = self.block_bottom;
+            match o11a1::settings::save(&stored) {
+                Ok(()) => self
+                    .shared
+                    .settings_revision
+                    .fetch_add(1, Ordering::SeqCst),
+                Err(error) => {
+                    log::line(&format!("danmaku settings save failed: {error:#}"));
+                    0
+                }
+            };
         }
         log::line(&format!(
             "danmaku ui opacity={} font={} speed={} area={} block={}/{}/{}",
@@ -1935,8 +3342,8 @@ impl Engine {
         self.apply_danmaku_ui();
     }
 
-    fn set_danmaku_font(&mut self, index: usize) {
-        self.danmaku_font = index.min(2) as u32;
+    fn set_danmaku_font(&mut self, percent: u32) {
+        self.danmaku_font = percent.clamp(50, 150);
         self.apply_danmaku_ui();
     }
 
@@ -1961,12 +3368,13 @@ impl Engine {
 
     fn request_comments(&mut self, reset: bool) {
         if self.comments_loading {
+            if reset {
+                self.comments_reload_pending = true;
+            }
             return;
         }
         if reset {
-            self.comments.clear();
-            self.comments_cursor.clear();
-            self.comments_end = false;
+            self.sidebar_scroll_target = 0.0;
         }
         self.comments_loading = true;
         self.ui_dirty = true;
@@ -1983,8 +3391,124 @@ impl Engine {
         let _ = self.detail_tx.send(DetailRequest::Comments {
             hot: self.comments_hot,
             reset,
-            cursor: self.comments_cursor.clone(),
+            cursor: if reset {
+                String::new()
+            } else {
+                self.comments_cursor.clone()
+            },
         });
+    }
+
+    fn set_comments_sort(&mut self, hot: bool) {
+        if self.comments_hot == hot {
+            return;
+        }
+        self.comments_hot = hot;
+        self.ui_dirty = true;
+        self.comments_reload_pending = true;
+        if !self.comments_loading {
+            self.comments_reload_pending = false;
+            self.request_comments(true);
+        }
+    }
+
+    fn request_comment_replies(&mut self, rpid: i64) {
+        let Some(comment) = self
+            .comments
+            .iter_mut()
+            .find(|comment| comment.rpid == rpid)
+        else {
+            return;
+        };
+        if comment.replies_loading || comment.replies_end {
+            return;
+        }
+        let page = if comment.replies_page <= 0 {
+            1
+        } else {
+            comment.replies_page + 1
+        };
+        comment.replies_loading = true;
+        comment.expanded = true;
+        self.comments_generation = self.comments_generation.wrapping_add(1);
+        self.ui_dirty = true;
+        log::line(&format!("comment replies request root={rpid} page={page}"));
+        let _ = self.detail_tx.send(DetailRequest::CommentReplies {
+            root_rpid: rpid,
+            page,
+        });
+    }
+
+    fn toggle_comment_thread(&mut self, rpid: i64, action: crate::overlay::CommentAction) {
+        let Some(index) = self
+            .comments
+            .iter()
+            .position(|comment| comment.rpid == rpid)
+        else {
+            return;
+        };
+        match action {
+            crate::overlay::CommentAction::Toggle => {
+                let expanded = self.comments[index].expanded;
+                self.comments[index].expanded = !expanded;
+                if !expanded {
+                    let comment = &self.comments[index];
+                    let shown = comment.replies.len() as i64;
+                    if comment.reply_count > shown && !comment.replies_end {
+                        self.request_comment_replies(rpid);
+                    }
+                }
+            }
+            crate::overlay::CommentAction::More => {
+                self.request_comment_replies(rpid);
+            }
+        }
+        self.comments_generation = self.comments_generation.wrapping_add(1);
+        self.ui_dirty = true;
+    }
+
+    fn advance_comment_animations(&mut self) {
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.comments_anim_last)
+            .as_secs_f32()
+            .min(0.05);
+        self.comments_anim_last = now;
+        let target = if self.comments_hot { 0.0 } else { 1.0 };
+        let diff = target - self.comments_sort_mix;
+        if diff.abs() > 0.002 {
+            // ~60 ms time constant: a 180–220 ms glide independent of loop rate.
+            let k = 1.0 - (-dt / 0.055).exp();
+            self.comments_sort_mix += diff * k;
+            self.ui_dirty = true;
+        } else if self.comments_sort_mix != target {
+            self.comments_sort_mix = target;
+            self.ui_dirty = true;
+        }
+        if self.comments_enter < 1.0 {
+            self.comments_enter = (self.comments_enter + dt / 0.22).min(1.0);
+            self.ui_dirty = true;
+        }
+    }
+
+    /// Fill the viewport without a load-more button: once the smooth scroll is
+    /// within one comfortable screen of the end, fetch the next page. The
+    /// overlay's measured height is only trusted after its layout was built.
+    fn poll_comments_autoload(&mut self) {
+        if !self.sidebar_open
+            || self.sidebar_tab != SidebarTab::Comments
+            || self.comments_loading
+            || self.comments_end
+            || self.comments.is_empty()
+            || !self.overlay.comments_layout_ready(self.comments_generation)
+        {
+            return;
+        }
+        let max = self.sidebar_max_scroll();
+        let margin = 220.0 * self.scale;
+        if max <= 1.0 || self.sidebar_scroll_target >= max - margin {
+            self.request_comments(false);
+        }
     }
 
     fn handle_detail(&mut self, event: DetailEvent) {
@@ -2006,10 +3530,26 @@ impl Engine {
                     if let Some(heartbeat) = &self.heartbeat {
                         heartbeat.set_aid(self.aid);
                     }
-                    log::line(&format!("heartbeat aid={} bvid={}", self.aid, self.source.bvid.as_deref().unwrap_or("-")));
+                    log::line(&format!(
+                        "heartbeat aid={} bvid={}",
+                        self.aid,
+                        self.source.bvid.as_deref().unwrap_or("-")
+                    ));
                 }
                 self.info = Some(InfoUi {
                     title: info.title,
+                    video_id: self
+                        .source
+                        .bvid
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if info.aid > 0 {
+                                format!("av{}", info.aid)
+                            } else {
+                                String::new()
+                            }
+                        }),
                     owner: info.owner,
                     views: info.views,
                     pubdate: info.pubdate,
@@ -2018,13 +3558,18 @@ impl Engine {
                     pages: self.pages.clone(),
                     current_page: info.current_page,
                 });
+                self.info_scroll_height = -1.0;
                 self.ui_dirty = true;
                 log::line(&format!(
                     "detail info loaded pages={} current={}",
                     self.pages.len(),
                     self.current_page
                 ));
-                if self.sidebar_open && self.sidebar_tab == SidebarTab::Comments {
+                if self.sidebar_open
+                    && self.sidebar_tab == SidebarTab::Comments
+                    && self.comments.is_empty()
+                    && !self.comments_loading
+                {
                     self.request_comments(true);
                 }
             }
@@ -2033,36 +3578,94 @@ impl Engine {
                 self.show_toast(&format!("视频信息加载失败：{error}"), true);
             }
             DetailEvent::Comments(Ok(data)) => {
+                if data.hot != self.comments_hot {
+                    // A page for the other order arrived after the user
+                    // switched. Drop it and start the current order.
+                    self.comments_loading = false;
+                    if self.comments_reload_pending {
+                        self.comments_reload_pending = false;
+                        self.request_comments(true);
+                    }
+                    return;
+                }
                 if data.reset {
                     self.comments.clear();
+                    self.sidebar_scroll = 0.0;
+                    self.sidebar_scroll_target = 0.0;
+                    self.comments_enter = 0.0;
                 }
                 for comment in data.comments {
-                    let avatar = self.avatars.get(&comment.avatar_url).cloned();
-                    self.comments.push(CommentUi {
-                        user: comment.user,
-                        message: comment.message,
-                        likes: comment.likes,
-                        avatar_url: comment.avatar_url,
-                        avatar,
-                    });
+                    let comment = comment_ui(comment, &self.avatars);
+                    self.comments.push(comment);
                 }
                 self.comments_total = data.total;
                 self.comments_cursor = data.cursor;
-                self.comments_end = data.end;
+                self.comments_end = data.end || self.comments_cursor.is_empty();
                 self.comments_loading = false;
+                self.comments_generation = self.comments_generation.wrapping_add(1);
                 self.ui_dirty = true;
                 log::line(&format!(
-                    "comments loaded n={} total={} end={}",
+                    "comments loaded n={} total={} end={} reset={}",
                     self.comments.len(),
                     self.comments_total,
-                    u8::from(self.comments_end)
+                    u8::from(self.comments_end),
+                    u8::from(data.reset)
                 ));
+                if self.comments_reload_pending {
+                    self.comments_reload_pending = false;
+                    self.request_comments(true);
+                }
             }
             DetailEvent::Comments(Err(error)) => {
                 self.comments_loading = false;
                 self.ui_dirty = true;
                 log::line(&format!("comments failed reason={error}"));
                 self.show_toast(&format!("评论加载失败：{error}"), true);
+                if self.comments_reload_pending {
+                    self.comments_reload_pending = false;
+                    self.request_comments(true);
+                }
+            }
+            DetailEvent::CommentReplies(Ok(data)) => {
+                let Some(comment) = self
+                    .comments
+                    .iter_mut()
+                    .find(|comment| comment.rpid == data.root_rpid)
+                else {
+                    self.ui_dirty = true;
+                    return;
+                };
+                let mut seen: HashSet<i64> =
+                    comment.replies.iter().map(|reply| reply.rpid).collect();
+                for reply in data.replies {
+                    if reply.rpid != 0 && !seen.insert(reply.rpid) {
+                        continue;
+                    }
+                    let reply = reply_ui(reply, &self.avatars);
+                    comment.replies.push(reply);
+                }
+                comment.replies_page = comment.replies_page.max(data.page);
+                comment.replies_end = !data.has_more;
+                comment.reply_count = comment.reply_count.max(data.total);
+                comment.replies_loading = false;
+                self.comments_generation = self.comments_generation.wrapping_add(1);
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "comment replies loaded root={} page={} n={} end={}",
+                    data.root_rpid,
+                    data.page,
+                    comment.replies.len(),
+                    u8::from(comment.replies_end)
+                ));
+            }
+            DetailEvent::CommentReplies(Err(error)) => {
+                for comment in self.comments.iter_mut() {
+                    comment.replies_loading = false;
+                }
+                self.comments_generation = self.comments_generation.wrapping_add(1);
+                self.ui_dirty = true;
+                log::line(&format!("comment replies failed reason={error}"));
+                self.show_toast(&format!("回复加载失败：{error}"), true);
             }
             DetailEvent::Avatars(list) => {
                 for (url, image) in list {
@@ -2070,6 +3673,11 @@ impl Engine {
                     for comment in self.comments.iter_mut() {
                         if comment.avatar_url == url {
                             comment.avatar = Some(image.clone());
+                        }
+                        for reply in comment.replies.iter_mut() {
+                            if reply.avatar_url == url {
+                                reply.avatar = Some(image.clone());
+                            }
                         }
                     }
                 }
@@ -2090,7 +3698,11 @@ impl Engine {
     }
 
     fn set_speed(&mut self, speed: f64) {
-        let speed = speed.clamp(0.5, 2.0) as f32;
+        let speed = crate::speed::clamp(speed as f32);
+        let shown = crate::speed::snap(speed);
+        self.speed_preview = shown;
+        self.speed_base = shown;
+        self.speed_commit_at = None;
         if (speed - self.speed).abs() < 0.001 {
             return;
         }
@@ -2110,38 +3722,278 @@ impl Engine {
     }
 
     fn cycle_interp(&mut self) {
-        self.interp = self.interp.next();        self.shared.interp.store(self.interp.as_u8(), Ordering::SeqCst);
-        self.ui_dirty = true;
+        if self.is_live {
+            self.show_toast("直播不支持插帧", true);
+            return;
+        }
+        let levels = self.interp_levels();
+        let current = if self.interp == InterpMode::Off {
+            0
+        } else if self.interp_hz == 0 {
+            levels.iter().position(|level| *level == Some(0)).unwrap_or(0)
+        } else {
+            levels
+                .iter()
+                .position(|level| *level == Some(self.interp_hz))
+                .unwrap_or(0)
+        };
+        let next = levels[(current + 1) % levels.len()];
+        self.select_interp_level(next);
+    }
+
+    /// Refresh rate of the monitor currently containing the player window.
+    fn monitor_refresh_hz(&self) -> u32 {
+        interp::display_refresh_hz_for_window(self.hwnd)
+    }
+
+    /// Ordered options for the 插帧 menu: 关闭, 自动, then the refresh rates
+    /// the monitor under this window can actually pace.
+    fn interp_levels(&self) -> Vec<Option<u32>> {
+        interp::levels(self.monitor_refresh_hz())
+    }
+
+    fn interp_rows(&self) -> Vec<ChoiceRowUi> {
+        self.interp_levels()
+            .into_iter()
+            .enumerate()
+            .map(|(index, level)| {
+                let (label, detail, current) = match level {
+                    None => ("关闭".to_string(), "不插帧".to_string(), self.interp == InterpMode::Off),
+                    Some(0) => (
+                        "自动".to_string(),
+                        "跟随屏幕刷新率".to_string(),
+                        self.interp != InterpMode::Off && self.interp_hz == 0,
+                    ),
+                    Some(hz) => (
+                        format!("{hz} Hz"),
+                        "固定输出".to_string(),
+                        self.interp != InterpMode::Off && self.interp_hz == hz,
+                    ),
+                };
+                ChoiceRowUi {
+                    index,
+                    label,
+                    detail,
+                    current,
+                }
+            })
+            .collect()
+    }
+
+    fn enhance_rows(&self) -> Vec<ChoiceRowUi> {
+        [
+            (EnhanceMode::Off, "不处理"),
+            (EnhanceMode::Cas, "CAS 锐化"),
+            (EnhanceMode::Anime, "Anime4K"),
+        ]
+        .into_iter()
+        .map(|(mode, detail)| ChoiceRowUi {
+            index: mode.as_u8() as usize,
+            label: mode.label().to_string(),
+            detail: detail.to_string(),
+            current: !self.is_live && self.enhance == mode,
+        })
+        .collect()
+    }
+
+    /// Store the global 插帧 / 画质增强 choice. A change made in the native
+    /// player must survive the next `player.open`; bumping the shared
+    /// revision tells the engine to rebroadcast the refreshed settings.
+    fn persist_interp_prefs(&mut self) {
+        let mut stored = o11a1::settings::load();
+        stored.interp_mode = self.interp.as_u8();
+        stored.interp_hz = self.interp_hz;
+        match o11a1::settings::save(&stored) {
+            Ok(()) => {
+                self.shared
+                    .settings_revision
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            Err(error) => log::line(&format!("interp prefs save failed: {error:#}")),
+        }
+    }
+
+    fn persist_enhance_prefs(&mut self) {
+        let mut stored = o11a1::settings::load();
+        stored.player_enhance = self.enhance.as_u8() as u32;
+        match o11a1::settings::save(&stored) {
+            Ok(()) => {
+                self.shared
+                    .settings_revision
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            Err(error) => log::line(&format!("enhance prefs save failed: {error:#}")),
+        }
+    }
+
+    /// Re-apply the global 插帧 / 画质增强 choice after a new source is
+    /// attached. The native menu and the settings page both write
+    /// settings.json, so the file is the single truth between windows.
+    fn reload_player_prefs(&mut self) {
+        if self.is_live {
+            return;
+        }
+        let stored = o11a1::settings::load();
+        self.set_interp_hz(stored.interp_hz);
+        self.apply_interp_mode(InterpMode::from_u8(stored.interp_mode));
+        self.set_enhance(EnhanceMode::from_u8(stored.player_enhance as u8));
         log::line(&format!(
-            "interp mode={} label={} out_hz={}",
+            "player prefs reloaded interp={} hz={} enhance={}",
             self.interp.as_u8(),
+            self.interp_hz,
+            self.enhance.as_u8()
+        ));
+    }
+
+    /// One interpolation level selection from the toolbar menu or keyboard.
+    /// `None` is 关闭; `Some(0)` is 自动 (display refresh); `Some(60/90/120)`
+    /// is a fixed pacer target. Targets above the panel rate are rejected.
+    fn select_interp_level(&mut self, level: Option<u32>) {
+        if self.is_live {
+            return;
+        }
+        if let Some(hz) = level {
+            if !interp::level_supported(hz, self.monitor_refresh_hz()) {
+                log::line(&format!("interp level rejected hz={hz}"));
+                self.ui_dirty = true;
+                return;
+            }
+            self.set_interp_hz(hz);
+            self.apply_interp_mode(InterpMode::Gpu);
+        } else {
+            self.apply_interp_mode(InterpMode::Off);
+        }
+        self.persist_interp_prefs();
+        log::line(&format!(
+            "interp selected level={} hz={} out_hz={}",
             self.interp.label(),
+            self.interp_hz,
             self.interp_out_hz.unwrap_or(0)
         ));
-        if self.interp == InterpMode::Cpu && self.interp_out_hz.is_none() {
+        self.ui_dirty = true;
+    }
+
+    /// Single entry point for every interpolation toggle (key, toolbar, RPC).
+    /// Keeping the lookahead and the pacer tick here prevents a mode switch
+    /// from dropping a due picture or leaving a stale grid behind.
+    fn apply_interp_mode(&mut self, requested: InterpMode) {
+        let requested = if self.is_live {
+            InterpMode::Off
+        } else {
+            requested
+        };
+        // Honour the requested mode verbatim: a clip whose own rate already
+        // fills the display simply has no output grid, it must not clear the
+        // user's setting or flip the toolbar back to Off.
+        let changed = self.interp != requested;
+        self.interp = requested;
+        self.shared
+            .interp
+            .store(requested.as_u8(), Ordering::SeqCst);
+        self.interp_ticks = 0;
+        self.interp_blends = 0;
+        self.interp_cuts = 0;
+        // Only start the pacer grid when one exists; a clip that already fills
+        // the target keeps the mode on but plays through the regular
+        // due-frame path, so a lookahead frame must not be parked forever.
+        let grid = requested == InterpMode::Gpu && self.interp_out_hz.is_some();
+        if grid {
+            self.next = None;
+            self.next_tick_at = Some(Instant::now());
+            self.fill_next(self.position_now().saturating_add(INTERP_LOOKAHEAD_MS));
+        } else {
+            // A lookahead frame may have been consumed from the queue; show it
+            // now so switching never skips a source picture.
+            if let Some(next) = self.next.take() {
+                self.show_source(next);
+            }
+            self.next_tick_at = None;
+        }
+        if changed {
             log::line(&format!(
-                "interp requested but source_fps={:.2} already fills the grid",
+                "interp mode={} label={} out_hz={} source_fps={:.2}",
+                self.interp.as_u8(),
+                self.interp.label(),
+                self.interp_out_hz.unwrap_or(0),
                 self.source.fps
             ));
+            self.ui_dirty = true;
+        }
+    }
+
+    /// Point the interpolation pacer at a fixed target. `0` follows the
+    /// display refresh; any other value is used as-is up to
+    /// [`interp::INTERP_MAX_OUT_HZ`] and is deliberately NOT clamped to the
+    /// display: if the compositor or the CPU cannot keep up, late ticks are
+    /// dropped and the achieved rate settles wherever the machine can.
+    fn set_interp_hz(&mut self, hz: u32) {
+        self.interp_hz = if hz == 0 {
+            0
+        } else {
+            hz.clamp(1, interp::INTERP_MAX_OUT_HZ)
+        };
+        let display_hz = self.monitor_refresh_hz();
+        self.monitor_hz = display_hz;
+        let plan = interp::interp_plan(display_hz, self.source.fps, self.interp_hz);
+        let out_hz = plan.unwrap_or_else(|| {
+            if self.source.fps.is_finite() && self.source.fps > 1.0 {
+                self.source.fps.round().clamp(1.0, 240.0) as u32
+            } else {
+                60
+            }
+        });
+        let previous = self.interp_out_hz;
+        self.interp_out_hz = plan;
+        self.out_period = Duration::from_secs_f64(1.0 / out_hz.max(1) as f64);
+        self.interp_ticks = 0;
+        self.interp_blends = 0;
+        self.interp_cuts = 0;
+        if plan.is_none() {
+            // No output grid: release any parked lookahead picture so the
+            // regular due-frame path never loses a source frame.
+            if let Some(next) = self.next.take() {
+                self.show_source(next);
+            }
+            self.next_tick_at = None;
+        } else if self.interp == InterpMode::Gpu {
+            self.next_tick_at = Some(Instant::now());
+        }
+        if previous != plan {
+            log::line(&format!(
+                "interp target={} display_hz={display_hz} out_hz={} source_fps={:.2}",
+                self.interp_hz,
+                plan.unwrap_or(0),
+                self.source.fps
+            ));
+            self.ui_dirty = true;
         }
     }
 
     fn cycle_enhance(&mut self) {
-        self.set_enhance(self.enhance.next());
+        if self.is_live {
+            self.show_toast("直播不支持画质增强", true);
+            return;
+        }
+        self.select_enhance(self.enhance.next());
     }
 
+    /// Show/hide the five-line debug panel at the video window's top-right.
+    /// The switch lives in the sidebar's 性能 tab; the shortcut keys only flip
+    /// the same flag and never move the sidebar.
     fn toggle_stats(&mut self) {
         self.stats = !self.stats;
-        if self.stats {
-            self.open_sidebar_tab(SidebarTab::Performance);
-        } else if self.sidebar_open && self.sidebar_tab == SidebarTab::Performance {
-            self.set_sidebar(false, SidebarTab::Performance);
-        }
+        self.state.stats = self.stats;
+        self.state_changed();
         self.ui_dirty = true;
         log::line(&format!("stats={}", u8::from(self.stats)));
     }
 
     fn set_enhance(&mut self, mode: EnhanceMode) {
+        let mode = if self.is_live {
+            EnhanceMode::Off
+        } else {
+            mode
+        };
         if mode != EnhanceMode::Off && self.enhance_pipeline.is_none() {
             log::line(&format!(
                 "enhance fallback requested={} reason=pipeline unavailable",
@@ -2162,20 +4014,32 @@ impl Engine {
         ));
     }
 
+    /// User-facing 画质增强 choice: apply it now, then store it globally so
+    /// the next video starts with the same mode.
+    fn select_enhance(&mut self, mode: EnhanceMode) {
+        self.set_enhance(mode);
+        self.persist_enhance_prefs();
+        log::line(&format!(
+            "enhance selected mode={} label={}",
+            self.enhance.as_u8(),
+            self.enhance.label()
+        ));
+    }
+
     fn set_aspect(&mut self, aspect: AspectMode) {
-        if self.aspect == aspect {
-            self.ui_dirty = true;
-            return;
+        if aspect != AspectMode::Fit && self.aspect == AspectMode::Fit {
+            self.show_toast("视频比例已固定为原始比例", false);
         }
-        self.aspect = aspect;
-        self.shared.aspect.store(aspect.as_u8(), Ordering::SeqCst);
+        self.aspect = AspectMode::Fit;
+        self.shared
+            .aspect
+            .store(AspectMode::Fit.as_u8(), Ordering::SeqCst);
         self.update_video_rect();
         self.state_changed();
         self.ui_dirty = true;
         log::line(&format!(
-            "aspect mode={} label={} client={}x{}",
+            "aspect locked=fit requested={} client={}x{}",
             aspect.as_u8(),
-            aspect.label(),
             self.client.0,
             self.client.1
         ));
@@ -2189,7 +4053,10 @@ impl Engine {
         self.ontop = ontop;
         if !self.mini {
             if let Err(error) = window::set_topmost(self.hwnd, ontop) {
-                log::line(&format!("ontop change failed enabled={} err={error:#}", u8::from(ontop)));
+                log::line(&format!(
+                    "ontop change failed enabled={} err={error:#}",
+                    u8::from(ontop)
+                ));
             }
         }
         let effective = window::is_topmost(self.hwnd);
@@ -2268,11 +4135,11 @@ impl Engine {
     }
 
     fn cycle_speed(&mut self, direction: i32) {
-        const SPEEDS: [f32; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+        const SPEEDS: [f32; 9] = [0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 10.0];
         let index = SPEEDS
             .iter()
             .position(|speed| (speed - self.speed).abs() < 0.001)
-            .unwrap_or(2);
+            .unwrap_or(4);
         let next = (index as i32 + direction).rem_euclid(SPEEDS.len() as i32) as usize;
         self.set_speed(SPEEDS[next] as f64);
     }
@@ -2280,29 +4147,10 @@ impl Engine {
     /// Re-present the held frame so brightness/audio-only changes are visible
     /// even while paused. Never changes the playback clock.
     fn repaint_picture(&mut self) {
-        let mut mode = self.enhance;
-        if let Some(bytes) = self.cur.as_deref() {
-            match Self::present_bytes(
-                &mut self.video,
-                &self.gpu,
-                &mut self.enhance_pipeline,
-                &mut mode,
-                bytes,
-                self.brightness,
-                self.audio_only,
-            ) {
-                Ok((_enhanced, presented)) => {
-                    if presented {
-                        self.presents_window = self.presents_window.saturating_add(1);
-                    }
-                    if mode != self.enhance {
-                        self.enhance = mode;
-                        self.shared.enhance.store(mode.as_u8(), Ordering::SeqCst);
-                        self.ui_dirty = true;
-                    }
-                }
-                Err(error) => log::line(&format!("repaint failed: {error:#}")),
-            }
+        if self.cur.is_some() {
+            // `present_current` handles the audio-only black frame and the
+            // enhancement fallback bookkeeping in one place.
+            self.present_current();
         } else if self.audio_only {
             if let Err(error) = self.video.present_black(&self.gpu) {
                 log::line(&format!("audio-only black frame failed: {error:#}"));
@@ -2326,11 +4174,20 @@ impl Engine {
     fn run_loop(&mut self) -> Result<()> {
         log::line(&format!(
             "window open hwnd={:?} client={}x{} scale={:.2} size={}x{}",
-            self.hwnd.0, self.client.0, self.client.1, self.scale, self.source.width, self.source.height
+            self.hwnd.0,
+            self.client.0,
+            self.client.1,
+            self.scale,
+            self.source.width,
+            self.source.height
         ));
         let mut last_status = String::new();
         while !self.quit {
             window::pump();
+            // Advance the morph before this turn's events: an open/close
+            // request then draws its first frame at the current mix instead
+            // of jumping one animation step ahead.
+            self.advance_precision_anim();
             for event in self.events.drain() {
                 self.handle_event(event);
             }
@@ -2352,16 +4209,30 @@ impl Engine {
                     Ok(Ok(open)) => {
                         self.source_pending = false;
                         self.apply_deferred_source(open);
+                        self.pending_replace = None;
+                        self.failed_replace = None;
+                        if let Some(next) = self.queued_replace.take() {
+                            self.begin_source_replace(next);
+                        }
                     }
                     Ok(Err(message)) => {
                         self.source_pending = false;
                         self.loading = false;
+                        if self.pending_replace.is_some() {
+                            self.failed_replace = self.pending_replace.take();
+                        }
                         self.report_error(format!("打开视频失败：{message}"));
+                        if let Some(next) = self.queued_replace.take() {
+                            self.begin_source_replace(next);
+                        }
                     }
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {
                         self.source_pending = false;
                         self.loading = false;
+                        if self.pending_replace.is_some() {
+                            self.failed_replace = self.pending_replace.take();
+                        }
                         self.report_error("打开视频失败：解析线程已退出");
                     }
                 }
@@ -2393,9 +4264,7 @@ impl Engine {
             let track_result = self.track_rx.as_ref().and_then(|rx| match rx.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("画质解析线程已结束".to_string()))
-                }
+                Err(TryRecvError::Disconnected) => Some(Err("画质解析线程已结束".to_string())),
             });
             if let Some(result) = track_result {
                 self.track_rx = None;
@@ -2410,21 +4279,40 @@ impl Engine {
             }
             let switch_result = self.switch_rx.as_ref().and_then(|rx| match rx.try_recv() {
                 Ok(result) => Some(result),
-                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Empty) => {
+                    let timed_out = self
+                        .switch_started
+                        .map(|at| at.elapsed() >= Duration::from_secs(25))
+                        .unwrap_or(false);
+                    if timed_out {
+                        log::line("source switch timeout");
+                        Some(Err("分P解析超时".to_string()))
+                    } else {
+                        None
+                    }
+                }
                 Err(TryRecvError::Disconnected) => Some(Err("分P解析线程已结束".to_string())),
             });
             if let Some(result) = switch_result {
                 self.switch_rx = None;
+                self.switch_started = None;
                 match result {
                     Ok(source) => self.apply_switched_source(source),
                     Err(error) => {
                         self.switch_target = None;
+                        self.page_loading = None;
                         log::line(&format!("source switch failed reason={error}"));
                         self.show_toast(&format!("分P切换失败：{error}"), true);
+                        // The click already stopped the old picture/audio, so a
+                        // bare toast would leave a dead loading card. Put the
+                        // previous page back at the position it had.
+                        self.restore_previous_page(Some(&error));
                     }
                 }
             }
             self.run_qa();
+            self.poll_pending_wheel_seek();
+            self.poll_pending_speed();
             self.poll_danmaku_long_press();
             self.poll_history();
             self.tick_undo();
@@ -2435,15 +4323,14 @@ impl Engine {
                 Err(TryRecvError::Disconnected) => {}
             }
             self.tick_player_state();
+            self.tick_volume_wheel();
             self.tick_heartbeat();
             self.tick_sleep();
+            self.tick_monitor_refresh();
             self.check_sessions();
             if let Some(limit) = self.auto_exit {
                 if self.started_at.elapsed() >= limit {
-                    log::line(&format!(
-                        "auto-exit seconds={:.3}",
-                        limit.as_secs_f64()
-                    ));
+                    log::line(&format!("auto-exit seconds={:.3}", limit.as_secs_f64()));
                     break;
                 }
             }
@@ -2460,16 +4347,22 @@ impl Engine {
             }
 
             self.position_ms = self.position_now();
-            self.shared.position_ms.store(self.position_ms, Ordering::SeqCst);
+            self.poll_ab_prefetch();
+            self.enforce_ab_loop();
+            self.animate_sidebar_scroll();
+            self.advance_comment_animations();
+            self.poll_comments_autoload();
+            self.shared
+                .position_ms
+                .store(self.position_ms, Ordering::SeqCst);
 
-            if self.fullscreen
-                && self.chrome_shown
+            if self.chrome_shown
                 && !self.dragging
                 && self.popup_drag.is_none()
                 && !self.sidebar_open
                 && !self.danmaku_popup
                 && self.dm_menu.is_none()
-                && self.last_mouse_activity.elapsed() >= Duration::from_millis(2500)
+                && self.last_mouse_activity.elapsed() >= Duration::from_secs(2)
             {
                 self.chrome_shown = false;
                 log::line(&format!(
@@ -2505,17 +4398,49 @@ impl Engine {
                 self.toast_until = None;
                 self.ui_dirty = true;
             }
-            if self.ui_dirty || self.last_ui_draw.elapsed() >= Duration::from_millis(200) {
+            // The whole native overlay (toolbar, sidebar, HUD, animations) is
+            // driven on the monitor's refresh grid. `Present(1, 0)` keeps the
+            // compositor on the same cadence; the absolute deadline below
+            // prevents loop overhead from turning 120 Hz into ~104 Hz.
+            let now = Instant::now();
+            if self.ui_dirty || now >= self.next_ui_draw {
+                let draw_at = Instant::now();
                 if let Err(error) = self.draw_ui() {
                     log::line(&format!("overlay draw failed: {error:#}"));
                 }
-                self.last_ui_draw = Instant::now();
+                self.ui_draw_us_total = self
+                    .ui_draw_us_total
+                    .saturating_add(draw_at.elapsed().as_micros() as u64);
+                self.ui_draw_count = self.ui_draw_count.saturating_add(1);
+                if now >= self.next_ui_draw {
+                    let hz = self.monitor_hz.max(60).min(240) as f32;
+                    let period = Duration::from_secs_f32(1.0 / hz);
+                    self.next_ui_draw += period;
+                    if self.next_ui_draw <= now {
+                        self.next_ui_draw = now + period;
+                    }
+                }
                 self.ui_dirty = false;
             }
 
             if self.fps_window_start.elapsed() >= Duration::from_secs(1) {
                 let elapsed = self.fps_window_start.elapsed().as_secs_f64();
                 self.fps = self.presents_window as f32 / elapsed as f32;
+                let danmaku_frames = self.danmaku_layer.frames;
+                self.danmaku_fps =
+                    danmaku_frames.saturating_sub(self.danmaku_frames_prev) as f32 / elapsed as f32;
+                self.danmaku_frames_prev = danmaku_frames;
+                let ui_presents = self.overlay.presents();
+                self.ui_fps =
+                    ui_presents.saturating_sub(self.ui_presents_prev) as f32 / elapsed as f32;
+                self.ui_presents_prev = ui_presents;
+                let ui_draw_us = if self.ui_draw_count > 0 {
+                    self.ui_draw_us_total / self.ui_draw_count
+                } else {
+                    0
+                };
+                self.ui_draw_us_total = 0;
+                self.ui_draw_count = 0;
                 let (queue, dropped) = self
                     .decoder
                     .as_ref()
@@ -2529,8 +4454,102 @@ impl Engine {
                 self.queue_len = queue;
                 self.dropped = dropped;
                 self.audio_ms = audio_pos;
+                let net_seconds = self.net_at.elapsed().as_secs_f64().max(0.001);
+                let (net_pid, net_read) = self
+                    .decoder
+                    .as_ref()
+                    .map(|decoder| {
+                        let pid = decoder.pid();
+                        (pid, crate::decode::process_read_bytes(pid))
+                    })
+                    .unwrap_or((0, None));
+                if net_pid != 0 && net_pid == self.net_pid {
+                    if let Some(bytes) = net_read {
+                        if bytes >= self.net_read {
+                            let seconds = net_seconds;
+                            self.net_bps = (bytes - self.net_read) as f64 / seconds;
+                            let total_bps = self.source.video_bitrate + self.source.audio_bitrate;
+                            self.net_lead_s = if total_bps > 0 {
+                                let bytes_per_media_second = total_bps as f64 / 8.0;
+                                let read_delta =
+                                    bytes.saturating_sub(self.net_base_read) as f64;
+                                let media_seconds = self
+                                    .position_ms
+                                    .saturating_sub(self.net_base_pos)
+                                    as f64
+                                    / 1000.0;
+                                (read_delta / bytes_per_media_second - media_seconds).max(0.0)
+                            } else {
+                                0.0
+                            };
+                        } else {
+                            self.net_bps = 0.0;
+                            self.net_lead_s = 0.0;
+                        }
+                        self.net_read = bytes;
+                    } else {
+                        self.net_bps = 0.0;
+                        self.net_lead_s = 0.0;
+                    }
+                } else {
+                    self.net_pid = net_pid;
+                    self.net_read = net_read.unwrap_or(0);
+                    self.net_base_read = self.net_read;
+                    self.net_base_pos = self.position_ms;
+                    self.net_bps = 0.0;
+                    self.net_lead_s = 0.0;
+                }
+                // Cached media means the decoder reads loopback, not the CDN.
+                // Report the cache workers' real network throughput instead.
+                if crate::source::media_cache_key(&self.source, false).is_some() {
+                    let cache_bytes = crate::mediacache::network_bytes();
+                    if self.cache_net_read == 0 {
+                        self.cache_net_read = cache_bytes;
+                    }
+                    let delta = cache_bytes.saturating_sub(self.cache_net_read);
+                    self.net_bps = delta as f64 / net_seconds;
+                    self.cache_net_read = cache_bytes;
+                    let total_bps = self.source.video_bitrate + self.source.audio_bitrate;
+                    if total_bps > 0 {
+                        let mut done = 0u64;
+                        let mut total = 0u64;
+                        for audio in [false, true] {
+                            if let Some(key) =
+                                crate::source::media_cache_key(&self.source, audio)
+                            {
+                                if let Some((key_done, key_total)) =
+                                    crate::mediacache::progress(&key)
+                                {
+                                    done = done.saturating_add(key_done);
+                                    total = total.saturating_add(key_total);
+                                }
+                            }
+                        }
+                        if total > 0 {
+                            self.cache_done = done;
+                            self.cache_total = total;
+                            let bytes_per_media_second = total_bps as f64 / 8.0;
+                            self.net_lead_s = (done as f64 / bytes_per_media_second
+                                - self.position_ms as f64 / 1000.0)
+                                .max(0.0);
+                        } else {
+                            self.cache_done = 0;
+                            self.cache_total = 0;
+                        }
+                    }
+                } else {
+                    self.cache_done = 0;
+                    self.cache_total = 0;
+                }
+                self.net_at = Instant::now();
+                let interp_ticks = self.interp_ticks;
+                let interp_blends = self.interp_blends;
+                let interp_cuts = self.interp_cuts;
+                self.interp_ticks = 0;
+                self.interp_blends = 0;
+                self.interp_cuts = 0;
                 log::line(&format!(
-                    "fps presented={} rate={:.2} source_fps={:.2} out_hz={} interp={} enhance={} queue={queue} dropped={dropped} pos_ms={} audio_ms={audio_pos} danmaku={}/{} dm_frames={}",
+                    "fps presented={} rate={:.2} source_fps={:.2} out_hz={} interp={} enhance={} queue={queue} dropped={dropped} pos_ms={} audio_ms={audio_pos} danmaku={}/{} dm_frames={} dm_fps={:.2} ui_fps={:.2} ui_draw_us={ui_draw_us} ticks={interp_ticks} blends={interp_blends} cuts={interp_cuts}",
                     self.presents_window,
                     self.fps,
                     self.source.fps,
@@ -2540,11 +4559,15 @@ impl Engine {
                     self.position_ms,
                     self.danmaku.total(),
                     self.danmaku.active_count(),
-                    self.danmaku_layer.frames
+                    self.danmaku_layer.frames,
+                    self.danmaku_fps,
+                    self.ui_fps
                 ));
                 self.shared
                     .fps_tenths
                     .store((self.fps * 10.0).round() as u32, Ordering::SeqCst);
+                // Interpolation is never disabled automatically. If it costs
+                // too much on this machine the user turns it off themselves.
                 self.presents_window = 0;
                 self.fps_window_start = Instant::now();
             }
@@ -2568,6 +4591,9 @@ impl Engine {
             return "正在缓冲…".to_string();
         }
         if self.starting {
+            if let Some(page) = self.page_loading {
+                return format!("正在加载第 {} P…", page + 1);
+            }
             return if self.cur.is_some() {
                 "正在缓冲…".to_string()
             } else {
@@ -2578,19 +4604,70 @@ impl Engine {
             return "已暂停".to_string();
         }
         if let Some(audio) = &self.audio {
-            if self.audio_master
-                && audio.clock.starved_ms.load(Ordering::SeqCst) > 350
-            {
+            if self.audio_master && audio.clock.starved_ms.load(Ordering::SeqCst) > 350 {
                 return "正在缓冲…".to_string();
             }
         }
         String::new()
     }
 
+    /// Replay a cached A–B pass. No decoder/network work happens here: the
+    /// first pass captured these pictures, and every loop reuses them.
+    fn poll_ab_cache(&mut self) {
+        if !self.playing {
+            return;
+        }
+        let Some((a, b)) = self.ab_range() else {
+            self.ab_cache_playing = false;
+            self.ab_cache_cursor = 0;
+            return;
+        };
+        let position = self.position_now();
+        self.position_ms = position;
+        self.shared.position_ms.store(position, Ordering::SeqCst);
+        if position >= b {
+            self.ab_cache_cursor = 0;
+            self.reset_loop_clock(a);
+            self.gate(false);
+            log::line(&format!("ab cache loop a={a}"));
+            return;
+        }
+        if self.interp == InterpMode::Gpu && self.interp_out_hz.is_some() {
+            self.poll_interp(position);
+            return;
+        }
+        let mut next_frame = None;
+        if let Some(cache) = self.ab_cache.as_mut() {
+            while self.ab_cache_cursor < cache.frames.len() {
+                let frame = &cache.frames[self.ab_cache_cursor];
+                if frame.ts_ms > position.saturating_add(6) {
+                    break;
+                }
+                next_frame = Some(DecodedFrame {
+                    data: frame.data.clone(),
+                    ts_ms: frame.ts_ms,
+                });
+                self.ab_cache_cursor += 1;
+            }
+        }
+        if let Some(frame) = next_frame {
+            self.display_new(frame, false);
+        }
+    }
+
     /// Take decoded frames due on the current presentation clock and present
     /// them; also drive the interpolation grid.
     fn poll_picture(&mut self) {
+        if self.ab_cache_playing {
+            self.poll_ab_cache();
+            return;
+        }
         if self.decoder.is_none() {
+            return;
+        }
+        if self.ab_swap_wait.is_some() {
+            // Hold the last frame while the next A pass warms. Presenting the
+            // old decoder's post-B frames here would show a jump past B.
             return;
         }
         if let Some(until) = self.stall_until {
@@ -2652,6 +4729,30 @@ impl Engine {
                     u8::from(self.starting)
                 ));
                 self.sync_shared();
+            } else {
+                // A seek past the real end of the DASH track opens a decoder
+                // that immediately EOFs with no picture. Waiting for that
+                // picture left the player frozen at the target (and stopped
+                // 下一分P from ever firing) — finish the stream instead.
+                let closed = self
+                    .decoder
+                    .as_ref()
+                    .map(|decoder| decoder.queue.is_closed())
+                    .unwrap_or(true);
+                if closed {
+                    log::line(&format!(
+                        "seek past end target_ms={} duration_ms={}",
+                        self.seek_target, self.duration_ms
+                    ));
+                    self.seek_in_flight = false;
+                    self.stalled = false;
+                    self.stall_audio_paused = false;
+                    let target = self.duration_ms.max(self.seek_target);
+                    self.position_ms = target;
+                    self.paused_at = target;
+                    self.shared.position_ms.store(target, Ordering::SeqCst);
+                    self.finish_stream(target);
+                }
             }
             return;
         }
@@ -2669,6 +4770,7 @@ impl Engine {
                 self.display_new(frame, true);
                 self.first_frame_at = Some(Instant::now());
                 self.had_first_frame = true;
+                self.ui_dirty = true;
                 let audio_ready = self
                     .audio
                     .as_ref()
@@ -2703,6 +4805,8 @@ impl Engine {
                     self.anchor = Some(Instant::now());
                     self.paused_at = self.seek_target;
                     self.playing = self.requested_play;
+                    self.next = None;
+                    self.next_tick_at = Some(Instant::now());
                     if self.playing {
                         self.on_playback_started();
                     }
@@ -2738,28 +4842,127 @@ impl Engine {
         self.maybe_enable_audio_master();
         self.log_drift_if_needed();
 
-        // Take the newest due picture. The reader is gated to real time, so at
-        // most one source frame is due per output period in normal playback.
-        let frame = self
+        let (queue_closed_now, queue_len_now) = self
             .decoder
             .as_ref()
-            .and_then(|decoder| decoder.queue.take_due(position, 6));
+            .map(|decoder| (decoder.queue.is_closed(), decoder.queue.len()))
+            .unwrap_or((true, 0));
+        let at_end = queue_closed_now
+            && queue_len_now == 0
+            && (self.duration_ms == 0 || position + 800 >= self.duration_ms);
+        // Decoder/reader dry: stop the device clock and show the buffer card
+        // instead of letting audio run away from a frozen picture. This is the
+        // lip-sync guard for a network slower than the video bitrate.
+        if self.audio_master
+            && !self.audio_only
+            && !at_end
+            && queue_len_now == 0
+            && self
+                .last_source_present
+                .map(|at| at.elapsed() >= Duration::from_millis(650))
+                .unwrap_or(false)
+            && !self.stall_audio_paused
+        {
+            self.stall_audio_paused = true;
+            self.stalled = true;
+            self.ui_dirty = true;
+            if let Some(audio) = &self.audio {
+                audio.send(AudioCommand::Pause);
+            }
+            log::line(&format!(
+                "buffer pause video-dry position_ms={position} audio_ms={}",
+                self.audio
+                    .as_ref()
+                    .map(|audio| audio.clock.position_ms.load(Ordering::SeqCst))
+                    .unwrap_or(0)
+            ));
+        }
+        if self.stall_audio_paused && queue_len_now > 0 {
+            self.stall_audio_paused = false;
+            self.stalled = false;
+            self.ui_dirty = true;
+            if let Some(audio) = &self.audio {
+                audio.send(AudioCommand::Resume);
+            }
+            // The wall clock kept running while the device was paused; bring
+            // it back onto the device timeline so drift diagnostics and any
+            // future non-audio fallback start from the right place.
+            self.base_ms = position;
+            self.anchor = Some(Instant::now());
+            self.paused_at = position;
+            log::line(&format!(
+                "buffer resume frames-ready position_ms={position} queue={queue_len_now}"
+            ));
+        }
+
+        // A network or decode stall can leave the picture hundreds of
+        // milliseconds behind while the device clock keeps running. Ordinary
+        // due-frame skipping handles small gaps; a persistent backlog gets one
+        // hard resync at the audio position.
+        if self.audio_master
+            && !self.audio_only
+            && !self.stall_audio_paused
+            && self.last_frame_ts.saturating_add(AV_RESYNC_MS) < position
+            && self
+                .last_source_present
+                .map(|at| at.elapsed() >= Duration::from_millis(1200))
+                .unwrap_or(false)
+            && self
+                .last_av_resync
+                .map(|at| at.elapsed() >= Duration::from_secs(8))
+                .unwrap_or(true)
+        {
+            self.last_av_resync = Some(now);
+            log::line(&format!(
+                "av resync video-behind position_ms={position} last_frame_ts={} queue={}",
+                self.last_frame_ts,
+                self.decoder
+                    .as_ref()
+                    .map(|decoder| decoder.queue.len())
+                    .unwrap_or(0)
+            ));
+            let _ = self.restart_at(position);
+            return;
+        }
+
+        // 插帧 owns the presentation grid: it consumes source frames in order,
+        // keeps one frame of lookahead and emits 120 Hz ticks (blends included).
+        // With interpolation off the due-frame path is kept, but its window
+        // follows the source cadence: a fixed 6 ms window made a 4K60 picture
+        // drop every frame the compositor delivered a hair late, which read as
+        // ~47 fps even though nothing had failed.
+        let interp_on = self.interp == InterpMode::Gpu && self.interp_out_hz.is_some();
+        let due_window = if self.source.fps.is_finite() && self.source.fps > 1.0 {
+            (1000.0 / self.source.fps / 2.0).round().clamp(6.0, 24.0) as u64
+        } else {
+            6
+        };
+        let max_lag = self
+            .source
+            .fps
+            .is_finite()
+            .then_some((3000.0 / self.source.fps).round().clamp(30.0, 120.0) as u64)
+            .unwrap_or(60);
+        let frame = if interp_on {
+            None
+        } else {
+            self.decoder.as_ref().and_then(|decoder| {
+                decoder
+                    .queue
+                    .take_due_in_order(position, due_window, max_lag)
+            })
+        };
         let (queue_closed, queue_len) = self
             .decoder
             .as_ref()
             .map(|decoder| (decoder.queue.is_closed(), decoder.queue.len()))
             .unwrap_or((true, 0));
-        let had_frame = frame.is_some();
+        let mut had_frame = frame.is_some();
         if let Some(frame) = frame {
-            self.last_frame_ts = frame.ts_ms;
             self.display_new(frame, false);
-        } else if self.interp == InterpMode::Cpu && self.interp_out_hz.is_some() {
-            if let Some(due) = self.blend_at {
-                if now >= due && self.prev.is_some() && self.cur.is_some() {
-                    self.present_blend();
-                    self.blend_at = None;
-                }
-            }
+        }
+        if interp_on && self.poll_interp(position) {
+            had_frame = true;
         }
         // A queue with frames but no presented picture for two seconds means
         // the reader and the presentation clock disagree (or the clock
@@ -2806,38 +5009,23 @@ impl Engine {
         }
 
         // End of stream: the reader has closed, the ring is empty, and the
-        // clock has reached the tail (or no duration is known).
-        if queue_closed && queue_len == 0 {
-            let reached_end = self.duration_ms == 0 || position + 800 >= self.duration_ms;
+        // clock has reached the tail (or no duration is known). While a
+        // source switch is already in flight the tail must not be handled
+        // again: `switch_page` returns early, so every loop turn would log and
+        // retry until the worker answers.
+        if queue_closed && queue_len == 0 && self.switch_rx.is_none() {
+            // Bilibili's DASH video track often stops 0.5–2 s before the
+            // duration in the playurl metadata. Waiting for `position + 800`
+            // to pass the metadata duration then deadlocks at the tail: the
+            // clock is frozen because the audio device has nothing left, so
+            // 下一分P never runs and the window sits on the loading/buffer
+            // card. The last decoded picture is the reliable signal here.
+            let tail_short = self.duration_ms > 0
+                && self.last_frame_ts.saturating_add(2_000) >= self.duration_ms;
+            let reached_end =
+                self.duration_ms == 0 || position + 800 >= self.duration_ms || tail_short;
             if reached_end {
-                if self.loop_one {
-                    // 单曲循环: same window, same sessions restarted at zero.
-                    log::line("loop_one replay");
-                    self.ended = false;
-                    self.requested_play = true;
-                    self.seek(0);
-                    self.play();
-                    return;
-                }
-                self.ended = true;
-                self.playing = false;
-                self.requested_play = false;
-                self.sync_shared();
-                self.on_playback_end();
-                self.gate(false);
-                if let Some(audio) = &self.audio {
-                    audio.send(AudioCommand::Pause);
-                }
-                self.danmaku.clear();
-                if let Err(error) = self.danmaku_layer.clear() {
-                    log::line(&format!("danmaku clear on end failed: {error:#}"));
-                }
-                log::line("danmaku cleared reason=end");
-                self.ui_dirty = true;
-                log::line(&format!(
-                    "ended position_ms={position} duration_ms={}",
-                    self.duration_ms
-                ));
+                self.finish_stream(position);
             } else if self.had_first_frame
                 && self.duration_ms > 0
                 && position + 3_000 < self.duration_ms
@@ -2848,39 +5036,153 @@ impl Engine {
         }
     }
 
-    fn display_new(&mut self, frame: DecodedFrame, first: bool) {
-        let width = self.source.width as usize;
-        let height = self.source.height as usize;
-        let size = width * height * 4;
-        let mut buffer = match self.prev.take() {
-            Some(buffer) if buffer.len() == size => buffer,
-            _ => vec![0u8; size],
+    /// Shared tail handling for a closed decoder: 循环播放 / 下一分P / end card.
+    /// `position` is the clock at the moment the stream ran out.
+    fn finish_stream(&mut self, position: u64) {
+        if self.loop_mode == o11a1::settings::LOOP_ONE {
+            // 循环播放: same window, same sessions restarted at zero.
+            log::line("loop mode replay");
+            self.ended = false;
+            self.requested_play = true;
+            self.seek(0);
+            self.play();
+            return;
+        }
+        if self.loop_mode == o11a1::settings::LOOP_NEXT_PART {
+            let pages = if self.pages.is_empty() {
+                self.info
+                    .as_ref()
+                    .map(|info| info.pages.len())
+                    .unwrap_or(0)
+            } else {
+                self.pages.len()
+            };
+            if self.current_page + 1 < pages {
+                log::line(&format!(
+                    "loop mode next part from={} to={}",
+                    self.current_page + 1,
+                    self.current_page + 2
+                ));
+                self.ended = false;
+                self.switch_page(self.current_page + 1);
+                return;
+            }
+        }
+        self.ended = true;
+        // Freeze exactly on the tail. The audio clock often stops a few
+        // hundred ms before the container duration, so leaving
+        // `position_ms`/`paused_at` at the last poll made the progress bar
+        // snap backwards when the end card appeared.
+        let end_position = if self.duration_ms > 0 {
+            self.duration_ms
+        } else {
+            position
         };
-        convert::nv12_to_bgra(&mut buffer, &frame.data, width, height);
-        let old_cur = self.cur.replace(buffer);
-        // Keep the previous picture for the CPU blend; the buffer we just took
-        // from `prev` is the one being overwritten, so steady state is two
-        // allocations, not one per frame.
-        self.prev = old_cur;
-        self.last_frame_ts = frame.ts_ms;
-        let mut mode = self.enhance;
-        let Some(bytes) = self.cur.as_deref() else {
+        self.position_ms = end_position;
+        self.paused_at = end_position;
+        self.shared
+            .position_ms
+            .store(end_position, Ordering::SeqCst);
+        self.playing = false;
+        self.requested_play = false;
+        self.sync_shared();
+        self.on_playback_end();
+        self.gate(false);
+        if let Some(audio) = &self.audio {
+            audio.send(AudioCommand::Pause);
+        }
+        self.danmaku.clear();
+        let _ = self.danmaku_layer.clear();
+        log::line("danmaku cleared reason=end");
+        self.ui_dirty = true;
+        log::line(&format!(
+            "ended position_ms={end_position} duration_ms={} loop_mode={}",
+            self.duration_ms, self.loop_mode
+        ));
+    }
+
+    fn display_new(&mut self, frame: DecodedFrame, first: bool) {
+        if first {
+            // The new part's first picture is on screen: the loading card must
+            // stop naming it.
+            self.page_loading = None;
+        }
+        self.cache_ab_frame(&frame);
+        let Some(prepared) = self.prepare_frame(frame) else {
             return;
         };
-        match Self::present_bytes(
-            &mut self.video,
-            &self.gpu,
-            &mut self.enhance_pipeline,
-            &mut mode,
-            bytes,
-            self.brightness,
-            self.audio_only,
-        ) {
-            Ok((enhanced, presented)) => {
+        self.show_source(prepared);
+        if first {
+            self.next = None;
+            self.next_tick_at = Some(Instant::now());
+        }
+    }
+
+    /// Upload one NV12 frame into the GPU frame ring and convert it to BGRA
+    /// with the NV12 shader. Keeping the conversion here (instead of in the
+    /// presenter) lets `next` be ready before the tick that needs it.
+    fn prepare_frame(&mut self, frame: DecodedFrame) -> Option<GpuFrame> {
+        if self.source.width == 0 || self.source.height == 0 {
+            return None;
+        }
+        match self
+            .video
+            .upload(&self.gpu, &frame.data, frame.ts_ms)
+        {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                log::line(&format!("gpu frame upload failed: {error:#}"));
+                None
+            }
+        }
+    }
+
+    fn show_source(&mut self, frame: GpuFrame) {
+        self.cur = Some(frame);
+        self.cur_ts_ms = frame.ts_ms;
+        self.last_frame_ts = frame.ts_ms;
+        self.present_current();
+        if self.stall_audio_paused {
+            self.stall_audio_paused = false;
+            if self.playing {
+                if let Some(audio) = &self.audio {
+                    audio.send(AudioCommand::Resume);
+                }
+            }
+            self.stalled = false;
+            self.ui_dirty = true;
+            log::line("buffer resume frame ready");
+        }
+        self.last_source_present = Some(Instant::now());
+        if self.stalled {
+            self.stalled = false;
+            self.ui_dirty = true;
+        }
+    }
+
+    fn present_current(&mut self) {
+        let Some(frame) = self.cur.as_ref().copied() else {
+            return;
+        };
+        let mut mode = self.enhance;
+        let result = if self.audio_only {
+            self.video
+                .present_black(&self.gpu)
+                .map(|presented| (false, presented))
+        } else {
+            self.video.present_frame(
+                &self.gpu,
+                &mut self.enhance_pipeline,
+                &mut mode,
+                &frame,
+                self.brightness,
+            )
+        };
+        match result {
+            Ok((_enhanced, presented)) => {
                 if presented {
                     self.presents_window = self.presents_window.saturating_add(1);
                 }
-                let _ = enhanced;
                 if mode != self.enhance {
                     self.enhance = mode;
                     self.shared.enhance.store(mode.as_u8(), Ordering::SeqCst);
@@ -2889,49 +5191,119 @@ impl Engine {
             }
             Err(error) => log::line(&format!("present failed: {error:#}")),
         }
-        self.last_source_present = Some(Instant::now());
-        self.blend_at = if self.interp == InterpMode::Cpu && self.interp_out_hz.is_some() {
-            Some(Instant::now() + self.out_period / 2)
-        } else {
-            None
-        };
-        if first {
-            self.last_frame_ts = frame.ts_ms;
+    }
+
+    /// Hold the next source picture one lookahead window ahead of the clock.
+    /// `take_front_until` keeps queue order; late frames are discarded rather
+    /// than rewinding the interpolator.
+    fn fill_next(&mut self, horizon_ms: u64) {
+        if self.next.is_some() {
+            return;
+        }
+        for _ in 0..6 {
+            let frame = if self.ab_cache_playing {
+                self.take_ab_cache_frame(horizon_ms)
+            } else {
+                match self.decoder.as_ref() {
+                    Some(decoder) => decoder.queue.take_front_until(horizon_ms),
+                    None => None,
+                }
+            };
+            let Some(frame) = frame else {
+                break;
+            };
+            if frame.ts_ms.saturating_add(1) < self.cur_ts_ms {
+                continue;
+            }
+            if let Some(prepared) = self.prepare_frame(frame) {
+                self.next = Some(prepared);
+            }
+            break;
         }
     }
 
-    fn present_blend(&mut self) {
-        let (Some(previous), Some(current)) = (self.prev.as_ref(), self.cur.as_ref()) else {
+    /// Build one output tick at `position_ms`. Returns true when a real source
+    /// picture was presented, so the stall detector can treat it as progress.
+    fn interp_tick(&mut self, position_ms: u64) -> bool {
+        self.fill_next(position_ms.saturating_add(INTERP_LOOKAHEAD_MS));
+
+        if let Some(next) = self.next.as_ref() {
+            if next.ts_ms <= position_ms.saturating_add(1) {
+                let next = self.next.take().expect("next checked");
+                self.show_source(next);
+                return true;
+            }
+        }
+
+        let (Some(current), Some(next)) = (self.cur.as_ref(), self.next.as_ref()) else {
+            return false;
+        };
+        if next.ts_ms <= self.cur_ts_ms {
+            return false;
+        }
+        let span = next.ts_ms - self.cur_ts_ms;
+        let phase = position_ms.saturating_sub(self.cur_ts_ms).min(span);
+        let mut weight = ((phase as f64 / span as f64) * 256.0).round() as u16;
+        // A cut or a very fast change must never be double-exposed. Presenting
+        // the nearest source picture also keeps the 60 Hz cadence intact. The
+        // signature is sampled during upload, so this costs no readback.
+        if interp::signature_difference(&current.signature, &next.signature) >= INTERP_CUT_DIFF {
+            weight = if weight < 128 { 0 } else { 256 };
+            self.interp_cuts = self.interp_cuts.saturating_add(1);
+        }
+        self.present_blend(weight);
+        false
+    }
+
+    /// Drive the 60 Hz grid independently of the source FPS. One tick per
+    /// engine iteration; a long stall restarts the grid instead of bursting
+    /// a row of catch-up frames.
+    fn poll_interp(&mut self, position_ms: u64) -> bool {
+        if self.cur.is_none() || self.interp_out_hz.is_none() {
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(due) = self.next_tick_at {
+            if now < due {
+                return false;
+            }
+        }
+        let mut next = self.next_tick_at.unwrap_or(now) + self.out_period;
+        if next + self.out_period <= now {
+            next = now + self.out_period;
+        }
+        self.next_tick_at = Some(next);
+        self.interp_ticks = self.interp_ticks.saturating_add(1);
+        self.interp_tick(position_ms)
+    }
+
+    fn present_blend(&mut self, weight: u16) {
+        let started = Instant::now();
+        let (Some(current), Some(next)) = (self.cur.as_ref().copied(), self.next.as_ref().copied())
+        else {
             return;
         };
-        let size = current.len();
-        if self.blend_buffer.len() != size {
-            self.blend_buffer.resize(size, 0);
-        }
-        let started = Instant::now();
-        interp::blend_bgra_into(&mut self.blend_buffer, previous, current, 128);
-        let elapsed_us = started.elapsed().as_micros().max(1) as u32;
-        self.blend_us_total = self.blend_us_total.saturating_add(elapsed_us as u64);
-        self.blend_count = self.blend_count.saturating_add(1);
-        self.last_blend_us = elapsed_us;
         let mut mode = self.enhance;
-        let bytes = std::mem::take(&mut self.blend_buffer);
-        let result = Self::present_bytes(
-            &mut self.video,
-            &self.gpu,
-            &mut self.enhance_pipeline,
-            &mut mode,
-            &bytes,
-            self.brightness,
-            self.audio_only,
-        );
-        self.blend_buffer = bytes;
+        let result = if self.audio_only {
+            self.video
+                .present_black(&self.gpu)
+                .map(|presented| (false, presented))
+        } else {
+            self.video.present_blend(
+                &self.gpu,
+                &mut self.enhance_pipeline,
+                &mut mode,
+                &current,
+                &next,
+                weight,
+                self.brightness,
+            )
+        };
         match result {
-            Ok((enhanced, presented)) => {
+            Ok((_enhanced, presented)) => {
                 if presented {
                     self.presents_window = self.presents_window.saturating_add(1);
                 }
-                let _ = enhanced;
                 if mode != self.enhance {
                     self.enhance = mode;
                     self.shared.enhance.store(mode.as_u8(), Ordering::SeqCst);
@@ -2940,25 +5312,18 @@ impl Engine {
             }
             Err(error) => log::line(&format!("blend present failed: {error:#}")),
         }
+        // Submission time, not GPU execution time: the blend and the enhance
+        // chain are queued by the same context and the compositor paces them.
+        let elapsed_us = started.elapsed().as_micros().max(1) as u32;
+        self.blend_us_total = self.blend_us_total.saturating_add(elapsed_us as u64);
+        self.blend_count = self.blend_count.saturating_add(1);
+        self.last_blend_us = elapsed_us;
         self.generated = self.generated.saturating_add(1);
-        self.shared.generated.store(self.generated, Ordering::SeqCst);
+        self.interp_blends = self.interp_blends.saturating_add(1);
+        self.shared
+            .generated
+            .store(self.generated, Ordering::SeqCst);
         self.shared.blend_us.store(elapsed_us, Ordering::SeqCst);
-    }
-
-    fn present_bytes(
-        video: &mut VideoSurface,
-        gpu: &Gpu,
-        pipeline: &mut Option<EnhancePipeline>,
-        mode: &mut EnhanceMode,
-        bytes: &[u8],
-        brightness: f32,
-        audio_only: bool,
-    ) -> Result<(bool, bool)> {
-        if audio_only {
-            return video.present_black(gpu).map(|presented| (false, presented));
-        }
-        video.stage(gpu, bytes)?;
-        video.present(gpu, pipeline, mode, brightness)
     }
 
     fn maybe_enable_audio_master(&mut self) {
@@ -2984,20 +5349,24 @@ impl Engine {
                 audio_ms as i64 - wall_ms as i64
             ));
         } else {
-            // The sound joined late; keep the wall clock rather than jump the
-            // picture backwards. Logged once per session (not every loop).
-            static REPORTED: AtomicBool = AtomicBool::new(false);
-            if !REPORTED.swap(true, Ordering::SeqCst) {
-                log::line(&format!(
-                    "av-drift audio_ms={audio_ms} wall_ms={wall_ms} delta_ms={} action=keep-wall-clock",
-                    audio_ms as i64 - wall_ms as i64
-                ));
-            }
+            // The sound joined late (or the picture was held at the loading
+            // card). Anchor the picture to the device clock instead of keeping
+            // a wall clock that the audio will never agree with: the decoder
+            // then skips stale frames and the rest of the session stays
+            // lip-synced.
+            self.base_ms = audio_ms;
+            self.anchor = Some(Instant::now());
+            self.paused_at = audio_ms;
+            self.audio_master = true;
+            log::line(&format!(
+                "audio clock master re-anchored audio_ms={audio_ms} wall_ms={wall_ms} delta_ms={}",
+                audio_ms as i64 - wall_ms as i64
+            ));
         }
     }
 
     fn log_drift_if_needed(&mut self) {
-        if !self.audio_master {
+        if !self.audio_master || self.stall_audio_paused || self.stalled {
             return;
         }
         // The first ~3 s are device warm-up: waveOut's 80 ms queue and the
@@ -3041,14 +5410,13 @@ impl Engine {
             Command::Pause => self.pause(),
             Command::TogglePlay => self.toggle_play(),
             Command::Seek(ms) => self.seek(ms),
+            Command::LoadSource(config) => self.begin_source_replace(config),
             Command::SetVolume(value) => self.set_volume(value),
             Command::SetSpeed(value) => self.set_speed(value),
             Command::SetInterp(mode) => {
-                self.interp = mode;
-                self.shared.interp.store(mode.as_u8(), Ordering::SeqCst);
-                self.ui_dirty = true;
-                log::line(&format!("interp mode={} label={}", mode.as_u8(), mode.label()));
+                self.apply_interp_mode(mode);
             }
+            Command::SetInterpHZ(hz) => self.set_interp_hz(hz),
             Command::SetEnhance(mode) => self.set_enhance(mode),
             Command::SetDanmaku(visible) => self.set_danmaku_visible(visible),
             Command::ToggleDanmaku => self.toggle_danmaku(),
@@ -3120,6 +5488,9 @@ impl Engine {
                     self.client = (width, height);
                     self.apply_client_geometry();
                 }
+                InputEvent::ResizeEnded { .. } => {
+                    // Hosted video windows follow the Electron viewport.
+                }
                 InputEvent::LeftDown { x, y } => {
                     let hit = self.danmaku_hit_at(x as f32, y as f32);
                     self.external_press = Some((Instant::now(), x, y, hit));
@@ -3140,9 +5511,7 @@ impl Engine {
                     }
                 }
                 InputEvent::DoubleClick { .. } => {
-                    self.shared
-                        .double_click_seq
-                        .fetch_add(1, Ordering::SeqCst);
+                    self.shared.double_click_seq.fetch_add(1, Ordering::SeqCst);
                 }
                 InputEvent::MouseMove { .. } => {
                     self.shared.move_seq.fetch_add(1, Ordering::SeqCst);
@@ -3163,12 +5532,18 @@ impl Engine {
         }
         match event {
             InputEvent::Quit => self.quit = true,
+            InputEvent::Focus => {
+                self.shared.focus_seq.fetch_add(1, Ordering::SeqCst);
+            }
             InputEvent::Resize { width, height } => {
                 if width < 32 || height < 32 {
                     return;
                 }
                 self.client = (width, height);
                 self.apply_client_geometry();
+            }
+            InputEvent::ResizeEnded { width, height } => {
+                self.remember_window_size(width, height);
             }
             InputEvent::Key(key) => {
                 self.note_activity();
@@ -3200,9 +5575,46 @@ impl Engine {
             InputEvent::MouseMove { x, y } => {
                 self.note_activity();
                 self.pointer = Some((x as f32, y as f32));
+                // A held right press that leaves its start point becomes a drag
+                // selection over the open context menu. Hovering 举报 opens the
+                // reason submenu so the pointer can continue straight into it.
+                if let Some((start_x, start_y, moved)) = self.dm_menu_drag.as_mut() {
+                    if !*moved && (x as f32 - *start_x).hypot(y as f32 - *start_y) > 5.0 {
+                        *moved = true;
+                    }
+                }
+                if let Some(menu) = self.dm_menu.clone() {
+                    if !menu.submenu {
+                        if let Some((_, _, true)) = self.dm_menu_drag {
+                            let layout = self.overlay.layout;
+                            let panel = dm_menu_rect(
+                                menu.x,
+                                menu.y,
+                                layout.width,
+                                layout.height,
+                                layout.scale,
+                            );
+                            if dm_menu_row(panel, DM_MENU_REPORT, layout.scale)
+                                .contains(x as f32, y as f32)
+                            {
+                                if let Some(menu) = self.dm_menu.as_mut() {
+                                    menu.submenu = true;
+                                    self.ui_dirty = true;
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some((arm_x, arm_y)) = self.window_drag_arm {
                     if (x - arm_x).abs() > 4 || (y - arm_y).abs() > 4 {
                         self.window_drag_arm = None;
+                        window::drag_window(self.hwnd);
+                        return;
+                    }
+                }
+                if let Some((arm_x, arm_y)) = self.sidebar_drag_arm {
+                    if (x - arm_x).abs() > 4 || (y - arm_y).abs() > 4 {
+                        self.sidebar_drag_arm = None;
                         window::drag_window(self.hwnd);
                         return;
                     }
@@ -3214,7 +5626,42 @@ impl Engine {
                     }
                 }
                 let layout = self.overlay.layout;
-                if self.dragging {
+                if let Some((start_x, start_speed)) = self.speed_drag {
+                    self.drag_speed(start_x, start_speed, x as f32);
+                } else if self.precision_dragging {
+                    let fraction = ((x as f32 - layout.precision_track.left)
+                        / layout.precision_track.width().max(1.0))
+                    .clamp(0.0, 1.0);
+                    if self.duration_ms > 0 {
+                        self.drag_preview =
+                            Some((fraction as f64 * self.duration_ms as f64) as u64);
+                        self.ui_dirty = true;
+                    }
+                } else if let Some((start_x, start_ms)) = self.tuner_drag {
+                    let notch = 12.0 * self.scale;
+                    // Continuous drag: the ruler follows the finger for the
+                    // whole gesture, but the playback position only changes on
+                    // release. Trunc keeps a small wobble inside a notch from
+                    // stepping a frame.
+                    let delta = x as f32 - start_x;
+                    let steps = tuner_steps(delta, notch);
+                    let fps = if self.source.fps > 1.0 {
+                        self.source.fps
+                    } else {
+                        30.0
+                    };
+                    let frame_ms = 1000.0 / fps;
+                    let start_frame = (start_ms as f64 / frame_ms).round();
+                    let target_frame = start_frame + (steps * self.frame_step as i64) as f64;
+                    let target = self.clamp_position((target_frame.max(0.0) * frame_ms).round() as u64);
+                    self.drag_preview = Some(target);
+                    // The ruler is endless: keep the full drag distance so the
+                    // scale can keep moving as far as the pointer travels. The
+                    // draw pass derives the visible tick range from this value.
+                    self.tuner_offset = delta;
+                    self.tuner_pulse = 0.0;
+                    self.ui_dirty = true;
+                } else if self.dragging {
                     let fraction = layout.progress_fraction(x as f32);
                     if self.duration_ms > 0 {
                         self.drag_preview =
@@ -3233,8 +5680,34 @@ impl Engine {
                     // a comment click is not a play/pause click in both cases.
                     return;
                 }
+                if self.speed_drag.take().is_some() {
+                    self.tuner_offset = 0.0;
+                    self.tuner_pulse = 0.0;
+                    self.commit_speed_preview();
+                    return;
+                }
+                if self.precision_dragging {
+                    self.precision_dragging = false;
+                    if let Some(target) = self.drag_preview.take() {
+                        self.seek(target);
+                    }
+                    return;
+                }
+                if let Some((_start_x, start_ms)) = self.tuner_drag.take() {
+                    self.tuner_offset = 0.0;
+                    self.tuner_pulse = 0.0;
+                    self.ui_dirty = true;
+                    if let Some(target) = self.drag_preview.take() {
+                        if target != start_ms {
+                            self.seek(target);
+                        }
+                    }
+                    return;
+                }
+                if self.sidebar_drag_arm.take().is_some() {
+                    return;
+                }
                 if self.window_drag_arm.take().is_some() {
-                    self.toggle_play();
                     return;
                 }
                 if self.dragging {
@@ -3245,6 +5718,7 @@ impl Engine {
                 self.popup_drag = None;
             }
             InputEvent::RightDown { x, y } => self.handle_right_click(x, y),
+            InputEvent::RightUp { x, y } => self.handle_right_up(x, y),
             InputEvent::DoubleClick { x, y } => {
                 if self.mini {
                     self.set_mini(false);
@@ -3258,6 +5732,8 @@ impl Engine {
                     return;
                 }
                 if layout.panel.contains(x as f32, y as f32)
+                    || (self.precision_open && layout.precision.contains(x as f32, y as f32))
+                    || (self.speed_open && layout.speed_panel.contains(x as f32, y as f32))
                     || (self.sidebar_open && layout.sidebar.contains(x as f32, y as f32))
                 {
                     return;
@@ -3265,6 +5741,52 @@ impl Engine {
                 self.toggle_fullscreen();
             }
             InputEvent::Wheel(delta) => {
+                if self.speed_open {
+                    let over_panel = self
+                        .pointer
+                        .map(|(x, y)| self.overlay.layout.speed_panel.contains(x, y))
+                        .unwrap_or(false);
+                    if over_panel {
+                        let raw = (delta as f32 / 120.0).round() as i32;
+                        if raw != 0 {
+                            // One notch is one wheel stop. The restart is
+                            // debounced: the session must not be rebuilt per
+                            // notch.
+                            let next = crate::speed::stepped(self.speed_preview, raw);
+                            self.preview_speed(next);
+                            self.speed_base = self.speed_preview;
+                            self.tuner_offset = 0.0;
+                            self.tuner_pulse = 0.0;
+                            self.speed_commit_at =
+                                Some(Instant::now() + Duration::from_millis(260));
+                        }
+                    }
+                    return;
+                }
+                if self.precision_open {
+                    let over_panel = self
+                        .pointer
+                        .map(|(x, y)| self.overlay.layout.precision.contains(x, y))
+                        .unwrap_or(false);
+                    if over_panel {
+                        let raw = (delta as f32 / 120.0).round() as i64;
+                        if raw != 0 {
+                            // Wheel-down is forward, matching drag-left. Every
+                            // notch only moves the preview and restarts the
+                            // idle countdown; the single real seek happens in
+                            // `poll_pending_wheel_seek` after the notches stop.
+                            let step = -raw;
+                            self.tuner_offset = 0.0;
+                            self.tuner_pulse = 0.001;
+                            self.tuner_pulse_dir = if step > 0 { -1.0 } else { 1.0 };
+                            if let Some(target) = self.nudge_frames(step * self.frame_step as i64) {
+                                self.pending_wheel_seek = Some((target, Instant::now()));
+                            }
+                            self.ui_dirty = true;
+                        }
+                    }
+                    return;
+                }
                 let step = (delta as f32 / 120.0).round() as i32;
                 if self.sidebar_open
                     && self
@@ -3272,13 +5794,39 @@ impl Engine {
                         .map(|(x, y)| self.overlay.layout.sidebar.contains(x, y))
                         .unwrap_or(false)
                 {
-                    self.sidebar_scroll =
-                        (self.sidebar_scroll - step as f32 * 42.0).max(0.0);
+                    if step == 0 {
+                        return;
+                    }
+                    let max = self.sidebar_max_scroll();
+                    self.sidebar_scroll_target =
+                        (self.sidebar_scroll_target - step as f32 * 88.0).clamp(0.0, max);
+                    log::line(&format!(
+                        "sidebar wheel step={step} target={} max={max} scroll={}",
+                        self.sidebar_scroll_target, self.sidebar_scroll
+                    ));
                     self.ui_dirty = true;
                     return;
                 }
-                let value = (self.volume as i32 + step * 5).clamp(0, 100) as u8;
-                self.set_volume(value);
+                let step = wheel_volume_step(
+                    &mut self.wheel_volume_accum,
+                    &mut self.wheel_volume_dir,
+                    delta,
+                );
+                if step != 0 {
+                    let value = (self.volume as i32 + step).clamp(0, 100) as u8;
+                    if value != self.volume || self.muted {
+                        self.set_volume(value);
+                    }
+                }
+                // Wheel over the picture is a volume gesture: show the
+                // right-edge level bar for a moment. The toolbar stays as it
+                // is; there is no volume flyout to reveal.
+                self.volume_wheel_until = Some(Instant::now() + Duration::from_millis(900));
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "volume wheel delta={delta} step={step} volume={}",
+                    self.volume
+                ));
             }
         }
     }
@@ -3295,19 +5843,34 @@ impl Engine {
     fn handle_click(&mut self, x: i32, y: i32) {
         self.hover_pinned = false;
         if self.mini {
-            // The mini window is frameless too: keep the top 26 px as a drag
-            // handle, and make the rest of the picture play/pause.
+            // The mini window is frameless too: keep the top 26 px as the
+            // drag handle. The picture itself has no click transport.
             if (y as f32) < 26.0 * self.scale {
                 window::drag_window(self.hwnd);
-            } else {
-                self.toggle_play();
             }
             return;
         }
         self.note_activity();
+        self.sidebar_drag_arm = None;
         let layout = self.overlay.layout;
         let px = x as f32;
         let py = y as f32;
+        if self.precision_open {
+            if self.handle_precision_click(px, py) {
+                return;
+            }
+            if !layout.precision.contains(px, py) {
+                self.close_precision();
+            }
+        }
+        if self.speed_open {
+            if self.handle_speed_click(px, py) {
+                return;
+            }
+            if !layout.speed_panel.contains(px, py) {
+                self.close_speed();
+            }
+        }
         // Overlay layers first: the undo row and the context menu sit above
         // the picture, so a click inside them must not toggle play.
         if self.undo.is_some() && layout.undo_toast.contains(px, py) {
@@ -3323,20 +5886,10 @@ impl Engine {
             self.close_dm_menu();
             return;
         }
-        if !self.fullscreen && self.chrome_shown {
+        if !self.fullscreen {
             if layout.top_close.contains(px, py) {
                 log::line("window close button");
                 window::close_window(self.hwnd);
-                return;
-            }
-            if layout.top_min.contains(px, py) {
-                log::line("window minimize button");
-                window::minimize(self.hwnd);
-                return;
-            }
-            if layout.top_max.contains(px, py) {
-                log::line("window maximize button");
-                window::toggle_maximize(self.hwnd);
                 return;
             }
             if layout.top_bar.contains(px, py) {
@@ -3351,48 +5904,52 @@ impl Engine {
             }
             return;
         }
-        if self.enhance_open {
-            for (index, row) in layout.enhance_rows.iter().enumerate() {
+        // A toolbar popover is modal for the picture: clicking the video only
+        // dismisses it, it must not pause, hit a danmaku, or open another menu.
+        if self.toolbar_popup_open()
+            && !self.point_in_toolbar_popup(&layout, px, py)
+            && self.is_picture_click(&layout, px, py)
+        {
+            self.close_toolbar_popups();
+            self.window_drag_arm = None;
+            self.dm_long = None;
+            return;
+        }
+        if self.loop_menu_open {
+            for (index, row) in layout.loop_rows.iter().enumerate() {
                 if row.contains(px, py) {
-                    let mode = EnhanceMode::from_u8(index as u8);
-                    self.set_enhance(mode);
-                    let mut stored = o11a1::settings::load();
-                    stored.player_enhance = mode.as_u8() as u32;
-                    if let Err(error) = o11a1::settings::save(&stored) {
-                        log::line(&format!("enhance save failed: {error:#}"));
-                    }
-                    self.enhance_open = false;
-                    self.ui_dirty = true;
+                    self.set_loop_mode(o11a1::settings::LOOP_MENU_ORDER[index]);
                     return;
                 }
             }
-            if layout.enhance_menu.contains(px, py) {
+            if layout.loop_menu.contains(px, py) {
                 return;
             }
-            if layout.toolbar_buttons[TB_ENHANCE].contains(px, py) {
-                self.enhance_open = false;
+            if layout.loop_btn.contains(px, py) {
+                self.loop_menu_open = false;
                 self.ui_dirty = true;
                 return;
             }
-            self.enhance_open = false;
+            self.loop_menu_open = false;
             self.ui_dirty = true;
         }
         if self.sidebar_open {
-            if layout.sidebar_close.contains(px, py) {
-                self.set_sidebar(false, self.sidebar_tab);
-                return;
-            }
             for (index, rect) in layout.sidebar_tabs.iter().enumerate() {
                 if rect.contains(px, py) {
                     self.open_sidebar_tab(SidebarTab::from_index(index));
                     return;
                 }
             }
-            if layout.sidebar_content.contains(px, py)
-                || layout.comments_more.contains(px, py)
+            if layout.sidebar_content.contains(px, py) && self.handle_sidebar_click(px, py, &layout)
             {
-                if self.handle_sidebar_click(px, py, &layout) {
-                    return;
+                return;
+            }
+            if layout.sidebar.contains(px, py) {
+                // Dragging the lane's background moves the window with it. A
+                // click alone is swallowed, so it can never toggle playback or
+                // dismiss the panel.
+                if !self.fullscreen && !self.external {
+                    self.sidebar_drag_arm = Some((x, y));
                 }
                 return;
             }
@@ -3403,18 +5960,21 @@ impl Engine {
         if self.chrome_shown {
             if layout.progress_hit(px, py) {
                 self.dragging = true;
-                self.drag_preview = Some(
-                    (layout.progress_fraction(px) as f64 * self.duration_ms as f64) as u64,
-                );
+                self.drag_preview =
+                    Some((layout.progress_fraction(px) as f64 * self.duration_ms as f64) as u64);
                 self.ui_dirty = true;
                 return;
             }
-            if layout.play.contains(px, py) {
-                self.toggle_play();
-                return;
-            }
             if layout.loop_btn.contains(px, py) {
-                self.toggle_loop();
+                self.loop_menu_open = !self.loop_menu_open;
+                self.danmaku_popup = false;
+                self.dm_input_focus = false;
+                self.settings_menu = None;
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "loop menu={}",
+                    u8::from(self.loop_menu_open)
+                ));
                 return;
             }
             for (index, rect) in layout.toolbar_buttons.iter().enumerate() {
@@ -3441,11 +6001,9 @@ impl Engine {
             return;
         }
         if !self.fullscreen && !self.external {
-            // Standalone window: defer play/pause until release so a drag on
-            // the picture can move the window instead.
+            // Standalone window: a press on the picture can drag the window.
+            // A clean release does nothing; spacebar owns play/pause.
             self.window_drag_arm = Some((x, y));
-        } else {
-            self.toggle_play();
         }
     }
 
@@ -3453,6 +6011,33 @@ impl Engine {
         self.note_activity();
         let px = x as f32;
         let py = y as f32;
+        self.dm_menu_drag = None;
+        // Right-clicking the open sidebar lane closes it; the rest of the
+        // picture keeps its own right-click gestures.
+        if self.sidebar_open && self.overlay.layout.sidebar.contains(px, py) {
+            self.set_sidebar(false, self.sidebar_tab);
+            return;
+        }
+        let layout = self.overlay.layout;
+        if self.toolbar_popup_open()
+            && !self.point_in_toolbar_popup(&layout, px, py)
+            && self.is_picture_click(&layout, px, py)
+        {
+            self.close_toolbar_popups();
+            return;
+        }
+        if self.speed_open {
+            self.close_speed();
+            return;
+        }
+        if self.precision_open {
+            self.close_precision();
+            return;
+        }
+        if self.chrome_shown && self.overlay.layout.progress_hit(px, py) {
+            self.open_precision();
+            return;
+        }
         if self.dm_menu.is_some() {
             self.close_dm_menu();
             return;
@@ -3460,11 +6045,41 @@ impl Engine {
         if self.mini {
             return;
         }
+        // A right press anywhere on the picture is a dismiss gesture for the
+        // sidebar, matching a right press on the lane itself. Layered popovers
+        // above still take the first press (they returned earlier), so this
+        // never eats a precision / danmaku menu close.
+        if self.sidebar_open && self.is_picture_click(&layout, px, py) {
+            self.set_sidebar(false, self.sidebar_tab);
+            return;
+        }
         match self.danmaku_hit_at(px, py) {
-            Some(hit) => self.open_dm_menu(&hit, px, py),
+            Some(hit) => {
+                self.open_dm_menu(&hit, px, py);
+                self.dm_menu_drag = Some((px, py, false));
+            }
             None => {
                 log::line(&format!("danmaku menu no-hit x={px:.0} y={py:.0}"));
             }
+        }
+    }
+
+    /// Right-button release. A press that was dragged onto a menu row activates
+    /// it, so the whole menu can be used as hold → move → release without a
+    /// second left click. A plain click leaves the menu open.
+    fn handle_right_up(&mut self, x: i32, y: i32) {
+        self.note_activity();
+        let Some((start_x, start_y, moved)) = self.dm_menu_drag.take() else {
+            return;
+        };
+        if !moved || self.dm_menu.is_none() {
+            return;
+        }
+        if (x as f32 - start_x).hypot(y as f32 - start_y) <= 5.0 {
+            return;
+        }
+        if self.handle_dm_menu_click(x as f32, y as f32) {
+            log::line(&format!("danmaku menu drag release x={x} y={y}"));
         }
     }
 
@@ -3484,43 +6099,44 @@ impl Engine {
         self.block_danmaku_sender(&hit.mid_hash);
     }
 
-    fn toolbar_action(&mut self, index: usize) {
-        if index != TB_ENHANCE {
-            self.enhance_open = false;
+    fn toolbar_popup_open(&self) -> bool {
+        self.danmaku_popup || self.loop_menu_open
+    }
+
+    fn point_in_toolbar_popup(&self, layout: &crate::overlay::Layout, x: f32, y: f32) -> bool {
+        (self.danmaku_popup && layout.popup.contains(x, y))
+            || (self.loop_menu_open && layout.loop_menu.contains(x, y))
+    }
+
+    fn is_picture_click(&self, layout: &crate::overlay::Layout, x: f32, y: f32) -> bool {
+        layout.stage.contains(x, y)
+            && !layout.panel.contains(x, y)
+            && (self.fullscreen || !layout.top_bar.contains(x, y))
+            && !(self.sidebar_open && layout.sidebar.contains(x, y))
+    }
+
+    fn close_toolbar_popups(&mut self) {
+        if !self.toolbar_popup_open() {
+            return;
         }
+        self.danmaku_popup = false;
+        self.dm_input_focus = false;
+        self.loop_menu_open = false;
+        self.ui_dirty = true;
+        log::line("toolbar popup close");
+    }
+
+    fn toolbar_action(&mut self, index: usize) {
+        self.loop_menu_open = false;
         match index {
-            TB_VOLUME => self.toggle_mute(),
+            TB_PRECISION => self.toggle_precision(),
+            TB_SPEED => self.toggle_speed(),
+            TB_MUTE => self.toggle_mute(),
             TB_DANMAKU => {
                 self.danmaku_popup = !self.danmaku_popup;
                 self.settings_menu = None;
                 self.ui_dirty = true;
-                log::line(&format!(
-                    "danmaku popup={}",
-                    u8::from(self.danmaku_popup)
-                ));
-            }
-            TB_INTERP => {
-                let next = if self.interp == InterpMode::Off {
-                    InterpMode::Cpu
-                } else {
-                    InterpMode::Off
-                };
-                self.interp = next;
-                self.shared.interp.store(next.as_u8(), Ordering::SeqCst);
-                self.ui_dirty = true;
-                let mut stored = o11a1::settings::load();
-                stored.interp_mode = next.as_u8();
-                if let Err(error) = o11a1::settings::save(&stored) {
-                    log::line(&format!("interp save failed: {error:#}"));
-                }
-                log::line(&format!("interp mode={} label={}", next.as_u8(), next.label()));
-            }
-            TB_ENHANCE => {
-                self.enhance_open = !self.enhance_open;
-                self.danmaku_popup = false;
-                self.settings_menu = None;
-                self.ui_dirty = true;
-                log::line(&format!("enhance menu={}", u8::from(self.enhance_open)));
+                log::line(&format!("danmaku popup={}", u8::from(self.danmaku_popup)));
             }
             TB_INFO => self.open_sidebar_tab(SidebarTab::Info),
             TB_COMMENTS => self.open_sidebar_tab(SidebarTab::Comments),
@@ -3531,42 +6147,144 @@ impl Engine {
         }
     }
 
-    fn toggle_loop(&mut self) {
-        self.loop_one = !self.loop_one;
+    fn set_loop_mode(&mut self, mode: u8) {
+        let mode = o11a1::settings::normalise_loop_mode(mode);
+        self.loop_mode = mode;
+        self.loop_menu_open = false;
         self.ui_dirty = true;
         let mut stored = o11a1::settings::load();
-        stored.loop_one = self.loop_one;
+        stored.loop_mode = mode;
+        stored.loop_one = mode == o11a1::settings::LOOP_ONE;
         if let Err(error) = o11a1::settings::save(&stored) {
-            log::line(&format!("loop_one save failed: {error:#}"));
+            log::line(&format!("loop_mode save failed: {error:#}"));
         }
-        log::line(&format!("loop_one={}", u8::from(self.loop_one)));
+        log::line(&format!(
+            "loop_mode={mode} ({})",
+            match mode {
+                o11a1::settings::LOOP_PAUSE => "pause at end",
+                o11a1::settings::LOOP_ONE => "loop",
+                o11a1::settings::LOOP_NEXT => "next / close",
+                o11a1::settings::LOOP_NEXT_PART => "next part",
+                _ => "next / close",
+            }
+        ));
+    }
+
+    /// Width added to, or removed from, the outer window when the sidebar is
+    /// open. The full-height lane sits directly beside the picture, so this is
+    /// exactly the lane width and the picture keeps its original size.
+    fn sidebar_delta(&self) -> i32 {
+        (360.0 * self.scale.max(0.75)).round() as i32
+    }
+
+    /// Maximize / fullscreen / mini can leave the window and the lane out of
+    /// sync. Re-grow or shrink once the window is back in normal windowed mode.
+    fn reconcile_sidebar_window(&mut self) {
+        if self.external || self.mini || self.fullscreen || window::is_maximized(self.hwnd) {
+            return;
+        }
+        if self.sidebar_open == self.sidebar_extra {
+            return;
+        }
+        let delta = if self.sidebar_open {
+            self.sidebar_delta()
+        } else {
+            -self.sidebar_delta()
+        };
+        window::grow_width(self.hwnd, delta);
+        self.sidebar_extra = self.sidebar_open;
+        self.client = window::client_size(self.hwnd);
     }
 
     fn set_sidebar(&mut self, open: bool, tab: SidebarTab) {
-        if open != self.sidebar_open && !self.fullscreen && !window::is_maximized(self.hwnd) {
-            let delta = if open {
-                (360.0 * self.scale).round() as i32
-            } else {
-                -(360.0 * self.scale).round() as i32
-            };
-            window::grow_width(self.hwnd, delta);
-            self.sidebar_extra = open;
-        }
+        let changed = open != self.sidebar_open;
         self.restore_live_danmaku();
         self.close_dm_menu();
         self.sidebar_open = open;
         self.sidebar_tab = tab;
         self.sidebar_scroll = 0.0;
+        self.sidebar_scroll_target = 0.0;
         self.settings_menu = None;
         self.chrome_shown = true;
         self.last_mouse_activity = Instant::now();
+
+        let windowed = !self.external && !self.fullscreen && !window::is_maximized(self.hwnd);
+        let mut delta = 0;
+        if changed && open != self.sidebar_extra && windowed {
+            self.sidebar_extra = open;
+            delta = if open {
+                self.sidebar_delta()
+            } else {
+                -self.sidebar_delta()
+            };
+        }
+
+        // The WM_SIZE caused by `grow_width` is only dispatched on the next
+        // loop turn. Lay the sidebar out for the *target* client width now:
+        // using the old width here reserves the lane inside the old picture
+        // and snaps the video to a 640x360 stage until the resize arrives.
+        let live = window::client_size(self.hwnd);
+        let target = if delta != 0 {
+            ((live.0 as i32 + delta).max(720) as u32, live.1)
+        } else {
+            live
+        };
+        self.client = target;
+        if let Err(error) = self.overlay.resize(target.0, target.1, self.scale) {
+            log::line(&format!("overlay resize (sidebar) failed: {error:#}"));
+        }
         self.overlay
             .set_chrome_state(self.sidebar_open, self.fullscreen);
-        // The strip changes the picture area even when the outer window resize
-        // lands in the same turn: refresh the video transform with the final
-        // open state so it can never stay at the pre-panel scale.
-        self.client = window::client_size(self.hwnd);
-        self.update_video_rect();
+
+        if open {
+            // Cover the right lane before the picture transform changes. The
+            // supersized UI surface already holds the finished sidebar, which
+            // sits outside the current window until `grow_width` exposes it.
+            if let Err(error) = self.composition.set_root_clip(target.0, target.1) {
+                log::line(&format!("composition clip (sidebar) failed: {error:#}"));
+            }
+            self.draw_ui_now();
+            self.update_video_rect_at(target.0, target.1);
+        } else {
+            // Expand the picture first; the old lane still covers its right
+            // edge until the window shrinks and the lane is cleared.
+            self.update_video_rect_at(target.0, target.1);
+        }
+
+        if delta != 0 {
+            window::grow_width(self.hwnd, delta);
+            let actual = window::client_size(self.hwnd);
+            if actual != target {
+                // The work-area clamp refused part of the growth (or the
+                // minimum width). Re-layout for the real client and paint it
+                // immediately instead of waiting for the queued WM_SIZE.
+                self.client = actual;
+                if let Err(error) = self.overlay.resize(actual.0, actual.1, self.scale) {
+                    log::line(&format!(
+                        "overlay resize (sidebar actual) failed: {error:#}"
+                    ));
+                }
+                self.overlay
+                    .set_chrome_state(self.sidebar_open, self.fullscreen);
+                if let Err(error) = self.composition.set_root_clip(actual.0, actual.1) {
+                    log::line(&format!(
+                        "composition clip (sidebar actual) failed: {error:#}"
+                    ));
+                }
+                self.draw_ui_now();
+                self.update_video_rect_at(actual.0, actual.1);
+            } else if !open {
+                if let Err(error) = self.composition.set_root_clip(actual.0, actual.1) {
+                    log::line(&format!(
+                        "composition clip (sidebar close) failed: {error:#}"
+                    ));
+                }
+                self.draw_ui_now();
+            }
+        } else if !open {
+            self.draw_ui_now();
+        }
+
         self.ui_dirty = true;
         if open {
             log::line(&format!("sidebar=1 tab={}", tab.label()));
@@ -3581,25 +6299,7 @@ impl Engine {
             self.set_sidebar(false, tab);
             return;
         }
-        self.restore_live_danmaku();
-        self.close_dm_menu();
-        if !self.sidebar_open && !self.fullscreen && !window::is_maximized(self.hwnd) {
-            window::grow_width(self.hwnd, (360.0 * self.scale).round() as i32);
-            self.sidebar_extra = true;
-        }
-        self.sidebar_open = true;
-        self.sidebar_tab = tab;
-        self.sidebar_scroll = 0.0;
-        self.settings_menu = None;
-        self.chrome_shown = true;
-        self.last_mouse_activity = Instant::now();
-        self.overlay
-            .set_chrome_state(self.sidebar_open, self.fullscreen);
-        self.client = window::client_size(self.hwnd);
-        self.update_video_rect();
-        self.ui_dirty = true;
-        log::line(&format!("sidebar=1 tab={}", tab.label()));
-        self.on_sidebar_tab(tab);
+        self.set_sidebar(true, tab);
     }
 
     fn on_sidebar_tab(&mut self, tab: SidebarTab) {
@@ -3617,6 +6317,11 @@ impl Engine {
     fn handle_sidebar_click(&mut self, x: f32, y: f32, layout: &crate::overlay::Layout) -> bool {
         match self.sidebar_tab {
             SidebarTab::Info => {
+                let y = y + self.sidebar_scroll;
+                if layout.info_id.contains(x, y) {
+                    self.copy_video_id();
+                    return true;
+                }
                 for (index, rect) in layout.info_actions.iter().enumerate() {
                     if rect.contains(x, y) {
                         self.info_action(index);
@@ -3630,25 +6335,27 @@ impl Engine {
                     .len()
                     .max(self.info.as_ref().map(|i| i.pages.len()).unwrap_or(0));
                 for index in 0..count {
-                    if layout.episode_row(index, self.sidebar_scroll).contains(x, y) {
+                    if layout
+                        .episode_row(index, self.sidebar_scroll)
+                        .contains(x, y)
+                    {
                         self.switch_page(index);
                         return true;
                     }
                 }
             }
             SidebarTab::Comments => {
-                if layout.comments_sort[0].contains(x, y) {
-                    self.comments_hot = true;
-                    self.request_comments(true);
+                let sort_y = y + self.sidebar_scroll;
+                if layout.comments_sort[0].contains(x, sort_y) {
+                    self.set_comments_sort(true);
                     return true;
                 }
-                if layout.comments_sort[1].contains(x, y) {
-                    self.comments_hot = false;
-                    self.request_comments(true);
+                if layout.comments_sort[1].contains(x, sort_y) {
+                    self.set_comments_sort(false);
                     return true;
                 }
-                if layout.comments_more.contains(x, y) && !self.comments_loading && !self.comments_end {
-                    self.request_comments(false);
+                if let Some(hit) = self.overlay.comment_hit(x, y, self.sidebar_scroll) {
+                    self.toggle_comment_thread(hit.rpid, hit.action);
                     return true;
                 }
             }
@@ -3659,7 +6366,10 @@ impl Engine {
                     return true;
                 }
                 for index in 0..self.history_dates.len() {
-                    if layout.history_row(index, self.sidebar_scroll).contains(x, y) {
+                    if layout
+                        .history_row(index, self.sidebar_scroll)
+                        .contains(x, y)
+                    {
                         let date = self.history_dates[index].clone();
                         if self.history_date.as_deref() == Some(date.as_str()) {
                             // Second click on the selected day returns to live.
@@ -3672,29 +6382,45 @@ impl Engine {
                 }
             }
             SidebarTab::Settings => {
-                if self.settings_menu.is_some() {
-                    if layout.settings_menu.contains(x, y) {
-                        let count = self.settings_menu_len();
-                        for index in 0..count {
-                            if layout.settings_menu_row(index, 0.0).contains(x, y) {
-                                self.select_settings_menu_row(index);
-                                return true;
-                            }
+                let scroll = self.sidebar_scroll;
+                let menu_state = self.settings_menu_state();
+                if let Some((row, count)) = menu_state {
+                    for index in 0..count {
+                        if layout
+                            .settings_menu_option(row, count, scroll, index)
+                            .contains(x, y)
+                        {
+                            self.select_settings_menu_row(index);
+                            return true;
                         }
+                    }
+                    if layout.settings_menu_rect(row, count, scroll).contains(x, y) {
                         return true;
                     }
-                    self.settings_menu = None;
-                    self.ui_dirty = true;
-                    return true;
                 }
+                let expanded = menu_state.map(|(row, count)| {
+                    (Some(row), settings_menu_height(self.scale.max(0.75), count))
+                });
+                let (expanded_row, expanded_h) = expanded.unwrap_or((None, 0.0));
                 for index in 0..SETTINGS_ROWS {
-                    if layout.settings_row(index, self.sidebar_scroll).contains(x, y) {
+                    if layout
+                        .settings_row(index, scroll, expanded_row, expanded_h)
+                        .contains(x, y)
+                    {
                         self.settings_action(index);
                         return true;
                     }
                 }
             }
-            SidebarTab::Performance => {}
+            SidebarTab::Performance => {
+                if layout
+                    .performance_hud_row(self.sidebar_scroll)
+                    .contains(x, y)
+                {
+                    self.toggle_stats();
+                    return true;
+                }
+            }
         }
         false
     }
@@ -3713,7 +6439,10 @@ impl Engine {
     }
 
     fn switch_page(&mut self, index: usize) {
-        if index == self.current_page {
+        // Clicking the current page is a no-op, but a pending switch may be
+        // replaced by a newer click: the receiver swap below drops the old
+        // answer, so the last clicked row always wins.
+        if index == self.current_page && self.switch_rx.is_none() {
             return;
         }
         let pages = if self.pages.is_empty() {
@@ -3728,7 +6457,6 @@ impl Engine {
             return;
         };
         let Some(bvid) = self.source.bvid.clone() else {
-            self.show_toast("当前是直链，无法切换到分P", true);
             return;
         };
         let cid = page.cid;
@@ -3740,9 +6468,49 @@ impl Engine {
             index + 1,
             page.title
         ));
+        if self.switch_rx.is_none() {
+            // Remember where the old part was, so a failed resolve can put the
+            // viewer back where they were instead of on a dead loading card.
+            self.switch_from_page = Some(self.current_page);
+            self.switch_resume_ms = self.position_now();
+        }
+        // Optimistic UI: move the 选集 highlight and show the loading card now,
+        // not after playurl answers. The old picture/audio stop here, so the
+        // spinner is honest about what is happening.
+        self.current_page = index;
+        self.page_loading = Some(index);
+        self.stop_sessions();
+        self.drop_loop_prefetch();
+        self.reset_ab_cache();
+        self.cur = None;
+        self.next = None;
+        self.cur_ts_ms = 0;
+        self.last_frame_ts = 0;
+        self.had_first_frame = false;
+        self.starting = true;
+        self.playing = false;
+        self.requested_play = true;
+        self.ended = false;
+        self.seek_in_flight = false;
+        self.position_ms = 0;
+        self.paused_at = 0;
+        self.seek_target = 0;
+        self.base_ms = 0;
+        self.anchor = None;
+        self.audio_master = false;
+        self.stall_audio_paused = false;
+        self.stalled = false;
+        self.stall_until = None;
+        self.session_started = Instant::now();
+        self.danmaku.clear();
+        let _ = self.danmaku_layer.clear();
+        self.ui_dirty = true;
+        self.sync_shared();
         let (tx, rx) = std::sync::mpsc::channel();
+        // A newer click supersedes a pending one.
         self.switch_rx = Some(rx);
         self.switch_target = Some(index);
+        self.switch_started = Some(Instant::now());
         let danmaku_tx = self.danmaku_tx.clone();
         let _ = std::thread::Builder::new()
             .name("player-source-switch".into())
@@ -3781,23 +6549,54 @@ impl Engine {
                     }
                 }
             });
-        self.show_toast("正在切换分P…", false);
+    }
+
+    /// Put the previous 分P back after a failed switch: the optimistic click
+    /// already stopped its decoder/audio, so reopen it at the position it had.
+    fn restore_previous_page(&mut self, reason: Option<&str>) {
+        self.switch_target = None;
+        self.page_loading = None;
+        let restore_page = self.switch_from_page.take().unwrap_or(self.current_page);
+        let resume = self.switch_resume_ms;
+        self.current_page = restore_page;
+        self.requested_play = true;
+        self.had_first_frame = false;
+        self.cur = None;
+        self.next = None;
+        self.cur_ts_ms = 0;
+        if let Err(reopen) = self.arm_new_sessions(resume) {
+            let text = match reason {
+                Some(reason) => {
+                    format!("分P切换失败：{reason}；恢复播放失败：{reopen:#}")
+                }
+                None => format!("恢复播放失败：{reopen:#}"),
+            };
+            self.report_error(text);
+        } else {
+            log::line(&format!(
+                "source switch reverted page={} at_ms={resume}",
+                restore_page + 1
+            ));
+        }
     }
 
     fn apply_switched_source(&mut self, new_source: MediaSource) {
+        self.reload_danmaku_settings();
         let size_changed =
             new_source.width != self.source.width || new_source.height != self.source.height;
-        let new_surface = if size_changed {
-            match VideoSurface::new(&self.gpu, new_source.width, new_source.height) {
-                Ok(surface) => Some(surface),
-                Err(error) => {
-                    log::line(&format!("page switch surface failed: {error:#}"));
-                    self.show_toast("新分P的视频层创建失败，保留当前分P", true);
-                    return;
-                }
+        // Always rebuild the surface on a part switch. Reusing the old swapchain
+        // after the decoder/audio sessions were stopped could leave a black
+        // picture with audio only; a fresh layer makes the switch deterministic.
+        let new_surface = match VideoSurface::new(&self.gpu, new_source.width, new_source.height) {
+            Ok(surface) => Some(surface),
+            Err(error) => {
+                log::line(&format!("page switch surface failed: {error:#}"));
+                self.show_toast("新分P的视频层创建失败，保留当前分P", true);
+                // The old sessions were stopped when the click landed, so the
+                // previous page has to be brought back explicitly.
+                self.restore_previous_page(None);
+                return;
             }
-        } else {
-            None
         };
         let new_pipeline = if size_changed {
             match EnhancePipeline::new(
@@ -3808,9 +6607,7 @@ impl Engine {
             ) {
                 Ok(pipeline) => Some(pipeline),
                 Err(error) => {
-                    log::line(&format!(
-                        "enhance fallback on page switch reason={error:#}"
-                    ));
+                    log::line(&format!("enhance fallback on page switch reason={error:#}"));
                     None
                 }
             }
@@ -3820,36 +6617,44 @@ impl Engine {
         if let Some(index) = self.switch_target.take() {
             self.current_page = index;
         }
+        self.switch_from_page = None;
         self.reset_danmaku_for_source();
         self.stop_sessions();
         if let Some(surface) = new_surface {
             if let Err(error) = self.composition.set_video_content(&surface.swap) {
                 log::line(&format!("page switch composition failed: {error:#}"));
                 self.show_toast("切换分P失败，恢复当前分P", true);
-                if let Err(reopen) = self.arm_new_sessions(0) {
-                    self.report_error(format!("恢复播放失败：{reopen:#}"));
-                }
+                self.restore_previous_page(None);
                 return;
             }
             self.video = surface;
-            self.enhance_pipeline = new_pipeline;
-            if self.enhance != EnhanceMode::Off && self.enhance_pipeline.is_none() {
-                self.enhance = EnhanceMode::Off;
-                self.shared.enhance.store(0, Ordering::SeqCst);
-                self.show_toast("新分辨率下画质增强不可用，已关闭", true);
+            if size_changed {
+                self.enhance_pipeline = new_pipeline;
+                if self.enhance != EnhanceMode::Off && self.enhance_pipeline.is_none() {
+                    self.enhance = EnhanceMode::Off;
+                    self.shared.enhance.store(0, Ordering::SeqCst);
+                    log::line("page switch enhance disabled reason=pipeline unavailable");
+                }
             }
             self.cur = None;
-            self.prev = None;
-            self.blend_buffer.clear();
+            self.cur_ts_ms = 0;
+            self.next = None;
+            self.next_tick_at = None;
             self.last_source_present = None;
             self.had_first_frame = false;
         }
         self.source = new_source;
+        self.info_scroll_height = -1.0;
+        self.events.set_video_aspect(
+            self.source.source_width,
+            self.source.source_height,
+        );
         self.restart_heartbeat_for_source();
         self.reset_storyboard();
         self.settings_menu = None;
         self.duration_ms = self.source.duration_ms;
         self.update_video_rect();
+        self.reload_player_prefs();
         self.position_ms = 0;
         self.base_ms = 0;
         self.paused_at = 0;
@@ -3865,12 +6670,15 @@ impl Engine {
         self.last_frame_ts = 0;
         self.generation = self.generation.saturating_add(1);
         self.danmaku.set_items(Vec::new());
-        if let Err(error) = self.danmaku_layer.clear() {
-            log::line(&format!("danmaku clear on source switch failed: {error:#}"));
-        }
+        let _ = self.danmaku_layer.clear();
         if let Err(error) = self.open_sessions(0, false) {
             log::line(&format!("source switch open failed: {error:#}"));
             self.show_toast("分P加载失败", true);
+            self.page_loading = None;
+            self.switch_from_page = None;
+            // The old decoder is already stopped at this point; without the
+            // error card the splash would stay up forever.
+            self.report_error(format!("分P加载失败：{error:#}"));
             return;
         }
         if let Some(info) = self.info.as_mut() {
@@ -3884,13 +6692,119 @@ impl Engine {
             self.source.cid.unwrap_or(0),
             self.source.title
         ));
-        self.show_toast("已切换分P", false);
+    }
+
+    /// Replace the video in this window without recreating it. Left-clicking a
+    /// card in the shell targets the most recently focused player, so the
+    /// window keeps its size, position and chrome; only the media source and
+    /// everything tied to it (session, info, pages, danmaku, heartbeat) change.
+    fn begin_source_replace(&mut self, config: crate::PlayerConfig) {
+        if self.source_pending {
+            // A newer click arrived while the previous source is resolving;
+            // run it as soon as that answer lands (last click wins).
+            self.queued_replace = Some(config);
+            log::line("source replace queued behind in-flight resolve");
+            return;
+        }
+        log::line(&format!(
+            "source replace start bvid={:?} cid={:?} title={:?} live={}",
+            config.bvid, config.cid, config.title, config.is_live
+        ));
+        self.pending_replace = Some(config.clone());
+        self.failed_replace = None;
+        self.stop_sessions();
+        self.drop_loop_prefetch();
+        // Drop the previous source's info/channel workers so a late detail or
+        // danmaku answer cannot paint the old video over the loading card.
+        let (detail_tx, _detail_rx_unused) = std::sync::mpsc::channel();
+        let (_detail_tx_unused, detail_rx) = std::sync::mpsc::channel();
+        self.detail_tx = detail_tx;
+        self.detail_rx = detail_rx;
+        self.heartbeat = None;
+        self.heartbeat_started = false;
+        self.session = None;
+        self.reset_ab_cache();
+        self.ab_swap_wait = None;
+        self.ab_cache_playing = false;
+        self.ab_cache_cursor = 0;
+        self.cur = None;
+        self.next = None;
+        self.cur_ts_ms = 0;
+        self.last_frame_ts = 0;
+        self.had_first_frame = false;
+        self.starting = true;
+        self.loading = true;
+        self.playing = false;
+        self.requested_play = true;
+        self.ended = false;
+        self.seek_in_flight = false;
+        self.stalled = false;
+        self.stall_audio_paused = false;
+        self.stall_until = None;
+        self.position_ms = 0;
+        self.paused_at = 0;
+        self.seek_target = 0;
+        self.base_ms = 0;
+        self.anchor = None;
+        self.audio_master = false;
+        self.duration_ms = 0;
+        self.requested_start_ms = config.start_ms;
+        self.session_started = Instant::now();
+        self.is_live = config.is_live;
+        self.aid = 0;
+        self.pages.clear();
+        self.current_page = 0;
+        self.info = None;
+        self.info_scroll_height = -1.0;
+        self.comments.clear();
+        self.comments_total = 0;
+        self.comments_end = false;
+        self.comments_cursor.clear();
+        self.comments_loading = false;
+        self.comments_reload_pending = false;
+        self.comments_enter = 1.0;
+        self.comments_generation = self.comments_generation.wrapping_add(1);
+        self.settings_menu = None;
+        self.danmaku.clear();
+        let _ = self.danmaku_layer.clear();
+        self.shared
+            .position_ms
+            .store(0, Ordering::SeqCst);
+        self.error = None;
+        self.source_pending = true;
+        let placeholder = if config.title.trim().is_empty() {
+            "正在打开视频…"
+        } else {
+            config.title.trim()
+        };
+        window::set_title(self.hwnd, &format!("O11A1 · {placeholder}"));
+        self.ui_dirty = true;
+        self.sync_shared();
+        let tx = self.source_tx.clone();
+        let danmaku_tx = self.danmaku_tx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("player-source-replace".into())
+            .spawn(move || {
+                let result = crate::resolve_deferred(config, danmaku_tx);
+                let _ = tx.send(result);
+            })
+        {
+            self.source_pending = false;
+            self.loading = false;
+            self.report_error(format!("开始加载视频失败：{error}"));
+        }
     }
 
     /// Install the source that the worker resolved while the window was
     /// already showing its loading card: swap in the real video surface and
     /// start the decode/audio sessions.
     fn apply_deferred_source(&mut self, open: crate::DeferredOpen) {
+        // A replacement can arrive while the previous video is still running.
+        // Stopping here (instead of only at the caller) makes both the initial
+        // open and an in-place replacement deterministic.
+        self.stop_sessions();
+        self.reload_danmaku_settings();
+        self.reset_ab_cache();
         let crate::DeferredOpen {
             mut source,
             session,
@@ -3900,8 +6814,7 @@ impl Engine {
             source.title = self.source.title.clone();
         }
         let title = source.title.clone();
-        let size_changed =
-            source.width != self.source.width || source.height != self.source.height;
+        let size_changed = source.width != self.source.width || source.height != self.source.height;
         let new_surface = if size_changed {
             match VideoSurface::new(&self.gpu, source.width, source.height) {
                 Ok(surface) => Some(surface),
@@ -3947,12 +6860,18 @@ impl Engine {
                 self.shared.enhance.store(0, Ordering::SeqCst);
             }
             self.cur = None;
-            self.prev = None;
-            self.blend_buffer.clear();
+            self.cur_ts_ms = 0;
+            self.next = None;
+            self.next_tick_at = None;
             self.last_source_present = None;
         }
         self.loading = false;
         self.source = source;
+        self.info_scroll_height = -1.0;
+        self.events.set_video_aspect(
+            self.source.source_width,
+            self.source.source_height,
+        );
         self.session = session;
         if let Some((tx, rx)) = detail {
             self.detail_tx = tx;
@@ -3971,6 +6890,10 @@ impl Engine {
         self.comments_total = 0;
         self.comments_end = false;
         self.comments_cursor.clear();
+        self.comments_loading = false;
+        self.comments_reload_pending = false;
+        self.comments_enter = 1.0;
+        self.comments_generation = self.comments_generation.wrapping_add(1);
         self.restart_heartbeat_for_source();
         self.reset_storyboard();
         self.settings_menu = None;
@@ -3992,8 +6915,9 @@ impl Engine {
         self.last_frame_ts = start;
         self.generation = self.generation.saturating_add(1);
         self.session_started = Instant::now();
-        let display_hz = interp::display_refresh_hz();
-        self.interp_out_hz = interp::interp_plan(display_hz, self.source.fps);
+        let display_hz = self.monitor_refresh_hz();
+        self.monitor_hz = display_hz;
+        self.interp_out_hz = interp::interp_plan(display_hz, self.source.fps, self.interp_hz);
         let out_hz = self.interp_out_hz.unwrap_or_else(|| {
             if self.source.fps.is_finite() && self.source.fps > 1.0 {
                 self.source.fps.round().clamp(1.0, 240.0) as u32
@@ -4003,9 +6927,7 @@ impl Engine {
         });
         self.out_period = Duration::from_secs_f64(1.0 / out_hz.max(1) as f64);
         self.danmaku.set_items(Vec::new());
-        if let Err(error) = self.danmaku_layer.clear() {
-            log::line(&format!("danmaku clear on initial source failed: {error:#}"));
-        }
+        let _ = self.danmaku_layer.clear();
         self.refresh_danmaku_geometry();
         self.update_video_rect();
         self.ui_dirty = true;
@@ -4022,13 +6944,29 @@ impl Engine {
             self.report_error(format!("打开播放会话失败：{error:#}"));
             return;
         }
+        self.reload_player_prefs();
         self.sync_shared();
+        self.start_playlist_prefetch();
     }
 
     fn settings_action(&mut self, index: usize) {
-        if (index == 0 || index == 1) && !self.source.has_track_menu() {
+        if self.is_live {
+            match index {
+                1 => self.toggle_ontop(),
+                2 => self.toggle_audio_only(),
+                _ => {}
+            }
+            return;
+        }
+        if (index == 0 || index == 2) && !self.source.has_track_menu() {
             self.show_toast("当前来源是直链，没有可切换的画质/音轨", true);
             return;
+        }
+        // Any non-menu settings row collapses an open inline menu in the same
+        // click, then performs its own action.
+        if index > 2 && self.settings_menu.is_some() {
+            self.settings_menu = None;
+            self.ui_dirty = true;
         }
         match index {
             0 => {
@@ -4045,6 +6983,19 @@ impl Engine {
                 ));
             }
             1 => {
+                self.settings_menu = if self.settings_menu == Some(SettingsMenu::DefaultQuality) {
+                    None
+                } else {
+                    Some(SettingsMenu::DefaultQuality)
+                };
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "settings menu={:?} rows={}",
+                    self.settings_menu,
+                    DEFAULT_QUALITY_HEIGHTS.len()
+                ));
+            }
+            2 => {
                 self.settings_menu = if self.settings_menu == Some(SettingsMenu::Audio) {
                     None
                 } else {
@@ -4057,26 +7008,35 @@ impl Engine {
                     self.audio_rows().len()
                 ));
             }
-            2 => self.cycle_speed(1),
-            3 => self.cycle_aspect(),
-            4 => self.step_brightness(0.1),
-            5 => self.cycle_interp(),
-            6 => self.cycle_enhance(),
-            7 => self.toggle_danmaku(),
-            8 => {
-                self.danmaku_popup = !self.danmaku_popup;
+            3 => self.cycle_speed(1),
+            4 => {
+                self.settings_menu = if self.settings_menu == Some(SettingsMenu::Interp) {
+                    None
+                } else {
+                    Some(SettingsMenu::Interp)
+                };
                 self.ui_dirty = true;
+                log::line(&format!(
+                    "settings menu={:?} rows={}",
+                    self.settings_menu,
+                    self.interp_rows().len()
+                ));
             }
-            9 => self.toggle_ontop(),
-            10 => self.toggle_audio_only(),
-            11 => self.cycle_sleep(),
-            12 => {
-                log::line(&format!("player keys hint={}", self.player_keys_hint));
-                self.show_toast(
-                    &format!("快捷键来自 设置 › 快捷键（{}）", self.player_keys_hint),
-                    false,
-                );
+            5 => {
+                self.settings_menu = if self.settings_menu == Some(SettingsMenu::Enhance) {
+                    None
+                } else {
+                    Some(SettingsMenu::Enhance)
+                };
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "settings menu={:?} rows={}",
+                    self.settings_menu,
+                    self.enhance_rows().len()
+                ));
             }
+            6 => self.toggle_ontop(),
+            7 => self.toggle_audio_only(),
             _ => {}
         }
     }
@@ -4152,18 +7112,32 @@ impl Engine {
             .collect()
     }
 
-    fn settings_menu_len(&self) -> usize {
-        match self.settings_menu {
-            Some(SettingsMenu::Quality) => self.quality_rows().len(),
-            Some(SettingsMenu::Audio) => self.audio_rows().len(),
-            None => 0,
+    /// Inline menu parent row and option count, if one is open.
+    fn settings_menu_state(&self) -> Option<(usize, usize)> {
+        if self.is_live {
+            return None;
         }
+        match self.settings_menu {
+            Some(SettingsMenu::Quality) => Some((0, self.quality_rows().len())),
+            Some(SettingsMenu::DefaultQuality) => Some((1, DEFAULT_QUALITY_HEIGHTS.len())),
+            Some(SettingsMenu::Audio) => Some((2, self.audio_rows().len())),
+            Some(SettingsMenu::Interp) => Some((4, self.interp_rows().len())),
+            Some(SettingsMenu::Enhance) => Some((5, self.enhance_rows().len())),
+            None => None,
+        }
+    }
+
+    fn settings_menu_len(&self) -> usize {
+        self.settings_menu_state()
+            .map(|(_, count)| count)
+            .unwrap_or(0)
     }
 
     fn open_settings_menu(&mut self, menu: SettingsMenu) {
         self.sidebar_open = true;
         self.sidebar_tab = SidebarTab::Settings;
         self.sidebar_scroll = 0.0;
+        self.sidebar_scroll_target = 0.0;
         self.chrome_shown = true;
         self.last_mouse_activity = Instant::now();
         self.overlay.set_chrome_state(true, self.fullscreen);
@@ -4173,13 +7147,37 @@ impl Engine {
             "settings menu={menu:?} rows={}",
             match menu {
                 SettingsMenu::Quality => self.quality_rows().len(),
+                SettingsMenu::DefaultQuality => DEFAULT_QUALITY_HEIGHTS.len(),
                 SettingsMenu::Audio => self.audio_rows().len(),
+                SettingsMenu::Interp => self.interp_rows().len(),
+                SettingsMenu::Enhance => self.enhance_rows().len(),
             }
         ));
     }
 
     fn select_settings_menu_row(&mut self, index: usize) {
         match self.settings_menu {
+            Some(SettingsMenu::DefaultQuality) => {
+                let Some(height) = DEFAULT_QUALITY_HEIGHTS.get(index).copied() else {
+                    return;
+                };
+                self.settings_menu = None;
+                self.quality_height_pref = height;
+                self.ui_dirty = true;
+                let mut stored = o11a1::settings::load();
+                stored.player_quality_height = height;
+                if let Err(error) = o11a1::settings::save(&stored) {
+                    log::line(&format!("default quality save failed: {error:#}"));
+                }
+                self.show_toast(
+                    &format!(
+                        "默认画质：{}（下次打开视频生效）",
+                        quality_height_label(height)
+                    ),
+                    false,
+                );
+                log::line(&format!("default quality height={height}"));
+            }
             Some(SettingsMenu::Quality) => {
                 let Some(row) = self.quality_rows().get(index).cloned() else {
                     return;
@@ -4191,10 +7189,7 @@ impl Engine {
                         "quality locked qn={} label={} reason=大会员",
                         row.qn, row.label
                     ));
-                    self.show_toast(
-                        &format!("{} 需要大会员，当前账号无法播放", row.label),
-                        true,
-                    );
+                    self.show_toast(&format!("{} 需要大会员，当前账号无法播放", row.label), true);
                     return;
                 }
                 if row.current {
@@ -4222,6 +7217,31 @@ impl Engine {
                     row.index, row.label
                 ));
                 self.request_track_switch(TrackRequest::audio(row.index), "音轨");
+            }
+            Some(SettingsMenu::Interp) => {
+                let Some(level) = self.interp_levels().get(index).copied() else {
+                    return;
+                };
+                self.settings_menu = None;
+                self.ui_dirty = true;
+                log::line(&format!("interp select index={index} level={level:?}"));
+                self.select_interp_level(level);
+            }
+            Some(SettingsMenu::Enhance) => {
+                let Some(row) = self.enhance_rows().get(index).cloned() else {
+                    return;
+                };
+                self.settings_menu = None;
+                self.ui_dirty = true;
+                if row.current {
+                    self.show_toast("已经是当前画质增强", false);
+                    return;
+                }
+                log::line(&format!(
+                    "enhance select mode={} label={}",
+                    row.index, row.label
+                ));
+                self.select_enhance(EnhanceMode::from_u8(row.index as u8));
             }
             None => {}
         }
@@ -4266,6 +7286,7 @@ impl Engine {
     }
 
     fn apply_track_switch(&mut self, new_source: MediaSource) {
+        self.reset_ab_cache();
         let old_bvid = self.source.bvid.clone();
         let old_cid = self.source.cid;
         if new_source.bvid != old_bvid || new_source.cid != old_cid {
@@ -4314,6 +7335,10 @@ impl Engine {
                 log::line(&format!("track switch composition failed: {error:#}"));
                 self.show_toast("切换画质失败，回到原播放流", true);
                 self.source = old_source;
+                self.events.set_video_aspect(
+                    self.source.source_width,
+                    self.source.source_height,
+                );
                 if let Err(reopen) = self.arm_new_sessions(target) {
                     self.report_error(format!("恢复播放失败：{reopen:#}"));
                 }
@@ -4330,12 +7355,14 @@ impl Engine {
             }
             // The old picture buffers are the previous size.
             self.cur = None;
-            self.prev = None;
-            self.blend_buffer.clear();
             self.last_source_present = None;
             self.had_first_frame = false;
         }
         self.source = new_source;
+        self.events.set_video_aspect(
+            self.source.source_width,
+            self.source.source_height,
+        );
         self.duration_ms = self.source.duration_ms;
         self.settings_menu = None;
         self.update_video_rect();
@@ -4368,13 +7395,16 @@ impl Engine {
         self.ended = false;
         self.playing = false;
         self.seek_target = target;
+        self.stream_start_ms = target;
         self.position_ms = target;
         self.base_ms = target;
         self.anchor = None;
         self.paused_at = target;
         self.audio_master = false;
         self.first_frame_at = None;
-        self.blend_at = None;
+        self.next = None;
+        self.cur_ts_ms = target;
+        self.next_tick_at = None;
         self.stalled = false;
         self.error = None;
         self.gate(false);
@@ -4405,6 +7435,15 @@ impl Engine {
     }
 
     fn retry(&mut self) {
+        // A replacement failed before it could attach: retry that exact
+        // request instead of bringing back the old video.
+        if let Some(config) = self.failed_replace.take() {
+            log::line("retry last source replace");
+            self.error = None;
+            self.stalled = false;
+            self.begin_source_replace(config);
+            return;
+        }
         // The initial resolve itself failed: there is no stream to reconnect,
         // so run the window's source lookup again.
         if self.source.video_url.is_empty() {
@@ -4525,12 +7564,35 @@ impl Engine {
         }
         if self.starting
             && self.cur.is_none()
+            && !self.had_first_frame
+            && self
+                .decoder
+                .as_ref()
+                .map(|decoder| decoder.queue.is_closed())
+                .unwrap_or(false)
+        {
+            // GPU-only: a closed pipe with no picture means the hardware
+            // decoder refused this stream/profile. Report the driver's own
+            // reason instead of waiting for the generic 15 s timeout.
+            let tail = self
+                .decoder
+                .as_ref()
+                .map(|decoder| decoder.stderr_tail())
+                .unwrap_or_default();
+            self.report_error(if tail.is_empty() {
+                "GPU 硬解失败（解码器已退出），点击重试".to_string()
+            } else {
+                format!("GPU 硬解失败：{tail}")
+            });
+            return;
+        }
+        if self.starting
+            && self.cur.is_none()
             && self.session_started.elapsed() >= Duration::from_secs(15)
         {
             self.report_error("视频加载超时，点击重试重新连接");
         }
     }
-
 
     /// Post the text in the 弹幕 popup through the WBI-signed `dm/post` API.
     fn send_danmaku(&mut self) {
@@ -4543,9 +7605,11 @@ impl Engine {
             self.show_toast("正在发送上一条弹幕…", false);
             return;
         }
-        let (Some(session), Some(bvid), Some(cid)) =
-            (self.session.clone(), self.source.bvid.clone(), self.source.cid)
-        else {
+        let (Some(session), Some(bvid), Some(cid)) = (
+            self.session.clone(),
+            self.source.bvid.clone(),
+            self.source.cid,
+        ) else {
             self.show_toast("当前来源不支持发送弹幕", true);
             return;
         };
@@ -4559,16 +7623,9 @@ impl Engine {
             .spawn(move || {
                 let result = match o11a1::bilibili::shared_runtime() {
                     Some(runtime) => runtime
-                        .block_on(session.danmaku_post(
-                            cid,
-                            &bvid,
-                            &text,
-                            progress,
-                            1,
-                            25,
-                            16_777_215,
-                            0,
-                        ))
+                        .block_on(
+                            session.danmaku_post(cid, &bvid, &text, progress, 1, 25, 16_777_215, 0),
+                        )
                         .map_err(|error| format!("{error:#}")),
                     None => Err("网络运行时不可用".to_string()),
                 };
@@ -4582,34 +7639,24 @@ impl Engine {
     }
 
     fn handle_popup_click(&mut self, x: f32, y: f32, layout: &crate::overlay::Layout) -> bool {
-        if layout.popup_send.contains(x, y) {
-            let send_button_left = layout.popup_send.right - 56.0 * layout.scale;
-            if x >= send_button_left {
-                self.send_danmaku();
-            } else {
-                self.dm_input_focus = true;
-            }
-            self.ui_dirty = true;
-            return true;
-        }
         if layout.popup_toggle.contains(x, y) {
             self.toggle_danmaku();
             return true;
         }
-        if layout.popup_close.contains(x, y) {
-            self.danmaku_popup = false;
-            self.dm_input_focus = false;
-            self.ui_dirty = true;
-            return true;
-        }
         if layout.popup.contains(x, y) {
-            let slop = 8.0 * layout.scale;
-            if (layout.popup_opacity.top - slop..=layout.popup_opacity.bottom + slop)
-                .contains(&y)
+            let slop = 12.0 * layout.scale;
+            if (layout.popup_opacity.top - slop..=layout.popup_opacity.bottom + slop).contains(&y)
                 && x >= layout.popup_opacity.left
             {
                 self.popup_drag = Some(0);
                 self.drag_popup(0, x, layout);
+                return true;
+            }
+            if (layout.popup_font.top - slop..=layout.popup_font.bottom + slop).contains(&y)
+                && x >= layout.popup_font.left
+            {
+                self.popup_drag = Some(2);
+                self.drag_popup(2, x, layout);
                 return true;
             }
             if (layout.popup_speed.top - slop..=layout.popup_speed.bottom + slop).contains(&y)
@@ -4618,12 +7665,6 @@ impl Engine {
                 self.popup_drag = Some(1);
                 self.drag_popup(1, x, layout);
                 return true;
-            }
-            for (index, rect) in layout.popup_font.iter().enumerate() {
-                if rect.contains(x, y) {
-                    self.set_danmaku_font(index);
-                    return true;
-                }
             }
             for (index, rect) in layout.popup_area.iter().enumerate() {
                 if rect.contains(x, y) {
@@ -4650,14 +7691,16 @@ impl Engine {
     }
 
     fn drag_popup(&mut self, kind: u8, x: f32, layout: &crate::overlay::Layout) {
-        let s = layout.scale;
-        let left = layout.popup.left + 90.0 * s;
-        let right = layout.popup.right - 54.0 * s;
-        let fraction = ((x - left) / (right - left).max(1.0)).clamp(0.0, 1.0);
-        if kind == 0 {
-            self.set_danmaku_opacity((fraction * 100.0).round() as u32);
-        } else {
-            self.set_danmaku_speed((50.0 + fraction * 150.0).round() as u32);
+        let track = match kind {
+            0 => layout.popup_opacity,
+            2 => layout.popup_font,
+            _ => layout.popup_speed,
+        };
+        let fraction = ((x - track.left) / track.width().max(1.0)).clamp(0.0, 1.0);
+        match kind {
+            0 => self.set_danmaku_opacity((fraction * 100.0).round() as u32),
+            2 => self.set_danmaku_font((50.0 + fraction * 100.0).round() as u32),
+            _ => self.set_danmaku_speed((50.0 + fraction * 150.0).round() as u32),
         }
     }
 
@@ -4731,6 +7774,13 @@ impl Engine {
                 self.danmaku_popup = false;
                 self.dm_input_focus = false;
                 self.ui_dirty = true;
+            } else if self.precision_step_open {
+                self.precision_step_open = false;
+                self.ui_dirty = true;
+            } else if self.precision_open {
+                self.close_precision();
+            } else if self.speed_open {
+                self.close_speed();
             } else if self.sidebar_open {
                 self.set_sidebar(false, self.sidebar_tab);
             } else if self.fullscreen {
@@ -4740,6 +7790,12 @@ impl Engine {
             } else {
                 self.quit = true;
             }
+            return;
+        }
+        // Space is a fixed transport key: even a stale/remapped key table must
+        // not turn it into fullscreen or leave playback without a shortcut.
+        if key == 0x20 {
+            self.toggle_play();
             return;
         }
         if let Some(action) = self.player_key_action(key) {
@@ -4784,14 +7840,18 @@ impl Engine {
             return;
         }
         window::toggle_fullscreen(self.hwnd, &mut self.fullscreen, &mut self.saved_window);
-        if !self.fullscreen && self.sidebar_open != self.sidebar_extra {
-            let delta = if self.sidebar_open {
-                (360.0 * self.scale).round() as i32
+        if !self.fullscreen
+            && self.sidebar_open != self.sidebar_extra
+            && !window::is_maximized(self.hwnd)
+        {
+            let want = self.sidebar_open;
+            self.sidebar_extra = want;
+            let delta = if want {
+                self.sidebar_delta()
             } else {
-                -(360.0 * self.scale).round() as i32
+                -self.sidebar_delta()
             };
             window::grow_width(self.hwnd, delta);
-            self.sidebar_extra = self.sidebar_open;
         }
         if let Err(error) = window::set_topmost(self.hwnd, self.ontop) {
             log::line(&format!("fullscreen topmost failed: {error:#}"));
@@ -4806,10 +7866,7 @@ impl Engine {
         {
             log::line(&format!("overlay resize (fullscreen) failed: {error:#}"));
         }
-        if let Err(error) = self
-            .composition
-            .set_root_clip(self.client.0, self.client.1)
-        {
+        if let Err(error) = self.composition.set_root_clip(self.client.0, self.client.1) {
             log::line(&format!("composition clip (fullscreen) failed: {error:#}"));
         }
         self.overlay
@@ -4822,6 +7879,7 @@ impl Engine {
     }
 
     fn apply_client_geometry(&mut self) {
+        self.reconcile_sidebar_window();
         let (width, height) = self.client;
         if let Err(error) = self.overlay.resize(width, height, self.scale) {
             log::line(&format!("overlay resize failed: {error:#}"));
@@ -4846,9 +7904,10 @@ impl Engine {
             if self.fullscreen {
                 self.toggle_fullscreen();
             }
+            self.sidebar_open = false;
             if self.sidebar_extra {
-                window::grow_width(self.hwnd, -(360.0 * self.scale).round() as i32);
                 self.sidebar_extra = false;
+                window::grow_width(self.hwnd, -self.sidebar_delta());
             }
             let window = window::outer_rect(self.hwnd);
             let client = window::client_size(self.hwnd);
@@ -4930,32 +7989,39 @@ impl Engine {
         self.set_mini(desired);
     }
 
-    fn video_area(&self) -> (u32, u32) {
-        let width = if self.sidebar_open {
-            (self.client.0 as f32 - 360.0 * self.scale).max(320.0) as u32
-        } else {
-            self.client.0
-        };
-        (width, self.client.1)
-    }
-
     fn update_video_rect(&mut self) {
         // Always read the live client rect: the player window can be resized by
         // the sidebar, maximize, DPI move or the user drag, and a cached size
         // would leave the picture at the old scale (a tiny video in the corner).
-        self.client = window::client_size(self.hwnd);
-        let (area_w, area_h) = self.video_area();
-        let (x, y, scale_x, scale_y) = crate::gpu::video_transform(
-            area_w as f32,
-            area_h as f32,
+        let client = window::client_size(self.hwnd);
+        self.update_video_rect_at(client.0, client.1);
+    }
+
+    /// Same as [`Self::update_video_rect`] but for a client size the window is
+    /// about to have. The sidebar needs the *new* width before `WM_SIZE` lands,
+    /// otherwise the lane is subtracted inside the old width and the picture
+    /// flashes at half size for a frame.
+    fn update_video_rect_at(&mut self, client_width: u32, client_height: u32) {
+        self.client = (client_width.max(1), client_height.max(1));
+        let inset = if self.sidebar_open
+            && !self.external
+            && !self.fullscreen
+            && !self.mini
+            && !window::is_maximized(self.hwnd)
+        {
+            self.sidebar_delta().max(0)
+        } else {
+            0
+        };
+        self.events.set_video_inset_right(inset);
+        let (x, y, width, height) = self.overlay.layout.stage_video_bounds(
             self.source.width,
             self.source.height,
-            self.aspect,
+            AspectMode::Fit,
         );
-        if let Err(error) = self
-            .composition
-            .set_video_transform(x, y, scale_x, scale_y)
-        {
+        let scale_x = width / self.source.width.max(2) as f32;
+        let scale_y = height / self.source.height.max(2) as f32;
+        if let Err(error) = self.composition.set_video_transform(x, y, scale_x, scale_y) {
             log::line(&format!("video transform failed: {error:#}"));
         }
         self.refresh_danmaku_geometry();
@@ -4963,28 +8029,25 @@ impl Engine {
 
     fn refresh_danmaku_geometry(&mut self) {
         let band = danmaku_band(
-            self.video_area(),
             &self.overlay.layout,
             &self.source,
             self.mini,
-            self.aspect,
+            AspectMode::Fit,
         );
         let position = self.position_now();
+        self.danmaku.update(position);
         self.danmaku_band = band;
         self.danmaku.relayout(band);
-        self.danmaku.reseed(position);
-        if let Err(error) = self.danmaku_layer.resize(self.client.0, self.client.1) {
-            log::line(&format!("danmaku layer resize failed: {error:#}"));
-        }
-        if let Err(error) = self.danmaku_layer.set_fonts(self.danmaku.font_sizes()) {
-            log::line(&format!("danmaku fonts failed: {error:#}"));
-        }
-        if let Err(error) = self.danmaku_layer.clear() {
-            log::line(&format!("danmaku clear after resize failed: {error:#}"));
-        }
+        let _ = self.danmaku_layer.resize(self.client.0, self.client.1);
+        // Repaint the retained comments immediately at the new geometry.
+        self.redraw_danmaku_now();
         log::line(&format!(
-            "danmaku layout client={}x{} band={}x{} rows_ready=1",
-            self.client.0, self.client.1, band.width, band.height
+            "danmaku layout client={}x{} band={}x{} rows_ready=1 active={}",
+            self.client.0,
+            self.client.1,
+            band.width,
+            band.height,
+            self.danmaku.active_count()
         ));
     }
 
@@ -5018,7 +8081,10 @@ impl Engine {
         let _ = tx.send(storyboard::Request::Init);
         self.storyboard_tx = Some(tx);
         self.storyboard_rx = Some(rx);
-        log::line(&format!("storyboard request bvid={} cid={cid}", self.source.bvid.as_deref().unwrap_or("-")));
+        log::line(&format!(
+            "storyboard request bvid={} cid={cid}",
+            self.source.bvid.as_deref().unwrap_or("-")
+        ));
     }
 
     fn preview_time(&self) -> Option<u64> {
@@ -5125,6 +8191,7 @@ impl Engine {
     fn apply_danmaku_items(&mut self, items: Vec<DanmakuItem>, view: &str) {
         let total = items.len();
         self.danmaku.set_items(items);
+        self.heatmap = build_heatmap(self.danmaku.items(), self.duration_ms);
         self.danmaku_layer.reset_layouts();
         let position = self.position_now();
         self.danmaku.reseed(position);
@@ -5132,7 +8199,7 @@ impl Engine {
             log::line(&format!("danmaku set fonts failed: {error:#}"));
         }
         let _ = self.danmaku_layer.clear();
-        self.last_danmaku_draw = Instant::now();
+        self.next_danmaku_draw = Instant::now();
         if view == "live" {
             self.shared
                 .danmaku_total
@@ -5172,7 +8239,7 @@ impl Engine {
         if let Err(error) = self.danmaku_layer.draw(&frame, clip, frame.is_empty()) {
             log::line(&format!("danmaku immediate draw failed: {error:#}"));
         }
-        self.last_danmaku_draw = Instant::now();
+        self.next_danmaku_draw = Instant::now();
     }
 
     fn draw_danmaku(&mut self) {
@@ -5185,18 +8252,21 @@ impl Engine {
         }
         // The comment layer runs on the display grid, independent of the video
         // rate: 120 Hz panels get 120 Hz scrolling comments, a 60 Hz panel gets
-        // 60. The old fixed 16 ms cap silently pinned every panel to 60.
-        let hz = crate::interp::display_refresh_hz().clamp(30, 120);
+        // 60. An absolute deadline grid is used instead of `last + interval`,
+        // so a 1-2 ms loop-sleep jitter cannot skip a whole display slot.
+        let hz = self.monitor_hz.clamp(30, 120);
         let interval = Duration::from_secs_f64(1.0 / f64::from(hz));
         let now = Instant::now();
-        if now.duration_since(self.last_danmaku_draw) < interval {
+        // Present up to 0.6 ms early: DWM shows the frame on the next refresh
+        // anyway, and this absorbs timer/scheduler granularity.
+        if now + Duration::from_micros(600) < self.next_danmaku_draw {
             return;
         }
         let position = self.position_now();
         let changed = self.danmaku.update(position);
         let frame = self.danmaku.frame(position);
         if frame.is_empty() && !changed {
-            self.last_danmaku_draw = now;
+            self.advance_danmaku_deadline(now, interval);
             return;
         }
         let band = self.danmaku_band;
@@ -5207,20 +8277,40 @@ impl Engine {
             bottom: band.top + band.height,
         };
         let force_clear = frame.is_empty();
-        match self.danmaku_layer.draw(&frame, clip, force_clear) {
-            Ok(()) => {
-                self.last_danmaku_draw = now;
-            }
-            Err(error) => {
-                log::line(&format!("danmaku draw failed: {error:#}"));
-                self.last_danmaku_draw = now;
-            }
+        if let Err(error) = self.danmaku_layer.draw(&frame, clip, force_clear) {
+            log::line(&format!("danmaku draw failed: {error:#}"));
         }
+        self.advance_danmaku_deadline(now, interval);
+    }
+
+    /// Keep the next present on the display grid. If the engine fell more than
+    /// one frame behind (heavy video frame, UI draw, resize), restart from now
+    /// instead of firing a catch-up burst.
+    fn advance_danmaku_deadline(&mut self, now: Instant, interval: Duration) {
+        let next = self.next_danmaku_draw + interval;
+        self.next_danmaku_draw = if next <= now { now + interval } else { next };
     }
 
     // -------------------------------------------------------------------- UI
 
+    /// Paint one frame synchronously. Sidebar open/close uses this so the
+    /// lane and the picture are committed in the same turn as the window
+    /// rectangle instead of waiting up to one UI interval.
+    fn draw_ui_now(&mut self) {
+        if let Err(error) = self.draw_ui_with(true) {
+            log::line(&format!("overlay draw (immediate) failed: {error:#}"));
+        } else {
+            let hz = self.monitor_hz.max(60).min(240) as f32;
+            self.next_ui_draw = Instant::now() + Duration::from_secs_f32(1.0 / hz);
+            self.ui_dirty = false;
+        }
+    }
+
     fn draw_ui(&mut self) -> Result<()> {
+        self.draw_ui_with(false)
+    }
+
+    fn draw_ui_with(&mut self, sync: bool) -> Result<()> {
         if self.external {
             let preview = self.preview_time().and_then(|time| {
                 self.storyboard_cell
@@ -5269,24 +8359,45 @@ impl Engine {
         let model = UiModel {
             title: self.source.title.clone(),
             playing: self.playing,
-            loop_one: self.loop_one,
+            loop_mode: self.loop_mode,
+            loop_menu_open: self.loop_menu_open,
             position_ms: self.drag_preview.unwrap_or(self.position_ms),
             duration_ms: self.duration_ms,
             volume: self.volume,
             muted: self.muted,
+            volume_wheel: self
+                .volume_wheel_until
+                .map(|until| Instant::now() < until)
+                .unwrap_or(false),
             interp: self.interp,
+            interp_hz: self.interp_hz,
             enhance: self.enhance,
             speed: self.speed,
+            speed_preview: self.speed_preview,
+            speed_base: self.speed_base,
+            panel: self.panel,
             fps: self.fps,
+            danmaku_fps: self.danmaku_fps,
+            ui_fps: self.ui_fps,
             source_fps: self.source.fps,
             generated: self.generated,
             blend_us: self.last_blend_us,
             stats: self.stats,
+            loaded_bytes: self.cache_done,
+            total_bytes: self.cache_total,
             status: self.status.clone(),
             source_size: (self.source.width, self.source.height),
             qn_label: self.source.qn_label.clone(),
             codec: self.source.codec.clone(),
             drag_preview: self.drag_preview,
+            precision_dragging: self.precision_dragging,
+            precision_step_open: self.precision_step_open,
+            precision_mix: self.precision_anim,
+            ab_a: self.ab_a,
+            ab_b: self.ab_b,
+            frame_step: self.frame_step,
+            heatmap: self.heatmap,
+            tuner_offset: self.tuner_offset,
             danmaku_visible: self.danmaku_visible,
             danmaku_total: self.danmaku.total(),
             live_danmaku_count: self.live_danmaku.len(),
@@ -5326,26 +8437,29 @@ impl Engine {
             current_page: self.current_page,
             comments: self.comments.clone(),
             comments_total: self.comments_total,
-            comments_hot: self.comments_hot,
             comments_loading: self.comments_loading,
-            comments_end: self.comments_end,
+            comments_sort_mix: self.comments_sort_mix,
+            comments_enter: self.comments_enter,
+            comments_generation: self.comments_generation,
             liked: self.liked,
             coined: self.coined,
             favorited: self.favorited,
             toast: self.toast.clone(),
             quality_label: self.source.qn_label.clone(),
+            player_quality_height: self.quality_height_pref,
             audio_label: self.source.audio_label.clone(),
             quality_rows: self.quality_rows(),
             audio_rows: self.audio_rows(),
+            interp_rows: self.interp_rows(),
+            enhance_rows: self.enhance_rows(),
             settings_menu: self.settings_menu,
             sleep_label: self.sleep_label(),
             keys_label: self.player_keys_hint.clone(),
             hover_preview: self.hover_preview,
             storyboard_cell,
             light_sidebar: self.light_sidebar,
+            is_live: self.is_live,
             buffering,
-            video_w: self.video_area().0 as f32,
-            enhance_open: self.enhance_open,
             splash: self.loading || !self.had_first_frame,
             error: self.error.clone(),
             danmaku_opacity: self.danmaku_opacity,
@@ -5358,14 +8472,29 @@ impl Engine {
             density_on: self.density_on,
             queue_len: self.queue_len,
             dropped: self.dropped,
-            audio_ms: self.audio_ms,
-            ui_ms: self.ui_ms,
-            renderer: "D3D11 + DirectComposition".to_string(),
+            source_host: host_label(&self.source.video_url),
+            audio_host: self
+                .source
+                .audio_url
+                .as_deref()
+                .map(host_label)
+                .unwrap_or_default(),
+            source_remote: self.source.remote,
+            video_bitrate: self.source.video_bitrate,
+            audio_bitrate: self.source.audio_bitrate,
+            net_bps: self.net_bps,
+            net_lead_s: self.net_lead_s,
+            download_streams: usize::from(self.decoder.is_some())
+                + usize::from(self.audio.is_some())
+                + usize::from(self.loop_prefetch.is_some()),
         };
-        self.overlay.set_chrome_state(self.sidebar_open, self.fullscreen);
-        let started = Instant::now();
-        let result = self.overlay.draw(&model);
-        self.ui_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.overlay
+            .set_chrome_state(self.sidebar_open, self.fullscreen);
+        let result = if sync {
+            self.overlay.draw_sync(&model)
+        } else {
+            self.overlay.draw(&model)
+        };
         result
     }
 
@@ -5400,9 +8529,9 @@ impl Engine {
         let fonts = self.danmaku.font_sizes();
         for render in self.danmaku.frame(position) {
             let font = fonts[render.bucket.min(2)];
-            if let Some(hit) = self
-                .danmaku
-                .hit_test(position, render.x + font * 0.5, render.y + font * 0.5)
+            if let Some(hit) =
+                self.danmaku
+                    .hit_test(position, render.x + font * 0.5, render.y + font * 0.5)
             {
                 return Some(hit);
             }
@@ -5446,6 +8575,11 @@ impl Engine {
                     log::line(&format!("qa seek target_ms={target}"));
                     self.seek(target);
                 }
+                QaKind::SeekEnd => {
+                    let target = self.duration_ms.saturating_sub(700);
+                    log::line(&format!("qa seek end target_ms={target}"));
+                    self.seek(target);
+                }
                 QaKind::Pause => {
                     log::line("qa pause");
                     self.pause();
@@ -5460,11 +8594,11 @@ impl Engine {
                 }
                 QaKind::Enhance => {
                     log::line("qa enhance");
-                    self.set_enhance(EnhanceMode::Cas);
+                    self.select_enhance(EnhanceMode::Cas);
                 }
                 QaKind::Anime => {
                     log::line("qa anime");
-                    self.set_enhance(EnhanceMode::Anime);
+                    self.select_enhance(EnhanceMode::Anime);
                 }
                 QaKind::Stats => {
                     // Readiness marker / capture trigger: do not steal a tab
@@ -5479,7 +8613,6 @@ impl Engine {
                 QaKind::Danmaku => {
                     log::line("qa danmaku on");
                     self.set_danmaku_visible(true);
-                    self.last_danmaku_draw = Instant::now() - Duration::from_millis(20);
                 }
                 QaKind::DanmakuOff => {
                     log::line("qa danmaku off");
@@ -5517,6 +8650,10 @@ impl Engine {
                     log::line("qa speeddown");
                     self.cycle_speed(-1);
                 }
+                QaKind::SpeedPanel => {
+                    log::line("qa speedpanel");
+                    self.open_speed();
+                }
                 QaKind::Sidebar => {
                     log::line("qa sidebar");
                     self.set_sidebar(!self.sidebar_open, self.sidebar_tab);
@@ -5524,6 +8661,10 @@ impl Engine {
                 QaKind::SidebarInfo => {
                     log::line("qa sidebar info");
                     self.open_sidebar_tab(SidebarTab::Info);
+                }
+                QaKind::InfoCopy => {
+                    log::line("qa info copy");
+                    self.copy_video_id();
                 }
                 QaKind::SidebarEpisodes => {
                     log::line("qa sidebar episodes");
@@ -5541,15 +8682,81 @@ impl Engine {
                     log::line("qa sidebar settings");
                     self.open_sidebar_tab(SidebarTab::Settings);
                 }
+                QaKind::Precision => {
+                    log::line("qa precision toggle");
+                    if self.precision_open {
+                        self.close_precision();
+                    } else {
+                        self.open_precision();
+                    }
+                }
+                QaKind::AbA => {
+                    log::line("qa ab a");
+                    self.set_ab_a();
+                }
+                QaKind::AbB => {
+                    log::line("qa ab b");
+                    self.set_ab_b();
+                }
+                QaKind::AbClear => {
+                    log::line("qa ab clear");
+                    self.clear_ab();
+                }
+                QaKind::LoopMenu => {
+                    log::line("qa loop menu toggle");
+                    self.loop_menu_open = !self.loop_menu_open;
+                    self.danmaku_popup = false;
+                    self.settings_menu = None;
+                    self.chrome_shown = true;
+                    self.last_mouse_activity = Instant::now();
+                    self.ui_dirty = true;
+                }
+                QaKind::LoopPause => {
+                    log::line("qa loop pause");
+                    self.set_loop_mode(o11a1::settings::LOOP_PAUSE);
+                }
+                QaKind::LoopOne => {
+                    log::line("qa loop one");
+                    self.set_loop_mode(o11a1::settings::LOOP_ONE);
+                }
+                QaKind::LoopNext => {
+                    log::line("qa loop next");
+                    self.set_loop_mode(o11a1::settings::LOOP_NEXT);
+                }
+                QaKind::LoopPart => {
+                    log::line("qa loop part");
+                    self.set_loop_mode(o11a1::settings::LOOP_NEXT_PART);
+                }
+                QaKind::InterpMenu => {
+                    log::line("qa interp menu");
+                    self.open_settings_menu(SettingsMenu::Interp);
+                }
+                QaKind::EnhanceMenu => {
+                    log::line("qa enhance menu");
+                    self.open_settings_menu(SettingsMenu::Enhance);
+                }
                 QaKind::DanmakuPopup => {
                     log::line("qa danmaku popup");
                     self.danmaku_popup = !self.danmaku_popup;
                     self.chrome_shown = true;
                     self.last_mouse_activity = Instant::now();
                     self.ui_dirty = true;
+                    log::line(&format!("danmaku popup={}", u8::from(self.danmaku_popup)));
+                }
+                QaKind::DanmakuLive => {
+                    // Exercise the same path the popup sliders use. The QA
+                    // harness backs up and restores settings.json around the
+                    // run, so writing through applies exactly like a click.
+                    let before = self.danmaku.active_count();
+                    self.danmaku_opacity = 70;
+                    self.danmaku_font = 120;
+                    self.danmaku_speed = 160;
+                    self.danmaku_area = 75;
+                    self.apply_danmaku_ui();
+                    let after = self.danmaku.active_count();
                     log::line(&format!(
-                        "danmaku popup={}",
-                        u8::from(self.danmaku_popup)
+                        "qa danmaku live opacity={} font={} speed={} area={} before={before} after={after}",
+                        self.danmaku_opacity, self.danmaku_font, self.danmaku_speed, self.danmaku_area
                     ));
                 }
                 QaKind::DmMenu => {
@@ -5597,30 +8804,26 @@ impl Engine {
                     log::line("qa danmaku report reason=1");
                     self.report_danmaku(1);
                 }
-                QaKind::DmBlock => {
-                    match self.qa_first_danmaku_hit() {
-                        Some(hit) => {
-                            log::line("qa danmaku block");
-                            self.block_danmaku_sender(&hit.mid_hash);
-                        }
-                        None => {
-                            log::line("qa danmaku block no visible comment");
-                            self.show_toast("当前画面没有可见弹幕", false);
-                        }
+                QaKind::DmBlock => match self.qa_first_danmaku_hit() {
+                    Some(hit) => {
+                        log::line("qa danmaku block");
+                        self.block_danmaku_sender(&hit.mid_hash);
                     }
-                }
-                QaKind::DmCopy => {
-                    match self.qa_first_danmaku_hit() {
-                        Some(hit) => {
-                            log::line("qa danmaku copy");
-                            self.copy_danmaku_text(&hit.text);
-                        }
-                        None => {
-                            log::line("qa danmaku copy no visible comment");
-                            self.show_toast("当前画面没有可见弹幕", false);
-                        }
+                    None => {
+                        log::line("qa danmaku block no visible comment");
+                        self.show_toast("当前画面没有可见弹幕", false);
                     }
-                }
+                },
+                QaKind::DmCopy => match self.qa_first_danmaku_hit() {
+                    Some(hit) => {
+                        log::line("qa danmaku copy");
+                        self.copy_danmaku_text(&hit.text);
+                    }
+                    None => {
+                        log::line("qa danmaku copy no visible comment");
+                        self.show_toast("当前画面没有可见弹幕", false);
+                    }
+                },
                 QaKind::DmUndo => {
                     log::line("qa danmaku undo");
                     self.undo_blocked_sender();
@@ -5654,8 +8857,7 @@ impl Engine {
                 }
                 QaKind::CommentsTime => {
                     log::line("qa comments time");
-                    self.comments_hot = false;
-                    self.request_comments(true);
+                    self.set_comments_sort(false);
                 }
                 QaKind::Like => self.info_action(0),
                 QaKind::Coin => self.info_action(1),
@@ -5729,12 +8931,12 @@ impl Engine {
                     self.open_settings_menu(SettingsMenu::Audio);
                     let rows = self.audio_rows();
                     if rows.len() > 1 {
-                        let current = rows
-                            .iter()
-                            .position(|row| row.current)
-                            .unwrap_or(0);
+                        let current = rows.iter().position(|row| row.current).unwrap_or(0);
                         let row = (current + 1) % rows.len();
-                        log::line(&format!("qa audio next row={row} index={}", rows[row].index));
+                        log::line(&format!(
+                            "qa audio next row={row} index={}",
+                            rows[row].index
+                        ));
                         self.select_settings_menu_row(row);
                     } else {
                         self.settings_menu = None;
@@ -5788,6 +8990,10 @@ impl Engine {
     }
 
     fn shutdown(&mut self) {
+        // Remove the window before any decoder/audio joins. The close click
+        // must feel instant even when a session takes a few hundred ms to tear
+        // down; cleanup continues out of sight.
+        window::set_visible(self.hwnd, false);
         self.gate(false);
         self.sync_shared();
         self.persist_state();
@@ -5862,23 +9068,16 @@ fn player_keys_summary(keys: &[u32]) -> String {
 }
 
 fn danmaku_band(
-    client: (u32, u32),
     layout: &crate::overlay::Layout,
     source: &MediaSource,
     mini: bool,
     aspect: AspectMode,
 ) -> Band {
-    let (x, y, width, height) = crate::gpu::video_bounds(
-        client.0 as f32,
-        client.1 as f32,
-        source.width,
-        source.height,
-        aspect,
-    );
+    let (x, y, width, height) = layout.stage_video_bounds(source.width, source.height, aspect);
     let video_bottom = y + height;
-    // Keep the first lane below the top glass bar: the bar always sits above
-    // the comments, and hiding the first line under it made the top of the
-    // video look empty while comments scrolled behind the title.
+    // Keep the first lane below the top controls: they always sit above the
+    // comments, and hiding the first line under them made the top of the
+    // video look empty while comments scrolled behind the chrome.
     let top = if mini {
         y
     } else {
@@ -5895,15 +9094,52 @@ fn danmaku_band(
         width,
         height: (video_bottom - top).max(1.0),
         bottom_limit: bottom_limit.max(top + 1.0),
-        window_height: client.1,
+        window_height: layout.height.round().max(1.0) as u32,
     }
 }
 
-fn window_size() -> (u32, u32) {    let text = std::env::var("BILI_PLAYER_SIZE").unwrap_or_default();
+/// Host part of a media URL, for the performance panel's source rows.
+fn host_label(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    rest.split('/').next().unwrap_or("").to_string()
+}
+
+/// Fold the loaded danmaku into a fixed 120-bucket density profile. The panel
+/// only needs this when opened (and once per new comment list), so a single
+/// pass per video is enough.
+fn build_heatmap(items: &[DanmakuItem], duration_ms: u64) -> [u8; HEAT_BUCKETS] {
+    let mut counts = [0u32; HEAT_BUCKETS];
+    if duration_ms > 1 {
+        for item in items {
+            let index =
+                ((item.progress_ms as u128 * HEAT_BUCKETS as u128) / duration_ms as u128) as usize;
+            counts[index.min(HEAT_BUCKETS - 1)] =
+                counts[index.min(HEAT_BUCKETS - 1)].saturating_add(1);
+        }
+    }
+    let max = counts.iter().copied().max().unwrap_or(0);
+    let mut out = [0u8; HEAT_BUCKETS];
+    if max > 0 {
+        for (slot, count) in out.iter_mut().zip(counts.iter()) {
+            *slot = ((*count as f32 / max as f32).sqrt() * 255.0).round() as u8;
+        }
+    }
+    out
+}
+
+fn window_size(state: &PlayerState) -> (u32, u32) {
+    let text = std::env::var("BILI_PLAYER_SIZE").unwrap_or_default();
     if let Some((width, height)) = text.split_once('x') {
         if let (Ok(width), Ok(height)) = (width.trim().parse(), height.trim().parse()) {
             return (width, height);
         }
+    }
+    if let (Some(width), Some(height)) = (state.window_width, state.window_height) {
+        let scale = window::system_dpi_scale();
+        return (
+            (width as f32 * scale).round().max(320.0) as u32,
+            (height as f32 * scale).round().max(180.0) as u32,
+        );
     }
     DEFAULT_WINDOW
 }
@@ -5939,15 +9175,60 @@ fn screenshot_path() -> PathBuf {
     directory
 }
 
-fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {    let Ok(text) = std::env::var("BILI_PLAYER_QA") else {
+fn comment_ui(
+    data: CommentData,
+    avatars: &std::collections::HashMap<String, ImageData>,
+) -> CommentUi {
+    let avatar = avatars.get(&data.avatar_url).cloned();
+    let replies = data
+        .replies
+        .into_iter()
+        .map(|reply| reply_ui(reply, avatars))
+        .collect();
+    CommentUi {
+        rpid: data.rpid,
+        user: data.user,
+        message: data.message,
+        likes: data.likes,
+        ctime: data.ctime,
+        pinned: data.pinned,
+        reply_count: data.reply_count,
+        avatar_url: data.avatar_url,
+        avatar,
+        replies,
+        replies_page: 0,
+        replies_end: false,
+        replies_loading: false,
+        expanded: false,
+    }
+}
+
+fn reply_ui(data: CommentData, avatars: &std::collections::HashMap<String, ImageData>) -> ReplyUi {
+    ReplyUi {
+        rpid: data.rpid,
+        user: data.user,
+        message: data.message,
+        likes: data.likes,
+        ctime: data.ctime,
+        avatar_url: data.avatar_url.clone(),
+        avatar: avatars.get(&data.avatar_url).cloned(),
+    }
+}
+
+fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
+    let Ok(text) = std::env::var("BILI_PLAYER_QA") else {
         return Vec::new();
     };
     let mut actions = Vec::new();
     let mut at = 3.5f64;
-    for token in text.split(',').map(|token| token.trim().to_ascii_lowercase()) {
+    for token in text
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+    {
         let kind = match token.as_str() {
             "" => continue,
             "seek" => QaKind::Seek,
+            "seek_end" | "seekend" | "end" => QaKind::SeekEnd,
             "pause" => QaKind::Pause,
             "resume" | "play" => QaKind::Play,
             "interp" => QaKind::Interp,
@@ -5967,13 +9248,16 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {    let Ok(text) = std::env::va
             "audioonly" | "audio" => QaKind::AudioOnly,
             "speedup" | "faster" => QaKind::SpeedUp,
             "speeddown" | "slower" => QaKind::SpeedDown,
+            "speedpanel" | "speed_panel" | "speed" => QaKind::SpeedPanel,
             "sidebar" => QaKind::Sidebar,
             "info" => QaKind::SidebarInfo,
+            "info_copy" | "infocopy" | "id_copy" | "idcopy" => QaKind::InfoCopy,
             "episodes" | "parts" => QaKind::SidebarEpisodes,
             "comments" | "comment" => QaKind::SidebarComments,
             "performance" | "perf" => QaKind::SidebarPerformance,
             "settings" | "set" => QaKind::SidebarSettings,
             "dmpopup" | "danmakupopup" => QaKind::DanmakuPopup,
+            "dmlive" | "danmakulive" => QaKind::DanmakuLive,
             "dm_menu" | "dmmenu" | "danmakumenu" => QaKind::DmMenu,
             "dm_hold" | "dmhold" => QaKind::DmHold,
             "dm_like" | "dmlike" => QaKind::DmLike,
@@ -6002,6 +9286,17 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {    let Ok(text) = std::env::va
             "hover2" => QaKind::Hover2,
             "sleep" => QaKind::Sleep,
             "sleep_short" | "sleepshort" => QaKind::SleepShort,
+            "precision" | "seek_precision" => QaKind::Precision,
+            "ab_a" | "aba" => QaKind::AbA,
+            "ab_b" | "abb" => QaKind::AbB,
+            "ab_clear" | "abclear" => QaKind::AbClear,
+            "loop_menu" | "loopmenu" => QaKind::LoopMenu,
+            "loop_pause" | "looppause" => QaKind::LoopPause,
+            "loop_one" | "loopone" => QaKind::LoopOne,
+            "loop_next" | "loopnext" => QaKind::LoopNext,
+            "loop_part" | "looppart" => QaKind::LoopPart,
+            "interp_menu" | "interpmenu" => QaKind::InterpMenu,
+            "enhance_menu" | "enhancemenu" => QaKind::EnhanceMenu,
             "fault" => QaKind::Fault,
             "retry" => QaKind::Retry,
             "stall" => QaKind::Stall,
@@ -6017,7 +9312,10 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {    let Ok(text) = std::env::va
         at += 1.8;
     }
     if !actions.is_empty() {
-        log::line(&format!("qa actions={} start_at=3.5s step=1.8s", actions.len()));
+        log::line(&format!(
+            "qa actions={} start_at=3.5s step=1.8s",
+            actions.len()
+        ));
     }
     actions
 }
@@ -6025,6 +9323,44 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {    let Ok(text) = std::env::va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_volume_moves_five_percent_per_notch() {
+        let mut accum = 0.0;
+        let mut direction = 0.0;
+        assert_eq!(wheel_volume_step(&mut accum, &mut direction, 120), 5);
+        assert_eq!(wheel_volume_step(&mut accum, &mut direction, 120), 5);
+        assert_eq!(wheel_volume_step(&mut accum, &mut direction, -120), -5);
+        assert_eq!(wheel_volume_step(&mut accum, &mut direction, 0), 0);
+    }
+
+    #[test]
+    fn wheel_volume_accumulates_a_precision_touchpad() {
+        let mut accum = 0.0;
+        let mut direction = 0.0;
+        let mut total = 0;
+        for _ in 0..8 {
+            total += wheel_volume_step(&mut accum, &mut direction, 15);
+        }
+        // Eight 15-unit events are one 120-unit notch: 5%.
+        assert_eq!(total, 5);
+        // The leftovers are below one percent and do not get lost.
+        assert!(accum.abs() < 1.0);
+        // Reversing direction responds on the first notch instead of eating
+        // the leftover of the previous direction.
+        assert_eq!(wheel_volume_step(&mut accum, &mut direction, -120), -5);
+    }
+
+    #[test]
+    fn frame_ruler_drag_steps_only_after_a_full_notch() {
+        // A small wobble must not step a frame.
+        assert_eq!(tuner_steps(-11.0, 12.0), 0);
+        assert_eq!(tuner_steps(11.0, 12.0), 0);
+        // Dragging left advances; dragging right rewinds.
+        assert_eq!(tuner_steps(-12.0, 12.0), 1);
+        assert_eq!(tuner_steps(-50.0, 12.0), 4);
+        assert_eq!(tuner_steps(50.0, 12.0), -4);
+    }
 
     #[test]
     fn player_key_pool_matches_the_old_settings_ui() {
@@ -6040,7 +9376,10 @@ mod tests {
     #[test]
     fn remapped_keys_resolve_by_action_index() {
         let keys = vec![8, 0, 5, 6, 7, 1, 3, 12, 9, 10, 11];
-        let action = |key: u32| keys.iter().position(|c| player_candidate_vk(*c) == Some(key));
+        let action = |key: u32| {
+            keys.iter()
+                .position(|c| player_candidate_vk(*c) == Some(key))
+        };
         assert_eq!(action(0x46), Some(0)); // F is now play/pause
         assert_eq!(action(0x20), Some(6)); // Space is now fullscreen
         assert_eq!(action(0x51), Some(9)); // Q stays like

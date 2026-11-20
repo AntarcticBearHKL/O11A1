@@ -74,7 +74,8 @@ pub fn wav_seconds(path: &Path) -> Option<f64> {
             }
             _ => {
                 // chunks are word-aligned
-                file.seek(SeekFrom::Current((size + (size & 1)) as i64)).ok()?;
+                file.seek(SeekFrom::Current((size + (size & 1)) as i64))
+                    .ok()?;
             }
         }
         if size & 1 == 1 && is_fmt {
@@ -85,18 +86,12 @@ pub fn wav_seconds(path: &Path) -> Option<f64> {
 
 /// Cut `audio` into `dir/chunk-%03d.wav`. Returns the pieces in time order; a
 /// file that fits in one chunk is returned as-is (no copy, no re-encode).
-pub fn split(
-    ffmpeg: &str,
-    audio: &Path,
-    dir: &Path,
-    seconds: u32,
-) -> Result<Vec<PathBuf>> {
+pub fn split(ffmpeg: &str, audio: &Path, dir: &Path, seconds: u32) -> Result<Vec<PathBuf>> {
     let total = wav_seconds(audio).unwrap_or(0.0);
     if total > 0.0 && total <= seconds as f64 {
         return Ok(vec![audio.to_path_buf()]);
     }
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("创建分段目录失败：{}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("创建分段目录失败：{}", dir.display()))?;
     let pattern = dir.join("chunk-%03d.wav");
     let segment_time = seconds.to_string();
     let status = proc::command(ffmpeg)

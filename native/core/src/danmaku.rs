@@ -226,8 +226,14 @@ fn danmaku_from_history(parts: &[&str], text: String) -> Option<Danmaku> {
         fontsize: parse(2, 25),
         color: parse(3, 0x00FF_FFFF),
         text,
-        mid_hash: parts.get(6).map(|v| v.trim().to_string()).unwrap_or_default(),
-        dmid: parts.get(7).map(|v| v.trim().to_string()).unwrap_or_default(),
+        mid_hash: parts
+            .get(6)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default(),
+        dmid: parts
+            .get(7)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default(),
     })
 }
 

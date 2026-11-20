@@ -29,9 +29,9 @@ use crate::bilibili::Session;
 use crate::fishwatch::proc;
 use crate::fishwatch::steps::{SkipReason, Step, StepFuture, StepId, StepOutput};
 use crate::fishwatch::transcript;
-use crate::fishwatch::{WatchConfig, WatchCtx};
 #[cfg(test)]
 use crate::fishwatch::Gathered;
+use crate::fishwatch::{WatchConfig, WatchCtx};
 
 /// Audio cache cap: 2 GB, oldest files deleted first.
 pub const CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -96,7 +96,10 @@ pub fn detect(config: &WatchConfig) -> Option<Availability> {
     let value = detect_inner(config);
     let key = probe_key(config);
     if let Ok(mut slot) = probe_slot().lock() {
-        *slot = Some(Probe { key, value: value.clone() });
+        *slot = Some(Probe {
+            key,
+            value: value.clone(),
+        });
     }
     value
 }
@@ -171,7 +174,12 @@ fn pick_engine(
     requested: &str,
     python: Option<String>,
     cpp: Option<PathBuf>,
-) -> Option<(&'static str, Option<String>, Option<PathBuf>, Option<&'static str>)> {
+) -> Option<(
+    &'static str,
+    Option<String>,
+    Option<PathBuf>,
+    Option<&'static str>,
+)> {
     let fw_ok = python.is_some();
     let cpp_ok = cpp.is_some();
     match requested {
@@ -312,7 +320,9 @@ pub fn status_text(config: &WatchConfig) -> String {
         return "引擎未安装：需要本机 faster-whisper（Python）或 whisper-cli".to_string();
     };
     let spec = spec_for(config);
-    let model = spec.map(|spec| spec.id).unwrap_or(config.asr.model.as_str());
+    let model = spec
+        .map(|spec| spec.id)
+        .unwrap_or(config.asr.model.as_str());
     let (ready, size) = match spec {
         Some(spec) if models::model_ready(&config.model_dir, spec) => {
             (true, models::human_bytes(spec.total_bytes()))
@@ -419,12 +429,7 @@ pub async fn ensure_audio(
     })
 }
 
-async fn download_stream(
-    session: &Session,
-    url: &str,
-    referer: &str,
-    path: &Path,
-) -> Result<u64> {
+async fn download_stream(session: &Session, url: &str, referer: &str, path: &Path) -> Result<u64> {
     let response = session
         .open_stream(url, referer)
         .await
@@ -652,10 +657,11 @@ impl AsrStep {
         let device = availability.device.clone();
         let total_s = chunk::wav_seconds(audio).unwrap_or(0.0);
         let chunk_s = chunk::chunk_seconds();
-        let dir = self
-            .config
-            .work_dir
-            .join(format!("asr-chunks-{}-{}", std::process::id(), monotonic_id()));
+        let dir = self.config.work_dir.join(format!(
+            "asr-chunks-{}-{}",
+            std::process::id(),
+            monotonic_id()
+        ));
         let started = Instant::now();
         let pieces = match chunk::split(&self.config.ffmpeg, audio, &dir, chunk_s) {
             Ok(pieces) => pieces,
@@ -780,9 +786,7 @@ impl AsrStep {
         }
         let segments = chunk::merge(parts);
         if segments.is_empty() {
-            return Err(anyhow!(
-                "所有分段转写都没有产出句子（可能是纯音乐或静音）"
-            ));
+            return Err(anyhow!("所有分段转写都没有产出句子（可能是纯音乐或静音）"));
         }
         let used_device = if cpu_chunks == 0 {
             device.clone()
@@ -865,7 +869,6 @@ impl Step for AsrStep {
     fn id(&self) -> StepId {
         StepId::Asr
     }
-
 
     fn timeout(&self) -> Duration {
         Duration::from_secs(1_800)
@@ -977,11 +980,8 @@ impl Step for AsrStep {
                 first_chunk_ms,
                 wall_ms,
             } = run;
-            let (count, chars) = transcript::attach_asr(
-                &mut ctx.gathered,
-                transcript.segments.clone(),
-                "asr",
-            );
+            let (count, chars) =
+                transcript::attach_asr(&mut ctx.gathered, transcript.segments.clone(), "asr");
             let covered: f64 = transcript
                 .segments
                 .iter()
@@ -1013,9 +1013,11 @@ impl Step for AsrStep {
                     used_device,
                     count,
                     chars,
-                    models::human_bytes(audio.bytes.max(
-                        std::fs::metadata(&audio.path).map(|m| m.len()).unwrap_or(0)
-                    )),
+                    models::human_bytes(
+                        audio
+                            .bytes
+                            .max(std::fs::metadata(&audio.path).map(|m| m.len()).unwrap_or(0))
+                    ),
                     wall_ms as f64 / 1_000.0
                 ),
                 bytes: audio.bytes,
@@ -1055,7 +1057,10 @@ fn wait_for_playback(ctx: &WatchCtx) -> u64 {
 /// `Gathered` is where the transcript lands; this helper exists so the unit
 /// tests can exercise the step's attachment without a process.
 #[cfg(test)]
-pub fn attach_test_transcript(gathered: &mut crate::fishwatch::Gathered, segments: Vec<transcript::Segment>) -> usize {
+pub fn attach_test_transcript(
+    gathered: &mut crate::fishwatch::Gathered,
+    segments: Vec<transcript::Segment>,
+) -> usize {
     let (count, _) = transcript::attach_asr(gathered, segments, "asr");
     count
 }
@@ -1139,8 +1144,7 @@ mod tests {
         assert_eq!(engine, "faster-whisper");
         assert_eq!(fallback, None);
 
-        let (engine, _, _, fallback) =
-            pick_engine("auto", None, cpp.clone()).expect("cpp only");
+        let (engine, _, _, fallback) = pick_engine("auto", None, cpp.clone()).expect("cpp only");
         assert_eq!(engine, "whisper.cpp");
         assert_eq!(fallback, None);
 
@@ -1177,7 +1181,8 @@ mod tests {
     }
 
     #[test]
-    fn attach_transcript_sets_source_and_text() {        let mut gathered = Gathered::default();
+    fn attach_transcript_sets_source_and_text() {
+        let mut gathered = Gathered::default();
         let count = attach_test_transcript(
             &mut gathered,
             vec![
@@ -1338,7 +1343,8 @@ mod tests {
         let root = std::env::var_os("BILI_MODEL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::paths::root().join("models/whisper"));
-        let engine = std::env::var("BILI_ASR_ENGINE").unwrap_or_else(|_| "faster-whisper".to_string());
+        let engine =
+            std::env::var("BILI_ASR_ENGINE").unwrap_or_else(|_| "faster-whisper".to_string());
         let config = WatchConfig {
             model_dir: root.clone(),
             audio_dir: crate::paths::root().join("cache/fishaudio"),
@@ -1425,4 +1431,3 @@ mod tests {
         assert!(!run.transcript.segments.is_empty());
     }
 }
-

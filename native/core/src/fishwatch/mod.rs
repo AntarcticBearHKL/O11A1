@@ -12,8 +12,13 @@
 // The module surface is consumed by `fish.rs` and (from phase 1's UI pass) by
 // `main.rs`; a few helpers exist for the next phase before their call site.
 
+pub mod agent;
 pub mod asr;
 pub mod comments;
+// The tool surface lives beside the steps it describes: the UI catalog can
+// never drift from the engine's actual step list.
+pub mod tool;
+pub use tool::{tool_catalog, ToolSpec};
 pub mod cost;
 pub mod coverage;
 pub mod evidence;
@@ -108,6 +113,21 @@ impl StepSelection {
         }
     }
 
+    /// A run with exactly one channel, used by the manual tool tester in the
+    /// 养鱼 工具台. The real watch plan never builds this shape.
+    pub fn only(id: StepId) -> Self {
+        let mut selection = StepSelection::none();
+        match id {
+            StepId::Meta => selection.meta = true,
+            StepId::Subtitle => selection.subtitle = true,
+            StepId::Outline => selection.outline = true,
+            StepId::Comments => selection.comments = true,
+            StepId::Asr => selection.asr = true,
+            StepId::Frames => selection.frames = true,
+        }
+        selection
+    }
+
     /// The tier this exact combination matches, if any. `None` = 自定义.
     #[cfg(test)]
     pub fn tier(&self) -> Option<u32> {
@@ -141,10 +161,7 @@ impl StepSelection {
     /// `aid`/`cid` from it; ASR last in the text tiers because it is the slow
     /// one; frames after that.
     pub fn ids(&self) -> Vec<StepId> {
-        StepId::ALL
-            .into_iter()
-            .filter(|id| self.get(*id))
-            .collect()
+        StepId::ALL.into_iter().filter(|id| self.get(*id)).collect()
     }
 
     /// A run with no steps would still ask DeepSeek for a verdict on nothing;
@@ -189,6 +206,8 @@ pub struct VisionOptions {
     /// Images per request (the API can take more; batching keeps each prompt
     /// small and makes a bad batch auditable).
     pub batch: usize,
+    /// Sampled-frame interval in seconds; `0` keeps automatic sampling.
+    pub interval_s: u64,
 }
 
 impl Default for VisionOptions {
@@ -196,6 +215,7 @@ impl Default for VisionOptions {
         VisionOptions {
             detail: "low".to_string(),
             batch: 10,
+            interval_s: 0,
         }
     }
 }
@@ -284,7 +304,6 @@ pub struct Gathered {
     /// `conclusion/get` payload, cached for the outline step.
     pub conclusion: Option<Conclusion>,
 }
-
 
 /// What the frame step produced (phase 3; kept here so coverage and the prompt
 /// share one shape).
@@ -435,11 +454,7 @@ impl WatchPlan {
     /// for persistence. ASR and frames make this much larger than the old
     /// fixed 75 s, which is the point.
     pub fn timeout(&self) -> Duration {
-        let total: u64 = self
-            .steps
-            .iter()
-            .map(|step| step.timeout().as_secs())
-            .sum();
+        let total: u64 = self.steps.iter().map(|step| step.timeout().as_secs()).sum();
         Duration::from_secs(total.saturating_add(30))
     }
 }
@@ -478,7 +493,6 @@ impl Step for MetaStep {
     fn id(&self) -> StepId {
         StepId::Meta
     }
-
 
     fn timeout(&self) -> Duration {
         Duration::from_secs(20)
@@ -535,7 +549,9 @@ impl Step for MetaStep {
                     }
                     crate::debug_log(&format!(
                         "fish step id=meta cid={} duration_s={} tname={}",
-                        ctx.gathered.meta.cid, ctx.gathered.meta.duration_s, ctx.gathered.meta.tname
+                        ctx.gathered.meta.cid,
+                        ctx.gathered.meta.duration_s,
+                        ctx.gathered.meta.tname
                     ));
                     Ok(StepOutput {
                         detail: format!(
@@ -680,14 +696,7 @@ impl WatchRun {
         for report in self.plan.pre_skips.clone() {
             index += 1;
             reports.push(report.clone());
-            publish_finished(
-                &hook,
-                &self.ctx.gathered,
-                &reports,
-                &report,
-                index,
-                total,
-            );
+            publish_finished(&hook, &self.ctx.gathered, &reports, &report, index, total);
         }
 
         let steps: Vec<Box<dyn Step>> = std::mem::take(&mut self.plan.steps);
@@ -697,14 +706,7 @@ impl WatchRun {
             if self.ctx.cancelled() {
                 let report = StepReport::skipped(id, "已取消");
                 reports.push(report.clone());
-                publish_finished(
-                    &hook,
-                    &self.ctx.gathered,
-                    &reports,
-                    &report,
-                    index,
-                    total,
-                );
+                publish_finished(&hook, &self.ctx.gathered, &reports, &report, index, total);
                 continue;
             }
             let started = Instant::now();
@@ -773,14 +775,7 @@ impl WatchRun {
             report.ms = ms;
             // A failed step still contributes its measured time/bytes.
             reports.push(report.clone());
-            publish_finished(
-                &hook,
-                &self.ctx.gathered,
-                &reports,
-                &report,
-                index,
-                total,
-            );
+            publish_finished(&hook, &self.ctx.gathered, &reports, &report, index, total);
         }
         reports.sort_by_key(|report| {
             StepId::ALL
@@ -829,6 +824,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_selects_exactly_one_tool() {
+        for id in StepId::ALL {
+            assert_eq!(StepSelection::only(id).ids(), vec![id]);
+        }
+    }
+
+    #[test]
     fn tiers_match_the_design_table() {
         let t0 = StepSelection::for_tier(0);
         assert!(t0.meta && !t0.subtitle && !t0.outline && !t0.comments && !t0.asr && !t0.frames);
@@ -854,7 +856,12 @@ mod tests {
         assert_eq!(selection.tier(), None, "T1 + ASR is not a preset");
         assert_eq!(
             selection.ids(),
-            vec![StepId::Meta, StepId::Subtitle, StepId::Comments, StepId::Asr]
+            vec![
+                StepId::Meta,
+                StepId::Subtitle,
+                StepId::Comments,
+                StepId::Asr
+            ]
         );
         selection.set(StepId::Asr, false);
         assert_eq!(selection.tier(), Some(1));
@@ -954,4 +961,3 @@ mod tests {
         assert!(outcome.evidence.channels.is_empty());
     }
 }
-

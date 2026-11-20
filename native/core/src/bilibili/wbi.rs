@@ -27,7 +27,8 @@ const TICKET_URL: &str =
 /// HMAC key Bilibili's web client uses to sign `GenWebTicket` requests.
 const TICKET_HMAC_KEY: &str = "XgwSnGZ1p";
 
-pub(super) const FEED_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd";
+pub(super) const FEED_URL: &str =
+    "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd";
 
 pub(super) const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/type";
 
@@ -92,7 +93,8 @@ pub(super) const COIN_STATE_URL: &str = "https://api.bilibili.com/x/web-interfac
 
 pub(super) const COIN_ADD_URL: &str = "https://api.bilibili.com/x/web-interface/coin/add";
 
-pub(super) const FAV_FOLDERS_URL: &str = "https://api.bilibili.com/x/v3/fav/folder/created/list-all";
+pub(super) const FAV_FOLDERS_URL: &str =
+    "https://api.bilibili.com/x/v3/fav/folder/created/list-all";
 
 pub(super) const FAV_FOLDER_ADD_URL: &str = "https://api.bilibili.com/x/v3/fav/folder/add";
 
@@ -204,7 +206,8 @@ pub(super) const COMMENT_REPLY_URL: &str = "https://api.bilibili.com/x/v2/reply/
 // -- 动态流 / 消息中心 / 私信 / 关注粉丝 ---------------------------------------
 
 /// 动态流 (web `feed/all`): `data.items[]` + `data.offset` / `data.has_more`.
-pub(super) const DYNAMIC_FEED_URL: &str = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all";
+pub(super) const DYNAMIC_FEED_URL: &str =
+    "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all";
 
 /// 动态点赞 write. POST form `dyn_id_str` + `up` + `csrf`.
 pub(super) const DYNAMIC_THUMB_URL: &str = "https://api.bilibili.com/x/dynamic/feed/dyn/thumb";
@@ -439,9 +442,8 @@ impl Session {
         mac.update(format!("ts{ts}").as_bytes());
         let hexsign = hex::encode(mac.finalize().into_bytes());
         let csrf = self.cookie_value("bili_jct").unwrap_or_default();
-        let url = format!(
-            "{TICKET_URL}?key_id=ec02&hexsign={hexsign}&context[ts]={ts}&csrf={csrf}"
-        );
+        let url =
+            format!("{TICKET_URL}?key_id=ec02&hexsign={hexsign}&context[ts]={ts}&csrf={csrf}");
         let resp: TicketResp = self.client.post(&url).send().await?.json().await?;
         crate::debug_log(&format!("bili_ticket code={}", resp.code));
         if resp.code == 0 {
@@ -589,7 +591,8 @@ impl Session {
     /// verbatim instead of failing on a non-zero code, so write endpoints whose
     /// result depends on risk control can report exactly what came back.
     /// `label` names the endpoint in the debug log (the URL may carry `csrf`).
-    pub(super) async fn post_form_code(        &self,
+    pub(super) async fn post_form_code(
+        &self,
         label: &str,
         url: &str,
         referer: &str,
@@ -873,7 +876,10 @@ impl Session {
 fn build_client(jar: Arc<Jar>) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(UA));
-    headers.insert(REFERER, HeaderValue::from_static("https://www.bilibili.com/"));
+    headers.insert(
+        REFERER,
+        HeaderValue::from_static("https://www.bilibili.com/"),
+    );
 
     // Every request runs on the shared multi-thread runtime (see
     // [`shared_runtime`]), so a pooled keep-alive connection is driven by a
@@ -898,7 +904,10 @@ fn build_client(jar: Arc<Jar>) -> Result<reqwest::Client> {
 fn build_raw_client(jar: Arc<Jar>) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(UA));
-    headers.insert(REFERER, HeaderValue::from_static("https://www.bilibili.com/"));
+    headers.insert(
+        REFERER,
+        HeaderValue::from_static("https://www.bilibili.com/"),
+    );
     let client = reqwest::Client::builder()
         .cookie_provider(jar)
         .default_headers(headers)
@@ -1005,7 +1014,8 @@ pub(crate) fn join_ids(ids: &[i64]) -> String {
         .join(",")
 }
 
-fn extract_wbi_key(url: &str) -> String {    let file = url.rsplit('/').next().unwrap_or("");
+fn extract_wbi_key(url: &str) -> String {
+    let file = url.rsplit('/').next().unwrap_or("");
     file.split('.').next().unwrap_or("").to_string()
 }
 

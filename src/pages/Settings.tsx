@@ -1,9 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { call, cover } from '../api';
 import { useApp } from '../context';
-import { PageHead, SettingsRow, Toggle } from '../components/Common';
+import { SettingsRow, Toggle } from '../components/Common';
 
 const CATEGORIES = ['账户', '外观', '防干扰', '播放', '快捷键', '系统', '弹幕', '屏蔽', '智能云屏蔽', '优化'];
+
+const CATEGORY_META: Record<string, string> = {
+  账户: '登录与会员', 外观: '主题与玻璃', 防干扰: '精简入口', 播放: '画质与解码',
+  快捷键: '播放器按键', 系统: '启动与更新', 弹幕: '样式与区域', 屏蔽: '关键词与用户',
+  智能云屏蔽: 'AI 过滤', 优化: '网络与预取',
+};
 
 const KEY_LABELS = ['播放 / 暂停', '快退', '快进', '音量 +', '音量 -', '静音', '全屏', '退出全屏', '弹幕开关', '点赞', '截图'];
 
@@ -36,6 +42,11 @@ export default function SettingsPage() {
   const [sender, setSender] = useState('');
   const [updateState, setUpdateState] = useState('');
   const [theme, setTheme] = useState<0 | 1 | 2>(settings.theme === 2 ? 1 : 0);
+  const [appVersion, setAppVersion] = useState('0.2.1');
+
+  useEffect(() => {
+    window.o11a1.info().then((info: any) => setAppVersion(info.version || '0.2.1')).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (theme !== 2) return;
@@ -98,14 +109,16 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHead title="设置" sub="10 个分类 · 修改后立即保存" />
       <div className="settings-layout">
         <div className="card settings-nav">
           {CATEGORIES.map((name) => (
-            <button key={name} className={category === name ? 'active' : ''} onClick={() => setCategory(name)}>{name}</button>
+            <button key={name} className={category === name ? 'active' : ''} onClick={() => setCategory(name)}>
+              <span>{name}</span>
+              <small>{CATEGORY_META[name]}</small>
+            </button>
           ))}
         </div>
-        <div className="settings-content">
+        <div className="settings-content" key={category}>
           {category === '账户' ? (
             <div className="card panel">
               <div className="panel-title">账户</div>
@@ -160,6 +173,12 @@ export default function SettingsPage() {
               <SettingsRow name="隐藏直播入口" desc="底栏不再显示「直播」，启动页也跳过直播加载">
                 <Toggle on={settings.hide_live_tab} onChange={(value) => saveSettings({ hide_live_tab: value })} />
               </SettingsRow>
+              <SettingsRow name="隐藏番剧入口" desc="底栏不再显示「番剧」，其余入口自动向前补位">
+                <Toggle on={settings.hide_pgc_tab} onChange={(value) => saveSettings({ hide_pgc_tab: value })} />
+              </SettingsRow>
+              <SettingsRow name="隐藏大肥鱼入口" desc="底栏不再显示「养鱼」，其余入口自动向前补位">
+                <Toggle on={settings.hide_fish_tab} onChange={(value) => saveSettings({ hide_fish_tab: value })} />
+              </SettingsRow>
               <SettingsRow name="隐藏热搜" desc="搜索页不显示热门搜索">
                 <Toggle on={settings.hide_hot_search} onChange={(value) => saveSettings({ hide_hot_search: value })} />
               </SettingsRow>
@@ -169,12 +188,15 @@ export default function SettingsPage() {
           {category === '播放' ? (
             <div className="card panel">
               <div className="panel-title">播放</div>
-              <SettingsRow name="默认画质" desc="0 为自动（不超过 1080P）">
-                <select className="select" value={settings.player_quality} onChange={(event) => saveSettings({ player_quality: Number(event.target.value) })}>
-                  <option value={0}>自动</option>
-                  <option value={80}>1080P</option>
-                  <option value={64}>720P</option>
-                  <option value={32}>480P</option>
+              <SettingsRow name="默认画质" desc="最高为当前可用最高流；手动档取不超过所选高度的最高流">
+                <select className="select" value={settings.player_quality_height ?? 0} onChange={(event) => saveSettings({ player_quality_height: Number(event.target.value) })}>
+                  <option value={0}>最高</option>
+                  <option value={2160}>2160P</option>
+                  <option value={1440}>1440P</option>
+                  <option value={1080}>1080P</option>
+                  <option value={720}>720P</option>
+                  <option value={480}>480P</option>
+                  <option value={360}>360P</option>
                 </select>
               </SettingsRow>
               <SettingsRow name="画质增强" desc="0 关闭 / 1 通用 CAS / 2 番剧 Anime4K">
@@ -184,11 +206,18 @@ export default function SettingsPage() {
                   <option value={2}>番剧（Anime4K）</option>
                 </select>
               </SettingsRow>
-              <SettingsRow name="插帧" desc="光流补帧；需要显示刷新率高于片源">
+              <SettingsRow name="插帧" desc="CPU 线性混合；只按这个开关启停">
                 <select className="select" value={settings.interp_mode} onChange={(event) => saveSettings({ interp_mode: Number(event.target.value) })}>
                   <option value={0}>关闭</option>
-                  <option value={1}>补到显示器刷新率</option>
-                  <option value={2}>固定 60fps</option>
+                  <option value={1}>开启</option>
+                </select>
+              </SettingsRow>
+              <SettingsRow name="插帧帧率" desc="目标帧率；达不到时按实际能到的最高输出，不会卡死">
+                <select className="select" value={settings.interp_hz ?? 0} onChange={(event) => saveSettings({ interp_hz: Number(event.target.value) })}>
+                  <option value={0}>自动（跟随显示器）</option>
+                  <option value={60}>60 fps</option>
+                  <option value={90}>90 fps</option>
+                  <option value={120}>120 fps</option>
                 </select>
               </SettingsRow>
               <SettingsRow name="默认速度" desc="0.5×–2.0×">
@@ -204,7 +233,7 @@ export default function SettingsPage() {
                   <option value={13}>AV1</option>
                 </select>
               </SettingsRow>
-              <SettingsRow name="原始分辨率解码" desc="关闭时按窗口尺寸解码，更省带宽">
+              <SettingsRow name="原始分辨率解码" desc="开启按片源分辨率（最高 4K）解码，CPU 占用高；关闭最多 1080P，4K 60 帧更稳">
                 <Toggle on={settings.player_native_size} onChange={(value) => saveSettings({ player_native_size: value })} />
               </SettingsRow>
               <SettingsRow name="硬件解码" desc="使用 D3D11VA / Media Foundation">
@@ -252,7 +281,7 @@ export default function SettingsPage() {
                 <button className="btn sm" onClick={() => window.o11a1.info().then((info: any) => window.o11a1.shell.openPath(info.dataRoot))}>打开</button>
               </SettingsRow>
               <SettingsRow name="版本" desc="Electron + Rust sidecar">
-                <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>O11A1 0.1.0</span>
+                <span style={{ color: 'var(--text-faint)', fontSize: 12 }}>O11A1 {appVersion}</span>
               </SettingsRow>
             </div>
           ) : null}
@@ -264,12 +293,9 @@ export default function SettingsPage() {
                 <input type="range" min={0} max={100} value={settings.danmaku_opacity} onChange={(event) => saveSettings({ danmaku_opacity: Number(event.target.value) })} />
                 <span style={{ width: 38, textAlign: 'right' }}>{settings.danmaku_opacity}</span>
               </SettingsRow>
-              <SettingsRow name="字号" desc="小 / 标准 / 大">
-                <select className="select" value={settings.danmaku_font} onChange={(event) => saveSettings({ danmaku_font: Number(event.target.value) })}>
-                  <option value={0}>小</option>
-                  <option value={1}>标准</option>
-                  <option value={2}>大</option>
-                </select>
+              <SettingsRow name="字号" desc="50–150%">
+                <input type="range" min={50} max={150} value={settings.danmaku_font} onChange={(event) => saveSettings({ danmaku_font: Number(event.target.value) })} />
+                <span style={{ width: 48, textAlign: 'right' }}>{settings.danmaku_font}%</span>
               </SettingsRow>
               <SettingsRow name="速度" desc="滚动速度百分比（50–200）">
                 <input type="range" min={50} max={200} value={settings.danmaku_speed} onChange={(event) => saveSettings({ danmaku_speed: Number(event.target.value) })} />
