@@ -5945,7 +5945,7 @@ impl Engine {
         if self.sidebar_open {
             for (index, rect) in layout.sidebar_tabs.iter().enumerate() {
                 if rect.contains(px, py) {
-                    self.open_sidebar_tab(SidebarTab::from_index(index));
+                    self.select_sidebar_tab(SidebarTab::from_index(index));
                     return;
                 }
             }
@@ -6021,13 +6021,20 @@ impl Engine {
         let px = x as f32;
         let py = y as f32;
         self.dm_menu_drag = None;
+        let layout = self.overlay.layout;
         // Right-clicking the open sidebar lane closes it; the rest of the
         // picture keeps its own right-click gestures.
-        if self.sidebar_open && self.overlay.layout.sidebar.contains(px, py) {
+        if self.sidebar_open && layout.sidebar.contains(px, py) {
             self.set_sidebar(false, self.sidebar_tab);
             return;
         }
-        let layout = self.overlay.layout;
+        // A right press on the picture is always a dismiss gesture for the
+        // lane, even when another layer (speed/precision) is open. Those
+        // layers live in the toolbar rectangle, which is excluded here.
+        if self.sidebar_open && self.is_picture_click(&layout, px, py) {
+            self.set_sidebar(false, self.sidebar_tab);
+            return;
+        }
         if self.toolbar_popup_open()
             && !self.point_in_toolbar_popup(&layout, px, py)
             && self.is_picture_click(&layout, px, py)
@@ -6052,14 +6059,6 @@ impl Engine {
             return;
         }
         if self.mini {
-            return;
-        }
-        // A right press anywhere on the picture is a dismiss gesture for the
-        // sidebar, matching a right press on the lane itself. Layered popovers
-        // above still take the first press (they returned earlier), so this
-        // never eats a precision / danmaku menu close.
-        if self.sidebar_open && self.is_picture_click(&layout, px, py) {
-            self.set_sidebar(false, self.sidebar_tab);
             return;
         }
         match self.danmaku_hit_at(px, py) {
@@ -6311,6 +6310,17 @@ impl Engine {
     fn open_sidebar_tab(&mut self, tab: SidebarTab) {
         if self.sidebar_open && self.sidebar_tab == tab {
             self.set_sidebar(false, tab);
+            return;
+        }
+        self.set_sidebar(true, tab);
+    }
+
+    /// Left-clicking a top tab only switches the panel. Unlike the toolbar's
+    /// active button it never closes the lane; right-click / Esc own closing.
+    fn select_sidebar_tab(&mut self, tab: SidebarTab) {
+        if self.sidebar_open && self.sidebar_tab == tab {
+            self.note_activity();
+            self.ui_dirty = true;
             return;
         }
         self.set_sidebar(true, tab);
