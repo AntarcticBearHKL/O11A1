@@ -82,7 +82,11 @@
 - **多屏刷新率**：插帧挡位、自动挡和弹幕节拍都跟随播放器窗口所在显示器：`MonitorFromWindow` 取 HMONITOR，`GetMonitorInfoW` 取设备名，再对该设备调用 `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`，结果缓存 2 秒；1 秒一次的 `tick_monitor_refresh` 在跨屏或改刷新率后重算，固定挡位高于新屏时退回自动。旧实现用 `EnumDisplaySettingsW(NULL)`，在双屏驱动上会失败并固定回 60Hz，所以 120Hz 屏也只显示到 60 挡位；现在 60Hz 屏只给 60，120Hz 屏给 60 / 90 / 120。
 - **4K 解码**：设置里的「原始分辨率解码」现在真正生效。关闭时最高 1080P（`scale_cuda` 在 GPU 上缩放，管道只传 3.1MB/帧）；开启时按片源最高 4K 解码。8K 仍降到 4K。4K60 实测（RTX 4060 Ti + i7-8700）：插帧 + CAS 输出 103–121fps，关闭插帧稳定 60fps，解码 + `hwdownload` 回读约 60–65fps 已是本机上限。
 - **并行磁盘缓存 / 预加载**：Bilibili DASH 视频/音频在播放前写入 `<root>/cache/media` 的稀疏文件，由 `prefetch_connections` 个 Range 线程按 512KB 分块并行下载；`.state` 记录已完成块，退出或崩溃后从断点继续，`.ok` 标记完整文件直接复用。ffmpeg 通过 127.0.0.1 的只读代理读缓存，读到未完成块会等待，播放可从第 0 块立即开始。当前视频的缓存优先；它的视频/音频完成后，队列中后续视频按顺序逐个完整预取。直播、无 Range 或小于 512KB 的资源回退原 URL。
-- **A/V 同步**：音频设备时钟为主时钟；启动时音频与墙钟差超过 300ms 就把画面重锚到音频。视频队列连续 650ms 没有帧时暂停音频并显示缓冲卡，帧到达或缓存补齐后一起恢复，并把墙钟重锚到设备位置；持续落后超过 800ms 且 8 秒内没有恢复时做一次硬重同步。Debug HUD 的网络行改用缓存工作线程的真实 CDN 字节数，不再显示 loopback 读取。
+- **A/V 同步**：音频设备时钟是唯一主时钟（有音频时 `position_now` 始终读设备位置，不再依赖 `audio_master` 开关）；视频按音频位置取帧，晚到帧直接丢弃。
+  视频解码跟不上实时（4K / 硬解降速）时，画面时间戳会持续落后音频，旧实现会把每个解码出来的帧依次播放，形成“视频慢放、声音正常”的永久漂移；
+  现在画面落后超过 250ms 且持续 900ms，就把视频单独 seek 到音频位置并丢掉无法实时解码的区间（音频只为这次短 seek 暂停，落地后一起恢复），2 秒内不会重复 seek。
+  视频队列干涸 650ms 时暂停音频显示缓冲；帧回来但 1.5 秒内追不上冻结的音频位置时同样跳帧追上，不再让声音等十几秒。
+  Debug HUD 的每秒统计增加 `av_gap`（音频时钟减最后上屏帧时间戳）。
 - **场景切换保护**：上传解码帧时采 32×18 亮度指纹，混合前比较两帧指纹，差异超过阈值时直接使用最近源帧，消除切镜时的双重曝光 / 白闪；不再读取整帧 BGRA。
 - **插帧不做任何自动关闭**：插帧只由用户选择开关或挡位——没有「连续掉帧自动关闭」，没有「源帧率已足够自动关闭」，也不会因为一次统计窗口低于目标帧率就改回关闭。源帧率本身已经填满显示（没有输出网格）时开关仍保持开启，只是不生成插帧；换成 24/25/30fps 的片子立即继续插帧。菜单只允许选择不超过显示器刷新率的固定挡位，自动挡直接跟随刷新率；已存在的高于当前刷新率的旧设置不会被崩溃式重置，pacer 仍按目标生成，Present 由显示器节奏决定。
 - **双击全屏**：窗口类启用 `CS_DBLCLKS`；单击在系统双击间隔内挂起，第二击是双击时第一击被吞掉，只切换全屏 / 还原；超过间隔才提交播放 / 暂停，已提交的单击不能再参与下一击的双击。全屏 / 还原只重新投影当前弹幕，保留在屏弹幕，不清空重来。
@@ -113,10 +117,11 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.7.2.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.7.3.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
+- **0.7.3 A/V 同步**：音频设备时钟成为唯一参考；画面持续落后时改为跳帧追赶，不再出现“视频慢放、声音正常”。详见上方 A/V 同步条目。
 
 ## 已知差异 / 后续
 
@@ -132,10 +137,11 @@
 | --- | --- |
 | Renderer | `npm run build:renderer` 通过 |
 | Rust | `cargo build --release`（vendored）通过 |
-| Rust 测试 | `native_player` 79 个测试通过（含 GPU 帧池 NV12→BGRA / 混合 / 真实 4K dump 转换、到期帧顺序、缓存分块边界） |
+| Rust 测试 | `native_player` 81 个测试通过（含 GPU 帧池 NV12→BGRA / 混合 / 真实 4K dump 转换、到期帧顺序、缓存分块边界、A/V 追赶判定） |
 | Rust 测试 | `o11a1-core` 251 个测试（7 ignored）通过 |
 | GPU 硬解 | 探测：本机 RTX 4060 Ti 对 `h264_cuvid` / `hevc_cuvid` / `av1_cuvid` 全部 supported=1；B 站 4K 流 `decoder=h264_cuvid`，直播 FLV `codec=h264 decoder=h264_cuvid` |
 | 4K 播放 | 真实 B 站 4K60 缓存流 + 音频：插帧 + CAS 103–121fps、`dropped=0`、`pos_ms == audio_ms`；关闭插帧稳定 60fps、`dropped=0`；1080P30 插帧 + CAS 120.1fps |
+| A/V 追赶 | `O11A1_QA_DECODE_DELAY_MS=50` 把 30fps 源限制到 20fps：`pos_ms == audio_ms`，`av_gap` 峰值约 0.5–0.6s，每约 2s 一次视频单独 seek，落地后画面与音频差 10–40ms；正常 1080P30（插帧开 / 关）`av_gap` 0–52ms、无追赶；900ms/帧时先暂停音频，帧回来后 1.5s 内跳帧追上 |
 | 自动下一分P | `BV1NDsS6UE8D` P1→P2→P3 实测：尾部自动切换一次、P3（未缓存）解码后首帧到达并 60fps 播放；拖到结尾之后立即进入切换；无重复切换日志 |
 | 更新下载 | 自建下载器实测 GitHub Release 资产 206,921,979 字节，sha256 与 API `digest` 一致；资产 302 跳转、节流进度、失败清理 `.part` 均通过 |
 | 更新 UI | 模拟 Release API（2 MB 资产）+ 隔离 `userData`：`update.check()` 返回 downloading 0→100%，收到 7 次进度事件与 `ready`；安装包落在 `<userData>/updates` 且 sha256 匹配 |

@@ -75,10 +75,23 @@ struct AbCache {
     disabled: bool,
 }
 const AV_DRIFT_MS: u64 = 200;
-/// If the picture is this far behind the device clock and has not presented
-/// for a while, restart the video at the audio position instead of letting a
-/// gradual drift become permanent.
-const AV_RESYNC_MS: u64 = 800;
+/// A picture may trail the device clock by this much before the engine treats
+/// it as a desync instead of normal decode jitter.
+const AV_VIDEO_LAG_MS: u64 = 250;
+/// How long the picture may sit past `AV_VIDEO_LAG_MS` while frames are still
+/// arriving before the engine drops the gap. A single GPU/engine hitch must
+/// not cost a seek; a decoder that cannot keep up must.
+const AV_VIDEO_LAG_HOLD_MS: u64 = 900;
+/// Minimum spacing between two video-only catch-up seeks.
+const AV_CATCHUP_COOLDOWN_MS: u64 = 2_000;
+/// After the sound was paused for a dry picture, the first picture back
+/// starts this grace. If the decoder still cannot reach the frozen clock,
+/// the picture is jumped there instead of holding the sound for tens of
+/// seconds (a hardware decoder below real time).
+const AV_STALL_CATCHUP_MS: u64 = 1_500;
+/// A video-only catch-up that has not produced a picture in this long is
+/// reported instead of leaving the sound paused forever.
+const AV_CATCHUP_TIMEOUT_MS: u64 = 8_000;
 /// Hold time for 屏蔽该用户 on a comment (left button).
 const LONG_PRESS: Duration = Duration::from_millis(500);
 /// Movement that turns a hold into a drag and cancels the long-press.
@@ -410,6 +423,17 @@ struct Engine {
     last_stall_log: Option<Instant>,
     /// Last hard A/V resync; throttled so a slow decoder cannot thrash seeks.
     last_av_resync: Option<Instant>,
+    /// The picture first went (and stayed) more than `AV_VIDEO_LAG_MS`
+    /// behind the sound while frames were still arriving. Turns normal
+    /// decode jitter into a catch-up only after it persists.
+    video_lag_since: Option<Instant>,
+    /// In-flight video-only seek that skips a stretch the decoder could not
+    /// produce in real time. The sound is paused for the short seek so both
+    /// resume together at the new picture.
+    video_resync: Option<VideoResync>,
+    /// Sound paused because the picture ran dry; tracks whether a frame has
+    /// come back so the catch-up grace starts from that moment.
+    stall_pause: Option<StallPause>,
     ended: bool,
     last_frame_ts: u64,
 
@@ -686,6 +710,33 @@ struct Engine {
 struct QaAction {
     at: Duration,
     kind: QaKind,
+}
+
+/// One video-only catch-up: a new decoder opened at the sound position while
+/// the sound clock is frozen.
+struct VideoResync {
+    target: u64,
+    started: Instant,
+}
+
+/// Sound paused because the picture ran dry. The first picture after the
+/// pause starts a grace period for the decoder to reach the frozen clock.
+struct StallPause {
+    first_frame_at: Option<Instant>,
+}
+
+/// A picture that stays more than `AV_VIDEO_LAG_MS` behind the sound while
+/// frames keep arriving is a decode deficit, not jitter: the decoder cannot
+/// play the medium at normal speed, so the un-decodable gap has to be
+/// skipped. A short GPU/engine hitch clears before the hold expires.
+fn picture_lag_requires_catch_up(
+    lag_ms: u64,
+    frames_flowing: bool,
+    held_for: Duration,
+) -> bool {
+    frames_flowing
+        && lag_ms > AV_VIDEO_LAG_MS
+        && held_for >= Duration::from_millis(AV_VIDEO_LAG_HOLD_MS)
 }
 
 struct MiniSaved {
@@ -1042,6 +1093,9 @@ impl Engine {
             last_drift_log: None,
             last_stall_log: None,
             last_av_resync: None,
+            video_lag_since: None,
+            video_resync: None,
+            stall_pause: None,
             ended: false,
             last_frame_ts: start_ms,
             volume,
@@ -1465,6 +1519,9 @@ impl Engine {
 
     fn stop_sessions(&mut self) {
         self.stall_audio_paused = false;
+        self.stall_pause = None;
+        self.video_lag_since = None;
+        self.video_resync = None;
         if let Some(mut decoder) = self.decoder.take() {
             decoder.stop();
         }
@@ -1476,6 +1533,9 @@ impl Engine {
     fn restart_at(&mut self, target_ms: u64) -> Result<()> {
         self.drop_loop_prefetch();
         self.stall_audio_paused = false;
+        self.stall_pause = None;
+        self.video_lag_since = None;
+        self.video_resync = None;
         self.ab_swap_wait = None;
         self.ab_cache_playing = false;
         self.ab_cache_cursor = 0;
@@ -1572,6 +1632,21 @@ impl Engine {
         }
     }
 
+    /// The device clock, when it is actually rendering. It stays readable
+    /// while the sound is paused (stall / catch-up), which is exactly what
+    /// keeps the picture frozen with it instead of running on a wall clock.
+    fn audio_position(&self) -> Option<u64> {
+        let audio = self.audio.as_ref()?;
+        if !audio.clock.available.load(Ordering::SeqCst)
+            || !audio.clock.ready.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(self.clamp_position(
+            audio.clock.position_ms.load(Ordering::SeqCst),
+        ))
+    }
+
     fn position_now(&self) -> u64 {
         if self.seek_in_flight {
             return self.seek_target;
@@ -1579,13 +1654,11 @@ impl Engine {
         if !self.playing {
             return self.paused_at;
         }
-        if self.audio_master {
-            if let Some(audio) = &self.audio {
-                let audio_ms = audio.clock.position_ms.load(Ordering::SeqCst);
-                if audio_ms > 0 || self.base_ms == 0 {
-                    return self.clamp_position(audio_ms);
-                }
-            }
+        // The sound is the clock whenever it exists: a picture that follows
+        // a wall clock while the device runs at its own rate is exactly how
+        // a slow decode turns into permanent lip desync.
+        if let Some(audio_ms) = self.audio_position() {
+            return audio_ms;
         }
         self.wall_position()
     }
@@ -1864,6 +1937,9 @@ impl Engine {
         self.ended = false;
         self.playing = self.requested_play;
         self.audio_master = false;
+        self.video_lag_since = None;
+        self.video_resync = None;
+        self.stall_pause = None;
         self.anchor = Some(Instant::now());
         self.cur_ts_ms = a;
         self.next = None;
@@ -2373,6 +2449,7 @@ impl Engine {
         self.paused_at = self.position_now();
         self.position_ms = self.paused_at;
         self.playing = false;
+        self.video_lag_since = None;
         self.on_user_pause();
         self.gate(false);
         if let Some(audio) = &self.audio {
@@ -2404,11 +2481,16 @@ impl Engine {
         self.anchor = Some(Instant::now());
         self.playing = true;
         self.ended = false;
+        self.video_lag_since = None;
         self.on_playback_started();
         self.gate(true);
         self.enforce_ab_loop();
         if let Some(audio) = &self.audio {
-            audio.send(AudioCommand::Resume);
+            // With the picture stalled or being jumped, the frame path owns
+            // the resume; starting the sound first would run it ahead again.
+            if self.video_resync.is_none() && !self.stall_audio_paused {
+                audio.send(AudioCommand::Resume);
+            }
         }
         self.status.clear();
         self.ui_dirty = true;
@@ -4549,7 +4631,7 @@ impl Engine {
                 self.interp_blends = 0;
                 self.interp_cuts = 0;
                 log::line(&format!(
-                    "fps presented={} rate={:.2} source_fps={:.2} out_hz={} interp={} enhance={} queue={queue} dropped={dropped} pos_ms={} audio_ms={audio_pos} danmaku={}/{} dm_frames={} dm_fps={:.2} ui_fps={:.2} ui_draw_us={ui_draw_us} ticks={interp_ticks} blends={interp_blends} cuts={interp_cuts}",
+                    "fps presented={} rate={:.2} source_fps={:.2} out_hz={} interp={} enhance={} queue={queue} dropped={dropped} pos_ms={} audio_ms={audio_pos} av_gap={} danmaku={}/{} dm_frames={} dm_fps={:.2} ui_fps={:.2} ui_draw_us={ui_draw_us} ticks={interp_ticks} blends={interp_blends} cuts={interp_cuts}",
                     self.presents_window,
                     self.fps,
                     self.source.fps,
@@ -4557,6 +4639,7 @@ impl Engine {
                     self.interp.label(),
                     self.enhance.label(),
                     self.position_ms,
+                    self.position_ms.saturating_sub(self.last_frame_ts),
                     self.danmaku.total(),
                     self.danmaku.active_count(),
                     self.danmaku_layer.frames,
@@ -4668,6 +4751,13 @@ impl Engine {
         if self.ab_swap_wait.is_some() {
             // Hold the last frame while the next A pass warms. Presenting the
             // old decoder's post-B frames here would show a jump past B.
+            return;
+        }
+        if self.video_resync.is_some() {
+            // The decoder was jumped to the sound position. This runs even
+            // while the engine is paused so the new picture is ready before
+            // play resumes.
+            self.poll_video_resync();
             return;
         }
         if let Some(until) = self.stall_until {
@@ -4834,12 +4924,11 @@ impl Engine {
             return;
         }
 
+        self.maybe_enable_audio_master();
         let now = Instant::now();
         let position = self.position_now();
         self.position_ms = position;
         self.shared.position_ms.store(position, Ordering::SeqCst);
-
-        self.maybe_enable_audio_master();
         self.log_drift_if_needed();
 
         let (queue_closed_now, queue_len_now) = self
@@ -4853,7 +4942,7 @@ impl Engine {
         // Decoder/reader dry: stop the device clock and show the buffer card
         // instead of letting audio run away from a frozen picture. This is the
         // lip-sync guard for a network slower than the video bitrate.
-        if self.audio_master
+        if self.audio_position().is_some()
             && !self.audio_only
             && !at_end
             && queue_len_now == 0
@@ -4864,6 +4953,9 @@ impl Engine {
             && !self.stall_audio_paused
         {
             self.stall_audio_paused = true;
+            self.stall_pause = Some(StallPause {
+                first_frame_at: None,
+            });
             self.stalled = true;
             self.ui_dirty = true;
             if let Some(audio) = &self.audio {
@@ -4876,53 +4968,6 @@ impl Engine {
                     .map(|audio| audio.clock.position_ms.load(Ordering::SeqCst))
                     .unwrap_or(0)
             ));
-        }
-        if self.stall_audio_paused && queue_len_now > 0 {
-            self.stall_audio_paused = false;
-            self.stalled = false;
-            self.ui_dirty = true;
-            if let Some(audio) = &self.audio {
-                audio.send(AudioCommand::Resume);
-            }
-            // The wall clock kept running while the device was paused; bring
-            // it back onto the device timeline so drift diagnostics and any
-            // future non-audio fallback start from the right place.
-            self.base_ms = position;
-            self.anchor = Some(Instant::now());
-            self.paused_at = position;
-            log::line(&format!(
-                "buffer resume frames-ready position_ms={position} queue={queue_len_now}"
-            ));
-        }
-
-        // A network or decode stall can leave the picture hundreds of
-        // milliseconds behind while the device clock keeps running. Ordinary
-        // due-frame skipping handles small gaps; a persistent backlog gets one
-        // hard resync at the audio position.
-        if self.audio_master
-            && !self.audio_only
-            && !self.stall_audio_paused
-            && self.last_frame_ts.saturating_add(AV_RESYNC_MS) < position
-            && self
-                .last_source_present
-                .map(|at| at.elapsed() >= Duration::from_millis(1200))
-                .unwrap_or(false)
-            && self
-                .last_av_resync
-                .map(|at| at.elapsed() >= Duration::from_secs(8))
-                .unwrap_or(true)
-        {
-            self.last_av_resync = Some(now);
-            log::line(&format!(
-                "av resync video-behind position_ms={position} last_frame_ts={} queue={}",
-                self.last_frame_ts,
-                self.decoder
-                    .as_ref()
-                    .map(|decoder| decoder.queue.len())
-                    .unwrap_or(0)
-            ));
-            let _ = self.restart_at(position);
-            return;
         }
 
         // 插帧 owns the presentation grid: it consumes source frames in order,
@@ -4964,11 +5009,73 @@ impl Engine {
         if interp_on && self.poll_interp(position) {
             had_frame = true;
         }
+
+        // The sound is the reference. Resuming it onto a picture that is
+        // still far behind is what turned one buffering stall into permanent
+        // lip desync, so the pause stays until the picture catches up.
+        let lag = position.saturating_sub(self.last_frame_ts);
+        let frames_flowing = queue_len > 0
+            || self
+                .last_source_present
+                .map(|at| at.elapsed() <= Duration::from_millis(600))
+                .unwrap_or(false);
+        if self.stall_audio_paused {
+            if lag <= AV_VIDEO_LAG_MS {
+                self.resume_audio_with_picture(position);
+            } else {
+                // The decoder is alive again but cannot reach the frozen
+                // clock (hardware decode below real time). Give it a short
+                // grace to skip the backlog, then jump the picture there
+                // instead of holding the sound for tens of seconds.
+                let grace_over = self
+                    .stall_pause
+                    .as_ref()
+                    .and_then(|pause| pause.first_frame_at)
+                    .map(|at| at.elapsed() >= Duration::from_millis(AV_STALL_CATCHUP_MS))
+                    .unwrap_or(false);
+                if grace_over
+                    && self
+                        .last_av_resync
+                        .map(|at| at.elapsed() >= Duration::from_millis(AV_CATCHUP_COOLDOWN_MS))
+                        .unwrap_or(true)
+                {
+                    self.start_video_catch_up(position);
+                    return;
+                }
+            }
+        } else if self.playing
+            && !self.audio_only
+            && self.audio_position().is_some()
+            && frames_flowing
+            && lag > AV_VIDEO_LAG_MS
+        {
+            // A decoder that cannot keep up presents every picture it manages
+            // to produce, so the video timeline advances at decode speed while
+            // the sound runs in real time: slow motion and a gap that keeps
+            // growing. Ordinary due-frame skipping cannot recover frames that
+            // were never decoded. If the gap persists, jump the picture to the
+            // sound and drop the stretch that could not be decoded.
+            let held = self
+                .video_lag_since
+                .get_or_insert_with(Instant::now)
+                .elapsed();
+            if picture_lag_requires_catch_up(lag, frames_flowing, held)
+                && self
+                    .last_av_resync
+                    .map(|at| at.elapsed() >= Duration::from_millis(AV_CATCHUP_COOLDOWN_MS))
+                    .unwrap_or(true)
+            {
+                self.start_video_catch_up(position);
+                return;
+            }
+        } else {
+            self.video_lag_since = None;
+        }
         // A queue with frames but no presented picture for two seconds means
         // the reader and the presentation clock disagree (or the clock
         // stopped); log it instead of silently freezing. Normal inter-frame
         // gaps never reach this threshold.
-        if had_frame && self.stall_until.is_none() {
+        if had_frame && self.stall_until.is_none() && !self.stall_audio_paused {
             self.last_stall_log = None;
             if self.stalled {
                 self.stalled = false;
@@ -5142,21 +5249,198 @@ impl Engine {
         self.cur_ts_ms = frame.ts_ms;
         self.last_frame_ts = frame.ts_ms;
         self.present_current();
-        if self.stall_audio_paused {
+        self.last_source_present = Some(Instant::now());
+        if let Some(pause) = &mut self.stall_pause {
+            if pause.first_frame_at.is_none() {
+                pause.first_frame_at = Some(Instant::now());
+            }
+        }
+        // Never resume the sound from here: the picture that just arrived may
+        // still be far behind the paused device clock. `poll_picture` resumes
+        // only once the picture has caught up (or was jumped there).
+        if self.stalled && !self.stall_audio_paused {
+            self.stalled = false;
+            self.ui_dirty = true;
+        }
+    }
+
+    /// Resume the device at the frozen sound position once the picture has
+    /// reached it. Called from the presentation loop, not from every frame.
+    fn resume_audio_with_picture(&mut self, position: u64) {
+        self.stall_audio_paused = false;
+        self.stall_pause = None;
+        self.stalled = false;
+        self.video_lag_since = None;
+        self.base_ms = position;
+        self.anchor = Some(Instant::now());
+        self.paused_at = position;
+        self.ui_dirty = true;
+        if self.playing {
+            if let Some(audio) = &self.audio {
+                audio.send(AudioCommand::Resume);
+            }
+        }
+        log::line(&format!(
+            "buffer resume synced position_ms={position} last_frame_ts={}",
+            self.last_frame_ts
+        ));
+    }
+
+    /// Open a fresh video decoder at the sound position while freezing the
+    /// sound for the short seek. The sound is the timeline; the picture may
+    /// skip content, but it must never continue behind the sound.
+    fn start_video_catch_up(&mut self, position: u64) {
+        if self.video_resync.is_some() || self.is_live || !self.playing {
+            return;
+        }
+        if self.decoder.is_none() {
+            return;
+        }
+        let target = clamp_seek(position, self.duration_ms);
+        if self.duration_ms > 0 && target.saturating_add(1_500) >= self.duration_ms {
+            // Too close to the end: the tail path will finish the stream
+            // instead of seeking into the end card.
+            return;
+        }
+        self.last_av_resync = Some(Instant::now());
+        self.video_lag_since = None;
+        // A jump means the first A/B pass is missing pictures; a cache built
+        // from it would replay with holes, so fall back to prefetch/seek.
+        if self.ab_cache.as_ref().map(|cache| !cache.ready).unwrap_or(false) {
+            self.reset_ab_cache();
+        }
+        let queue_before = self
+            .decoder
+            .as_ref()
+            .map(|decoder| decoder.queue.len())
+            .unwrap_or(0);
+        // Freeze the sound before the decoder teardown: stopping ffmpeg can
+        // take a few milliseconds and the target must stay where the user
+        // heard the sound, not where it ran to during the teardown.
+        if let Some(audio) = &self.audio {
+            audio.send(AudioCommand::Pause);
+        }
+        if let Some(mut decoder) = self.decoder.take() {
+            decoder.stop();
+        }
+        self.stall_audio_paused = true;
+        self.stall_pause = None;
+        self.stalled = true;
+        self.ui_dirty = true;
+        self.next = None;
+        self.next_tick_at = None;
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+        log::line(&format!(
+            "av catch-up start target_ms={target} audio_ms={} last_frame_ts={} queue={queue_before}",
+            self.audio
+                .as_ref()
+                .map(|audio| audio.clock.position_ms.load(Ordering::SeqCst))
+                .unwrap_or(0),
+            self.last_frame_ts
+        ));
+        match VideoDecoder::spawn(&self.video_spec(), target, generation, true) {
+            Ok(decoder) => {
+                self.decoder = Some(decoder);
+                self.video_resync = Some(VideoResync {
+                    target,
+                    started: Instant::now(),
+                });
+            }
+            Err(error) => {
+                // The old decoder is already gone; fall back to a normal
+                // restart (which also reopens the sound) rather than leaving
+                // the window with no picture.
+                log::line(&format!(
+                    "av catch-up spawn failed target_ms={target} err={error:#}"
+                ));
+                self.stall_audio_paused = false;
+                self.stalled = false;
+                if let Err(retry) = self.restart_at(target) {
+                    self.report_error(format!("视频追赶失败，请点击重试：{retry:#}"));
+                }
+            }
+        }
+    }
+
+    /// Land the catch-up decoder's first picture and resume the sound from
+    /// the same position. A seek that fails to produce a picture reports an
+    /// error instead of leaving the sound paused forever.
+    fn poll_video_resync(&mut self) {
+        let Some(state) = self.video_resync.as_ref() else {
+            return;
+        };
+        let target = state.target;
+        let started = state.started;
+        let frame = self
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.queue.take_first());
+        if let Some(frame) = frame {
+            self.video_resync = None;
+            let landed = frame.ts_ms;
+            let frozen = self.audio_position().unwrap_or(landed);
             self.stall_audio_paused = false;
+            self.stall_pause = None;
+            self.stalled = false;
+            self.video_lag_since = None;
+            self.base_ms = landed;
+            self.anchor = Some(Instant::now());
+            self.paused_at = landed;
+            self.audio_master = true;
+            self.display_new(frame, true);
+            self.next_tick_at = Some(Instant::now());
+            self.ui_dirty = true;
             if self.playing {
                 if let Some(audio) = &self.audio {
                     audio.send(AudioCommand::Resume);
                 }
             }
-            self.stalled = false;
-            self.ui_dirty = true;
-            log::line("buffer resume frame ready");
+            log::line(&format!(
+                "av catch-up landed target_ms={} frame_ts={landed} audio_ms={frozen} picture_gap_ms={}",
+                target,
+                frozen.saturating_sub(landed)
+            ));
+            self.sync_shared();
+            return;
         }
-        self.last_source_present = Some(Instant::now());
-        if self.stalled {
+        // A seek past the real end of the DASH track opens a decoder that
+        // immediately EOFs with no picture. Finish (or report) instead of
+        // leaving the sound paused until the catch-up timeout.
+        let closed = self
+            .decoder
+            .as_ref()
+            .map(|decoder| decoder.queue.is_closed())
+            .unwrap_or(true);
+        if closed {
+            self.video_resync = None;
+            self.stall_audio_paused = false;
+            self.stall_pause = None;
             self.stalled = false;
-            self.ui_dirty = true;
+            self.video_lag_since = None;
+            let position = self.audio_position().unwrap_or(target);
+            log::line(&format!(
+                "av catch-up hit eof target_ms={target} position_ms={position} duration_ms={}",
+                self.duration_ms
+            ));
+            if self.duration_ms > 0 && position.saturating_add(3_000) < self.duration_ms {
+                self.report_error("视频解码中断（ffmpeg 提前结束），点击重试");
+            } else {
+                self.finish_stream(position);
+            }
+            return;
+        }
+        if started.elapsed() >= Duration::from_millis(AV_CATCHUP_TIMEOUT_MS) {
+            self.video_resync = None;
+            self.stall_audio_paused = false;
+            self.stall_pause = None;
+            self.stalled = false;
+            self.video_lag_since = None;
+            log::line(&format!(
+                "av catch-up timeout target_ms={target} elapsed_ms={}",
+                started.elapsed().as_millis()
+            ));
+            self.report_error("视频追赶超时，点击重试");
         }
     }
 
@@ -5333,9 +5617,11 @@ impl Engine {
         let Some(audio) = &self.audio else {
             return;
         };
+        // `playing` is false while the sound is intentionally paused for a
+        // stall or a video catch-up; the device clock is still the right
+        // reference then, so do not wait for it to run again.
         if !audio.clock.available.load(Ordering::SeqCst)
             || !audio.clock.ready.load(Ordering::SeqCst)
-            || !audio.clock.playing.load(Ordering::SeqCst)
         {
             return;
         }
@@ -7452,6 +7738,10 @@ impl Engine {
         self.anchor = None;
         self.error = Some(text.clone());
         self.stalled = false;
+        self.stall_audio_paused = false;
+        self.stall_pause = None;
+        self.video_lag_since = None;
+        self.video_resync = None;
         self.playing = false;
         self.on_user_pause();
         self.gate(false);
@@ -9366,6 +9656,46 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_or_small_picture_lag_is_not_a_catch_up() {
+        // Normal decode jitter: the picture is only a frame or two late.
+        assert!(!picture_lag_requires_catch_up(
+            120,
+            true,
+            Duration::from_secs(3)
+        ));
+        // A real stall with no frames arriving is the buffering path's job,
+        // not a reason to seek.
+        assert!(!picture_lag_requires_catch_up(
+            400,
+            false,
+            Duration::from_secs(3)
+        ));
+        // One short GPU/engine hitch clears before the hold expires.
+        assert!(!picture_lag_requires_catch_up(
+            400,
+            true,
+            Duration::from_millis(300)
+        ));
+    }
+
+    #[test]
+    fn sustained_picture_lag_triggers_a_catch_up() {
+        // The decoder keeps producing frames but its media clock cannot keep
+        // up with the sound: this is the slow-motion case and must skip the
+        // undecodable gap.
+        assert!(picture_lag_requires_catch_up(
+            400,
+            true,
+            Duration::from_millis(AV_VIDEO_LAG_HOLD_MS)
+        ));
+        assert!(picture_lag_requires_catch_up(
+            AV_VIDEO_LAG_MS + 1,
+            true,
+            Duration::from_millis(AV_VIDEO_LAG_HOLD_MS)
+        ));
+    }
 
     #[test]
     fn wheel_volume_moves_five_percent_per_notch() {

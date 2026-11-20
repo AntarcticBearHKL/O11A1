@@ -355,6 +355,21 @@ impl VideoDecoder {
             let speed = crate::speed::clamp(speed as f32) as f64;
             Duration::from_secs_f64(1.0 / (fps.min(240.0) * speed))
         };
+        // QA hook: cap decode throughput to reproduce the 4K / slow-decoder
+        // case where the picture cannot be produced in real time. Unset in
+        // normal runs, so the reader never sleeps.
+        let qa_delay = std::env::var("O11A1_QA_DECODE_DELAY_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_default();
+        if !qa_delay.is_zero() {
+            log::line(&format!(
+                "decoder qa throttle gen={generation} delay_ms={}",
+                qa_delay.as_millis()
+            ));
+        }
         let reader = {
             let queue = queue.clone();
             let stop = stop.clone();
@@ -370,6 +385,7 @@ impl VideoDecoder {
                         frame_bytes,
                         start_ms,
                         frame_period,
+                        qa_delay,
                     )
                 })
                 .context("spawn video reader")?
@@ -486,6 +502,7 @@ fn read_frames(
     frame_bytes: usize,
     start_ms: u64,
     frame_period: Duration,
+    qa_delay: Duration,
 ) {
     // Reusable frame buffers. A buffer is free once only this list holds it;
     // the engine drops its reference when it presents/replaces the picture.
@@ -523,6 +540,9 @@ fn read_frames(
                 log::line(&format!("decoder eof after {index} frames reason={reason}"));
             }
             break;
+        }
+        if !qa_delay.is_zero() {
+            std::thread::sleep(qa_delay);
         }
         let ts_ms = start_ms
             .saturating_add((index as f64 * frame_period.as_secs_f64() * 1000.0).round() as u64);
