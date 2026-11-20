@@ -5854,53 +5854,29 @@ impl Overlay {
         self.text_centered(&label, rect, &self.hint_format, &self.sidebar_text);
     }
 
-    /// Wheel volume feedback: a vertical level bar on a theme-aware paper
-    /// capsule at the picture's right edge. Light theme uses the warm paper
-    /// surface, dark theme the dark surface; the bar is intentionally large
-    /// enough to read at a glance.
+    /// Wheel volume feedback: only the vertical level bar itself at the
+    /// picture's right edge — no card, no rim. The track brush is rebound by
+    /// `apply_sidebar_theme` every frame, so the empty part follows the
+    /// current theme while the filled part stays accent blue.
     unsafe fn draw_volume_osd(&self, model: &UiModel, layout: &Layout) {
         if !model.volume_wheel {
             return;
         }
         let s = layout.scale;
         let stage = layout.stage;
-        let card_w = 56.0 * s;
-        let card_h = (280.0 * s).min((stage.height() - 190.0 * s).max(120.0 * s));
-        let card_right = stage.right - 20.0 * s;
-        let card_left = card_right - card_w;
-        let centered_top = stage.top + (stage.height() - card_h) * 0.5;
-        let max_bottom = (stage.bottom - 128.0 * s).max(stage.top + card_h + 16.0 * s);
-        let card_top = centered_top
-            .min(max_bottom - card_h)
-            .max(stage.top + 16.0 * s);
-        let card = Rect {
-            left: card_left,
-            top: card_top,
-            right: card_right,
-            bottom: card_top + card_h,
-        };
-        let card_round = D2D1_ROUNDED_RECT {
-            rect: to_d2d(card),
-            radiusX: 18.0 * s,
-            radiusY: 18.0 * s,
-        };
-        // `sidebar_wallpaper` and `panel_border` are rebound by
-        // `apply_sidebar_theme` every frame: warm paper in light mode, the
-        // dark paper surface in dark mode.
-        self.d2d
-            .FillRoundedRectangle(&card_round, &self.sidebar_wallpaper);
-        self.d2d
-            .DrawRoundedRectangle(&card_round, &self.panel_border, 1.0 * s, None);
-
         let track_w = 14.0 * s;
-        let track_h = (card.height() - 56.0 * s).max(24.0 * s);
-        let track_left = (card.left + card.right - track_w) * 0.5;
-        let track_top = card.top + (card.height() - track_h) * 0.5;
+        let track_h = (260.0 * s).min((stage.height() - 210.0 * s).max(120.0 * s));
+        let right = stage.right - 24.0 * s;
+        let centered_top = stage.top + (stage.height() - track_h) * 0.5;
+        let max_bottom = (stage.bottom - 128.0 * s).max(stage.top + track_h + 16.0 * s);
+        let top = centered_top
+            .min(max_bottom - track_h)
+            .max(stage.top + 16.0 * s);
         let bar = Rect {
-            left: track_left,
-            top: track_top,
-            right: track_left + track_w,
-            bottom: track_top + track_h,
+            left: right - track_w,
+            top,
+            right,
+            bottom: top + track_h,
         };
         let bar_round = D2D1_ROUNDED_RECT {
             rect: to_d2d(bar),
