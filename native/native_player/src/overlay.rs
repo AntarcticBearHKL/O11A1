@@ -129,7 +129,7 @@ impl SidebarTab {
 }
 
 /// The 设置 tab's rows, in draw/hit-test order.
-pub const SETTINGS_ROWS: usize = 8;
+pub const SETTINGS_ROWS: usize = 7;
 
 /// Opening-quality choices. `0` means the highest stream the source has.
 pub const DEFAULT_QUALITY_HEIGHTS: [u32; 7] = [0, 2160, 1440, 1080, 720, 480, 360];
@@ -4267,7 +4267,6 @@ impl Overlay {
                     true,
                 ),
                 ("音轨", model.audio_label.clone(), true),
-                ("速度", crate::speed::label(model.speed), true),
                 ("插帧", interp_level_label(model), true),
                 ("画质增强", model.enhance.label().to_string(), true),
                 (
@@ -4291,8 +4290,8 @@ impl Overlay {
                     Some((1usize, DEFAULT_QUALITY_HEIGHTS.len()))
                 }
                 Some(SettingsMenu::Audio) => Some((2usize, model.audio_rows.len())),
-                Some(SettingsMenu::Interp) => Some((4usize, model.interp_rows.len())),
-                Some(SettingsMenu::Enhance) => Some((5usize, model.enhance_rows.len())),
+                Some(SettingsMenu::Interp) => Some((3usize, model.interp_rows.len())),
+                Some(SettingsMenu::Enhance) => Some((4usize, model.enhance_rows.len())),
                 None => None,
             }
         };

@@ -7337,9 +7337,10 @@ impl Engine {
             self.show_toast("当前来源是直链，没有可切换的画质/音轨", true);
             return;
         }
-        // Any non-menu settings row collapses an open inline menu in the same
-        // click, then performs its own action.
-        if index > 2 && self.settings_menu.is_some() {
+        // Any settings row other than the open inline menu's own row collapses
+        // that menu in the same click, then performs its own action.
+        let open_menu_row = self.settings_menu_state().map(|(row, _)| row);
+        if open_menu_row.map(|row| row != index).unwrap_or(false) {
             self.settings_menu = None;
             self.ui_dirty = true;
         }
@@ -7383,8 +7384,7 @@ impl Engine {
                     self.audio_rows().len()
                 ));
             }
-            3 => self.cycle_speed(1),
-            4 => {
+            3 => {
                 self.settings_menu = if self.settings_menu == Some(SettingsMenu::Interp) {
                     None
                 } else {
@@ -7397,7 +7397,7 @@ impl Engine {
                     self.interp_rows().len()
                 ));
             }
-            5 => {
+            4 => {
                 self.settings_menu = if self.settings_menu == Some(SettingsMenu::Enhance) {
                     None
                 } else {
@@ -7410,8 +7410,8 @@ impl Engine {
                     self.enhance_rows().len()
                 ));
             }
-            6 => self.toggle_ontop(),
-            7 => self.toggle_audio_only(),
+            5 => self.toggle_ontop(),
+            6 => self.toggle_audio_only(),
             _ => {}
         }
     }
@@ -7496,8 +7496,8 @@ impl Engine {
             Some(SettingsMenu::Quality) => Some((0, self.quality_rows().len())),
             Some(SettingsMenu::DefaultQuality) => Some((1, DEFAULT_QUALITY_HEIGHTS.len())),
             Some(SettingsMenu::Audio) => Some((2, self.audio_rows().len())),
-            Some(SettingsMenu::Interp) => Some((4, self.interp_rows().len())),
-            Some(SettingsMenu::Enhance) => Some((5, self.enhance_rows().len())),
+            Some(SettingsMenu::Interp) => Some((3, self.interp_rows().len())),
+            Some(SettingsMenu::Enhance) => Some((4, self.enhance_rows().len())),
             None => None,
         }
     }
