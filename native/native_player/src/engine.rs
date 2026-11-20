@@ -5534,6 +5534,11 @@ impl Engine {
             InputEvent::Quit => self.quit = true,
             InputEvent::Focus => {
                 self.shared.focus_seq.fetch_add(1, Ordering::SeqCst);
+                // The settings page may have changed the danmaku values while
+                // this window was in the background. Pull them from disk as
+                // soon as the window is active again instead of waiting for a
+                // popup slider to be touched.
+                self.reload_danmaku_settings();
             }
             InputEvent::Resize { width, height } => {
                 if width < 32 || height < 32 {
@@ -6133,6 +6138,11 @@ impl Engine {
             TB_SPEED => self.toggle_speed(),
             TB_MUTE => self.toggle_mute(),
             TB_DANMAKU => {
+                if !self.danmaku_popup {
+                    // Opening the popup is also a sync point: an already-open
+                    // player may predate changes made in the settings page.
+                    self.reload_danmaku_settings();
+                }
                 self.danmaku_popup = !self.danmaku_popup;
                 self.settings_menu = None;
                 self.ui_dirty = true;
@@ -8741,6 +8751,9 @@ impl Engine {
                 }
                 QaKind::DanmakuPopup => {
                     log::line("qa danmaku popup");
+                    if !self.danmaku_popup {
+                        self.reload_danmaku_settings();
+                    }
                     self.danmaku_popup = !self.danmaku_popup;
                     self.chrome_shown = true;
                     self.last_mouse_activity = Instant::now();
