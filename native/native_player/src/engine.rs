@@ -8066,6 +8066,18 @@ impl Engine {
         self.danmaku.update(position);
         self.danmaku_band = band;
         self.danmaku.relayout(band);
+        // The font size follows the window height, so the layer's cached D2D
+        // text formats have to be pushed here as well. Without this the first
+        // fullscreen / resize keeps the startup size until a slider is touched.
+        if let Err(error) = self.danmaku_layer.set_fonts(self.danmaku.font_sizes()) {
+            log::line(&format!("danmaku geometry font update failed: {error:#}"));
+        }
+        log::line(&format!(
+            "danmaku font geometry model={:?} layer={:?} window_height={}",
+            self.danmaku.font_sizes(),
+            self.danmaku_layer.font_sizes(),
+            band.window_height
+        ));
         let _ = self.danmaku_layer.resize(self.client.0, self.client.1);
         // Repaint the retained comments immediately at the new geometry.
         self.redraw_danmaku_now();

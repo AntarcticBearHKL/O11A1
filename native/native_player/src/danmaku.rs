@@ -882,6 +882,12 @@ impl DanmakuOverlay {
         Ok(())
     }
 
+    /// The text sizes the layer currently renders with. The model recomputes
+    /// its sizes from the window height, so the two must be pushed together.
+    pub fn font_sizes(&self) -> [f32; 3] {
+        self.font_sizes
+    }
+
     pub fn set_fonts(&mut self, sizes: [f32; 3]) -> Result<()> {
         if sizes == self.font_sizes && self.formats.iter().all(Option::is_some) {
             return Ok(());
