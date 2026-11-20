@@ -589,13 +589,15 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
   const submitSearch = useCallback((term?: string) => {
     const query = (term ?? searchDraft).trim();
+    // An empty query is not a search: leave the dock and its hot list alone.
+    if (!query) return;
     searchSuggestSeq.current += 1;
     setSearchDraft('');
     setSearchSuggestions([]);
     setSearchSuggestLoading(false);
     setSearchSuggestion(-1);
     setSearchOpen(false);
-    navigate(query ? `search?q=${encodeURIComponent(query)}` : 'search');
+    navigate(`search?q=${encodeURIComponent(query)}`);
   }, [searchDraft, navigate]);
 
   const highlightSuggestion = (text: string) => {
