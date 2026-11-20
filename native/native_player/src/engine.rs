@@ -440,6 +440,13 @@ struct Engine {
     /// video presenting and defers chrome, shadow and overlay layout until
     /// the gesture ends.
     interacting: bool,
+    /// Whether the active gesture changes the client size. A move only moves
+    /// the composition; a resize also scales the frozen danmaku/UI layers so
+    /// they follow the window edge.
+    interaction_resizing: bool,
+    /// Client size at the start of the gesture. The overlay visuals are scaled
+    /// from this size to the current one during a resize, then reset on settle.
+    interaction_start_client: (u32, u32),
     /// Latest client size from WM_SIZE during a resize; applied once per
     /// frame instead of once per Win32 message.
     pending_live_resize: Option<(u32, u32)>,
@@ -1106,6 +1113,8 @@ impl Engine {
             ended: false,
             last_frame_ts: start_ms,
             interacting: false,
+            interaction_resizing: false,
+            interaction_start_client: (0, 0),
             pending_live_resize: None,
             volume,
             muted,
@@ -5871,6 +5880,8 @@ impl Engine {
                 if active {
                     if !self.interacting {
                         self.interacting = true;
+                        self.interaction_resizing = resizing;
+                        self.interaction_start_client = self.client;
                         self.pending_live_resize = None;
                         self.video_lag_since = None;
                         self.video.set_interaction(true);
@@ -5884,13 +5895,21 @@ impl Engine {
                     }
                 } else if self.interacting {
                     self.interacting = false;
+                    self.interaction_resizing = false;
                     self.pending_live_resize = None;
                     self.video_lag_since = None;
                     self.video.set_interaction(false);
+                    // Drop the temporary overlay scale before the final
+                    // layout is drawn; otherwise the new UI would be scaled a
+                    // second time.
+                    if let Err(error) = self.composition.set_overlay_scale(1.0, 1.0) {
+                        log::line(&format!("overlay scale reset failed: {error:#}"));
+                    }
                     self.client = window::client_size(self.hwnd);
                     self.apply_client_geometry();
                     self.next_tick_at = Some(Instant::now());
                     self.ui_dirty = true;
+                    self.draw_ui_now();
                     log::line(&format!(
                         "interaction settle client={}x{}",
                         self.client.0, self.client.1
@@ -8275,6 +8294,16 @@ impl Engine {
     /// redraw, no shadow, no rounded region, no hoisted UI text.
     fn apply_client_geometry_live(&mut self, width: u32, height: u32) {
         self.client = (width.max(1), height.max(1));
+        if self.interaction_resizing {
+            let start = self.interaction_start_client;
+            if start.0 > 0 && start.1 > 0 {
+                let scale_x = self.client.0 as f32 / start.0 as f32;
+                let scale_y = self.client.1 as f32 / start.1 as f32;
+                if let Err(error) = self.composition.set_overlay_scale(scale_x, scale_y) {
+                    log::line(&format!("interaction overlay scale failed: {error:#}"));
+                }
+            }
+        }
         if let Err(error) = self.overlay.resize(self.client.0, self.client.1, self.scale) {
             log::line(&format!("interaction layout failed: {error:#}"));
         }

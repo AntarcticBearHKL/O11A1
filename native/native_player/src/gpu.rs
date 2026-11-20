@@ -635,6 +635,11 @@ pub struct Composition {
     target: IDCompositionTarget,
     root: IDCompositionVisual,
     pub video_visual: IDCompositionVisual,
+    /// Danmaku and UI live above the video. During a drag-resize these two
+    /// visuals are scaled with the window so the frozen last frames follow
+    /// the frame; they are reset and redrawn when the gesture settles.
+    danmaku_visual: IDCompositionVisual,
+    ui_visual: IDCompositionVisual,
 }
 
 impl Composition {
@@ -669,6 +674,8 @@ impl Composition {
                 target,
                 root,
                 video_visual,
+                danmaku_visual,
+                ui_visual,
             })
         }
     }
@@ -696,6 +703,28 @@ impl Composition {
     /// changes the decoded picture size rebuilds the swapchain). The rest of
     /// the composition tree is untouched, so the UI/danmaku layers keep their
     /// order.
+    /// Scale the danmaku and UI layers with the window during a drag-resize.
+    /// Their swapchains are monitor-sized and hold the last frame; scaling the
+    /// visuals from the gesture's starting client size makes the danmaku,
+    /// loading card, toolbar and HUD follow the window instead of freezing at
+    /// the old rectangle. The engine resets this to 1:1 and redraws on settle.
+    pub fn set_overlay_scale(&self, scale_x: f32, scale_y: f32) -> Result<()> {
+        let matrix = Matrix3x2 {
+            M11: scale_x,
+            M12: 0.0,
+            M21: 0.0,
+            M22: scale_y,
+            M31: 0.0,
+            M32: 0.0,
+        };
+        unsafe {
+            self.danmaku_visual.SetTransform2(&matrix)?;
+            self.ui_visual.SetTransform2(&matrix)?;
+            self.device.Commit()?;
+        }
+        Ok(())
+    }
+
     pub fn set_video_content(&self, video: &IDXGISwapChain1) -> Result<()> {
         unsafe {
             let content: IUnknown = video.cast()?;
