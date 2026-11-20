@@ -1,5 +1,13 @@
 'use strict';
 
+// stdout/stderr are diagnostics only. A shortcut or detached launcher can
+// leave them connected to a closed pipe; Node then raises EPIPE while
+// `console.error` writes, which Electron reports as a modal main-process
+// crash. Swallow errors on those streams instead of taking the app down.
+for (const output of [process.stdout, process.stderr]) {
+  if (output && typeof output.on === 'function') output.on('error', () => {});
+}
+
 const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -133,7 +141,13 @@ function startEngine() {
     }
   });
   engineProcess.stderr.setEncoding('utf8');
-  engineProcess.stderr.on('data', (chunk) => console.error('[engine]', chunk.trim()));
+  engineProcess.stderr.on('data', (chunk) => {
+    // Drain the pipe always, but only echo it in dev or when explicitly
+    // asked. A packaged app launched without a console must not write engine
+    // lines into a dead stdout/stderr pipe.
+    if (!IS_DEV && process.env.O11A1_ENGINE_LOG !== '1') return;
+    console.error('[engine]', chunk.trim());
+  });
   engineProcess.on('exit', (code) => {
     engineProcess = null;
     engineReady = false;

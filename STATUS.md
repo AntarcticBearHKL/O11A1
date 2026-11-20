@@ -113,8 +113,8 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.6.185.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
-- `release/win-unpacked-0.6.185/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
+- 产物：`release/O11A1 Setup 0.6.186.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- `release/win-unpacked-0.6.186/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 
 ## 已知差异 / 后续
@@ -151,6 +151,7 @@
 | 工具条图标 | 循环 / 精准定位 / 播放速度改为 repeat 双箭头、准星、开口仪表盘线性图标；16px path + 1.5px 笔画，1× 与 8× 截图检查 |
 | 速度面板 | 顶部「速度」+ 16px 当前值；刻度槽内 21 个档位各一根刻度，整数档蓝色加高并带刻度帽，正中 2px 红色瞄准线贯穿全高；标签随拖动滚动，松手吸附回红线 |
 | 弹幕设置同步 | 用真实 `settings.json`（透明度 50 / 字号 110 / 速度 53 / 区域 100）启动引擎，播放器弹窗显示 50% / 110% / 53% / 100%；打开播放器、窗口重新聚焦、打开弹幕浮层都会重新读盘并应用 |
+| 主进程 EPIPE | 引擎 stderr 只在 dev 或 `O11A1_ENGINE_LOG=1` 时回显，其余情况只排空管道；stdout/stderr 都挂 error 监听，断开的管道不再弹主进程 JavaScript 错误框 |
 | 选集切换 | 点击 P2 后先同步重绘选中态并显示「正在加载第 2 P…」，再停止旧解码/音频；解析约 2.2s 后新分P首帧上屏，不会出现点完没反应的等待窗口 |
 | 卡片左键 / 右键 | 左键 `player.replace`：同一 HWND（如 7473580）标题从 A 变 C，窗口矩形不变，新视频 120fps 播放；右键走 `player.open` 新窗口。连续点 B、C：B 的解析结果先到后立即被 C 替换，最终播放 C |
 | 缓冲提示 | 只有居中圆环 + `正在缓冲`，不再显示「网络恢复后会自动继续播放」；加载 / 定位仍保留第二行说明 |
