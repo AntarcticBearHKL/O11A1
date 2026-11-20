@@ -117,12 +117,13 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.7.4.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.7.5.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
 - **0.7.3 A/V 同步**：音频设备时钟成为唯一参考；画面持续落后时改为跳帧追赶，不再出现“视频慢放、声音正常”。详见上方 A/V 同步条目。
 - **0.7.4 窗口缩放**：主窗口右下角新增 36px 透明缩放热区（`cursor: nwse-resize`，主进程 10ms 光标跟随，同时改宽高），覆盖 22px 透明留边和可见圆角；原生播放器右下角命中区从 6px 扩大到 24px（DPI 缩放），8px 边带保留，16px 圆角裁切后仍能稳定出现斜向缩放指针。
+- **0.7.5 缩放指示**：右下角只保留 36px 透明缩放热区和 `nwse-resize` 光标，删除可见的折角标记；热区、拖动同时改宽高、最大化隐藏的逻辑不变。
 
 ## 已知差异 / 后续
 
