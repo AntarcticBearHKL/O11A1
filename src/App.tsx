@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { call, cover } from './api';
+import { call, callRaw, cover } from './api';
 import { AppContext, Route } from './context';
 import { readLastAccount } from './components/LoginSurface';
 import { useToast } from './hooks';
@@ -25,6 +25,8 @@ import Fish from './pages/Fish';
 import { launchPlayer } from './player';
 import { CoverImage } from './components/CoverImage';
 import { clearPreloadedData } from './preload';
+
+type HotSearchItem = { keyword: string; show_name: string };
 
 function parseRoute(): Route {
   const raw = window.location.hash.replace(/^#\/?/, '');
@@ -76,6 +78,13 @@ export default function App({ initial }: { initial?: AppInitial }) {
   const [appVersion, setAppVersion] = useState(initial?.version || '0.1.0');
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchDraft, setSearchDraft] = useState('');
+  const [searchSuggestions, setSearchSuggestions] = useState<string[]>([]);
+  const [searchSuggestLoading, setSearchSuggestLoading] = useState(false);
+  const [searchSuggestion, setSearchSuggestion] = useState(-1);
+  const [searchHot, setSearchHot] = useState<HotSearchItem[]>([]);
+  const [searchHotLoading, setSearchHotLoading] = useState(false);
+  const searchSuggestSeq = useRef(0);
+  const searchHotCache = useRef<HotSearchItem[]>([]);
   const [accountOpen, setAccountOpen] = useState(false);
   const [playlistOpen, setPlaylistOpen] = useState(false);
   const [holdPoint, setHoldPoint] = useState<{ id: number; x: number; y: number } | null>(null);
@@ -153,6 +162,81 @@ export default function App({ initial }: { initial?: AppInitial }) {
       return () => clearTimeout(timer);
     }
   }, [searchOpen]);
+
+  // Search-box suggestions: one debounced request per edit, with a generation
+  // guard so a slow earlier answer can never overwrite the current term.
+  useEffect(() => {
+    const term = searchDraft.trim();
+    if (!searchOpen || !term) {
+      searchSuggestSeq.current += 1;
+      setSearchSuggestions([]);
+      setSearchSuggestLoading(false);
+      setSearchSuggestion(-1);
+      return;
+    }
+    const seq = ++searchSuggestSeq.current;
+    setSearchSuggestions([]);
+    setSearchSuggestLoading(true);
+    setSearchSuggestion(-1);
+    const timer = setTimeout(async () => {
+      try {
+        const items = await callRaw<string[]>('search.suggest', { term });
+        if (seq !== searchSuggestSeq.current) return;
+        setSearchSuggestions(
+          Array.isArray(items)
+            ? items.filter((item) => typeof item === 'string' && item.trim()).slice(0, 8)
+            : [],
+        );
+      } catch {
+        if (seq === searchSuggestSeq.current) setSearchSuggestions([]);
+      } finally {
+        if (seq === searchSuggestSeq.current) setSearchSuggestLoading(false);
+      }
+    }, 160);
+    return () => clearTimeout(timer);
+  }, [searchOpen, searchDraft]);
+
+  // Empty search box: the same dropdown becomes the hot-search list instead
+  // of disappearing. Cached for the app session so clearing the input is
+  // instant; the first open fetches it once.
+  useEffect(() => {
+    if (!searchOpen) {
+      setSearchHotLoading(false);
+      return;
+    }
+    if (searchDraft.trim()) {
+      setSearchHotLoading(false);
+      return;
+    }
+    if (searchHotCache.current.length) {
+      setSearchHot(searchHotCache.current);
+      setSearchHotLoading(false);
+      setSearchSuggestion(-1);
+      return;
+    }
+    let cancelled = false;
+    setSearchHotLoading(true);
+    const timer = setTimeout(async () => {
+      try {
+        const items = await callRaw<HotSearchItem[]>('search.hot');
+        if (cancelled) return;
+        const list = Array.isArray(items)
+          ? items.filter((item) => item && (item.keyword || item.show_name)).slice(0, 10)
+          : [];
+        searchHotCache.current = list;
+        setSearchHot(list);
+        setSearchSuggestion(-1);
+      } catch {
+        if (!cancelled) setSearchHot([]);
+      } finally {
+        if (!cancelled) setSearchHotLoading(false);
+      }
+    }, 120);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [searchOpen, searchDraft]);
 
   useEffect(() => {
     const onDown = (event: MouseEvent) => {
@@ -493,11 +577,28 @@ export default function App({ initial }: { initial?: AppInitial }) {
     setSearchOpen(true);
   }, [route.name, route.query]);
 
-  const submitSearch = useCallback(() => {
-    const query = searchDraft.trim();
+  const submitSearch = useCallback((term?: string) => {
+    const query = (term ?? searchDraft).trim();
+    searchSuggestSeq.current += 1;
+    setSearchSuggestions([]);
+    setSearchSuggestLoading(false);
+    setSearchSuggestion(-1);
     setSearchOpen(false);
     navigate(query ? `search?q=${encodeURIComponent(query)}` : 'search');
   }, [searchDraft, navigate]);
+
+  const highlightSuggestion = (text: string) => {
+    const query = searchDraft.trim();
+    const at = query ? text.toLowerCase().indexOf(query.toLowerCase()) : -1;
+    if (at < 0) return text;
+    return (
+      <>
+        {text.slice(0, at)}
+        <b>{text.slice(at, at + query.length)}</b>
+        {text.slice(at + query.length)}
+      </>
+    );
+  };
 
   type DockItem = { key: string; label: string; icon: React.ComponentType<{ size?: number }>; hint?: string };
   const dock = useMemo(() => {
@@ -626,6 +727,19 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
   const activeNav = dock.items.some((item) => item.key === route.name) ? route.name : '';
   const currentEntry = playlistCurrent != null ? playlist[playlistCurrent] : null;
+  const searchTerm = searchDraft.trim();
+  const searchPanelItems: Array<{ value: string; label: string; rank?: number }> = searchTerm
+    ? searchSuggestions.map((item) => ({ value: item, label: item }))
+    : searchHot.map((item, index) => ({
+        value: item.keyword || item.show_name,
+        label: item.show_name || item.keyword,
+        rank: index + 1,
+      }));
+  const showSearchPanel = searchOpen && (
+    searchTerm
+      ? (searchSuggestLoading || searchSuggestions.length > 0)
+      : (searchHotLoading || searchHot.length > 0)
+  );
 
   const page = (() => {
     switch (route.name) {
@@ -727,10 +841,33 @@ export default function App({ initial }: { initial?: AppInitial }) {
                   tabIndex={searchOpen ? 0 : -1}
                   placeholder="搜索视频或 UP 主"
                   value={searchDraft}
-                  onChange={(event) => setSearchDraft(event.target.value)}
+                  onChange={(event) => {
+                    setSearchDraft(event.target.value);
+                    setSearchSuggestion(-1);
+                  }}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') submitSearch();
-                    if (event.key === 'Escape') setSearchOpen(false);
+                    if ((event.nativeEvent as any).isComposing) return;
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault();
+                      setSearchSuggestion((current) => (
+                        searchPanelItems.length
+                          ? (current >= searchPanelItems.length - 1 ? 0 : current + 1)
+                          : -1
+                      ));
+                    } else if (event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      setSearchSuggestion((current) => (
+                        searchPanelItems.length
+                          ? (current <= 0 ? searchPanelItems.length - 1 : current - 1)
+                          : -1
+                      ));
+                    } else if (event.key === 'Enter') {
+                      event.preventDefault();
+                      const picked = searchSuggestion >= 0 ? searchPanelItems[searchSuggestion]?.value : '';
+                      submitSearch(picked || undefined);
+                    } else if (event.key === 'Escape') {
+                      setSearchOpen(false);
+                    }
                   }}
                 />
                 <button
@@ -740,6 +877,41 @@ export default function App({ initial }: { initial?: AppInitial }) {
                   onClick={(event) => { event.stopPropagation(); setSearchOpen(false); }}
                 ><IconClose size={12} /></button>
               </div>
+              {showSearchPanel ? (
+                <div
+                  className="search-suggest-panel"
+                  role="listbox"
+                  aria-label={searchTerm ? '搜索建议' : '热搜'}
+                >
+                  {(searchTerm ? searchSuggestLoading && searchSuggestions.length === 0 : searchHotLoading && searchHot.length === 0) ? (
+                    <div className="search-suggest-status">
+                      <i />{searchTerm ? '正在联想…' : '正在加载热搜…'}
+                    </div>
+                  ) : (
+                    searchPanelItems.map((item, index) => (
+                      <button
+                        key={`${item.value}-${index}`}
+                        className={`search-suggest-item${index === searchSuggestion ? ' active' : ''}`}
+                        role="option"
+                        aria-selected={index === searchSuggestion}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onMouseEnter={() => setSearchSuggestion(index)}
+                        onClick={() => submitSearch(item.value)}
+                      >
+                        {item.rank ? (
+                          <span className={`search-suggest-rank${item.rank <= 3 ? ' top' : ''}`}>{item.rank}</span>
+                        ) : (
+                          <IconSearch size={14} />
+                        )}
+                        <span>{searchTerm ? highlightSuggestion(item.label) : item.label}</span>
+                        <svg className="search-suggest-go" width="14" height="14" viewBox="0 0 24 24" aria-hidden>
+                          <path d="M7 17 17 7M9 7h8v8" />
+                        </svg>
+                      </button>
+                    ))
+                  )}
+                </div>
+              ) : null}
             </div>
 
             <div className="window-controls no-drag">

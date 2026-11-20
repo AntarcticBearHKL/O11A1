@@ -113,8 +113,8 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.6.183.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
-- `release/win-unpacked-0.6.183/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
+- 产物：`release/O11A1 Setup 0.6.184.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- `release/win-unpacked-0.6.184/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 
 ## 已知差异 / 后续
@@ -145,7 +145,7 @@
 | 右键长按刷新 | 仅在非互动区域启动：44px 圆形进度环（3px 轨道 + 3.8px 蓝色弧从 12 点顺时针填充，无图标 / 文字 / 卡片），`fixed` 环绕光标；140ms 内可见，400ms 后淡出；养鱼（大肥鱼）页和设置页不启动 |
 | 页内 tabs | 6 组页面 tabs 均为独立药丸按钮；右键单击不再产生焦点边框，也不触发刷新环 |
 | 弹幕右键拖动 | 原生播放器实测：右键按下打开菜单，拖到「点赞」松开触发点赞；拖到举报子菜单「垃圾广告」松开触发 reason=1 |
-| 顶部栏 / 搜索 | 绝对定位的透明磨砂条覆盖内容；左侧头像 40px、中间 320px 搜索框（浅灰 `搜索视频或 UP 主` placeholder）、右侧窗口钮；展开后从 70px 到右侧窗口钮前，铺满中间全部宽度；打开后右键任意位置关闭；空输入不显示热搜或历史 |
+| 顶部栏 / 搜索 | 绝对定位的透明磨砂条覆盖内容；左侧头像 40px、中间 320px 搜索框（浅灰 `搜索视频或 UP 主` placeholder）、右侧窗口钮；展开后从 70px 到右侧窗口钮前，铺满中间全部宽度；输入任意关键词 160ms 防抖调用 `search.suggest`，联想框与搜索框同宽、无标题/分割线，↑↓ / Enter 可选；空输入调用 `search.hot` 在同一面板显示热搜排名；打开后右键任意位置关闭 |
 | Debug FPS | 默认关闭；开关在播放器侧栏「性能 → 右上角性能显示」，状态写入 `player_state.json`；开启后右上角五行显示 `画面 FPS 120.0 · 8.3 ms` + `弹幕 FPS x` + 读取 bps / 码率 bps + 缓冲秒数 + `UI FPS x`；弹幕值按最近 1 秒实际绘制计数，无可见弹幕为 0；UI FPS 覆盖工具栏、侧栏、HUD 与动画；F12 / Ctrl+Shift+H 仍可切换；首页右上角 HUD 与头像菜单开关已删除 |
 | 性能 / 网络 | 性能 tab 无标题，只剩一个 HUD 开关；网络 tab 显示播放位置 / 已播放 / 已加载（真实缓存百分比与字节数；本地文件 100%）/ 缓冲 / 码率 / 线程 / 速度 / 源；24×6 = 144 格固定切片热力图（每格 0.7%）带图例区分已播放、已加载、当前位置、未加载；工具条进度条用同一可用区间画缓存带 |
 | 工具条图标 | 循环 / 精准定位 / 播放速度改为 repeat 双箭头、准星、开口仪表盘线性图标；16px path + 1.5px 笔画，1× 与 8× 截图检查 |
