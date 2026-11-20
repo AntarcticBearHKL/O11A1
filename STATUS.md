@@ -117,11 +117,12 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.7.3.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.7.4.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
 - **0.7.3 A/V 同步**：音频设备时钟成为唯一参考；画面持续落后时改为跳帧追赶，不再出现“视频慢放、声音正常”。详见上方 A/V 同步条目。
+- **0.7.4 窗口缩放**：主窗口右下角新增 36px 透明缩放热区（`cursor: nwse-resize`，主进程 10ms 光标跟随，同时改宽高），覆盖 22px 透明留边和可见圆角；原生播放器右下角命中区从 6px 扩大到 24px（DPI 缩放），8px 边带保留，16px 圆角裁切后仍能稳定出现斜向缩放指针。
 
 ## 已知差异 / 后续
 
@@ -137,11 +138,12 @@
 | --- | --- |
 | Renderer | `npm run build:renderer` 通过 |
 | Rust | `cargo build --release`（vendored）通过 |
-| Rust 测试 | `native_player` 81 个测试通过（含 GPU 帧池 NV12→BGRA / 混合 / 真实 4K dump 转换、到期帧顺序、缓存分块边界、A/V 追赶判定） |
+| Rust 测试 | `native_player` 82 个测试通过（含 GPU 帧池 NV12→BGRA / 混合 / 真实 4K dump 转换、到期帧顺序、缓存分块边界、A/V 追赶判定、窗口缩放命中） |
 | Rust 测试 | `o11a1-core` 251 个测试（7 ignored）通过 |
 | GPU 硬解 | 探测：本机 RTX 4060 Ti 对 `h264_cuvid` / `hevc_cuvid` / `av1_cuvid` 全部 supported=1；B 站 4K 流 `decoder=h264_cuvid`，直播 FLV `codec=h264 decoder=h264_cuvid` |
 | 4K 播放 | 真实 B 站 4K60 缓存流 + 音频：插帧 + CAS 103–121fps、`dropped=0`、`pos_ms == audio_ms`；关闭插帧稳定 60fps、`dropped=0`；1080P30 插帧 + CAS 120.1fps |
 | A/V 追赶 | `O11A1_QA_DECODE_DELAY_MS=50` 把 30fps 源限制到 20fps：`pos_ms == audio_ms`，`av_gap` 峰值约 0.5–0.6s，每约 2s 一次视频单独 seek，落地后画面与音频差 10–40ms；正常 1080P30（插帧开 / 关）`av_gap` 0–52ms、无追赶；900ms/帧时先暂停音频，帧回来后 1.5s 内跳帧追上 |
+| 窗口缩放 | 主窗口 CDP 实测：右下角 grip 36×36、`cursor=nwse-resize`，按住拖动 +90/+64 后窗口从 1280×800 变为 1370×864；原生播放器 `WM_NCHITTEST` 在右下角 5 / 10 / 16 / 22px 均返回 `HTBOTTOMRIGHT(17)`，28px 为 `HTCLIENT` |
 | 自动下一分P | `BV1NDsS6UE8D` P1→P2→P3 实测：尾部自动切换一次、P3（未缓存）解码后首帧到达并 60fps 播放；拖到结尾之后立即进入切换；无重复切换日志 |
 | 更新下载 | 自建下载器实测 GitHub Release 资产 206,921,979 字节，sha256 与 API `digest` 一致；资产 302 跳转、节流进度、失败清理 `.part` 均通过 |
 | 更新 UI | 模拟 Release API（2 MB 资产）+ 隔离 `userData`：`update.check()` 返回 downloading 0→100%，收到 7 次进度事件与 `ready`；安装包落在 `<userData>/updates` 且 sha256 匹配 |

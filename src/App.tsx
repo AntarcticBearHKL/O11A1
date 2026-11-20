@@ -24,6 +24,7 @@ import Downloads from './pages/Downloads';
 import Fish from './pages/Fish';
 import { launchPlayer } from './player';
 import { CoverImage } from './components/CoverImage';
+import { WindowResizeGrip } from './components/WindowResizeGrip';
 import { clearPreloadedData } from './preload';
 
 type HotSearchItem = { keyword: string; show_name: string };
@@ -1123,6 +1124,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
         {toast ? <div className={`toast ${toast.error ? 'error' : ''}`}>{toast.text}</div> : null}
       </div>
+      <WindowResizeGrip hidden={maximized} />
     </AppContext.Provider>
   );
 }

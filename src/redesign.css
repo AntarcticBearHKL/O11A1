@@ -3972,6 +3972,46 @@ html, body, #root {
 }
 
 
+/* Bottom-right resize grip for the frameless window. Chromium's native
+   sizing border is only ~5 px and the paper is inset by 22 px, so the
+   visible rounded corner was almost impossible to grab. The grip starts in
+   the transparent rim and covers the visible corner; the diagonal cursor is
+   always the same, and the main process follows the cursor to resize both
+   axes together. */
+.window-resize-grip {
+  position: fixed;
+  right: 4px;
+  bottom: 4px;
+  width: 36px;
+  height: 36px;
+  z-index: 2147483000;
+  cursor: nwse-resize;
+  -webkit-app-region: no-drag;
+  touch-action: none;
+}
+.window-resize-grip::before {
+  content: '';
+  position: absolute;
+  right: 13px;
+  bottom: 13px;
+  width: 9px;
+  height: 9px;
+  border-right: 1.5px solid var(--text-faint);
+  border-bottom: 1.5px solid var(--text-faint);
+  border-bottom-right-radius: 3px;
+  opacity: 0.38;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+.window-resize-grip:hover::before,
+.window-resize-grip:active::before {
+  opacity: 0.85;
+}
+[data-theme='dark'] .window-resize-grip::before {
+  border-color: rgba(255, 255, 255, 0.36);
+}
+
+
 /* =========================================================================
    Login — one minimal surface shared by the startup window and the in-app
    account page. Only three kinds of objects are allowed there: the user

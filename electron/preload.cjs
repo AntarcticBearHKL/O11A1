@@ -24,6 +24,8 @@ contextBridge.exposeInMainWorld('o11a1', {
     startDrag: () => ipcRenderer.invoke('window:start-drag'),
     beginDrag: () => ipcRenderer.invoke('window:begin-drag'),
     endDrag: () => ipcRenderer.invoke('window:end-drag'),
+    beginResize: () => ipcRenderer.invoke('window:begin-resize'),
+    endResize: () => ipcRenderer.invoke('window:end-resize'),
     fullscreen: (on) => ipcRenderer.invoke('window:fullscreen', on),
     isFullscreen: () => ipcRenderer.invoke('window:isFullscreen'),
     topmost: (on) => ipcRenderer.invoke('window:topmost', on),

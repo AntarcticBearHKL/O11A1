@@ -256,6 +256,58 @@ const EDGE_RIGHT: u8 = 2;
 const EDGE_TOP: u8 = 4;
 const EDGE_BOTTOM: u8 = 8;
 
+/// Resize border in 96-DPI units. Windows' own sizing frame is about 8 px;
+/// the old 6 px band plus the 16 px rounded window region left almost no
+/// reachable corner at the bottom right.
+const RESIZE_EDGE_DIP: f32 = 8.0;
+/// Bottom corner grip in 96-DPI units. It is larger than the 16 px window
+/// corner radius, so the visible arc and the area just inside it both return
+/// the diagonal resize code. The top corners stay at `edge` because the
+/// 36x34 close button sits 8 px from the top-right edge.
+const RESIZE_BOTTOM_CORNER_DIP: f32 = 24.0;
+
+/// Hit-test a client point against the resize grips. Bottom corners are
+/// deliberately larger than the top ones: the rounded window region clips
+/// the exact corner, and the top-right one must not cover the close button.
+fn resize_hit(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    edge: i32,
+    bottom_corner: i32,
+) -> Option<u32> {
+    let edge = edge.max(1);
+    let bottom_corner = bottom_corner.max(edge);
+    let near_left = x < edge;
+    let near_right = x >= width.saturating_sub(edge);
+    let near_top = y < edge;
+    let near_bottom = y >= height.saturating_sub(edge);
+    let bottom_left = x < bottom_corner && y >= height.saturating_sub(bottom_corner);
+    let bottom_right =
+        x >= width.saturating_sub(bottom_corner) && y >= height.saturating_sub(bottom_corner);
+    let hit = if bottom_left {
+        HTBOTTOMLEFT
+    } else if bottom_right {
+        HTBOTTOMRIGHT
+    } else if near_top && near_left {
+        HTTOPLEFT
+    } else if near_top && near_right {
+        HTTOPRIGHT
+    } else if near_left {
+        HTLEFT
+    } else if near_right {
+        HTRIGHT
+    } else if near_top {
+        HTTOP
+    } else if near_bottom {
+        HTBOTTOM
+    } else {
+        return None;
+    };
+    Some(hit)
+}
+
 fn edges_for_hit(hit: u32) -> Option<u8> {
     if hit == HTLEFT as u32 {
         Some(EDGE_LEFT)
@@ -637,32 +689,27 @@ unsafe extern "system" fn wndproc(
             unsafe {
                 let _ = GetWindowRect(hwnd, &mut rect);
             }
-            let border = (6.0 * unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0).round() as i32;
-            let border = border.max(4);
-            let left = x < rect.left + border;
-            let right = x >= rect.right - border;
-            let top = y < rect.top + border;
-            let bottom = y >= rect.bottom - border;
-            let hit = if top && left {
-                HTTOPLEFT
-            } else if top && right {
-                HTTOPRIGHT
-            } else if bottom && left {
-                HTBOTTOMLEFT
-            } else if bottom && right {
-                HTBOTTOMRIGHT
-            } else if left {
-                HTLEFT
-            } else if right {
-                HTRIGHT
-            } else if top {
-                HTTOP
-            } else if bottom {
-                HTBOTTOM
-            } else {
-                return LRESULT(1); // HTCLIENT
-            };
-            LRESULT(hit as isize)
+            // A maximized window has no resize grips: its edges are the
+            // screen edges, and the custom drag loop owns the top strip.
+            if unsafe { IsZoomed(hwnd).as_bool() } {
+                return LRESULT(1);
+            }
+            let dpi = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+            let edge = (RESIZE_EDGE_DIP * dpi).round().max(4.0) as i32;
+            let bottom_corner = (RESIZE_BOTTOM_CORNER_DIP * dpi).round().max(edge as f32) as i32;
+            let width = (rect.right - rect.left).max(1);
+            let height = (rect.bottom - rect.top).max(1);
+            match resize_hit(
+                x - rect.left,
+                y - rect.top,
+                width,
+                height,
+                edge,
+                bottom_corner,
+            ) {
+                Some(hit) => LRESULT(hit as isize),
+                None => LRESULT(1), // HTCLIENT
+            }
         }
         WM_MOUSELEAVE => {
             if let Some(events) = events {
@@ -1936,7 +1983,54 @@ pub fn tiny_sleep() {
 
 #[cfg(test)]
 mod tests {
-    use super::aspect_client_size;
+    use super::{
+        aspect_client_size, resize_hit, HTBOTTOM, HTBOTTOMRIGHT, HTRIGHT, HTTOPRIGHT,
+    };
+
+    #[test]
+    fn bottom_right_grip_survives_the_rounded_corner() {
+        let (width, height) = (800, 600);
+        let edge = 8;
+        let corner = 24;
+        // The visible arc is about 5 px inside the window corner; the old
+        // 6 px square left only a tiny sliver of it reachable. The 24 px grip
+        // must classify the whole visible corner as the diagonal resize.
+        assert_eq!(
+            resize_hit(width - 5, height - 5, width, height, edge, corner),
+            Some(HTBOTTOMRIGHT as u32)
+        );
+        assert_eq!(
+            resize_hit(width - 12, height - 12, width, height, edge, corner),
+            Some(HTBOTTOMRIGHT as u32)
+        );
+        assert_eq!(
+            resize_hit(width - 24, height - 24, width, height, edge, corner),
+            Some(HTBOTTOMRIGHT as u32)
+        );
+        // Outside the corner grip the ordinary edge bands still work.
+        assert_eq!(
+            resize_hit(width - 4, height / 2, width, height, edge, corner),
+            Some(HTRIGHT as u32)
+        );
+        assert_eq!(
+            resize_hit(width / 2, height - 4, width, height, edge, corner),
+            Some(HTBOTTOM as u32)
+        );
+        // The top-right corner stays at the 8 px edge band so it never
+        // covers the close button, which sits 8 px from the window edge.
+        assert_eq!(
+            resize_hit(width - 4, 4, width, height, edge, corner),
+            Some(HTTOPRIGHT as u32)
+        );
+        assert_eq!(
+            resize_hit(width - 12, 20, width, height, edge, corner),
+            None
+        );
+        assert_eq!(
+            resize_hit(width / 2, height / 2, width, height, edge, corner),
+            None
+        );
+    }
 
     fn ratio_ok(width: i32, height: i32, aspect: f32) -> bool {
         ((width as f32 / height as f32) - aspect).abs() < 0.01

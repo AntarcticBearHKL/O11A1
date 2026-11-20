@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { call } from './api';
 import App from './App';
+import { WindowResizeGrip } from './components/WindowResizeGrip';
 import { LoginQrPlaceholder, LoginSurface, loginQrColors, readLastAccount } from './components/LoginSurface';
 import { preloadAll, refreshFeedAfterLogin, type BootstrapData, type PreloadData, type PreloadProgress } from './preload';
 import { IconClose, IconMax, IconMin } from './components/Icons';
@@ -61,10 +62,13 @@ function useWindowMaximized() {
 function LoginScreen({ closeAction, children }: { closeAction: number; children: React.ReactNode }) {
   const maximized = useWindowMaximized();
   return (
-    <div className={`login-gate${maximized ? ' maximized' : ''}`}>
-      <WindowControls closeAction={closeAction} />
-      <section className="login-panel">{children}</section>
-    </div>
+    <>
+      <div className={`login-gate${maximized ? ' maximized' : ''}`}>
+        <WindowControls closeAction={closeAction} />
+        <section className="login-panel">{children}</section>
+      </div>
+      <WindowResizeGrip hidden={maximized} />
+    </>
   );
 }
 

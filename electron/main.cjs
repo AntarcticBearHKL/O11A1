@@ -48,6 +48,7 @@ let engineStarting = false;
 let quitting = false;
 let trayHintShown = false;
 let windowDrag = null;
+let windowResize = null;
 
 function dataRoot() {
   const dir = path.join(app.getPath('userData'), 'data');
@@ -1001,10 +1002,20 @@ function stopWindowDrag() {
   windowDrag = null;
 }
 
+function stopWindowResize() {
+  if (!windowResize) return;
+  clearInterval(windowResize.timer);
+  if (windowResize.onBlur) {
+    windowResize.win.removeListener('blur', windowResize.onBlur);
+  }
+  windowResize = null;
+}
+
 ipcMain.handle('window:begin-drag', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win || win.isDestroyed() || win.isFullScreen()) return false;
   stopWindowDrag();
+  stopWindowResize();
   if (win.isMaximized()) win.unmaximize();
   const startCursor = screen.getCursorScreenPoint();
   const [startX, startY] = win.getPosition();
@@ -1030,6 +1041,40 @@ ipcMain.handle('window:begin-drag', (event) => {
 
 ipcMain.handle('window:end-drag', () => {
   stopWindowDrag();
+  return true;
+});
+
+ipcMain.handle('window:begin-resize', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed() || win.isFullScreen()) return false;
+  stopWindowDrag();
+  stopWindowResize();
+  if (win.isMaximized()) win.unmaximize();
+  const startCursor = screen.getCursorScreenPoint();
+  const bounds = win.getBounds();
+  const [minWidth, minHeight] = win.getMinimumSize();
+  const onBlur = () => stopWindowResize();
+  win.once('blur', onBlur);
+  const timer = setInterval(() => {
+    if (!windowResize || windowResize.win.isDestroyed()) {
+      stopWindowResize();
+      return;
+    }
+    const cursor = screen.getCursorScreenPoint();
+    const width = Math.max(minWidth, bounds.width + cursor.x - startCursor.x);
+    const height = Math.max(minHeight, bounds.height + cursor.y - startCursor.y);
+    try {
+      windowResize.win.setBounds({ x: bounds.x, y: bounds.y, width, height }, false);
+    } catch {
+      stopWindowResize();
+    }
+  }, 10);
+  windowResize = { win, timer, onBlur };
+  return true;
+});
+
+ipcMain.handle('window:end-resize', () => {
+  stopWindowResize();
   return true;
 });
 
