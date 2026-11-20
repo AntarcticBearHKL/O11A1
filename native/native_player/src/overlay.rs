@@ -1092,7 +1092,7 @@ impl Layout {
     /// the click test both use this rect (and the tab's shared scroll).
     pub fn performance_hud_row(&self, scroll: f32) -> Rect {
         let s = self.scale;
-        let top = self.sidebar_content.top + (PERF_TOP_PAD + PERF_SECTION_H) * s - scroll;
+        let top = self.sidebar_content.top + PERF_TOP_PAD * s - scroll;
         Rect {
             left: self.sidebar_content.left,
             top,
@@ -1120,16 +1120,39 @@ impl Layout {
 pub const HEAT_BUCKETS: usize = 120;
 
 /// Height of the performance tab, in logical pixels. The draw and the engine
-/// scroll clamp share it. There is no fixed section header any more: the two
-/// sections (性能 / 网络) scroll with the content.
-pub const PERFORMANCE_CONTENT_H: f32 = 556.0;
+/// scroll clamp share it. There is no fixed section header any more: the HUD
+/// switch and the network block scroll with the content.
+pub const PERFORMANCE_CONTENT_H: f32 = 576.0;
 
 /// 性能 tab vertical rhythm (logical pixels).
 pub const PERF_TOP_PAD: f32 = 2.0;
 pub const PERF_SECTION_H: f32 = 20.0;
 pub const PERF_SWITCH_H: f32 = 44.0;
-/// Gap + hairline + gap between the 性能 and 网络 sections.
+/// Gap + hairline + gap between the HUD switch and the network block.
 pub const PERF_SECTION_GAP: f32 = 22.0;
+
+/// End of the media span already available on this machine. A local file is
+/// complete; cached remote media follows the disk cache (or the reader's
+/// read-ahead window for direct URLs). Both the heat map and the toolbar cache
+/// band use this so the two never disagree.
+fn available_end_ms(model: &UiModel) -> u64 {
+    let duration = model.duration_ms;
+    if duration == 0 || model.is_live {
+        return 0;
+    }
+    if !model.source_remote {
+        return duration;
+    }
+    if model.total_bytes > 0 && model.loaded_bytes >= model.total_bytes {
+        return duration;
+    }
+    let decoded_s = (model.queue_len as f64 + 1.0) / model.source_fps.max(1.0);
+    let lead_s = model.net_lead_s.max(decoded_s).max(0.0);
+    model
+        .position_ms
+        .saturating_add((lead_s * 1000.0).round() as u64)
+        .min(duration)
+}
 
 /// The state the overlay draws. One value per redraw; no video pixels.
 pub struct UiModel {
@@ -1345,6 +1368,8 @@ pub struct Overlay {
     panel: ID2D1SolidColorBrush,
     panel_border: ID2D1SolidColorBrush,
     chip: ID2D1SolidColorBrush,
+    /// Loaded-but-not-played heat cells and the toolbar cache band.
+    cache_fill: ID2D1SolidColorBrush,
     hint_band: ID2D1SolidColorBrush,
     stats_panel: ID2D1SolidColorBrush,
     heat: ID2D1SolidColorBrush,
@@ -1530,6 +1555,7 @@ impl Overlay {
             let stats_panel = solid(&render_target, color(8, 10, 15, 0.92))?;
             let heat = solid(&render_target, color(62, 166, 255, 0.55))?;
             let heat_hot = solid(&render_target, color(62, 166, 255, 0.92))?;
+            let cache_fill = solid(&render_target, color(62, 166, 255, 0.30))?;
             let loop_fill = solid(&render_target, color(62, 166, 255, 0.16))?;
             let hud_bg = solid(&render_target, color(12, 14, 19, 0.88))?;
             let hud_text = solid(&render_target, color(216, 255, 223, 0.94))?;
@@ -1699,6 +1725,7 @@ impl Overlay {
                 stats_panel,
                 heat,
                 heat_hot,
+                cache_fill,
                 loop_fill,
                 hud_bg,
                 hud_text,
@@ -3890,24 +3917,26 @@ impl Overlay {
         let scroll = model.sidebar_scroll.clamp(0.0, max_scroll);
         let mut y = content.top + PERF_TOP_PAD * s - scroll;
         let visible = |y: f32| y >= content.top - 18.0 * s && y + 18.0 * s <= content.bottom;
-        // Section titles are the sidebar's standard label level now: the old
-        // fixed "性能 实时 · 0 FPS" bar is gone and these two sections are the
-        // top of the tab.
-        let section = |name: &str, first: bool, y: &mut f32| {
-            if !first {
-                *y += PERF_SECTION_GAP * s * 0.5;
-                if visible(*y) {
-                    self.line(
-                        content.left,
-                        *y,
-                        content.right,
-                        *y,
-                        1.0 * s,
-                        &self.sidebar_chip,
-                    );
-                }
-                *y += PERF_SECTION_GAP * s * 0.5;
+        // 24 × 6 = 144 fixed timeline slices. Every cell is exactly 1/144 of
+        // the video, not a bucket sized from the remaining cache.
+        let cols = 24usize;
+        let grid_rows = 6usize;
+        let cells = cols * grid_rows;
+        // The network block keeps the sidebar's standard label level. There is
+        // no inner 性能 heading: the tab strip already labels this panel.
+        let section = |name: &str, y: &mut f32| {
+            *y += PERF_SECTION_GAP * s * 0.5;
+            if visible(*y) {
+                self.line(
+                    content.left,
+                    *y,
+                    content.right,
+                    *y,
+                    1.0 * s,
+                    &self.sidebar_chip,
+                );
             }
+            *y += PERF_SECTION_GAP * s * 0.5;
             if visible(*y) {
                 self.text_box(
                     name,
@@ -3954,9 +3983,8 @@ impl Overlay {
             *y += 24.0 * s;
         };
 
-        // 性能: the only control the tab needs. Every value it used to repeat
-        // lives in the top-right five-line panel, so this is just its switch.
-        section("性能", true, &mut y);
+        // 性能: the only control the tab needs. The tab label already says
+        // 性能, so there is no inner title or FPS line here — just the switch.
         let switch_row = layout.performance_hud_row(scroll);
         if visible(switch_row.top) {
             self.text_box(
@@ -3986,7 +4014,17 @@ impl Overlay {
 
         // 网络: the live transfer data plus where playback is and how much of
         // the file has arrived. No duplicated FPS/frame counters here.
-        section("网络", false, &mut y);
+        section("网络", &mut y);
+        if visible(y - PERF_SECTION_H * s) {
+            self.text_right(
+                &format!("{cells} 格 · 每格 {:.1}%", 100.0 / cells as f32),
+                content.right,
+                y - PERF_SECTION_H * s,
+                content.width() * 0.6,
+                &self.small_format,
+                &self.sidebar_text_faint,
+            );
+        }
         let position = model.position_ms.min(model.duration_ms.max(1));
         let played_percent = if model.duration_ms > 0 {
             (position as f32 / model.duration_ms as f32 * 100.0).clamp(0.0, 100.0)
@@ -4015,27 +4053,33 @@ impl Overlay {
         } else if model.source_remote {
             "边下边播（无缓存）".to_string()
         } else {
-            "本地文件".to_string()
+            "100% · 本地文件".to_string()
         };
         row("已加载", &loaded_value, &mut y);
         let lead_s = model
             .net_lead_s
             .max((model.queue_len as f64 + 1.0) / model.source_fps.max(24.0))
             .max(0.0);
-        row("缓冲", &format!("{:.1} s", lead_s.min(99.9)), &mut y);
+        row(
+            "缓冲",
+            &if model.source_remote {
+                format!("{:.1} s", lead_s.min(99.9))
+            } else {
+                "本地".to_string()
+            },
+            &mut y,
+        );
 
-        // Loaded-span grid: played cells, the cached run ahead, the current
-        // cell. Same 24×6 heat map, now fed by the real cache progress.
+        // Fixed-cell heat map: the whole video is one complete rectangle of
+        // 144 equal slices, so a cell is always 1/144 of the duration. Colors:
+        // played / loaded / current / not loaded; the legend below names them.
         let grid_top = y + 4.0 * s;
-        let cols = 24usize;
-        let grid_rows = 6usize;
-        let gap = 2.0 * s;
+        let gap = 1.0 * s;
         let cell_w = ((content.width() - gap * (cols as f32 - 1.0)) / cols as f32).max(2.0);
         let cell_h = 9.0 * s;
-        let cells = cols * grid_rows;
+        let grid_h = grid_rows as f32 * (cell_h + gap) - gap;
         let duration = model.duration_ms;
-        let lead_ms = (lead_s * 1000.0).round() as u64;
-        let loaded_end = position.saturating_add(lead_ms).min(duration.max(position));
+        let loaded_end = available_end_ms(model);
         let current = if duration > 0 {
             ((position as f64 / duration as f64) * cells as f64).floor() as usize
         } else {
@@ -4059,7 +4103,7 @@ impl Overlay {
             } else if time <= position as f64 {
                 &self.heat
             } else if time <= loaded_end as f64 {
-                &self.loop_fill
+                &self.cache_fill
             } else {
                 &self.chip
             };
@@ -4071,13 +4115,59 @@ impl Overlay {
             };
             let rounded = D2D1_ROUNDED_RECT {
                 rect: to_d2d(cell),
-                radiusX: 2.0 * s,
-                radiusY: 2.0 * s,
+                radiusX: 1.0 * s,
+                radiusY: 1.0 * s,
             };
             self.d2d.FillRoundedRectangle(&rounded, brush);
         }
-        let grid_h = grid_rows as f32 * (cell_h + gap) - gap;
-        y = grid_top + grid_h + 10.0 * s;
+        // A hairline around the whole grid makes the 24×6 cells read as one
+        // complete block instead of loose chips.
+        self.stroke_rect(
+            Rect {
+                left: content.left,
+                top: grid_top,
+                right: content.left + cols as f32 * (cell_w + gap) - gap,
+                bottom: grid_top + grid_h,
+            },
+            1.0 * s,
+            &self.sidebar_panel_line,
+        );
+        y = grid_top + grid_h + 6.0 * s;
+
+        // Legend: every state the heat map paints, with the same colors.
+        if visible(y) {
+            let mut x = content.left;
+            let swatch = 7.0 * s;
+            for (label, brush) in [
+                ("已播放", &self.heat),
+                ("已加载", &self.cache_fill),
+                ("当前位置", &self.heat_hot),
+                ("未加载", &self.chip),
+            ] {
+                let cell = Rect {
+                    left: x,
+                    top: y + 2.0 * s,
+                    right: x + swatch,
+                    bottom: y + 2.0 * s + swatch,
+                };
+                let rounded = D2D1_ROUNDED_RECT {
+                    rect: to_d2d(cell),
+                    radiusX: 1.5 * s,
+                    radiusY: 1.5 * s,
+                };
+                self.d2d.FillRoundedRectangle(&rounded, brush);
+                self.text(
+                    label,
+                    x + swatch + 4.0 * s,
+                    y,
+                    64.0 * s,
+                    &self.small_format,
+                    &self.sidebar_text_dim,
+                );
+                x += swatch + 4.0 * s + self.text_width(label, &self.small_format) + 8.0 * s;
+            }
+        }
+        y += 18.0 * s;
 
         let total_bps = (model.video_bitrate + model.audio_bitrate) as f64;
         let bytes_per_sec = total_bps / 8.0;
@@ -5402,13 +5492,10 @@ impl Overlay {
         // Cached/buffered span: the real cache progress (or the decoded ring
         // when a direct URL has no disk cache) drawn under the played fill, so
         // the toolbar shows how much is already available ahead of the knob.
+        // Local files are complete, and the disk cache reports its whole
+        // downloaded span instead of only the reader's look-ahead.
         if model.duration_ms > 0 {
-            let decoded_s = (model.queue_len as f64 + 1.0) / model.source_fps.max(1.0);
-            let lead_ms = ((model.net_lead_s.max(decoded_s)).max(0.0) * 1000.0) as u64;
-            let buffered_end = model
-                .position_ms
-                .saturating_add(lead_ms)
-                .min(model.duration_ms);
+            let buffered_end = available_end_ms(model);
             let buffered_fraction =
                 (buffered_end as f32 / model.duration_ms as f32).clamp(fraction, 1.0);
             if buffered_fraction > fraction + 0.0005 {
@@ -5423,7 +5510,7 @@ impl Overlay {
                     radiusX: 2.0 * s,
                     radiusY: 2.0 * s,
                 };
-                self.d2d.FillRoundedRectangle(&rounded, &self.loop_fill);
+                self.d2d.FillRoundedRectangle(&rounded, &self.cache_fill);
             }
         }
         let filled = Rect {
