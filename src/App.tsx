@@ -577,14 +577,20 @@ export default function App({ initial }: { initial?: AppInitial }) {
   }, [route.name, triggerRefresh]);
 
   const openSearchMorph = useCallback(() => {
-    setSearchDraft(route.name === 'search' ? (route.query.get('q') || '') : '');
+    // Every open starts from an empty field, so hot searches are visible and
+    // the previous query never stays behind after a submitted search.
+    setSearchDraft('');
+    setSearchSuggestions([]);
+    setSearchSuggestion(-1);
+    setSearchSuggestLoading(false);
     setPlaylistOpen(false);
     setSearchOpen(true);
-  }, [route.name, route.query]);
+  }, []);
 
   const submitSearch = useCallback((term?: string) => {
     const query = (term ?? searchDraft).trim();
     searchSuggestSeq.current += 1;
+    setSearchDraft('');
     setSearchSuggestions([]);
     setSearchSuggestLoading(false);
     setSearchSuggestion(-1);
