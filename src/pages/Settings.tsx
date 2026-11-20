@@ -15,13 +15,6 @@ const KEY_LABELS = ['播放 / 暂停', '快退', '快进', '音量 +', '音量 -
 
 const DEFAULT_KEYS = [0x20, 0x25, 0x27, 0x26, 0x28, 0x4d, 0x46, 0x1b, 0x44, 0x4c, 0x53];
 
-/// Playback speed readout: integers keep one decimal (`1.0倍`), other stops
-/// keep their natural decimals (`0.75倍`, `1.25倍`).
-function speedLabel(value: number): string {
-  const text = Number.isInteger(value) ? value.toFixed(1) : String(value);
-  return `${text}倍`;
-}
-
 function effectiveKey(stored: number | undefined, index: number): number {
   return stored && stored >= 0x20 ? stored : DEFAULT_KEYS[index] || 0;
 }
@@ -253,11 +246,6 @@ export default function SettingsPage() {
                   <option value={60}>60 fps</option>
                   <option value={90}>90 fps</option>
                   <option value={120}>120 fps</option>
-                </select>
-              </SettingsRow>
-              <SettingsRow name="默认速度" desc="0.5倍–2.0倍">
-                <select className="select" value={settings.player_speed} onChange={(event) => saveSettings({ player_speed: Number(event.target.value) })}>
-                  {[500, 750, 1000, 1250, 1500, 2000].map((value) => <option key={value} value={value}>{speedLabel(value / 1000)}</option>)}
                 </select>
               </SettingsRow>
               <SettingsRow name="编码偏好" desc="自动 / AVC / HEVC / AV1">

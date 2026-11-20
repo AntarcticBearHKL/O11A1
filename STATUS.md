@@ -113,8 +113,8 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.6.188.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
-- `release/win-unpacked-0.6.188/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
+- 产物：`release/O11A1 Setup 0.6.189.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- `release/win-unpacked-0.6.189/O11A1.exe`：免安装的新版（当前 `release/win-unpacked` 仍是被占用的运行中版本，安装器会替换它）。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 
 ## 已知差异 / 后续
