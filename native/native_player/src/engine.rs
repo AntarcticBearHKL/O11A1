@@ -5760,7 +5760,11 @@ impl Engine {
                             let next = crate::speed::stepped(self.speed_preview, raw);
                             self.preview_speed(next);
                             self.speed_base = self.speed_preview;
-                            self.tuner_offset = 0.0;
+                            // Let the wheel glide one stop instead of snapping.
+                            // The new base sits one gap off-centre, then the
+                            // idle glide above eases it under the red needle.
+                            self.tuner_offset =
+                                raw as f32 * crate::speed::WHEEL_GAP * self.overlay.layout.scale;
                             self.tuner_pulse = 0.0;
                             self.speed_commit_at =
                                 Some(Instant::now() + Duration::from_millis(260));

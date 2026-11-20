@@ -1500,9 +1500,9 @@ impl Overlay {
                 ::windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP,
             )?;
             let hud_format = mono_format(&dwrite, 10.5 * s)?;
-            let speed_scale_format = mono_format(&dwrite, 9.0 * s)?;
+            let speed_scale_format = mono_format(&dwrite, 9.5 * s)?;
             let speed_value_format =
-                mono_format_weight(&dwrite, 16.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+                mono_format_weight(&dwrite, 17.5 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let info_label_format =
                 text_format(&dwrite, 10.5 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let info_id_format =
@@ -1638,6 +1638,8 @@ impl Overlay {
                 (&comment_meta_format, 12.5 * s, 400),
                 (&wrap_comment, 12.5 * s, 400),
                 (&hud_format, 10.5 * s, 400),
+                (&speed_scale_format, 9.5 * s, 400),
+                (&speed_value_format, 17.5 * s, 600),
                 (&info_label_format, 10.5 * s, 600),
                 (&info_id_format, 11.5 * s, 600),
                 (&info_body_format, 13.5 * s, 400),
@@ -4676,7 +4678,7 @@ impl Overlay {
 
     /// A flat horizontal picker wheel modelled on the precision frame ruler:
     /// every speed stop owns one tick, the reel travels under a fixed centre
-    /// band, and a tall red aim line marks the stop under the middle. The
+    /// aim line, and a tall red needle marks the stop under the middle. The
     /// selected value is read out above the ruler, so the red line never
     /// crosses a label.
     unsafe fn draw_speed_wheel(&self, layout: &Layout, speed: f32, base: f32, offset: f32) {
@@ -4686,25 +4688,39 @@ impl Overlay {
         let gap = crate::speed::WHEEL_GAP * s;
         let base_index = crate::speed::index_of(base) as f32;
 
-        // Fixed readout above the ruler. The ruler itself only carries the
-        // scale, exactly like the frame wheel in the precision panel.
-        self.text_centered(
-            &crate::speed::label(speed),
-            Rect {
-                left: centre - 60.0 * s,
-                top: card.top + 3.0 * s,
-                right: centre + 60.0 * s,
-                bottom: card.top + 27.0 * s,
-            },
+        // Readout: the number carries the emphasis, the unit steps down to
+        // secondary ink so `1.0倍` reads as a value, not a sentence.
+        let label = crate::speed::label(speed);
+        let number = label.trim_end_matches('倍');
+        let unit = "倍";
+        let number_w = self.text_width(number, &self.speed_value_format);
+        let unit_w = self.text_width(unit, &self.small_format);
+        let unit_gap = 1.2 * s;
+        let total = number_w + unit_gap + unit_w;
+        let start = centre - total * 0.5;
+        let baseline = card.top + 23.0 * s;
+        self.text_on_baseline(
+            number,
+            start,
+            baseline,
+            number_w + 2.0 * s,
             &self.speed_value_format,
             &self.accent_blue,
+        );
+        self.text_on_baseline(
+            unit,
+            start + number_w + unit_gap,
+            baseline,
+            unit_w + 2.0 * s,
+            &self.small_format,
+            &self.text_dim,
         );
 
         let strip = Rect {
             left: card.left + 12.0 * s,
-            top: card.top + 28.0 * s,
+            top: card.top + 31.0 * s,
             right: card.right - 12.0 * s,
-            bottom: card.bottom - 8.0 * s,
+            bottom: card.bottom - 9.0 * s,
         };
         let strip_round = D2D1_ROUNDED_RECT {
             rect: to_d2d(strip),
@@ -4715,10 +4731,20 @@ impl Overlay {
         self.d2d
             .DrawRoundedRectangle(&strip_round, &self.panel_border, 1.0 * s, None);
 
-        let label_top = strip.top + 1.0 * s;
-        let label_bottom = strip.top + 15.0 * s;
-        let tick_top = strip.top + 18.0 * s;
-        let tick_bottom = strip.bottom - 6.0 * s;
+        let label_top = strip.top + 5.0 * s;
+        let label_bottom = strip.top + 18.0 * s;
+        let tick_top = label_bottom + 4.0 * s;
+        let baseline_y = strip.bottom - 8.0 * s;
+        // The ruler needs a floor: ticks stand on this hairline instead of
+        // floating in the middle of the inset.
+        self.line(
+            strip.left + 8.0 * s,
+            baseline_y,
+            strip.right - 8.0 * s,
+            baseline_y,
+            1.0 * s,
+            &self.sidebar_panel_line,
+        );
 
         let clip = windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
             left: strip.left + 1.0 * s,
@@ -4741,13 +4767,13 @@ impl Overlay {
                 let (top, width, brush): (f32, f32, &ID2D1SolidColorBrush) = if major {
                     (tick_top, 1.6 * s, &self.accent_blue)
                 } else if distance < 1.6 {
-                    (tick_top + 5.0 * s, 1.0 * s, &self.text_dim)
+                    (tick_top + 4.0 * s, 1.0 * s, &self.text_dim)
                 } else if distance < 3.6 {
-                    (tick_top + 5.0 * s, 1.0 * s, &self.text_faint)
+                    (tick_top + 4.0 * s, 1.0 * s, &self.text_faint)
                 } else {
-                    (tick_top + 5.0 * s, 1.0 * s, &self.sidebar_text_faint)
+                    (tick_top + 4.0 * s, 1.0 * s, &self.sidebar_text_faint)
                 };
-                self.line(x, top, x, tick_bottom, width, brush);
+                self.line(x, top, x, baseline_y, width, brush);
                 if major {
                     self.line(
                         x - 3.5 * s,
@@ -4771,9 +4797,9 @@ impl Overlay {
                 self.text_centered(
                     &crate::speed::label(*value),
                     Rect {
-                        left: x - 26.0 * s,
+                        left: x - 28.0 * s,
                         top: label_top,
-                        right: x + 26.0 * s,
+                        right: x + 28.0 * s,
                         bottom: label_bottom,
                     },
                     &self.speed_scale_format,
@@ -4783,17 +4809,21 @@ impl Overlay {
         }
         self.d2d.PopAxisAlignedClip();
 
-        // Full-height centred aim line: the tick under it is the stop that
-        // will be committed. The centre label is omitted, so the line never
-        // cuts through the selected value at rest.
-        self.line(
-            centre,
-            strip.top + 2.0 * s,
-            centre,
-            strip.bottom - 2.0 * s,
-            2.0 * s,
-            &self.aim_line,
-        );
+        // Full-height centred needle with rounded caps. The stop under it is
+        // the one that will be committed; the centre label is omitted above.
+        let aim_w = 2.5 * s;
+        let aim_rect = Rect {
+            left: centre - aim_w * 0.5,
+            top: strip.top + 3.0 * s,
+            right: centre + aim_w * 0.5,
+            bottom: strip.bottom - 3.0 * s,
+        };
+        let aim_round = D2D1_ROUNDED_RECT {
+            rect: to_d2d(aim_rect),
+            radiusX: aim_w * 0.5,
+            radiusY: aim_w * 0.5,
+        };
+        self.d2d.FillRoundedRectangle(&aim_round, &self.aim_line);
     }
 
     /// Precision seek: a two-sided timecode / frame readout, a full-width
