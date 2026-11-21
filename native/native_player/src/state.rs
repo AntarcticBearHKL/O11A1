@@ -29,7 +29,7 @@ pub struct PlayerState {
     /// 0..=100; the audio engine is started with this value.
     pub volume: u8,
     pub muted: bool,
-    /// 0.5..=2.0. Applied before the decoder/audio sessions open.
+    /// 0.1..=10.0. Applied before the decoder/audio sessions open.
     pub speed: f32,
     /// [`crate::gpu::AspectMode`] value (0 适应, 1 填充, 2 拉伸).
     pub aspect: u8,

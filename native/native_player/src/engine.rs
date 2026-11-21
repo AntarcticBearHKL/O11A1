@@ -1386,12 +1386,6 @@ impl Engine {
         }
     }
 
-    /// Audio is useful up to 2×; above that the atempo chain cannot keep the
-    /// media clock moving and would drag the picture below the selected speed.
-    fn audio_speed_allowed(&self) -> bool {
-        self.speed <= 2.0
-    }
-
     fn spawn_audio_at(&mut self, start_ms: u64) {
         let audio_url = self
             .source
@@ -1531,11 +1525,10 @@ impl Engine {
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
         }
-        if self.audio_speed_allowed() {
-            self.spawn_audio_at(start_ms);
-        } else {
-            log::line(&format!("audio skipped at speed={:.2}", self.speed));
-        }
+        // The audio chain supports the whole 0.1×–10× range (atempo stages),
+        // and the wall-clock/atempo clock stays correct at every stop. Always
+        // open sound, so 3×/5×/10× fast-forward is not silent.
+        self.spawn_audio_at(start_ms);
         self.session_started = Instant::now();
         self.shared.position_ms.store(start_ms, Ordering::SeqCst);
         self.position_ms = start_ms;
@@ -1577,11 +1570,7 @@ impl Engine {
         if let Some(mut decoder) = self.decoder.take() {
             decoder.stop();
         }
-        if self.speed > 2.0 {
-            if let Some(mut audio) = self.audio.take() {
-                audio.stop();
-            }
-        } else if self.audio.is_none() {
+        if self.audio.is_none() {
             self.spawn_audio_at(target);
         }
         if let Some(audio) = &self.audio {

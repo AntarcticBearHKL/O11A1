@@ -374,6 +374,7 @@
 - [x] 播放器状态持久化（`player_state.json`，防抖保存）`[R]`
 - [x] 120Hz 弹幕独立节拍：绝对截止时间网格对齐刷新率，Present 成功才计入，实测 119.8–120.9fps `[R]`
 - [x] 原生视频子窗口：D3D11 + DComp waitable swap chain `[R]`
+- [x] 高倍速声音：0.1×–10× 不再在 2× 以上静音，atempo 链与设备时钟覆盖全范围；3×/5×/10× 实测无音频饥饿 `[R]`
 - [x] 零拷贝解码（进程内 D3D11VA）：libavformat/libavcodec 直接解码到播放器 D3D11 纹理，NV12/P010 着色器转换后进入插帧/增强/DComp；不支持的片源自动回退 ffmpeg 管道；4K60 H.264/HEVC/AV1 实测 60fps `[R]`
 - [x] 视频帧不经过 Electron，零拷贝上屏 `[R]`
 
