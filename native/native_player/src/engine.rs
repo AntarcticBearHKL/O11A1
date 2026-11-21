@@ -421,6 +421,10 @@ struct Engine {
     audio_master: bool,
     last_drift_log: Option<Instant>,
     last_stall_log: Option<Instant>,
+    /// Last automatic recovery of a wedged playback clock. The watchdog must
+    /// never seek more often than this: a genuinely broken decoder should be
+    /// reported once, not turned into a seek loop.
+    last_stall_restart: Option<Instant>,
     /// Last hard A/V resync; throttled so a slow decoder cannot thrash seeks.
     last_av_resync: Option<Instant>,
     /// The picture first went (and stayed) more than `AV_VIDEO_LAG_MS`
@@ -1106,6 +1110,7 @@ impl Engine {
             audio_master: false,
             last_drift_log: None,
             last_stall_log: None,
+            last_stall_restart: None,
             last_av_resync: None,
             video_lag_since: None,
             video_resync: None,
@@ -4777,6 +4782,87 @@ impl Engine {
         }
     }
 
+    /// Last-resort recovery for a wedged session.
+    ///
+    /// The decoder can keep a full ring while the presentation clock stops
+    /// moving (a paused waveOut clock, a lost device position, or a stale A/V
+    /// resume). The normal stall guard only covers an *empty* ring, so that
+    /// state used to sit on the buffering card forever even though decoding was
+    /// healthy. A restart at the current position rebuilds both the video and
+    /// audio sessions; it is rate-limited so a genuinely broken source reports
+    /// an error instead of turning into a seek loop.
+    fn recover_wedged_clock(&mut self, position: u64, queue_len: usize, queue_closed: bool) -> bool {
+        if !self.playing
+            || self.starting
+            || self.seek_in_flight
+            || self.video_resync.is_some()
+            || self.ab_swap_wait.is_some()
+            || self.interacting
+            || self.is_live
+            || self.ended
+        {
+            return false;
+        }
+        if queue_closed {
+            return false;
+        }
+        let no_picture_for = self
+            .last_source_present
+            .map(|at| at.elapsed())
+            .unwrap_or_default();
+        // Empty ring is normally the network/buffer path, which the normal
+        // stall guard owns. On a local source it can only be a stuck decoder or
+        // a stopped clock, so allow the recovery there as well.
+        let local_dry_stall = !self.source.remote && self.stalled && no_picture_for >= Duration::from_secs(8);
+        if queue_len == 0 && !local_dry_stall {
+            return false;
+        }
+        let Some(last_present) = self.last_source_present else {
+            return false;
+        };
+        if last_present.elapsed() < Duration::from_secs(5) {
+            return false;
+        }
+        if self
+            .last_stall_restart
+            .map(|at| at.elapsed() < Duration::from_secs(8))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let front_ts = self
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.queue.front_ts());
+        let audio_ms = self
+            .audio
+            .as_ref()
+            .map(|audio| audio.clock.position_ms.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let audio_playing = self
+            .audio
+            .as_ref()
+            .map(|audio| audio.clock.playing.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        let starved = self
+            .audio
+            .as_ref()
+            .map(|audio| audio.clock.starved_ms.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        log::line(&format!(
+            "playback watchdog restart position_ms={position} queue={queue_len} front_ts={front_ts:?} last_frame_ts={} audio_ms={audio_ms} audio_playing={} starved_ms={starved} stalled={}",
+            self.last_frame_ts,
+            u8::from(audio_playing),
+            u8::from(self.stalled)
+        ));
+        self.last_stall_restart = Some(Instant::now());
+        if let Err(error) = self.restart_at(position) {
+            log::line(&format!("playback watchdog restart failed: {error:#}"));
+            self.report_error("播放时钟卡死，自动恢复失败，请点击重试");
+        }
+        true
+    }
+
     /// Take decoded frames due on the current presentation clock and present
     /// them; also drive the interpolation grid.
     fn poll_picture(&mut self) {
@@ -4978,6 +5064,9 @@ impl Engine {
         let at_end = queue_closed_now
             && queue_len_now == 0
             && (self.duration_ms == 0 || position + 800 >= self.duration_ms);
+        if self.recover_wedged_clock(position, queue_len_now, queue_closed_now) {
+            return;
+        }
         // Decoder/reader dry: stop the device clock and show the buffer card
         // instead of letting audio run away from a frozen picture. This is the
         // lip-sync guard for a network slower than the video bitrate.

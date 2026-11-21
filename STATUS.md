@@ -91,6 +91,7 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.3 卡缓冲自动恢复**：播放中解码队列仍有画面，但 5 秒没有新帧上屏时，判定为播放时钟/会话卡死，自动 seek 到当前位置重建视频与音频会话；本地源队列为空且 8 秒没有画面也会恢复。恢复有 8 秒冷却，直播和普通网络缓冲仍走原来的 buffer 路径，不会变成反复 seek。日志现在同时写入 `O11A1_HOME/logs/player.log`（8 MB 两代），下次卡住可以直接看到 `playback watchdog restart` 及当时的 queue/front_ts/audio 时钟。
 - **0.9.2 关闭视频恢复主界面**：关闭视频窗口后统一调用 `restoreMainWindow`：主窗口若被最小化则 restore，若关闭到托盘则 show，然后 focus。覆盖玩家点视频窗口 X / Alt+F4、播放结束自动关闭、Electron 播放器关闭、以及 `player.state open=false` 所有关闭路径；不再出现关掉视频后主界面也一起消失。
 - **A/V 同步**：音频设备时钟是唯一主时钟（有音频时 `position_now` 始终读设备位置，不再依赖 `audio_master` 开关）；视频按音频位置取帧，晚到帧直接丢弃。
   视频解码跟不上实时（4K / 硬解降速）时，画面时间戳会持续落后音频，旧实现会把每个解码出来的帧依次播放，形成“视频慢放、声音正常”的永久漂移；
@@ -127,7 +128,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.2.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.9.3.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
