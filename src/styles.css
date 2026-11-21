@@ -861,7 +861,6 @@ img { display: block; }
 .queue-row:hover { background: rgba(0, 0, 0, 0.04); }
 .queue-row.active {
   background: var(--accent-soft);
-  box-shadow: inset 3px 0 0 var(--accent);
 }
 .queue-cover {
   position: relative;
