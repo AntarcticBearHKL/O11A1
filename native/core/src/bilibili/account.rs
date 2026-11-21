@@ -3821,6 +3821,8 @@ pub struct DmMessage {
     pub msg_type: i64,
     /// 0 normal, 1 recalled, 2 system-recalled, 50 expired image.
     pub msg_status: i64,
+    /// Image URL for `msg_type` 2 / 6 / 13; empty for text and system messages.
+    pub image: String,
 }
 
 /// One `fetch_session_msgs` page for a single conversation.
@@ -4532,6 +4534,7 @@ fn content_text(raw: &str) -> String {
 }
 
 fn dm_message_from(raw: DmMessageRaw) -> DmMessage {
+    let image = dm_image_url(&raw.content, raw.msg_type);
     DmMessage {
         sender_uid: raw.sender_uid,
         text: content_text(&raw.content),
@@ -4539,7 +4542,25 @@ fn dm_message_from(raw: DmMessageRaw) -> DmMessage {
         seqno: raw.msg_seqno,
         msg_type: raw.msg_type,
         msg_status: raw.msg_status,
+        image,
     }
+}
+
+/// The image URL inside an image / custom-emoji / image-card message. The
+/// content is a JSON object; text and system messages return an empty string.
+fn dm_image_url(raw: &str, msg_type: i64) -> String {
+    if !matches!(msg_type, 2 | 6 | 13) {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return String::new();
+    };
+    let url = value
+        .get("url")
+        .or_else(|| value.get("pic_url"))
+        .and_then(|url| url.as_str())
+        .unwrap_or("");
+    normalize_url(url)
 }
 
 /// Fold one `fetch_session_msgs` answer. The API returns newest first; the
@@ -5144,6 +5165,26 @@ mod message_pagination_tests {
         assert!(page.messages.is_empty());
         assert!(!page.has_more);
         assert_eq!(page.max_seqno, 0);
+    }
+
+    #[test]
+    fn dm_image_messages_expose_the_image_url() {
+        let resp: DmMessagesResp = serde_json::from_str(
+            r#"{"code":0,"data":{"messages":[
+                {"sender_uid":2,"content":"{\"url\":\"https://message.biliimg.com/bfs/im_new/a.jpg\",\"height\":300,\"width\":300}","timestamp":1,"msg_seqno":1,"msg_type":2,"msg_status":0},
+                {"sender_uid":2,"content":"{\"pic_url\":\"//i0.hdslb.com/bfs/location/b.png\",\"title\":\"card\"}","timestamp":2,"msg_seqno":2,"msg_type":13,"msg_status":0}
+            ],"has_more":0,"min_seqno":1,"max_seqno":2}}"#,
+        )
+        .expect("fixture");
+        let page = dm_page_from(resp);
+        assert_eq!(
+            page.messages[0].image,
+            "https://message.biliimg.com/bfs/im_new/a.jpg"
+        );
+        assert_eq!(
+            page.messages[1].image,
+            "https://i0.hdslb.com/bfs/location/b.png"
+        );
     }
 
     #[test]

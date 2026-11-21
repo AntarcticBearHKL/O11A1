@@ -3,6 +3,7 @@ import { call, cover, relativeTime } from '../api';
 import { useApp } from '../context';
 import type { DmMessage, DmPage, DmSession, MsgPage } from '../types';
 import { Empty, ErrorBox, LoadingText, PageHead, Tabs } from '../components/Common';
+import { ImageViewer } from '../components/ImageViewer';
 
 const TABS = ['回复我的', '@我的', '收到的赞', '私信'];
 const KINDS = ['reply', 'at', 'like', 'dm'];
@@ -16,9 +17,15 @@ function dmDisplayName(session: DmSession | null): string {
 
 function dmMessageText(message: DmMessage): string {
   if (message.msg_status === 1 || message.msg_status === 2) return '[消息已撤回]';
+  if (message.msg_status === 50) return '[图片已失效]';
   if (message.text) return message.text;
   if (message.msg_type === 2) return '[图片]';
   return `[消息类型 ${message.msg_type}]`;
+}
+
+function dmMessageImage(message: DmMessage): string {
+  if (message.msg_status === 1 || message.msg_status === 2 || message.msg_status === 50) return '';
+  return message.image || '';
 }
 
 export default function Messages() {
@@ -36,6 +43,7 @@ export default function Messages() {
   const [threadMore, setThreadMore] = useState(false);
   const [threadError, setThreadError] = useState('');
   const [minSeqno, setMinSeqno] = useState(0);
+  const [viewer, setViewer] = useState<{ images: string[]; index: number } | null>(null);
 
   const chatRef = useRef<HTMLDivElement>(null);
   const scrollToBottomRef = useRef(false);
@@ -76,6 +84,7 @@ export default function Messages() {
     setThread(null);
     setThreadMessages([]);
     setThreadError('');
+    setViewer(null);
     setCursor(null);
     setHasMore(false);
     load(tab);
@@ -84,6 +93,7 @@ export default function Messages() {
   const openThread = async (session: DmSession) => {
     const token = ++threadRequestRef.current;
     prependRef.current = null;
+    setViewer(null);
     setThread(session);
     setThreadMessages([]);
     setThreadMore(false);
@@ -160,6 +170,10 @@ export default function Messages() {
     );
   }
 
+  const threadImages = threadMessages
+    .map((message) => dmMessageImage(message))
+    .filter((url): url is string => Boolean(url));
+
   return (
     <>
       <PageHead eyebrow="社区" title="消息" sub={unread ? `未读 ${unread.total}` : '回复 / @ / 收到的赞 / 私信'}>
@@ -216,10 +230,25 @@ export default function Messages() {
                     const mine = message.sender_uid === account.mid;
                     const previous = index > 0 ? threadMessages[index - 1] : null;
                     const firstOfGroup = !previous || (previous.sender_uid === account.mid) !== mine;
+                    const image = dmMessageImage(message);
+                    const imageIndex = image
+                      ? threadMessages.slice(0, index).filter((row) => dmMessageImage(row)).length
+                      : -1;
                     return (
                       <div className={`dm-line ${mine ? 'mine' : ''}`} key={message.seqno}>
                         {firstOfGroup ? <div className="dm-who">{mine ? '我' : dmDisplayName(thread)}</div> : null}
-                        <div className="dm-text">{dmMessageText(message)}</div>
+                        {image ? (
+                          <button
+                            type="button"
+                            className="dm-image"
+                            onClick={() => setViewer({ images: threadImages, index: imageIndex })}
+                            aria-label="查看图片"
+                          >
+                            <img src={image} alt="" loading="lazy" referrerPolicy="no-referrer" draggable={false} />
+                          </button>
+                        ) : (
+                          <div className="dm-text">{dmMessageText(message)}</div>
+                        )}
                         <div className="dm-time">{message.timestamp ? relativeTime(message.timestamp) : ''}</div>
                       </div>
                     );
@@ -251,6 +280,14 @@ export default function Messages() {
           {hasMore ? <div className="page-more"><button className="btn" onClick={() => load(tab, cursor, true)}>加载更多</button></div> : null}
         </div>
       )) : null}
+
+      {viewer ? (
+        <ImageViewer
+          images={viewer.images}
+          initialIndex={viewer.index}
+          onClose={() => setViewer(null)}
+        />
+      ) : null}
     </>
   );
 }

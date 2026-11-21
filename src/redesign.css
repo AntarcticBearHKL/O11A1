@@ -2209,9 +2209,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   justify-content: center;
   border-radius: 18px;
   overflow: hidden;
-  background: rgba(9, 10, 13, 0.94);
-  backdrop-filter: blur(14px) saturate(1.1);
-  -webkit-backdrop-filter: blur(14px) saturate(1.1);
+  background: #090a0d;
   animation: imageViewerIn 0.16s var(--ease) both;
 }
 .app.maximized .image-viewer { border-radius: 0; }
@@ -2258,7 +2256,6 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   max-width: calc(100vw - 140px);
   max-height: calc(100vh - 160px);
   border-radius: 6px;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
   user-select: none;
   cursor: zoom-in;
 }
@@ -2506,6 +2503,24 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   word-break: break-word;
 }
 .dm-line.mine .dm-text { text-align: right; }
+.dm-image {
+  display: block;
+  max-width: 320px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  overflow: hidden;
+  cursor: zoom-in;
+}
+.dm-image img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+}
+.dm-line.mine .dm-image { align-self: flex-end; }
 .dm-time { margin-top: 4px; color: var(--text-faint); font-size: 9px; font-variant-numeric: tabular-nums; }
 .dm-chat > .dm-empty,
 .dm-thread > .dm-empty {

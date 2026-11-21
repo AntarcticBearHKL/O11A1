@@ -91,6 +91,12 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.22 私信图片与大图浏览优化**：
+  - 私信图片消息（`msg_type` 2 / 6 / 13）现在直接显示缩略图；点击进入大图查看器，支持左右切换。撤回或失效的图片不显示，分别显示 `[消息已撤回]` / `[图片已失效]`。
+  - 大图查看器不再把当前索引提升到页面 state：左右切换只重渲染查看器本身，不再重渲染背后的动态或私信列表，这是之前卡顿的主要原因。
+  - 查看器去掉全屏 `backdrop-filter` 模糊和图片 `box-shadow`，改成纯色深底，减少每次切图的合成开销。
+  - 预加载当前、下一张、下下一张和上一张；B 站 CDN 图片在适应窗口时使用 1600px 的 rendition，只有点“原始大小”才请求原图。左右切换基本即时。
+  - 动态页与私信共用同一套查看器，两处都受益。
 - **0.9.21 私信双栏与真实用户名**：
   - 私信页改成左右双栏：左侧是会话名单，右侧是当前会话；两栏之间只有一条 1px 分割线。
   - 会话名不再显示 `用户<mid>`。系统会话直接使用 `account_info.name`；普通用户会话由引擎并发（最多 6 个）调用 `x/web-interface/card` 解析真实用户名并带回头像 URL，结果缓存 5 分钟。解析失败显示“未知用户”，不伪造 `用户xxxx`。
@@ -211,7 +217,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.21.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.9.22.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。

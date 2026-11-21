@@ -392,6 +392,7 @@ export interface DmMessage {
   seqno: number;
   msg_type: number;
   msg_status: number;
+  image: string;
 }
 
 export interface DmPage {

@@ -166,9 +166,8 @@ export default function Dynamic() {
       {viewer ? (
         <ImageViewer
           images={viewer.images}
-          index={viewer.index}
+          initialIndex={viewer.index}
           onClose={() => setViewer(null)}
-          onIndexChange={(index) => setViewer((current) => current ? { ...current, index } : current)}
         />
       ) : null}
     </>

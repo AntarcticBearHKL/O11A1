@@ -611,9 +611,8 @@ export function FrameLab({ seedBvid = '', embedded = false }: Props) {
       {viewer ? (
         <ImageViewer
           images={viewer.images}
-          index={viewer.index}
+          initialIndex={viewer.index}
           onClose={() => setViewer(null)}
-          onIndexChange={(index) => setViewer((current) => current ? { ...current, index } : current)}
         />
       ) : null}
     </div>
