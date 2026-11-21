@@ -96,8 +96,10 @@ const BUFFER_LOW_MS: u64 = 400;
 const BUFFER_LEAD_MS: u64 = 2_500;
 /// Never hold the sound longer than this for a cache lead. The loopback server
 /// proxies a stuck chunk after a few seconds, so the ring can be full while the
-/// chunk is still not marked done.
-const BUFFER_WAIT_MAX_MS: u64 = 8_000;
+/// chunk is still not marked done. Eight seconds made a recoverable CDN hole
+/// look like a frozen player; 1.5 s is long enough for a normal chunk and short
+/// enough that the user sees a brief pause, not a dead window.
+const BUFFER_WAIT_MAX_MS: u64 = 1_500;
 /// How long the picture may sit past `AV_VIDEO_LAG_MS` while frames are still
 /// arriving before the engine drops the gap. A single GPU/engine hitch must
 /// not cost a seek; a decoder that cannot keep up must.
@@ -4812,7 +4814,7 @@ impl Engine {
     /// Contiguous cached video ahead of the current position, in milliseconds.
     /// `None` when the source is not cached or the range is served through the
     /// CDN proxy, where the local lead is meaningless.
-    fn cache_lead_ms(&self) -> Option<u64> {
+    fn cache_byte_offset(&self) -> Option<(String, u64)> {
         if !self.source.remote || self.source.video_bitrate == 0 {
             return None;
         }
@@ -4822,8 +4824,24 @@ impl Engine {
             return None;
         }
         let offset = (self.position_ms as u128 * bytes_per_ms) as u64;
+        Some((key, offset))
+    }
+
+    fn cache_lead_ms(&self) -> Option<u64> {
+        let (key, offset) = self.cache_byte_offset()?;
         let lead = crate::mediacache::lead_bytes(&key, offset)?;
+        let bytes_per_ms = self.source.video_bitrate as u128 / 8_000;
+        if bytes_per_ms == 0 {
+            return None;
+        }
         Some((lead as u128 / bytes_per_ms) as u64)
+    }
+
+    /// Fill the chunk under the presentation clock before the cursor window.
+    fn prioritize_cache(&self) {
+        if let Some((key, offset)) = self.cache_byte_offset() {
+            crate::mediacache::prioritize(&key, offset);
+        }
     }
 
     /// Take decoded frames due on the current presentation clock and present
@@ -5058,6 +5076,7 @@ impl Engine {
             if let Some(audio) = &self.audio {
                 audio.send(AudioCommand::Pause);
             }
+            self.prioritize_cache();
             log::line(&format!(
                 "buffer pause video-low position_ms={position} queue={queue_len_now} no_picture_ms={} audio_ms={} lead_ms={:?}",
                 no_picture_for.as_millis(),
@@ -6946,7 +6965,11 @@ impl Engine {
         };
         let cid = page.cid;
         let quality = self.source.qn;
-        let codecid = self.source.codecid;
+        // A page change is not a codec choice. Use the user's explicit codec
+        // preference when one exists; otherwise re-run automatic selection.
+        // Inheriting `self.source.codecid` here is what silently kept the next
+        // page on 18 Mbit/s AVC after an automatic AV1/HEVC first page.
+        let codecid = self.state.quality_codecid.unwrap_or(0);
         let audio_index = self.source.audio_index;
         log::line(&format!(
             "source switch request bvid={bvid} cid={cid} page={} title={:?}",
@@ -9068,7 +9091,10 @@ impl Engine {
             video_bitrate: self.source.video_bitrate,
             audio_bitrate: self.source.audio_bitrate,
             net_bps: self.net_bps,
-            net_lead_s: self.net_lead_s,
+            net_lead_s: self
+                .cache_lead_ms()
+                .map(|ms| (ms as f64 / 1000.0).min(99.9))
+                .unwrap_or(self.net_lead_s),
             download_streams: usize::from(self.decoder.is_some())
                 + usize::from(self.audio.is_some())
                 + usize::from(self.loop_prefetch.is_some()),

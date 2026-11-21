@@ -391,6 +391,27 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
             _ => best_audio_index(&info),
         };
         let audio = info.audio_tracks.get(audio_index);
+        // Bilibili returns one primary URL plus backup mirrors for the same
+        // signature. Use a host the process already measured, but never block
+        // the first frame on a network probe: a cold cache keeps the primary
+        // and the cache retries/proxies if that edge is unhealthy.
+        let video_backups: Vec<String> = track.urls.iter().skip(1).cloned().collect();
+        let video_url = session
+            .cached_choice(&track.url, &video_backups)
+            .map(|choice| choice.url)
+            .unwrap_or_else(|| track.url.clone());
+        let audio_url = match audio {
+            Some(track) => {
+                let backups: Vec<String> = track.urls.iter().skip(1).cloned().collect();
+                Some(
+                    session
+                        .cached_choice(&track.url, &backups)
+                        .map(|choice| choice.url)
+                        .unwrap_or_else(|| track.url.clone()),
+                )
+            }
+            None => None,
+        };
         let headers = session.media_headers();
         let duration_ms = if info.duration > 0 {
             info.duration * 1000
@@ -407,7 +428,7 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
         let mut fps = track.frame_rate;
         let mut duration_ms = duration_ms;
         if source_width == 0 || source_height == 0 {
-            if let Some(probe) = ffprobe(&track.url, &headers, true) {
+            if let Some(probe) = ffprobe(&video_url, &headers, true) {
                 source_width = probe.width;
                 source_height = probe.height;
                 if fps <= 0.0 || !fps.is_finite() {
@@ -453,8 +474,8 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
                 title,
                 bvid: Some(bvid_owned.clone()),
                 cid: Some(cid),
-                video_url: track.url.clone(),
-                audio_url: audio.map(|track| track.url.clone()),
+                video_url,
+                audio_url,
                 headers,
                 duration_ms,
                 video_bitrate: track.bandwidth,
@@ -562,7 +583,7 @@ fn preferred_height_track<'a>(
         // a fresh download for a different codec. This keeps a video the user
         // already watched (possibly the old AVC cache) instant on upgrade,
         // while new videos still prefer the half-bitrate HEVC stream.
-        for codecid in [12, 13, 7] {
+        for codecid in [13, 12, 7] {
             if let Some(track) = at_height.clone().find(|track| {
                 track.codecid == codecid
                     && crate::mediacache::is_complete_key(&track_cache_key(
@@ -585,13 +606,14 @@ fn track_cache_key(bvid: &str, cid: u64, track: &o11a1::bilibili::VideoTrack) ->
     )
 }
 
-/// HEVC first, then AV1, then AVC. All three are hardware-decoded here; HEVC
-/// is the most mature D3D11VA path and its 4K representation is about half
-/// the AVC bitrate.
+/// AV1 first, then HEVC, then AVC. All three are hardware-decoded here; AV1's
+/// 4K representation is usually the cheapest (about 6 Mbit/s for this source
+/// versus 18 Mbit/s for AVC), which leaves the cache real headroom. A user who
+/// explicitly picked a codec still wins over this order.
 fn auto_codec_rank(codecid: i64) -> u8 {
     match codecid {
-        12 => 0, // HEVC
-        13 => 1, // AV1
+        13 => 0, // AV1
+        12 => 1, // HEVC
         7 => 2,  // AVC
         _ => 3,
     }
@@ -616,7 +638,7 @@ fn track_for_qn<'a>(
         }
     } else if let Some((bvid, cid)) = cache_base {
         let at_qn = tracks.iter().filter(|track| track.id == qn);
-        for codecid in [12, 13, 7] {
+        for codecid in [13, 12, 7] {
             if let Some(track) = at_qn.clone().find(|track| {
                 track.codecid == codecid
                     && crate::mediacache::is_complete_key(&track_cache_key(

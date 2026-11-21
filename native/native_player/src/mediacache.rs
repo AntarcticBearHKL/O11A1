@@ -319,6 +319,29 @@ pub fn is_complete_key(key: &str) -> bool {
     total >= MIN_CACHE_BYTES && file_len(&path_for(&dir, &id)) == Some(total)
 }
 
+/// Ask the cache workers to fetch the chunk at `offset` next. The reader's
+/// cursor can be tens of megabytes ahead (FFmpeg's demuxer buffer), which
+/// leaves a hole at the picture the user is actually watching. Prioritising
+/// that hole is what turns a 0-second lead into a filled chunk instead of
+/// waiting for the cursor window to come back around.
+pub fn prioritize(key: &str, offset: u64) {
+    let id = media_id(key);
+    let Some(media) = registry().lock().ok().and_then(|map| map.get(&id).cloned()) else {
+        return;
+    };
+    let Ok(mut state) = media.state.lock() else {
+        return;
+    };
+    let index = (offset / media.chunk) as usize;
+    if index < state.chunks.len()
+        && matches!(state.chunks[index], ChunkState::Pending | ChunkState::Active)
+    {
+        state.priority = Some(index);
+        state.cursor = index;
+        media.ready.notify_all();
+    }
+}
+
 /// Wait until a cached key is complete (or failed). Used by the playlist
 /// prefetch worker so it does not steal bandwidth from the active video.
 pub fn wait_for_key(key: &str) {
