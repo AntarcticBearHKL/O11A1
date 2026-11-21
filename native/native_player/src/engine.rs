@@ -443,6 +443,8 @@ struct Engine {
     audio_master: bool,
     last_drift_log: Option<Instant>,
     last_stall_log: Option<Instant>,
+    /// Last periodic cache throughput line (5 s cadence).
+    last_cache_rate_log: Option<Instant>,
     /// Last hard A/V resync; throttled so a slow decoder cannot thrash seeks.
     last_av_resync: Option<Instant>,
     /// The picture first went (and stayed) more than `AV_VIDEO_LAG_MS`
@@ -1140,6 +1142,7 @@ impl Engine {
             audio_master: false,
             last_drift_log: None,
             last_stall_log: None,
+            last_cache_rate_log: None,
             last_av_resync: None,
             video_lag_since: None,
             video_resync: None,
@@ -1409,6 +1412,7 @@ impl Engine {
             width: self.source.width,
             height: self.source.height,
             fps: self.source.fps,
+            video_bitrate: self.source.video_bitrate,
             speed: self.speed as f64,
             live: self.is_live,
             cache_key: if self.is_live {
@@ -4695,6 +4699,35 @@ impl Engine {
                 } else {
                     self.cache_done = 0;
                     self.cache_total = 0;
+                }
+                // Keep the cache anchored to the picture, not to FFmpeg's
+                // much farther read-ahead cursor. Also report whether the
+                // workers are actually beating the stream's bitrate.
+                if let Some((key, offset)) = self.cache_byte_offset() {
+                    crate::mediacache::set_playhead(&key, offset);
+                    let total_bps = self.source.video_bitrate + self.source.audio_bitrate;
+                    if total_bps > 0
+                        && self.cache_total > 0
+                        && self.cache_done < self.cache_total
+                    {
+                        let ratio = (self.net_bps * 8.0) / total_bps as f64;
+                        let due = self
+                            .last_cache_rate_log
+                            .map(|at| at.elapsed() >= Duration::from_secs(5))
+                            .unwrap_or(true);
+                        if due {
+                            self.last_cache_rate_log = Some(Instant::now());
+                            log::line(&format!(
+                                "cache rate mbps={:.2} demand_mbps={:.2} ratio={:.2} lead_s={:.1} done={}/{}",
+                                self.net_bps * 8.0 / 1_000_000.0,
+                                total_bps as f64 / 1_000_000.0,
+                                ratio,
+                                self.cache_lead_ms().map(|ms| ms as f64 / 1000.0).unwrap_or(0.0),
+                                self.cache_done,
+                                self.cache_total
+                            ));
+                        }
+                    }
                 }
                 self.net_at = Instant::now();
                 let interp_ticks = self.interp_ticks;

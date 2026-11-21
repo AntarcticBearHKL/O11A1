@@ -232,6 +232,8 @@ pub struct VideoSpec {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// Declared video bitrate in bit/s; used to anchor the cache at a seek.
+    pub video_bitrate: u64,
     /// Live streams must not seek and cannot be restarted at an arbitrary
     /// position; the zero-copy decoder keeps the reconnect policy instead.
     pub live: bool,
@@ -301,7 +303,7 @@ impl VideoDecoder {
             .map(|value| value.trim().to_ascii_lowercase() != "ffmpeg")
             .unwrap_or(true)
             && o11a1::settings::load().player_mf_decode;
-        let (url, _cached) = resolve_url(spec);
+        let (url, _cached) = resolve_url(spec, start_ms);
         if zero_copy_requested {
             let (_, queue_depth) = ring_plan(spec);
             let queue = FrameQueue::new(queue_depth);
@@ -358,7 +360,7 @@ impl VideoDecoder {
         let target_w = spec.width.max(2) & !1;
         let target_h = spec.height.max(2) & !1;
         let frame_bytes = target_w as usize * target_h as usize * 3 / 2;
-        let (url, cached) = resolve_url(spec);
+        let (url, cached) = resolve_url(spec, start_ms);
         let scale = target_w != spec.source_width || target_h != spec.source_height;
         let mut command = proc::command("ffmpeg.exe");
         command
@@ -593,11 +595,23 @@ impl Drop for VideoDecoder {
 
 /// Prefer the completed disk cache or the loopback cache server, exactly like
 /// the external pipe. `cached` reports whether the URL changed.
-fn resolve_url(spec: &VideoSpec) -> (String, bool) {
+fn resolve_url(spec: &VideoSpec, start_ms: u64) -> (String, bool) {
     let url = if spec.remote {
+        let start_offset = if spec.video_bitrate > 0 {
+            (start_ms as u128 * spec.video_bitrate as u128 / 8_000) as u64
+        } else {
+            0
+        };
         spec.cache_key
             .as_deref()
-            .and_then(|key| crate::mediacache::cached_url(&spec.url, &spec.headers, key))
+            .and_then(|key| {
+                crate::mediacache::cached_url_from(
+                    &spec.url,
+                    &spec.headers,
+                    key,
+                    start_offset,
+                )
+            })
             .unwrap_or_else(|| spec.url.clone())
     } else {
         spec.url.clone()

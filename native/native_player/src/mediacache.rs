@@ -36,11 +36,12 @@ use crate::log;
 const CHUNK_BYTES: u64 = 512 * 1024;
 /// Very small resources are not worth a cache file and a local server.
 const MIN_CACHE_BYTES: u64 = 512 * 1024;
-/// Eight HTTP/1.1 range workers: one connection each, enough parallel
-/// streams to saturate a normal CDN link without the HTTP/2 resets that made
-/// sixteen multiplexed ranges fail. The user's `prefetch_connections` setting
-/// can lower this, never raise it.
-const MAX_WORKERS: usize = 8;
+/// Sixteen HTTP/1.1 range workers: one connection each. Measured on the same
+/// Bilibili 4K AV1 source, 16 concurrent 512 KB ranges reach ~11.8 MB/s versus
+/// ~7.2 MB/s with eight; the CDN resets that plagued multiplexed HTTP/2 do not
+/// apply because the client is HTTP/1.1 only. The user's
+/// `prefetch_connections` setting can lower this, never raise it.
+const MAX_WORKERS: usize = 16;
 const READ_CHUNK: usize = 256 * 1024;
 /// A reader waits at most this long for one cache chunk before it asks the
 /// loopback server to fetch that range straight from the CDN. A worker stuck
@@ -55,6 +56,11 @@ const CHUNK_ATTEMPTS: u32 = 6;
 /// Far-away chunks would only grow the file behind the playhead while the
 /// decoder waits for the next few hundred kilobytes.
 const CURSOR_WINDOW: usize = 64;
+/// The post-playhead window that is filled first. At 512 KB per chunk this is
+/// 64 MB: about 85 seconds of 6 Mbit/s AV1 or 28 seconds of 18 Mbit/s AVC.
+/// Sixteen workers keep the whole window saturated in playhead order instead
+/// of following FFmpeg's much farther read-ahead cursor.
+const PLAYHEAD_WINDOW: usize = 128;
 /// Bump when the completed-chunk journal changes meaning. Old partial caches
 /// have no version line and are restarted instead of being trusted.
 const STATE_VERSION: &str = "v2";
@@ -82,6 +88,9 @@ struct MediaState {
     /// Last chunk a reader needed. Workers fill forward from here rather than
     /// from byte zero, so a seek starts downloading where the picture is.
     cursor: usize,
+    /// Chunk under the presentation clock. Workers fill the post-playhead
+    /// window in order before looking at the reader's farther-ahead cursor.
+    playhead: usize,
 }
 
 pub struct CachedMedia {
@@ -216,10 +225,22 @@ fn read_resume_state(path: &std::path::Path, total_hint: Option<u64>) -> Option<
 /// if needed. `None` means the URL did not expose a usable byte size/range
 /// response; the caller should keep the original URL.
 pub fn cached_url(url: &str, headers: &[(String, String)], key: &str) -> Option<String> {
+    cached_url_from(url, headers, key, 0)
+}
+
+/// Like [`cached_url`], but starts the workers at the byte offset the player
+/// will first read. A seek to minute 10 must not spend its first 16 requests
+/// on byte zero while the picture waits for the new position.
+pub fn cached_url_from(
+    url: &str,
+    headers: &[(String, String)],
+    key: &str,
+    start_offset: u64,
+) -> Option<String> {
     if url.trim().is_empty() || key.trim().is_empty() {
         return None;
     }
-    let media = prepare(url, headers, key)?;
+    let media = prepare(url, headers, key, start_offset)?;
     // A complete file is read directly. The loopback server exists so ffmpeg
     // can block on chunks that are still downloading; a finished 4K file has
     // no such chunks, and serving it over TCP added a full extra copy of
@@ -319,6 +340,24 @@ pub fn is_complete_key(key: &str) -> bool {
     total >= MIN_CACHE_BYTES && file_len(&path_for(&dir, &id)) == Some(total)
 }
 
+/// Update the presentation-clock anchor used for cache scheduling. The engine
+/// calls this once per second; it is deliberately separate from the reader's
+/// cursor, which FFmpeg can move tens of megabytes ahead of the picture.
+pub fn set_playhead(key: &str, offset: u64) {
+    let id = media_id(key);
+    let Some(media) = registry().lock().ok().and_then(|map| map.get(&id).cloned()) else {
+        return;
+    };
+    let Ok(mut state) = media.state.lock() else {
+        return;
+    };
+    let index = ((offset / media.chunk) as usize).min(state.chunks.len());
+    if state.playhead != index {
+        state.playhead = index;
+        media.ready.notify_all();
+    }
+}
+
 /// Ask the cache workers to fetch the chunk at `offset` next. The reader's
 /// cursor can be tens of megabytes ahead (FFmpeg's demuxer buffer), which
 /// leaves a hole at the picture the user is actually watching. Prioritising
@@ -358,13 +397,13 @@ pub fn wait_for_key(key: &str) {
 pub fn prefetch_source(source: &crate::source::MediaSource) -> bool {
     let mut ok = true;
     if let Some(key) = crate::source::media_cache_key(source, false) {
-        if let Some(media) = prepare(&source.video_url, &source.headers, &key) {
+        if let Some(media) = prepare(&source.video_url, &source.headers, &key, 0) {
             ok &= media.wait_complete().is_ok();
         }
     }
     if let Some(url) = source.audio_url.as_deref() {
         if let Some(key) = crate::source::media_cache_key(source, true) {
-            if let Some(media) = prepare(url, &source.headers, &key) {
+            if let Some(media) = prepare(url, &source.headers, &key, 0) {
                 ok &= media.wait_complete().is_ok();
             }
         }
@@ -372,7 +411,12 @@ pub fn prefetch_source(source: &crate::source::MediaSource) -> bool {
     ok
 }
 
-fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<CachedMedia>> {
+fn prepare(
+    url: &str,
+    headers: &[(String, String)],
+    key: &str,
+    start_offset: u64,
+) -> Option<Arc<CachedMedia>> {
     let id = media_id(key);
     if let Ok(map) = registry().lock() {
         if let Some(existing) = map.get(&id) {
@@ -426,6 +470,7 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
                         error: None,
                         priority: None,
                         cursor: 0,
+                        playhead: 0,
                     }),
                     ready: Condvar::new(),
                     stop: AtomicBool::new(false),
@@ -485,6 +530,8 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
         (total, Vec::new(), file, journal)
     };
     let chunks = chunks_for(total);
+    let initial_chunk =
+        ((start_offset / CHUNK_BYTES) as usize).min(chunks.saturating_sub(1));
     let mut chunk_states = vec![ChunkState::Pending; chunks];
     let resumed_chunks = done.len();
     for index in done {
@@ -514,7 +561,8 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
             done: complete,
             error: None,
             priority: None,
-            cursor: 0,
+            cursor: initial_chunk,
+            playhead: initial_chunk,
         }),
         ready: Condvar::new(),
         stop: AtomicBool::new(false),
@@ -617,6 +665,7 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
         };
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
+    let mut logged_first = false;
     loop {
         if media.stop.load(Ordering::SeqCst) {
             break;
@@ -637,15 +686,23 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
                             && state.chunks[*index] == ChunkState::Pending
                     })
                     .or_else(|| {
+                        // Fill the post-playhead window first: this is the
+                        // data the user is about to watch, regardless of how
+                        // far FFmpeg's demuxer has read ahead.
+                        let start = state.playhead.min(state.chunks.len());
+                        let end = (start + PLAYHEAD_WINDOW).min(state.chunks.len());
+                        (start..end).find(|index| state.chunks[*index] == ChunkState::Pending)
+                    })
+                    .or_else(|| {
                         // Fill forward from the last byte a reader asked for.
-                        // Downloading from byte zero while the picture is at
-                        // minute 15 only grows the wrong end of the file.
                         let start = state.cursor.min(state.chunks.len());
                         let end = (start + CURSOR_WINDOW).min(state.chunks.len());
                         (start..end).find(|index| state.chunks[*index] == ChunkState::Pending)
                     })
                     .or_else(|| {
-                        let start = state.cursor.min(state.chunks.len());
+                        // Backfill before the playhead only after the useful
+                        // post-playhead windows are fully claimed.
+                        let start = state.playhead.min(state.chunks.len());
                         (0..start).find(|index| state.chunks[*index] == ChunkState::Pending)
                     })
                     .or_else(|| {
@@ -688,6 +745,15 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
         let Some(index) = index else {
             break;
         };
+        if !logged_first {
+            logged_first = true;
+            log::line(&format!(
+                "media cache worker first id={} chunk={index} playhead={} cursor={}",
+                media.id,
+                media.state.lock().map(|state| state.playhead).unwrap_or(0),
+                media.state.lock().map(|state| state.cursor).unwrap_or(0)
+            ));
+        }
         let start = index as u64 * media.chunk;
         let end = ((index as u64 + 1) * media.chunk - 1).min(media.total - 1);
         let mut last_error = String::new();

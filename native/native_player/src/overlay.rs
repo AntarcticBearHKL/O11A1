@@ -2333,12 +2333,28 @@ impl Overlay {
         let video_bitrate = model.video_bitrate;
         let total_bps = model.video_bitrate + model.audio_bitrate;
         let network = if model.net_bps > 0.0 {
-            // Actual ffmpeg read rate in bits per second.
-            format!(
-                "{} / {}",
-                format_bitrate((model.net_bps * 8.0).round() as u64),
-                format_bitrate(video_bitrate)
-            )
+            // Actual cache worker read rate in bits per second, plus how many
+            // times the stream's own demand that is. The scheduler targets
+            // 1.5x; this line makes it visible instead of guessing.
+            let ratio = if total_bps > 0 {
+                model.net_bps * 8.0 / total_bps as f64
+            } else {
+                0.0
+            };
+            if total_bps > 0 {
+                format!(
+                    "{} / {} ({:.1}×)",
+                    format_bitrate((model.net_bps * 8.0).round() as u64),
+                    format_bitrate(video_bitrate),
+                    ratio
+                )
+            } else {
+                format!(
+                    "{} / {}",
+                    format_bitrate((model.net_bps * 8.0).round() as u64),
+                    format_bitrate(video_bitrate)
+                )
+            }
         } else if total_bps > 0 {
             // First second after open: fall back to the stream's demand until
             // the process read counter has a baseline.
