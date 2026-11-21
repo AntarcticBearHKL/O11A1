@@ -4351,3 +4351,94 @@ html, body, #root {
 
 .fish-agent-line { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .fish-agent-line .agent-tool-strip { margin-top: 0; }
+
+/* ------------------------------------------------ home feed: glass cards */
+/* Full-card frosted shell for the home feed only. Search/history/favorites
+   keep the airy transparent card so a dense list does not turn into a wall of
+   blurred panels. The shell is weaker than the floating toolbar (14px vs
+   26px blur) and only the shell is translucent; the cover stays opaque. */
+.home-feed .video-grid {
+  grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
+  gap: 30px 18px;
+}
+.home-feed .video-card {
+  padding: 8px 8px 6px;
+  border-radius: 24px;
+  background: color-mix(in srgb, var(--card-solid) 56%, transparent);
+  border: 1px solid var(--card-border);
+  box-shadow:
+    0 16px 36px -30px rgba(20, 18, 14, 0.44),
+    inset 0 1px 0 rgba(255, 255, 255, 0.46);
+  backdrop-filter: blur(14px) saturate(1.12);
+  -webkit-backdrop-filter: blur(14px) saturate(1.12);
+  transition:
+    translate 0.26s var(--ease),
+    background 0.22s var(--ease),
+    border-color 0.22s var(--ease),
+    box-shadow 0.22s var(--ease);
+}
+.home-feed .video-card:hover {
+  transform: none;
+  translate: 0 -3px;
+  background: color-mix(in srgb, var(--card-solid) 63%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 18%, var(--card-border));
+  box-shadow:
+    0 22px 44px -30px rgba(20, 18, 14, 0.50),
+    inset 0 1px 0 rgba(255, 255, 255, 0.52);
+}
+.home-feed .video-card:focus-visible {
+  border-radius: 26px;
+}
+.home-feed .video-card .cover {
+  border-radius: 16px;
+  box-shadow: none;
+}
+.home-feed .video-card:hover .cover {
+  box-shadow: none;
+}
+.home-feed .video-card .body {
+  height: auto;
+  padding: 10px 4px 4px;
+}
+.home-feed .video-card .video-meta {
+  margin-top: 6px;
+}
+[data-theme='dark'] .home-feed .video-card {
+  background: color-mix(in srgb, var(--card-solid) 60%, transparent);
+  border-color: rgba(255, 255, 255, 0.10);
+  box-shadow:
+    0 18px 40px -30px rgba(0, 0, 0, 0.86),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+[data-theme='dark'] .home-feed .video-card:hover {
+  background: color-mix(in srgb, var(--card-solid) 68%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 28%, rgba(255, 255, 255, 0.10));
+  box-shadow:
+    0 24px 48px -30px rgba(0, 0, 0, 0.90),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10);
+}
+@media (max-width: 1260px) {
+  .home-feed .video-grid {
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 28px 16px;
+  }
+}
+@media (max-width: 720px) {
+  .home-feed .video-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px 12px;
+  }
+  .home-feed .video-card {
+    padding: 6px 6px 4px;
+    border-radius: 20px;
+  }
+  .home-feed .video-card .cover {
+    border-radius: 13px;
+  }
+  .home-feed .video-card .body {
+    padding: 8px 2px 2px;
+  }
+  .home-feed .video-card .video-title {
+    font-size: 12.5px;
+  }
+}

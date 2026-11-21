@@ -115,7 +115,7 @@ export default function Home() {
       {error && !items.length ? <ErrorBox error={error} onRetry={loadInitial} /> : null}
       {loading && !items.length ? <SkeletonGrid count={FEED_ROWS * 5} /> : null}
       {items.length ? (
-        <div ref={feedRef}>
+        <div ref={feedRef} className="home-feed">
           <VideoGrid items={shown} onPlay={play} />
           <div className="feed-end">我是有底线的</div>
         </div>
