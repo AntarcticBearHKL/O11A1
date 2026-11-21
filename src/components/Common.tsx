@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { formatCount, formatDuration } from '../api';
 import { CoverImage } from './CoverImage';
 import { useApp } from '../context';
+import { flushCardRightClick, scheduleCardRightClick } from '../rightClickGuard';
 import type { FeedVideo, VideoCard } from '../types';
 
 export function Spinner({ label }: { label?: string }) {
@@ -250,11 +251,15 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
         onPlay(item);
       }}
       onContextMenu={(event) => {
-        // Right-click always opens a new player window; left-click replaces
-        // the video in the most recently focused one.
+        // A short right click always opens a new player window. If the shell's
+        // refresh ring owns this press, the pending open is cancelled when the
+        // ring fires; a held menu delivered before mouseup waits for release.
         event.preventDefault();
         setTip(null);
-        onPlay(item, true);
+        scheduleCardRightClick(() => onPlay(item, true));
+      }}
+      onMouseUp={(event) => {
+        if (event.button === 2) flushCardRightClick();
       }}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) return;

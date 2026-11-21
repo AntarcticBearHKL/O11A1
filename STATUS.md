@@ -91,6 +91,12 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.18 右键长按刷新不再打开视频**：
+  - 新增 `rightClickGuard` 手势仲裁：右键按下时记录手势；短按仍然打开新窗口，长按触发 400ms 刷新环后，挂起的卡片打开动作会被取消。
+  - Chromium 的 `contextmenu` 可能先于或后于 `mouseup` 到达：菜单在按住时到达就挂起，等 `mouseup` 再决定；在松手后到达且没有触发刷新环则立即打开。这样不会靠事件顺序碰运气。
+  - 长按刷新后，下一次右键按下会重置手势状态，普通短右键仍然能打开新窗口；移动超过 16px 也会取消挂起打开。
+  - 首页/搜索/历史/收藏等所有 `VideoCardItem` 以及动态页的视频卡片都接入了同一套保护。
+  - 实测逻辑覆盖：短按打开、长按刷新不打开、长按后再次短按可打开、拖动取消、contextmenu 在 mouseup 前后两种顺序。
 - **0.9.17 视频卡改宽、去阴影、等距网格**：
   - 所有标准视频卡的封面比例从 **16:10 改为 16:9**，画面更宽；PGC 每日卡也同步改为 16:9，普通 PGC 竖版海报保持 100:128。
   - 扁平化：删除视频卡封面、PGC 封面、首页玻璃卡的普通/悬停/深色 box-shadow，只保留玻璃底色、1px 边框和封面内圆角；首页玻璃卡仍保留悬停背景和 3px 位移反馈。
@@ -190,7 +196,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.17.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.9.18.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。

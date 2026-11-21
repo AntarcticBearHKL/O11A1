@@ -26,6 +26,12 @@ import { launchPlayer } from './player';
 import { CoverImage } from './components/CoverImage';
 import { WindowResizeGrip } from './components/WindowResizeGrip';
 import { clearPreloadedData } from './preload';
+import {
+  beginRightClickGesture,
+  flushCardRightClick,
+  markHoldRefreshFired,
+  markRightClickMoved,
+} from './rightClickGuard';
 
 type HotSearchItem = { keyword: string; show_name: string };
 
@@ -485,6 +491,9 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
     const start = (event: MouseEvent) => {
       if (event.button !== 2) return;
+      // Every right press starts a fresh gesture. A previous long press must
+      // not leave the next short right click unable to open a card.
+      beginRightClickGesture();
       // 养鱼 (大肥鱼) owns its own interaction surface; a long right press must
       // not reload the page while inspecting frames or chatting with the agent.
       // 设置页也禁用长按刷新：那里全是开关、滑杆和下拉，误触刷新会打断配置。
@@ -522,6 +531,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
         if (progress >= 1) {
           if (!active.fired) {
             active.fired = true;
+            markHoldRefreshFired();
             holdBoxRef.current?.classList.add('fired');
             triggerRefresh();
             active.timer = setTimeout(() => {
@@ -539,6 +549,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
       const current = holdRef.current;
       if (!current || current.fired) return;
       if (Math.hypot(event.clientX - current.x, event.clientY - current.y) > 16) {
+        markRightClickMoved();
         clear();
         return;
       }
@@ -553,6 +564,9 @@ export default function App({ initial }: { initial?: AppInitial }) {
     const release = (event: MouseEvent) => {
       if (event.button !== 2) return;
       if (holdRef.current && !holdRef.current.fired) clear();
+      // Resolve a contextmenu that Chromium delivered while the button was
+      // still down. The hold's timer has already cancelled it on a long press.
+      flushCardRightClick();
     };
     const leftDown = (event: MouseEvent) => {
       if (event.button === 0) clear();
