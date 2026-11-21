@@ -184,6 +184,10 @@ export default function History() {
             })}
             onPlay={(item, newWindow) => launch({
               bvid: item.bvid,
+              // Multi-part history rows belong to one cid; without it the
+              // player would resume P1 at the position of whichever P was
+              // actually watched last.
+              cid: Number(item.cid) || null,
               title: item.title,
               cover: item.cover,
               owner: item.author,

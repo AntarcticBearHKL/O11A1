@@ -75,6 +75,11 @@ pub struct MediaSource {
     pub audio_url: Option<String>,
     pub headers: Vec<(String, String)>,
     pub duration_ms: u64,
+    /// Position the window should start at when the caller did not ask for an
+    /// explicit one. Filled from local watch progress or the official history
+    /// entry; `None` means start from zero. Page and quality switches ignore
+    /// it.
+    pub resume_ms: Option<u64>,
     /// Selected video/audio stream bitrates in bits per second (0 when a
     /// direct URL did not advertise one).
     pub video_bitrate: u64,
@@ -124,6 +129,7 @@ impl MediaSource {
             audio_url: None,
             headers: Vec::new(),
             duration_ms: 0,
+            resume_ms: None,
             video_bitrate: 0,
             audio_bitrate: 0,
             source_width: 1280,
@@ -308,6 +314,7 @@ fn resolve_direct(url: &str, config: &PlayerConfig) -> Result<ResolvedSource> {
             ),
             headers,
             duration_ms,
+            resume_ms: None,
             video_bitrate: 0,
             audio_bitrate: 0,
             source_width,
@@ -442,13 +449,18 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
         if !(fps.is_finite() && fps > 1.0) {
             fps = 30.0;
         }
+        let resume_ms = if config.start_ms == 0 && !config.is_live {
+            resume_position(&session, &bvid_owned, cid, duration_ms, logged_in).await
+        } else {
+            None
+        };
         let cap = decode_cap_for();
         let (width, height) = fit_capped(source_width, source_height, cap.0, cap.1);
         let video_tracks = video_track_infos(&tracks);
         let audio_tracks = audio_track_infos(&info);
         let quality_tiers = quality_tier_infos(&bvid_owned, cid);
         log::line(&format!(
-            "source bilibili bvid={} cid={cid} login={} title={:?} qn={} codec={} decoder={} size={}x{} -> {}x{} fps={:.3} duration_ms={} audio={} audio_index={} tracks={} tiers={} headers={}",
+            "source bilibili bvid={} cid={cid} login={} title={:?} qn={} codec={} decoder={} size={}x{} -> {}x{} fps={:.3} duration_ms={} resume_ms={} audio={} audio_index={} tracks={} tiers={} headers={}",
             bvid_owned,
             u8::from(logged_in),
             title,
@@ -461,6 +473,9 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
             height,
             fps,
             duration_ms,
+            resume_ms
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             audio
                 .map(|track| format!("{}/{}", track.id, track.bandwidth))
                 .unwrap_or_else(|| "-".to_string()),
@@ -478,6 +493,7 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
                 audio_url,
                 headers,
                 duration_ms,
+                resume_ms,
                 video_bitrate: track.bandwidth,
                 audio_bitrate: audio.map(|track| track.bandwidth).unwrap_or(0),
                 source_width,
@@ -504,6 +520,70 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
     });
     let (source, session) = resolved?;
     Ok(ResolvedSource { source, session })
+}
+
+/// Start position for a video with watch history: this install's own progress
+/// first, then Bilibili's history endpoint for a video it has never played.
+/// Both use the shared 3 s / 5 s rule from [`crate::watch`].
+async fn resume_position(
+    session: &o11a1::bilibili::Session,
+    bvid: &str,
+    cid: u64,
+    duration_ms: u64,
+    logged_in: bool,
+) -> Option<u64> {
+    if let Some(position_ms) = crate::watch::lookup(bvid, cid, duration_ms) {
+        log::line(&format!(
+            "resume local bvid={bvid} cid={cid} position_ms={position_ms}"
+        ));
+        return Some(position_ms);
+    }
+    if !logged_in {
+        return None;
+    }
+    // The history cursor is a small GET, but the window is already showing its
+    // loading card: a stalled request must not hold the first frame for more
+    // than a couple of seconds. No entry means start at zero, as before.
+    let history = match tokio::time::timeout(
+        std::time::Duration::from_millis(2_000),
+        session.history(0, 0, ""),
+    )
+    .await
+    {
+        Ok(Ok(page)) => page,
+        Ok(Err(error)) => {
+            log::line(&format!(
+                "resume history failed bvid={bvid} cid={cid} err={error:#}"
+            ));
+            return None;
+        }
+        Err(_) => {
+            log::line(&format!("resume history timeout bvid={bvid} cid={cid}"));
+            return None;
+        }
+    };
+    // A multi-part entry is only valid for the exact part it stopped on.
+    // Rows without a cid are older single-part entries, where page 1 is the
+    // only part the progress can belong to.
+    let item = history
+        .items
+        .iter()
+        .find(|item| item.bvid == bvid && item.cid == cid)
+        .or_else(|| {
+            history
+                .items
+                .iter()
+                .find(|item| item.bvid == bvid && item.cid == 0 && item.page <= 1)
+        })?;
+    let position_ms = u64::try_from(item.progress.max(0))
+        .ok()?
+        .saturating_mul(1000);
+    let position_ms = crate::watch::usable_resume(position_ms, duration_ms)?;
+    log::line(&format!(
+        "resume history bvid={bvid} cid={cid} page={} progress_ms={position_ms}",
+        item.page
+    ));
+    Some(position_ms)
 }
 
 struct ProbeInfo {
@@ -846,6 +926,9 @@ pub fn resolve_track_switch(
         audio_url: audio.map(|track| track.url.clone()),
         headers,
         duration_ms,
+        // A quality switch continues from the live position, never from the
+        // stored resume point.
+        resume_ms: None,
         video_bitrate: track.bandwidth,
         audio_bitrate: audio.map(|track| track.bandwidth).unwrap_or(0),
         source_width,

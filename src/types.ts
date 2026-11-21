@@ -222,6 +222,11 @@ export interface HistoryItem {
   title: string;
   cover: string;
   bvid: string;
+  /// The part this entry stopped on (0 when the payload omits it), so a
+  /// history row opens the same P the official player would resume.
+  cid: number;
+  page: number;
+  part: string;
   kid: string;
   author: string;
   owner_mid: number;

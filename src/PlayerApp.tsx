@@ -1076,7 +1076,7 @@ export default function PlayerApp() {
                   {!historyDate ? <div style={{ color: '#8a8d92', fontSize: 11.5, marginTop: 4 }}>选择日期查看历史弹幕；「实时」是当前播放的列表。</div> : null}
                   <div className="side-title" style={{ marginTop: 16 }}>最近观看</div>
                   {history.slice(0, 5).map((item: any) => (
-                    <div key={item.kid} style={{ padding: '5px 0', cursor: 'pointer' }} onClick={() => openPlayer({ bvid: item.bvid, title: item.title, cover: item.cover, startMs: item.progress * 1000, url: null, audioUrl: null, epId: null, cid: null })}>
+                    <div key={item.kid} style={{ padding: '5px 0', cursor: 'pointer' }} onClick={() => openPlayer({ bvid: item.bvid, cid: item.cid || null, title: item.title, cover: item.cover, startMs: item.progress * 1000, url: null, audioUrl: null, epId: null })}>
                       <div style={{ fontSize: 11, fontWeight: 600 }}>{item.title}</div>
                       <div style={{ fontSize: 10, color: '#8a8d92' }}>{item.author} · {formatTime(item.progress * 1000)}</div>
                     </div>

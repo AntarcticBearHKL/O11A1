@@ -1324,6 +1324,20 @@ where
     })
 }
 
+/// Numeric fields occasionally arrive as strings in older payloads (the
+/// history cursor's `cid`/`page` are the known cases), so accept both.
+pub(crate) fn de_i64_lenient<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Number(number) => number.as_i64().unwrap_or(0),
+        serde_json::Value::String(text) => text.trim().parse().unwrap_or(0),
+        _ => 0,
+    })
+}
+
 /// Bilibili's booleans flip between `true`/`false` and `1`/`0` across
 /// endpoints (and even between payload versions of the same endpoint), so a
 /// flag field accepts both.

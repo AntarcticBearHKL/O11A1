@@ -1177,30 +1177,7 @@ impl Session {
             view_at: cursor.view_at,
             business: cursor.business,
         });
-        let items: Vec<HistoryItem> = data
-            .list
-            .into_iter()
-            .map(|item| {
-                let history = item.history.unwrap_or_default();
-                let kid = if !history.business.is_empty() {
-                    format!("{}_{}", history.business, history.oid)
-                } else if !item.kid.is_empty() {
-                    item.kid
-                } else {
-                    history.kid.clone()
-                };
-                HistoryItem {
-                    title: item.title,
-                    cover: normalize_url(&item.cover),
-                    bvid: history.bvid,
-                    kid,
-                    author: item.author_name,
-                    owner_mid: item.author_mid,
-                    duration: item.duration,
-                    progress: item.progress,
-                }
-            })
-            .collect();
+        let items = history_items_from(data.list);
         let has_more = !items.is_empty()
             && cursor
                 .as_ref()
@@ -1212,6 +1189,40 @@ impl Session {
             has_more,
         })
     }
+}
+
+/// Convert raw cursor rows into the UI/history item, keeping the exact part
+/// (`cid`/`page`) the account stopped on so a history row can resume it.
+fn history_items_from(list: Vec<HistoryEntry>) -> Vec<HistoryItem> {
+    list.into_iter()
+        .map(|item| {
+            let history = item.history.unwrap_or_default();
+            let kid = if !history.business.is_empty() {
+                format!("{}_{}", history.business, history.oid)
+            } else if !item.kid.is_empty() {
+                item.kid
+            } else {
+                history.kid.clone()
+            };
+            HistoryItem {
+                title: item.title,
+                cover: normalize_url(&item.cover),
+                bvid: history.bvid,
+                cid: if history.cid > 0 {
+                    history.cid as u64
+                } else {
+                    0
+                },
+                page: history.page.max(0),
+                part: history.part,
+                kid,
+                author: item.author_name,
+                owner_mid: item.author_mid,
+                duration: item.duration,
+                progress: item.progress,
+            }
+        })
+        .collect()
 }
 
 impl Session {
@@ -2678,6 +2689,14 @@ struct HistoryMeta {
     bvid: String,
     #[serde(default)]
     oid: i64,
+    /// The cid this entry stopped on. Zero for legacy/single-part entries.
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    cid: i64,
+    /// 1-based part number; zero when the API does not report one.
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    page: i64,
+    #[serde(default)]
+    part: String,
     #[serde(default)]
     business: String,
     #[serde(default, deserialize_with = "de_string_lenient")]
@@ -2744,6 +2763,47 @@ pub(super) struct SpiData {
     pub(super) b_3: String,
     #[serde(default)]
     pub(super) b_4: String,
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::{history_items_from, HistoryResp};
+
+    #[test]
+    fn history_rows_keep_the_part_the_account_stopped_on() {
+        let payload = r#"{
+            "code": 0,
+            "data": {
+                "cursor": { "max": 0, "view_at": 0, "business": "" },
+                "list": [{
+                    "title": "多P视频",
+                    "cover": "//i0.hdslb.com/x.jpg",
+                    "kid": "archive_1",
+                    "author_name": "UP",
+                    "author_mid": 7,
+                    "duration": 1249,
+                    "progress": 1113,
+                    "history": {
+                        "bvid": "BV1NDsS6UE8D",
+                        "oid": 1,
+                        "cid": "43779425794",
+                        "page": "18",
+                        "part": "第18P",
+                        "business": "archive",
+                        "kid": "archive_1"
+                    }
+                }]
+            }
+        }"#;
+        let resp: HistoryResp = serde_json::from_str(payload).expect("history fixture");
+        let items = history_items_from(resp.data.expect("data").list);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].cid, 43_779_425_794);
+        assert_eq!(items[0].page, 18);
+        assert_eq!(items[0].part, "第18P");
+        assert_eq!(items[0].progress, 1113);
+        assert_eq!(items[0].kid, "archive_1");
+    }
 }
 
 #[cfg(test)]
@@ -3376,6 +3436,12 @@ pub struct HistoryItem {
     pub title: String,
     pub cover: String,
     pub bvid: String,
+    /// The cid this entry stopped on (0 when the payload omits it).
+    pub cid: u64,
+    /// 1-based part number (0 when the payload omits it).
+    pub page: i64,
+    /// Part title for multi-part videos.
+    pub part: String,
     pub kid: String,
     pub author: String,
     /// The uploader's mid, for the row's UP name.

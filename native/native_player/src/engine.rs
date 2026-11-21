@@ -93,6 +93,10 @@ const BUFFER_LOW_MS: u64 = 400;
 /// left. Ten seconds covers the playurl resolve plus the first range requests,
 /// so the auto "next part" switch lands on a local opening chunk.
 const NEXT_PAGE_PREFETCH_MS: u64 = 10_000;
+/// How often the watched position of the current part is written to
+/// `watch_progress.json`. Five seconds is one heartbeat interval and bounds
+/// what a killed process can lose.
+const WATCH_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// While buffer-paused, wait until this much contiguous video is on disk.
 /// Resuming as soon as the ring refills makes a link that is slower than the
 /// bitrate pause and resume every few hundred milliseconds; a real lead turns
@@ -422,6 +426,9 @@ struct Engine {
     /// debounced `player_state.json` writes.
     state: PlayerState,
     state_save: SaveDebouncer,
+    /// Last write of `watch_progress.json`; while a video plays the current
+    /// position is stored every [`WATCH_SAVE_INTERVAL`].
+    last_watch_save: Instant,
     enhance_pipeline: Option<EnhancePipeline>,
     decoder: Option<VideoDecoder>,
     /// A decoder pre-rolled at A while the current pass approaches B. It is
@@ -1155,6 +1162,7 @@ impl Engine {
             qa_history_pick: None,
             state,
             state_save: SaveDebouncer::default(),
+            last_watch_save: Instant::now(),
             enhance_pipeline,
             decoder: None,
             loop_prefetch: None,
@@ -2610,6 +2618,7 @@ impl Engine {
             return;
         }
         self.paused_at = self.position_now();
+        self.record_watch_progress();
         self.position_ms = self.paused_at;
         self.playing = false;
         self.video_lag_since = None;
@@ -2833,6 +2842,37 @@ impl Engine {
         if self.state_save.due(Instant::now()) {
             self.persist_state();
         }
+        if self.last_watch_save.elapsed() >= WATCH_SAVE_INTERVAL {
+            self.last_watch_save = Instant::now();
+            // Pause and close store explicitly; the periodic write only needs
+            // to run while the clock actually advances, so a window sitting
+            // paused does not rewrite the same position every five seconds.
+            if self.playing {
+                self.record_watch_progress();
+            }
+        }
+    }
+
+    /// Store the current part's position for the next open. Only a picture
+    /// that has actually presented counts: the loading card and the initial
+    /// seek must never overwrite a stored resume point with zero.
+    fn record_watch_progress(&mut self) {
+        if !self.had_first_frame || self.duration_ms == 0 {
+            return;
+        }
+        let Some(bvid) = self
+            .source
+            .bvid
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+        let Some(cid) = self.source.cid.filter(|value| *value > 0) else {
+            return;
+        };
+        let position = self.position_now().min(self.duration_ms);
+        crate::watch::record(bvid, cid, position, self.duration_ms);
     }
 
     /// Follow the monitor under the player window. Moving the window between a
@@ -7138,6 +7178,8 @@ impl Engine {
         let Some(bvid) = self.source.bvid.clone() else {
             return;
         };
+        // Leaving this part: keep its position before the old sessions stop.
+        self.record_watch_progress();
         let cid = page.cid;
         let quality = self.source.qn;
         // A page change is not a codec choice. Use the user's explicit codec
@@ -7414,6 +7456,8 @@ impl Engine {
     /// window keeps its size, position and chrome; only the media source and
     /// everything tied to it (session, info, pages, danmaku, heartbeat) change.
     fn begin_source_replace(&mut self, config: crate::PlayerConfig) {
+        // The old video is about to be replaced; store its position first.
+        self.record_watch_progress();
         if self.source_pending {
             // A newer click arrived while the previous source is resolving;
             // run it as soon as that answer lands (last click wins).
@@ -7617,7 +7661,23 @@ impl Engine {
         self.reset_storyboard();
         self.settings_menu = None;
         self.duration_ms = self.source.duration_ms;
-        let start = clamp_seek(self.requested_start_ms, self.duration_ms);
+        // An explicit start (history row, quality reopen, playlist advance)
+        // always wins. Otherwise continue where the last watch stopped, as the
+        // official player does; `resume_ms` is already filtered by the 3 s /
+        // 5 s rule in the resolver.
+        let start = if self.requested_start_ms > 0 {
+            self.requested_start_ms
+        } else {
+            self.source.resume_ms.unwrap_or(0)
+        };
+        let start = clamp_seek(start, self.duration_ms);
+        if self.requested_start_ms == 0 && start > 0 {
+            log::line(&format!(
+                "resume playback bvid={} cid={} start_ms={start}",
+                self.source.bvid.as_deref().unwrap_or("-"),
+                self.source.cid.unwrap_or(0)
+            ));
+        }
         self.position_ms = start;
         self.base_ms = start;
         self.paused_at = start;
@@ -9823,6 +9883,7 @@ impl Engine {
         window::set_visible(self.hwnd, false);
         self.gate(false);
         self.sync_shared();
+        self.record_watch_progress();
         self.persist_state();
         self.on_playback_end();
         if let Some(mut heartbeat) = self.heartbeat.take() {

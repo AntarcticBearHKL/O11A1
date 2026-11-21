@@ -38,6 +38,7 @@ mod source;
 mod speed;
 mod state;
 mod storyboard;
+mod watch;
 mod window;
 mod zerocopy;
 
