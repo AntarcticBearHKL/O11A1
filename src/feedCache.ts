@@ -20,8 +20,16 @@ function warmCovers(batch: FeedVideo[]): void {
     if (!url) continue;
     const image = new Image();
     image.referrerPolicy = 'no-referrer';
-    image.onload = () => { image.src = ''; };
-    image.onerror = () => { image.src = ''; };
+    // Release the handlers, not the URL. Assigning `src = ''` resolved to the
+    // document URL, whose load failed and fired `onerror` again: every warm
+    // cover became an infinite image-error loop that pinned one renderer core
+    // from the moment the home feed appeared.
+    const release = () => {
+      image.onload = null;
+      image.onerror = null;
+    };
+    image.onload = release;
+    image.onerror = release;
     image.src = url;
   }
 }

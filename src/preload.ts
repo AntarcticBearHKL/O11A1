@@ -81,6 +81,8 @@ function waitImage(url: string): Promise<void> {
     const finish = () => {
       if (done) return;
       done = true;
+      image.onload = null;
+      image.onerror = null;
       resolve();
     };
     image.onload = finish;

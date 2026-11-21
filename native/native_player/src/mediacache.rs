@@ -146,6 +146,19 @@ pub fn cached_url(url: &str, headers: &[(String, String)], key: &str) -> Option<
         return None;
     }
     let media = prepare(url, headers, key)?;
+    // A complete file is read directly. The loopback server exists so ffmpeg
+    // can block on chunks that are still downloading; a finished 4K file has
+    // no such chunks, and serving it over TCP added a full extra copy of
+    // every 12.4 MB picture plus the HTTP stack. Direct file reads keep warm
+    // 4K playback off that path entirely.
+    if media.is_complete() {
+        let dir = cache_dir().ok()?;
+        return Some(
+            path_for(&dir, &media.id)
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
     let port = server_port()?;
     Some(format!("http://127.0.0.1:{port}/media/{}", media.id))
 }
@@ -596,6 +609,10 @@ fn download_range(
 impl CachedMedia {
     fn failed(&self) -> bool {
         self.state.lock().map(|state| state.failed).unwrap_or(true)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state.lock().map(|state| state.done).unwrap_or(false)
     }
 
     pub fn wait_complete(&self) -> Result<()> {

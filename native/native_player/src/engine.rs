@@ -4499,11 +4499,23 @@ impl Engine {
                 self.toast_until = None;
                 self.ui_dirty = true;
             }
-            // The whole native overlay (toolbar, sidebar, HUD, animations) is
-            // driven on the monitor's refresh grid. `Present(1, 0)` keeps the
-            // compositor on the same cadence; the absolute deadline below
-            // prevents loop overhead from turning 120 Hz into ~104 Hz.
+            // The overlay runs on an adaptive grid: 60–120 Hz only while the
+            // toolbar/sidebar/menu/OSD is actually animating, 10 Hz when the
+            // chrome is hidden and the picture is just playing. The old
+            // unconditional monitor-rate D2D redraw cost 2–4 ms every 8.3 ms
+            // on a 120 Hz panel, stealing a large slice of the same core the
+            // 4K frame upload needs.
             let now = Instant::now();
+            let fast_ui = self.ui_fast();
+            let hz = if fast_ui {
+                self.monitor_hz.clamp(60, 120) as f32
+            } else {
+                10.0
+            };
+            let period = Duration::from_secs_f32(1.0 / hz);
+            if fast_ui && self.next_ui_draw > now + period {
+                self.next_ui_draw = now;
+            }
             if self.ui_dirty || now >= self.next_ui_draw {
                 let draw_at = Instant::now();
                 if let Err(error) = self.draw_ui() {
@@ -4514,8 +4526,6 @@ impl Engine {
                     .saturating_add(draw_at.elapsed().as_micros() as u64);
                 self.ui_draw_count = self.ui_draw_count.saturating_add(1);
                 if now >= self.next_ui_draw {
-                    let hz = self.monitor_hz.max(60).min(240) as f32;
-                    let period = Duration::from_secs_f32(1.0 / hz);
                     self.next_ui_draw += period;
                     if self.next_ui_draw <= now {
                         self.next_ui_draw = now + period;
@@ -8758,10 +8768,37 @@ impl Engine {
         if let Err(error) = self.draw_ui_with(true) {
             log::line(&format!("overlay draw (immediate) failed: {error:#}"));
         } else {
-            let hz = self.monitor_hz.max(60).min(240) as f32;
+            let hz = self.monitor_hz.clamp(60, 120) as f32;
             self.next_ui_draw = Instant::now() + Duration::from_secs_f32(1.0 / hz);
             self.ui_dirty = false;
         }
+    }
+
+    /// Whether the overlay needs the full animation grid. Hover, menus, the
+    /// sidebar, the volume OSD, a toast and the precision/speed morph all
+    /// animate; plain playback with the chrome hidden does not, and can be
+    /// repainted at 10 Hz instead of the display refresh.
+    fn ui_fast(&self) -> bool {
+        self.interacting
+            || self.dragging
+            || self.chrome_shown
+            || self.sidebar_open
+            || self.danmaku_popup
+            || self.dm_menu.is_some()
+            || self.toast.is_some()
+            || self.volume_wheel_until.is_some()
+            || self.drag_preview.is_some()
+            || self.hover_preview.is_some()
+            || self.precision_open
+            || self.speed_open
+            || self.loop_menu_open
+            || self.settings_menu.is_some()
+            || self.loading
+            || self.starting
+            || self.stalled
+            || self.error.is_some()
+            || self.page_loading.is_some()
+            || (self.precision_anim > 0.0001 && self.precision_anim < 0.9999)
     }
 
     fn draw_ui(&mut self) -> Result<()> {

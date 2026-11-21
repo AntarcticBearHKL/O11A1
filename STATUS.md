@@ -83,6 +83,8 @@
 - **4K 解码**：设置里的「原始分辨率解码」现在真正生效。关闭时最高 1080P（`scale_cuda` 在 GPU 上缩放，管道只传 3.1MB/帧）；开启时按片源最高 4K 解码。8K 仍降到 4K。4K60 实测（RTX 4060 Ti + i7-8700）：插帧 + CAS 输出 93–121fps，关闭插帧稳定 60fps。解码帧环从固定 6 帧改成按帧率的 250ms 抖动缓冲（60fps 15 帧、30fps 8 帧），4K 冷缓存不再因为一次 100ms 抖动连丢 5 帧。10-bit HEVC/AV1 走 `scale_cuda=w:h:format=nv12` 在 GPU 转 8-bit NV12，4K60 10-bit 实测 60fps，不再报「GPU 硬解失败」。
 - **并行磁盘缓存 / 预加载**：Bilibili DASH 视频/音频在播放前写入 `<root>/cache/media` 的稀疏文件，由 `prefetch_connections` 个 Range 线程按 512KB 分块并行下载；`.state` 记录已完成块，退出或崩溃后从断点继续，`.ok` 标记完整文件直接复用。ffmpeg 通过 127.0.0.1 的只读代理读缓存，读到未完成块会等待，播放可从第 0 块立即开始。当前视频的缓存优先；它的视频/音频完成后，队列中后续视频按顺序逐个完整预取。直播、无 Range 或小于 512KB 的资源回退原 URL。
 - **0.8.1 4K 缓存抗抖**：Range 下载改成 8 个 HTTP/1.1 连接（每连接独立，避免 HTTP/2 多路复用被 CDN 重置），worker 线程降到 BELOW_NORMAL，解码 ffmpeg 提到 ABOVE_NORMAL、管道读线程 ABOVE_NORMAL；单块失败重试 8 次并指数退避，仍失败时 loopback 代理直接回源该区间，不再判死整个视频；代理读块从 64KB 提到 256KB。4K60 冷缓存首播 45 秒 `dropped=0`，缓存完成前也保持 60fps。
+- **0.8.2 首页 / UI CPU**：首页封面预热在 `onload` / `onerror` 里执行 `image.src = ''`；空串被解析成文档 URL，加载失败又触发 `onerror`，形成无限图片错误循环。首页 renderer 固定吃满一个核心并以约 12 MB/s 持续写 I/O，从打开首页起整机就变慢。现在只解绑 handler，不碰 `src`；实测首页 renderer 100% → 0%。原生播放器 overlay 从无条件 120Hz 改成自适应网格：chrome 隐藏时 10Hz，菜单 / 侧栏 / OSD / 加载 / 错误 / 拖拽 / 悬停时 60–120Hz。完整缓存改为直接读本地文件，不再走 loopback HTTP 代理。
+- **0.8.2 4K60 CPU 实测**：i7-8700 + RTX 4060 Ti，本地 4K60 H.264、关闭插帧和增强：稳定 60fps、`dropped=0`、帧队列 15；播放器主线程约 66% 单核，ffmpeg 约 115% 单核，整机约 1.8 个逻辑核，不再占满 CPU。
 - **A/V 同步**：音频设备时钟是唯一主时钟（有音频时 `position_now` 始终读设备位置，不再依赖 `audio_master` 开关）；视频按音频位置取帧，晚到帧直接丢弃。
   视频解码跟不上实时（4K / 硬解降速）时，画面时间戳会持续落后音频，旧实现会把每个解码出来的帧依次播放，形成“视频慢放、声音正常”的永久漂移；
   现在画面落后超过 250ms 且持续 900ms，就把视频单独 seek 到音频位置并丢掉无法实时解码的区间（音频只为这次短 seek 暂停，落地后一起恢复），2 秒内不会重复 seek。
@@ -118,7 +120,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.8.1.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.8.2.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
@@ -150,6 +152,9 @@
 | Rust 测试 | `o11a1-core` 251 个测试（7 ignored）通过 |
 | GPU 硬解 | 探测：本机 RTX 4060 Ti 对 `h264_cuvid` / `hevc_cuvid` / `av1_cuvid` 全部 supported=1；B 站 4K 流 `decoder=h264_cuvid`，直播 FLV `codec=h264 decoder=h264_cuvid` |
 | 4K 播放 | 真实 B 站 4K60 冷缓存首播 45 秒：`dropped=0`、帧队列 15、`pos_ms == audio_ms`；4K60 10-bit HEVC 本地源 60fps；8MB/s 限速 + 180ms 抖动源 `dropped=0`；插帧 + Anime4K 93–121fps |
+| 首页 CPU | 修复封面预热无限 `onerror` 循环：renderer 100% → 0%，I/O 写从约 12 MB/s 回落到 0 |
+| 4K60 CPU | 本地 4K60、无插帧/增强：60fps、`dropped=0`；播放器约 66% 单核 + ffmpeg 约 115% 单核，整机约 1.8 核 |
+| 播放器 UI | chrome 隐藏 10Hz、交互/菜单 60–120Hz；空闲 UI 绘制占用从每 8.3ms 一次降到每 100ms 一次 |
 | A/V 追赶 | `O11A1_QA_DECODE_DELAY_MS=50` 把 30fps 源限制到 20fps：`pos_ms == audio_ms`，`av_gap` 峰值约 0.5–0.6s，每约 2s 一次视频单独 seek，落地后画面与音频差 10–40ms；正常 1080P30（插帧开 / 关）`av_gap` 0–52ms、无追赶；900ms/帧时先暂停音频，帧回来后 1.5s 内跳帧追上 |
 | 窗口缩放 | 主窗口 CDP 实测：右下角 grip 36×36、`cursor=nwse-resize`，按住拖动 +90/+64 后窗口从 1280×800 变为 1370×864；原生播放器 `WM_NCHITTEST` 在右下角 5 / 10 / 16 / 22px 均返回 `HTBOTTOMRIGHT(17)`，28px 为 `HTCLIENT` |
 | 窗口交互 | 原生播放器右下角拖动 1211×681 → 1311×745；拖动期间 `fps presented=30`、`av_gap=0`、`queue=6`、`dropped=0`、`ui_fps`/`dm_fps=0`（冻结帧按窗口比例缩放），松手后恢复；移动窗口 `interaction begin` / `settle` 正常，阴影不重传 |
