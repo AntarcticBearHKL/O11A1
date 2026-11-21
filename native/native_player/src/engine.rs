@@ -310,6 +310,17 @@ fn tuner_steps(delta_px: f32, notch_px: f32) -> i64 {
     (-delta_px / notch_px).trunc() as i64
 }
 
+/// The precision panel's frame-step modes, in click order. Any unexpected
+/// stored value returns to the single-frame mode.
+fn next_frame_step(step: u64) -> u64 {
+    match step {
+        1 => 2,
+        2 => 5,
+        5 => 10,
+        _ => 1,
+    }
+}
+
 /// One wheel notch is 120 units and moves the volume 5%. Precision touchpads
 /// and free-spinning wheels send fractions of a notch; those accumulate so a
 /// slow scroll still moves the volume instead of rounding every event away.
@@ -875,6 +886,7 @@ enum QaKind {
     Sleep,
     SleepShort,
     Precision,
+    FrameStep,
     AbA,
     AbB,
     AbClear,
@@ -2419,35 +2431,20 @@ impl Engine {
         }
     }
 
+    /// The frame-step chip is a cycle button: 1 → 2 → 5 → 10 → 1 frames.
+    /// Keeping the modes inside one click is faster than opening a dropdown
+    /// while the right hand is already on the ruler.
+    fn cycle_frame_step(&mut self) {
+        self.frame_step = next_frame_step(self.frame_step);
+        self.precision_step_open = false;
+        self.ui_dirty = true;
+        log::line(&format!("precision frame step={}", self.frame_step));
+    }
+
     fn handle_precision_click(&mut self, px: f32, py: f32) -> bool {
         let layout = self.overlay.layout;
-        if self.precision_step_open {
-            for (index, rect) in layout.precision_step_rows.iter().enumerate() {
-                if rect.contains(px, py) {
-                    self.frame_step = [1u64, 2, 5, 10][index];
-                    self.precision_step_open = false;
-                    self.ui_dirty = true;
-                    return true;
-                }
-            }
-            if layout.precision_step.contains(px, py) {
-                self.precision_step_open = false;
-                self.ui_dirty = true;
-                return true;
-            }
-            if layout.precision_step_menu.contains(px, py) {
-                self.precision_step_open = false;
-                self.ui_dirty = true;
-                return true;
-            }
-            // Clicking anywhere else closes the select and still reaches the
-            // control underneath in this same click.
-            self.precision_step_open = false;
-            self.ui_dirty = true;
-        }
         if layout.precision_step.contains(px, py) {
-            self.precision_step_open = true;
-            self.ui_dirty = true;
+            self.cycle_frame_step();
             return true;
         }
         if layout.precision_a.contains(px, py) {
@@ -9032,7 +9029,7 @@ impl Engine {
             codec: self.source.codec.clone(),
             drag_preview: self.drag_preview,
             precision_dragging: self.precision_dragging,
-            precision_step_open: self.precision_step_open,
+            precision_step_open: false,
             precision_mix: self.precision_anim,
             ab_a: self.ab_a,
             ab_b: self.ab_b,
@@ -9333,6 +9330,10 @@ impl Engine {
                     } else {
                         self.open_precision();
                     }
+                }
+                QaKind::FrameStep => {
+                    log::line("qa frame step");
+                    self.cycle_frame_step();
                 }
                 QaKind::AbA => {
                     log::line("qa ab a");
@@ -9934,6 +9935,7 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
             "sleep" => QaKind::Sleep,
             "sleep_short" | "sleepshort" => QaKind::SleepShort,
             "precision" | "seek_precision" => QaKind::Precision,
+            "frame_step" | "framestep" | "step" => QaKind::FrameStep,
             "ab_a" | "aba" => QaKind::AbA,
             "ab_b" | "abb" => QaKind::AbB,
             "ab_clear" | "abclear" => QaKind::AbClear,
@@ -10045,6 +10047,15 @@ mod tests {
         // Reversing direction responds on the first notch instead of eating
         // the leftover of the previous direction.
         assert_eq!(wheel_volume_step(&mut accum, &mut direction, -120), -5);
+    }
+
+    #[test]
+    fn frame_step_chip_cycles_without_a_menu() {
+        assert_eq!(next_frame_step(1), 2);
+        assert_eq!(next_frame_step(2), 5);
+        assert_eq!(next_frame_step(5), 10);
+        assert_eq!(next_frame_step(10), 1);
+        assert_eq!(next_frame_step(0), 1);
     }
 
     #[test]

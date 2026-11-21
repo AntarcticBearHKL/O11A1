@@ -5203,26 +5203,19 @@ impl Overlay {
             &self.aim_line,
         );
 
-        // Frame-step dropdown.
+        // Frame-step cycle button: one click advances 1 → 2 → 5 → 10 → 1.
+        // There is no dropdown; the value in the chip is the mode.
         let field = layout.precision_step;
-        let open = model.precision_step_open;
         let field_round = D2D1_ROUNDED_RECT {
             rect: to_d2d(field),
             radiusX: 10.0 * s,
             radiusY: 10.0 * s,
         };
-        self.d2d.FillRoundedRectangle(
-            &field_round,
-            if open { &self.sidebar_chip } else { &self.chip },
-        );
+        self.d2d.FillRoundedRectangle(&field_round, &self.chip);
         self.d2d.DrawRoundedRectangle(
             &field_round,
-            if open {
-                &self.accent_blue
-            } else {
-                &self.panel_border
-            },
-            if open { 1.2 * s } else { 1.0 * s },
+            &self.panel_border,
+            1.0 * s,
             None,
         );
         let label = format!("{} 帧", model.frame_step);
@@ -5230,54 +5223,9 @@ impl Overlay {
             &label,
             field,
             &self.precision_step_format,
-            if open { &self.accent_blue } else { &self.text },
+            &self.text,
             1,
         );
-        if open {
-            let menu = layout.precision_step_menu;
-            self.draw_home_panel(menu, 10.0 * s, menu, model.light_sidebar);
-            for (index, rect) in layout.precision_step_rows.iter().enumerate() {
-                let step = [1u64, 2, 5, 10][index];
-                let current = model.frame_step == step;
-                let hot = model
-                    .pointer
-                    .map(|(x, y)| rect.contains(x, y))
-                    .unwrap_or(false);
-                if hot && !current {
-                    let rounded = D2D1_ROUNDED_RECT {
-                        rect: to_d2d(*rect),
-                        radiusX: 7.0 * s,
-                        radiusY: 7.0 * s,
-                    };
-                    self.d2d.FillRoundedRectangle(&rounded, &self.sidebar_hover);
-                }
-                if current {
-                    self.d2d.FillEllipse(
-                        &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
-                            point: Vector2::new(
-                                rect.left + 10.0 * s,
-                                (rect.top + rect.bottom) * 0.5,
-                            ),
-                            radiusX: 2.5 * s,
-                            radiusY: 2.5 * s,
-                        },
-                        &self.accent_blue,
-                    );
-                }
-                self.text(
-                    &format!("{} 帧", step),
-                    rect.left + 18.0 * s,
-                    rect.top + (rect.height() - 17.0 * s) * 0.5,
-                    rect.width() - 24.0 * s,
-                    &self.comment_body_format,
-                    if current {
-                        &self.accent_blue
-                    } else {
-                        &self.text
-                    },
-                );
-            }
-        }
     }
 
     /// The toolbar is the same home-page paper as the sidebar lane: an opaque
