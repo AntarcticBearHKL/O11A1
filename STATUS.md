@@ -152,7 +152,7 @@
 | Rust 测试 | `o11a1-core` 251 个测试（7 ignored）通过 |
 | GPU 硬解 | 探测：本机 RTX 4060 Ti 对 `h264_cuvid` / `hevc_cuvid` / `av1_cuvid` 全部 supported=1；B 站 4K 流 `decoder=h264_cuvid`，直播 FLV `codec=h264 decoder=h264_cuvid` |
 | 4K 播放 | 真实 B 站 4K60 冷缓存首播 45 秒：`dropped=0`、帧队列 15、`pos_ms == audio_ms`；4K60 10-bit HEVC 本地源 60fps；8MB/s 限速 + 180ms 抖动源 `dropped=0`；插帧 + Anime4K 93–121fps |
-| 首页 CPU | 修复封面预热无限 `onerror` 循环：renderer 100% → 0%，I/O 写从约 12 MB/s 回落到 0 |
+| 首页 CPU | 修复封面预热无限 `onerror` 循环：renderer 100% → 0.1%，整机不再被一个核心拖住 |
 | 4K60 CPU | 本地 4K60、无插帧/增强：60fps、`dropped=0`；播放器约 66% 单核 + ffmpeg 约 115% 单核，整机约 1.8 核 |
 | 播放器 UI | chrome 隐藏 10Hz、交互/菜单 60–120Hz；空闲 UI 绘制占用从每 8.3ms 一次降到每 100ms 一次 |
 | A/V 追赶 | `O11A1_QA_DECODE_DELAY_MS=50` 把 30fps 源限制到 20fps：`pos_ms == audio_ms`，`av_gap` 峰值约 0.5–0.6s，每约 2s 一次视频单独 seek，落地后画面与音频差 10–40ms；正常 1080P30（插帧开 / 关）`av_gap` 0–52ms、无追赶；900ms/帧时先暂停音频，帧回来后 1.5s 内跳帧追上 |
