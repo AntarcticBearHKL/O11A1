@@ -577,6 +577,7 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             // Start from the file: a native player may have saved loop_mode
             // since the sidecar last read settings into memory.
             let mut current = settings::load();
+            let was_random = current.playlist_random;
             let mut base = serde_json::to_value(&current).map_err(e)?;
             if let (Some(target), Some(patch)) = (base.as_object_mut(), params.as_object()) {
                 for (key, value) in patch {
@@ -588,6 +589,28 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                 params.get("interp_hz").is_some() || params.get("interp_mode").is_some();
             let enhance_changed = params.get("player_enhance").is_some();
             current = serde_json::from_value(base).map_err(e)?;
+            // Keep the pre-picked next row valid after any queue/current edit:
+            // sequential always targets the next row, random keeps a valid
+            // pre-pick so the prefetcher can protect that exact cache. Turning
+            // random on drops the old sequential pick and rolls a fresh one.
+            let random_turned_on = !was_random && current.playlist_random;
+            let stored_next = params
+                .get("playlist_next")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if random_turned_on {
+                        String::new()
+                    } else {
+                        current.playlist_next.clone()
+                    }
+                });
+            current.playlist_next = settings::normalise_playlist_next(
+                &current.playlist,
+                current.playlist_current,
+                current.playlist_random,
+                &stored_next,
+            );
             settings::save(&current).map_err(e)?;
             *app.settings.lock().await = current.clone();
             if interp_changed {

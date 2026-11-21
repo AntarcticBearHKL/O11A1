@@ -456,17 +456,26 @@ async function advanceNativePlaylist(record, loopMode) {
     if (current < 0 || !playlist[current] || String(playlist[current].bvid) !== bvid) {
       current = playlist.findIndex((item) => item && String(item.bvid) === bvid);
     }
-    const next = current >= 0 ? playlist[current + 1] : null;
+    // The next row was chosen ahead of time (`playlist_next`: sequential next
+    // or the pre-picked random row). Fall back to the old sequential lookup
+    // for a settings file written before that field existed.
+    let nextIndex = String(settings.playlist_next || '')
+      ? playlist.findIndex((item) => item && String(item.bvid) === String(settings.playlist_next))
+      : -1;
+    if (nextIndex < 0 && current >= 0) nextIndex = current + 1;
+    const next = nextIndex >= 0 ? playlist[nextIndex] : null;
     if (current >= 0) {
       // The finished row leaves the queue before the next one starts; the
-      // following row slides into `current`, which is also where the current
-      // marker has to point for the next player.
+      // surviving rows shift, so the next index has to shift with them.
       playlist.splice(current, 1);
+      if (nextIndex > current) nextIndex -= 1;
       record.queueRetired = true;
       await engineCall('settings.patch', {
         playlist,
         playlist_current:
-          next && next.bvid && !quitting && current < playlist.length ? current : null,
+          next && next.bvid && !quitting && nextIndex >= 0 && nextIndex < playlist.length
+            ? nextIndex
+            : null,
       }, 15000).catch(() => {});
     }
     await engineCall('player.close', { playerId: record.playerId }).catch(() => {});

@@ -20,7 +20,7 @@ use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Client, Response};
@@ -64,6 +64,15 @@ const PLAYHEAD_WINDOW: usize = 128;
 /// Bump when the completed-chunk journal changes meaning. Old partial caches
 /// have no version line and are restarted instead of being trusted.
 const STATE_VERSION: &str = "v2";
+/// Completed or interrupted media is kept this long after its last download
+/// activity unless a player, worker, or reservation still holds it.
+pub const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+/// The janitor checks once a minute; the TTL itself is far longer.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Give the first player enough time to pin its current source (and reserve
+/// the next queue row) before the first sweep. Otherwise a warm cache opened
+/// right after launch could be deleted before the player reaches it.
+const INITIAL_SWEEP_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
      AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
@@ -98,6 +107,9 @@ pub struct CachedMedia {
     pub total: u64,
     chunk: u64,
     file: File,
+    /// Range workers still attached to this media. The janitor never removes a
+    /// file while a worker can still write it.
+    workers: std::sync::atomic::AtomicUsize,
     state: Mutex<MediaState>,
     ready: Condvar,
     stop: AtomicBool,
@@ -121,6 +133,222 @@ static PREPARE_LOCK: Mutex<()> = Mutex::new(());
 /// Bytes pulled from the CDN by every cache worker in this process. The
 /// player HUD samples this instead of the decoder process's loopback reads.
 static NETWORK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cache ids currently held by a player window or a prefetch reservation.
+/// Keyed by the hashed media id that also names the files on disk.
+static PINS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn pins() -> &'static Mutex<HashMap<String, usize>> {
+    PINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keeps one cache representation alive while a player session or reservation
+/// exists. Dropping it makes the cache eligible for the 15-minute sweep.
+pub struct CachePin {
+    id: String,
+}
+
+impl Drop for CachePin {
+    fn drop(&mut self) {
+        let Ok(mut pins) = pins().lock() else {
+            return;
+        };
+        if let Some(count) = pins.get_mut(&self.id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pins.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// Pin a cache key (the representation identifier, not the on-disk hash).
+pub fn pin_key(key: &str) -> CachePin {
+    let id = media_id(key);
+    if let Ok(mut pins) = pins().lock() {
+        *pins.entry(id.clone()).or_insert(0) += 1;
+    }
+    CachePin { id }
+}
+
+/// Pin the video or audio representation of one resolved source.
+pub fn pin_source(source: &crate::source::MediaSource, audio: bool) -> Option<CachePin> {
+    crate::source::media_cache_key(source, audio).map(|key| pin_key(&key))
+}
+
+fn is_pinned(id: &str) -> bool {
+    pins()
+        .lock()
+        .map(|pins| pins.get(id).copied().unwrap_or(0) > 0)
+        .unwrap_or(true)
+}
+
+/// Start the background TTL sweeper once for this process. It removes caches
+/// whose last download activity is older than [`CACHE_TTL`] and that no player,
+/// worker, or reservation is using.
+pub fn start_janitor() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("media-cache-janitor".into())
+        .spawn(|| {
+            std::thread::sleep(INITIAL_SWEEP_DELAY);
+            loop {
+                let removed = sweep_expired(SystemTime::now(), CACHE_TTL);
+                if removed > 0 {
+                    log::line(&format!("media cache sweep removed={removed}"));
+                }
+                std::thread::sleep(SWEEP_INTERVAL);
+            }
+        });
+}
+
+/// Run one sweep immediately (QA and manual diagnostics).
+pub fn sweep_now() -> usize {
+    sweep_expired(SystemTime::now(), CACHE_TTL)
+}
+
+/// Remove expired, unused cache entries. Returns the number of media entries
+/// deleted. Exposed for tests and for the janitor.
+fn sweep_expired(now: SystemTime, ttl: Duration) -> usize {
+    let Ok(dir) = cache_dir() else {
+        return 0;
+    };
+    sweep_directory(&dir, now, ttl, &|id| {
+        if is_pinned(id) {
+            return false;
+        }
+        drop_registry_if_idle(id)
+    })
+}
+
+/// Drop this process's registry handle when nobody else holds the media.
+/// Returns true when the id is free and its file may be unlinked.
+fn drop_registry_if_idle(id: &str) -> bool {
+    let Ok(mut map) = registry().lock() else {
+        return false;
+    };
+    let Some(media) = map.get(id) else {
+        return true;
+    };
+    if media.workers.load(Ordering::SeqCst) > 0 || Arc::strong_count(media) > 1 {
+        return false;
+    }
+    map.remove(id);
+    true
+}
+
+fn newest_mtime(paths: &[&std::path::Path]) -> Option<SystemTime> {
+    paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok()?.modified().ok())
+        .max()
+}
+
+fn expired(now: SystemTime, last: SystemTime, ttl: Duration) -> bool {
+    now.duration_since(last)
+        .map(|age| age >= ttl)
+        .unwrap_or(false)
+}
+
+/// True when another process still has the file open. Asking for zero sharing
+/// fails against any live reader/writer, including an older O11A1 process that
+/// does not know about this process's in-memory pins.
+#[cfg(windows)]
+fn file_is_open_elsewhere(path: &std::path::Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => {
+            drop(file);
+            false
+        }
+        // Sharing violation is the expected "in use" answer. Treat any error
+        // as busy: leaking one cache is safer than unlinking live media.
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn file_is_open_elsewhere(_path: &std::path::Path) -> bool {
+    false
+}
+
+/// Pure directory sweep used by [`sweep_expired`] and the tests. `release`
+/// returns false when the id is in use and true once any registry handle has
+/// been dropped.
+fn sweep_directory(
+    dir: &std::path::Path,
+    now: SystemTime,
+    ttl: Duration,
+    release: &dyn Fn(&str) -> bool,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut media: Vec<(String, PathBuf)> = Vec::new();
+    let mut sidecars: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("media") => media.push((stem.to_string(), path)),
+            Some("ok") | Some("state") => sidecars.push((stem.to_string(), path)),
+            _ => {}
+        }
+    }
+
+    let mut removed = 0usize;
+    for (id, path) in media {
+        let ok = dir.join(format!("{id}.ok"));
+        let state = dir.join(format!("{id}.state"));
+        let Some(last) = newest_mtime(&[&path, &ok, &state]) else {
+            continue;
+        };
+        if !expired(now, last, ttl) || !release(&id) {
+            continue;
+        }
+        if file_is_open_elsewhere(&path) {
+            log::line(&format!("media cache sweep busy id={id}"));
+            continue;
+        }
+        let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(&ok);
+            let _ = std::fs::remove_file(&state);
+            removed += 1;
+            log::line(&format!(
+                "media cache sweep removed id={id} bytes={bytes} age_s={}",
+                now.duration_since(last).map(|age| age.as_secs()).unwrap_or(0)
+            ));
+        }
+    }
+
+    // A crash between writing `.ok` and creating `.media` (or a manual delete)
+    // can leave a sidecar; remove it after the same grace period.
+    for (id, path) in sidecars {
+        if dir.join(format!("{id}.media")).exists() {
+            continue;
+        }
+        let Some(last) = newest_mtime(&[&path]) else {
+            continue;
+        };
+        if !expired(now, last, ttl) || !release(&id) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            log::line(&format!("media cache sweep removed orphan id={id}"));
+        }
+    }
+    removed
+}
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<CachedMedia>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -496,6 +724,7 @@ fn prepare_workers(
                     total,
                     chunk: CHUNK_BYTES,
                     file,
+                    workers: std::sync::atomic::AtomicUsize::new(0),
                     state: Mutex::new(MediaState {
                         chunks: vec![ChunkState::Done; chunks_for(total)],
                         failed: false,
@@ -588,6 +817,7 @@ fn prepare_workers(
         total,
         chunk: CHUNK_BYTES,
         file,
+        workers: std::sync::atomic::AtomicUsize::new(0),
         state: Mutex::new(MediaState {
             chunks: chunk_states,
             failed: false,
@@ -625,13 +855,17 @@ fn prepare_workers(
         "media cache start id={id} bytes={total} chunks={chunks} workers={workers} resumed={resumed_chunks}"
     ));
     for _ in 0..workers {
-        let media = media.clone();
+        let worker_media = media.clone();
         let url = url.to_string();
         let headers = header_map.clone();
         let client = client.clone();
-        let _ = std::thread::Builder::new()
+        media.workers.fetch_add(1, Ordering::SeqCst);
+        let spawned = std::thread::Builder::new()
             .name("media-cache-worker".into())
-            .spawn(move || download_worker(media, client, url, headers));
+            .spawn(move || download_worker(worker_media, client, url, headers));
+        if spawned.is_err() {
+            media.workers.fetch_sub(1, Ordering::SeqCst);
+        }
     }
     Some(media)
 }
@@ -692,6 +926,13 @@ fn content_range_total(text: &str) -> Option<u64> {
 }
 
 fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers: HeaderMap) {
+    struct WorkerGuard(Arc<CachedMedia>);
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            self.0.workers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let _guard = WorkerGuard(media.clone());
     // Cache prefetch is background work. Below-normal priority keeps the
     // decoder, the pipe reader and the engine responsive while a 4K file is
     // filling in; the download still uses every idle cycle.
@@ -1344,6 +1585,57 @@ mod tests {
         assert_eq!(contiguous_lead(&chunks, 10, 40, 5), 15);
         assert_eq!(contiguous_lead(&chunks, 10, 40, 20), 0);
         assert_eq!(contiguous_lead(&chunks, 10, 40, 40), 0);
+    }
+
+    #[test]
+    fn ttl_sweep_removes_only_expired_free_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "o11a1-sweep-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ["a", "b"] {
+            std::fs::write(dir.join(format!("{id}.media")), vec![0u8; 1024]).unwrap();
+            std::fs::write(dir.join(format!("{id}.ok")), "1024").unwrap();
+        }
+        let now = SystemTime::now() + Duration::from_secs(16 * 60);
+        let removed = sweep_directory(&dir, now, CACHE_TTL, &|id| id != "b");
+        assert_eq!(removed, 1);
+        assert!(!dir.join("a.media").exists());
+        assert!(!dir.join("a.ok").exists());
+        assert!(dir.join("b.media").exists());
+        assert!(dir.join("b.ok").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ttl_sweep_keeps_fresh_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "o11a1-sweep-fresh-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.media"), vec![0u8; 1024]).unwrap();
+        std::fs::write(dir.join("a.ok"), "1024").unwrap();
+        let removed = sweep_directory(&dir, SystemTime::now(), CACHE_TTL, &|_| true);
+        assert_eq!(removed, 0);
+        assert!(dir.join("a.media").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_pin_counts_and_releases_by_id() {
+        let key = format!("BV-sweep-pin-{}", std::process::id());
+        let id = media_id(&key);
+        let first = pin_key(&key);
+        let second = pin_key(&key);
+        assert!(is_pinned(&id));
+        drop(first);
+        assert!(is_pinned(&id));
+        drop(second);
+        assert!(!is_pinned(&id));
     }
 
     #[test]

@@ -91,6 +91,13 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.13 视频缓存 15 分钟 TTL 管理**：
+  - `cache/media` 现在有每 **60 秒**运行一次的后台 janitor（首次启动延迟 30 秒，给当前视频和下一个队列项留出加 pin 的时间）。缓存按**最后下载活动时间**计算：完成缓存的 `.ok` mtime、未完成缓存的 `.state` mtime（兜底 `.media`），超过 **15 分钟**且没有被使用就删除。
+  - 「正在使用」有三层保护：当前播放器的视频/音频 cache pin（暂停、缓冲、结束但窗口未关都保持）；下载 worker 计数；进程内 registry 还有其它 `Arc` 持有者。删除前先移除空闲 registry 条目释放文件句柄。
+  - 跨进程保护：删除前用 `share_mode(0)` 探测文件；0.9.7 等旧进程仍打开的缓存会返回 busy，下一轮再试，不会把正在播放的文件删掉。
+  - 队列预取从「当前之后的全部条目」收紧为**只预取下一项**；解析后先向主线程发送视频/音频 cache key 加 reservation pin，再等当前缓存完成并下载，所以下一项即使当前视频看很久也不会被 TTL 清掉。
+  - 随机播放改为**提前随机好**：`settings.playlist_next` 保存下一项的 bvid（顺序模式是下一行，随机模式是预先抽中的行）。播放器、Electron 推进、队列预取都读同一个值；切换随机开关会清掉旧的顺序选择并重新抽，当前项变化后也会重抽。队列编辑时会自动校正。
+  - 实测：旧假缓存被删除；当前视频/音频缓存 mtime 回拨 20 分钟后 sweep 仍保留；下一个队列项缓存 mtime 回拨 20 分钟后被 reservation 保留；被另一个进程以读句柄打开的文件 sweep 返回 busy；随机模式下预取目标为预选中的第三项而不是顺序第二项。native_player 97 个测试、core 268 个测试通过。
 - **0.9.12 滚轮音量条玻璃胶囊背景**：
   - 滚轮调节音量时的竖条从 14px 加宽到 **26px**，整条就是一个玻璃胶囊，不再另加外层卡片，蓝色进度填满胶囊宽度。
   - 胶囊底色跟随主题：浅色模式是暖白半透明纸面，深色模式是深色玻璃；透明度让**视频画面透出来**，和视频上的悬浮控件一样有视频背景感。
@@ -170,7 +177,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.12.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.9.13.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。

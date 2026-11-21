@@ -47,6 +47,9 @@ export interface Settings {
   net_threads: number;
   playlist: any[];
   playlist_current: number | null;
+  /// Pre-chosen next queue row (sequential next or the random pick) so the
+  /// player can prefetch and protect its cache before the current ends.
+  playlist_next: string;
   play_mode: number;
   playlist_autoplay: boolean;
   playlist_random: boolean;

@@ -658,6 +658,21 @@ struct Engine {
     /// The queue prefetcher runs once per player window; it waits for the
     /// active entry's own cache and then fills the following entries.
     playlist_prefetch_started: bool,
+    /// Cache pins for the current video/audio. Held from `open_sessions` to
+    /// `stop_sessions`, so a playing or paused window cannot have its cache
+    /// swept by the 15-minute TTL.
+    current_video_pin: Option<crate::mediacache::CachePin>,
+    current_audio_pin: Option<crate::mediacache::CachePin>,
+    /// The bvid chosen for the next queue slot (`settings.playlist_next`),
+    /// and the exact cache representations reserved for it. The reservation
+    /// keeps the prefetched next item alive even if the current video runs
+    /// much longer than the cache TTL.
+    queue_next_target: Option<String>,
+    queue_next_pins: Vec<crate::mediacache::CachePin>,
+    /// Worker -> engine handoff with the cache keys the next-item prefetcher
+    /// resolved, so pins exist before its download starts.
+    queue_prefetch_rx: Option<Receiver<Vec<String>>>,
+    last_queue_next_check: Instant,
     /// Page index whose media is already being warmed for the auto "next
     /// part" transition. Prevents starting a second resolver/worker pool for
     /// the same page while the current video is in its last ten seconds.
@@ -818,6 +833,30 @@ fn buffer_is_low(queue_len: usize, no_picture_ms: u64) -> bool {
         || (queue_len <= BUFFER_LOW_FRAMES && no_picture_ms >= BUFFER_LOW_MS)
 }
 
+/// The queue row after `current` that the prefetcher should warm. It follows
+/// the pre-chosen `playlist_next` (sequential next or the random pick) and
+/// falls back to the physical next row for an older settings file.
+fn queue_next_target(settings: &o11a1::settings::Settings, current: &str) -> Option<String> {
+    let index = settings
+        .playlist
+        .iter()
+        .position(|entry| entry.bvid == current)?;
+    let chosen = if settings.playlist_random {
+        settings.playlist_next.trim()
+    } else {
+        ""
+    };
+    let target = if !chosen.is_empty() && chosen != current {
+        settings
+            .playlist
+            .iter()
+            .find(|entry| entry.bvid == chosen)
+    } else {
+        settings.playlist.get(index + 1)
+    }?;
+    (target.bvid != current && !target.bvid.trim().is_empty()).then(|| target.bvid.clone())
+}
+
 /// The auto "next part" transition gets a head start when the current part is
 /// in its last ten seconds. Single/V loop modes and the final part do not.
 fn next_page_prefetch_due(
@@ -873,6 +912,8 @@ enum QaKind {
     /// QA only: set a mid-level volume and keep the wheel OSD up long enough
     /// for a screenshot.
     Volume,
+    /// QA only: run one cache TTL sweep immediately.
+    CacheSweep,
     Fullscreen,
     Danmaku,
     DanmakuOff,
@@ -1300,6 +1341,12 @@ impl Engine {
             info_scroll_height: -1.0,
             info_scroll_width: 0.0,
             playlist_prefetch_started: false,
+            current_video_pin: None,
+            current_audio_pin: None,
+            queue_next_target: None,
+            queue_next_pins: Vec::new(),
+            queue_prefetch_rx: None,
+            last_queue_next_check: Instant::now(),
             next_page_prefetch: None,
             danmaku_popup: false,
             dm_input: String::new(),
@@ -1586,7 +1633,15 @@ impl Engine {
         }
     }
 
-    fn start_playlist_prefetch(&mut self) {        log::line(&format!(
+    fn reset_queue_prefetch(&mut self) {
+        self.queue_next_pins.clear();
+        self.queue_next_target = None;
+        self.playlist_prefetch_started = false;
+        self.queue_prefetch_rx = None;
+    }
+
+    fn start_playlist_prefetch(&mut self) {
+        log::line(&format!(
             "playlist prefetch check started={} live={} bvid={:?}",
             u8::from(self.playlist_prefetch_started),
             u8::from(self.is_live),
@@ -1613,23 +1668,28 @@ impl Engine {
             log::line("playlist prefetch skipped: current not in queue");
             return;
         };
-        let entries: Vec<(String, u64)> = settings
+        // Only the pre-chosen next row is prefetched. In random mode this is
+        // the row picked ahead of time, not a fresh roll at the end.
+        let Some(target_bvid) = queue_next_target(&settings, &current) else {
+            log::line("playlist prefetch skipped: no next item");
+            return;
+        };
+        let Some(target) = settings
             .playlist
             .iter()
-            .skip(index + 1)
-            .filter(|entry| !entry.bvid.trim().is_empty())
-            .map(|entry| (entry.bvid.clone(), entry.cid))
-            .collect();
-        if entries.is_empty() {
-            log::line("playlist prefetch skipped: no entries after current");
+            .find(|entry| entry.bvid == target_bvid)
+        else {
+            log::line("playlist prefetch skipped: next row disappeared");
             return;
-        }
+        };
+        let target_cid = target.cid;
         log::line(&format!(
-            "playlist prefetch queued current_index={} entries={}",
-            index,
-            entries.len()
+            "playlist prefetch queued current_index={} next_bvid={target_bvid} next_cid={target_cid}",
+            index
         ));
         self.playlist_prefetch_started = true;
+        self.queue_next_target = Some(target_bvid.clone());
+        self.queue_next_pins.clear();
         let quality_height = settings.player_quality_height;
         let codec = if settings.codec_pref > 0 {
             Some(settings.codec_pref as i64)
@@ -1638,52 +1698,141 @@ impl Engine {
         };
         let active_video = crate::source::media_cache_key(&self.source, false);
         let active_audio = crate::source::media_cache_key(&self.source, true);
+        let (pin_tx, pin_rx) = std::sync::mpsc::channel();
+        self.queue_prefetch_rx = Some(pin_rx);
         let _ = std::thread::Builder::new()
             .name("playlist-prefetch".into())
             .spawn(move || {
-                if let Some(key) = active_video {
-                    crate::mediacache::wait_for_key(&key);
-                }
-                if let Some(key) = active_audio {
-                    crate::mediacache::wait_for_key(&key);
-                }
-                log::line("playlist prefetch active-cache ready");
-                for (bvid, cid) in entries {
-                    log::line(&format!("playlist prefetch resolve start bvid={bvid} cid={cid}"));
-                    let config = PlayerConfig {
-                        bvid: Some(bvid.clone()),
-                        cid: (cid > 0).then_some(cid),
-                        quality_height: Some(quality_height),
-                        quality_codecid: codec,
-                        ..Default::default()
-                    };
-                    match crate::source::resolve(&config) {
-                        Ok(resolved) => {
-                            let ok = crate::mediacache::prefetch_source(&resolved.source);
-                            log::line(&format!(
-                                "playlist prefetch bvid={bvid} cid={cid} ok={}",
-                                u8::from(ok)
-                            ));
+                // Resolve first so the exact cache keys can be reserved before
+                // the TTL janitor's first sweep. The download itself still
+                // waits for the active video/audio cache, so it cannot steal
+                // bandwidth from the picture.
+                log::line(&format!(
+                    "playlist prefetch resolve start bvid={target_bvid} cid={target_cid}"
+                ));
+                let config = PlayerConfig {
+                    bvid: Some(target_bvid.clone()),
+                    cid: (target_cid > 0).then_some(target_cid),
+                    quality_height: Some(quality_height),
+                    quality_codecid: codec,
+                    ..Default::default()
+                };
+                match crate::source::resolve(&config) {
+                    Ok(resolved) => {
+                        let keys: Vec<String> = [
+                            crate::source::media_cache_key(&resolved.source, false),
+                            crate::source::media_cache_key(&resolved.source, true),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        let _ = pin_tx.send(keys);
+                        if let Some(key) = active_video {
+                            crate::mediacache::wait_for_key(&key);
                         }
-                        Err(error) => log::line(&format!(
-                            "playlist prefetch resolve failed bvid={bvid} err={error:#}"
-                        )),
+                        if let Some(key) = active_audio {
+                            crate::mediacache::wait_for_key(&key);
+                        }
+                        log::line("playlist prefetch active-cache ready");
+                        let ok = crate::mediacache::prefetch_source(&resolved.source);
+                        log::line(&format!(
+                            "playlist prefetch bvid={target_bvid} cid={target_cid} ok={}",
+                            u8::from(ok)
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = pin_tx.send(Vec::new());
+                        log::line(&format!(
+                            "playlist prefetch resolve failed bvid={target_bvid} err={error:#}"
+                        ));
                     }
                 }
             });
     }
 
+    /// Poll the prefetch worker for the next item's exact cache keys and pin
+    /// them. The pins live until the target changes or the window closes.
+    fn poll_queue_prefetch_pins(&mut self) {
+        let received = self
+            .queue_prefetch_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        let Some(keys) = received else {
+            return;
+        };
+        self.queue_prefetch_rx = None;
+        self.queue_next_pins = keys
+            .iter()
+            .map(|key| crate::mediacache::pin_key(key))
+            .collect();
+        log::line(&format!(
+            "playlist prefetch protected keys={} bvid={:?}",
+            self.queue_next_pins.len(),
+            self.queue_next_target
+        ));
+    }
+
+    /// Re-evaluate the pre-chosen next row periodically. A queue edit, random
+    /// toggle, or manual row click can change it without touching the current
+    /// source, and the reservation must follow the new next item.
+    fn tick_queue_next(&mut self) {
+        if self.last_queue_next_check.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_queue_next_check = Instant::now();
+        self.poll_queue_prefetch_pins();
+        if self.is_live {
+            return;
+        }
+        let Some(current) = self
+            .source
+            .bvid
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+        let settings = o11a1::settings::load();
+        let desired = queue_next_target(&settings, &current);
+        if desired == self.queue_next_target {
+            return;
+        }
+        // No next row (or the current row left the queue): release the old
+        // reservation immediately instead of keeping an unused cache alive.
+        if desired.is_none() && self.queue_next_target.is_none() {
+            return;
+        }
+        self.queue_next_pins.clear();
+        self.queue_next_target = None;
+        self.playlist_prefetch_started = false;
+        self.queue_prefetch_rx = None;
+        self.start_playlist_prefetch();
+    }
+
     fn open_sessions(&mut self, start_ms: u64, gate_open: bool) -> Result<()> {
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        let decoder = VideoDecoder::spawn(
+        // Pin both representations before the decoder/audio spawn starts its
+        // cache preparation, so the TTL janitor cannot delete a cache between
+        // prepare and the first read.
+        self.current_video_pin = crate::mediacache::pin_source(&self.source, false);
+        self.current_audio_pin = crate::mediacache::pin_source(&self.source, true);
+        let decoder = match VideoDecoder::spawn(
             &self.video_spec(),
             start_ms,
             generation,
             gate_open,
             &self.gpu,
         )
-        .with_context(|| format!("open video decoder at {start_ms} ms"))?;
+        .with_context(|| format!("open video decoder at {start_ms} ms"))
+        {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                self.current_video_pin = None;
+                self.current_audio_pin = None;
+                return Err(error);
+            }
+        };
         self.decoder = Some(decoder);
 
         // Above 2× the sound is unintelligible and its reader becomes the
@@ -1704,6 +1853,11 @@ impl Engine {
     }
 
     fn stop_sessions(&mut self) {
+        // Closing/switching/quality change releases the current cache pins;
+        // the janitor will remove them after the 15-minute TTL if nobody else
+        // holds them.
+        self.current_video_pin = None;
+        self.current_audio_pin = None;
         self.stall_audio_paused = false;
         self.stall_pause = None;
         self.video_lag_since = None;
@@ -4618,6 +4772,7 @@ impl Engine {
                 Err(TryRecvError::Disconnected) => {}
             }
             self.tick_player_state();
+            self.tick_queue_next();
             self.tick_volume_wheel();
             self.tick_heartbeat();
             self.tick_sleep();
@@ -7459,8 +7614,10 @@ impl Engine {
     /// window keeps its size, position and chrome; only the media source and
     /// everything tied to it (session, info, pages, danmaku, heartbeat) change.
     fn begin_source_replace(&mut self, config: crate::PlayerConfig) {
-        // The old video is about to be replaced; store its position first.
+        // The old video is about to be replaced; store its position first and
+        // drop the old next-item reservation before the new source pins itself.
         self.record_watch_progress();
+        self.reset_queue_prefetch();
         if self.source_pending {
             // A newer click arrived while the previous source is resolving;
             // run it as soon as that answer lands (last click wins).
@@ -9499,6 +9656,10 @@ impl Engine {
                         Some(Instant::now() + Duration::from_secs(6));
                     self.ui_dirty = true;
                 }
+                QaKind::CacheSweep => {
+                    let removed = crate::mediacache::sweep_now();
+                    log::line(&format!("qa cache sweep removed={removed}"));
+                }
                 QaKind::Fullscreen => self.toggle_fullscreen(),
                 QaKind::Danmaku => {
                     log::line("qa danmaku on");
@@ -10136,6 +10297,7 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
             "stats" => QaKind::Stats,
             "mute" => QaKind::Mute,
             "volume" | "vol" => QaKind::Volume,
+            "cache_sweep" | "cachesweep" | "sweep" => QaKind::CacheSweep,
             "fullscreen" | "fs" => QaKind::Fullscreen,
             "danmaku" | "dm" => QaKind::Danmaku,
             "danmakuoff" | "dmoff" => QaKind::DanmakuOff,
@@ -10298,6 +10460,31 @@ mod tests {
         // Reversing direction responds on the first notch instead of eating
         // the leftover of the previous direction.
         assert_eq!(wheel_volume_step(&mut accum, &mut direction, -120), -5);
+    }
+
+    #[test]
+    fn queue_next_target_prefers_the_prechosen_random_row() {
+        let entry = |bvid: &str| o11a1::settings::QueueEntry {
+            bvid: bvid.to_string(),
+            ..Default::default()
+        };
+        let mut settings = o11a1::settings::Settings::default();
+        settings.playlist = vec![entry("BV1"), entry("BV2"), entry("BV3")];
+        settings.playlist_current = Some(0);
+        settings.playlist_random = true;
+        settings.playlist_next = "BV3".to_string();
+        assert_eq!(queue_next_target(&settings, "BV1").as_deref(), Some("BV3"));
+        // A stale empty pick falls back to the physical next row.
+        settings.playlist_next.clear();
+        assert_eq!(queue_next_target(&settings, "BV1").as_deref(), Some("BV2"));
+        // Sequential mode uses the next row even if an old random pick exists.
+        settings.playlist_random = false;
+        settings.playlist_next = "BV3".to_string();
+        assert_eq!(queue_next_target(&settings, "BV1").as_deref(), Some("BV2"));
+        // Current is not in the queue; there is nothing to prefetch.
+        assert_eq!(queue_next_target(&settings, "BV9"), None);
+        // The tail has no sequential next row.
+        assert_eq!(queue_next_target(&settings, "BV3"), None);
     }
 
     #[test]

@@ -549,9 +549,16 @@ export default function PlayerApp() {
     const playlist = settings?.playlist || [];
     if (!playlist.length) return;
     const current = settings?.playlist_current ?? -1;
-    const next = settings?.playlist_random
-      ? Math.floor(Math.random() * playlist.length)
-      : (current + 1) % playlist.length;
+    // Prefer the row chosen ahead of time. In random mode that is the
+    // pre-picked row whose cache is already protected; only fall back to a
+    // fresh random roll for a settings file without the field.
+    const chosen = playlist.findIndex((item: any) => item?.bvid === settings?.playlist_next);
+    const pool = playlist.map((_: any, index: number) => index).filter((index: number) => index !== current);
+    const next = chosen >= 0
+      ? chosen
+      : settings?.playlist_random && pool.length
+        ? pool[Math.floor(Math.random() * pool.length)]
+        : (current + 1) % playlist.length;
     playPlaylistIndex(next);
   };
 

@@ -179,6 +179,10 @@ impl Player {
     /// up, so a slow `video_view`/`playurl` round-trip no longer delays the
     /// window appearing.
     pub fn open(config: PlayerConfig) -> Result<Self> {
+        // One janitor per process: it sweeps expired, unused media cache files
+        // every minute (first pass immediately, so an old cache does not wait
+        // for the first tick).
+        crate::mediacache::start_janitor();
         let state = PlayerState::load();
         log::line(&format!(
             "player state file={} volume={} muted={} speed={:.2} aspect={} brightness={:.2} audio_only={} ontop={} danmaku={} qn={:?} codecid={:?} audio_index={:?}",

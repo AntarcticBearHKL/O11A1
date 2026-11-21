@@ -261,6 +261,12 @@ pub struct Settings {
     /// 与 [`normalise_playlist_state`] 一起校正，永远落在 `playlist` 范围内。
     #[serde(default)]
     pub playlist_current: Option<usize>,
+    /// The bvid that will play after `playlist_current`, chosen in advance.
+    /// Sequential mode stores the next row; 随机播放 stores the pre-picked
+    /// row so the prefetcher protects the exact cache that will be used.
+    /// Empty means there is no next item.
+    #[serde(default)]
+    pub playlist_next: String,
     /// f249: legacy 循环模式 (0 手动 / 1 自动 / 2 随机). Read only so an old
     /// `settings.json` can be migrated to the two switches below; never
     /// written again. See [`migrate_playlist_mode`].
@@ -1314,6 +1320,54 @@ pub fn normalise_playlist_state(
     (kept.into_iter().map(|(_, entry)| entry).collect(), current)
 }
 
+/// Pick the item that follows `current` and persist that decision.
+///
+/// Sequential playback always targets the next row. 随机播放 keeps a valid
+/// pre-picked bvid instead of rolling again at the end, so the queue prefetcher
+/// can protect that exact cache; only a missing/stale choice (or one that just
+/// became current) is rolled again.
+pub fn normalise_playlist_next(
+    playlist: &[QueueEntry],
+    current: Option<usize>,
+    random: bool,
+    stored: &str,
+) -> String {
+    let Some(index) = current.filter(|index| *index < playlist.len()) else {
+        return String::new();
+    };
+    let current_bvid = playlist[index].bvid.as_str();
+    if !random {
+        return playlist
+            .get(index + 1)
+            .map(|entry| entry.bvid.clone())
+            .unwrap_or_default();
+    }
+    if !stored.is_empty()
+        && stored != current_bvid
+        && playlist.iter().any(|entry| entry.bvid == stored)
+    {
+        return stored.to_string();
+    }
+    if playlist.len() <= 1 {
+        return String::new();
+    }
+    // No `rand` dependency: a time-seeded xorshift over the remaining rows is
+    // enough for a queue choice and keeps the helper pure/serialisable.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut seed = nanos ^ (index as u64).rotate_left(17) ^ playlist.len() as u64;
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    let mut pick = (seed % (playlist.len() as u64 - 1)) as usize;
+    if pick >= index {
+        pick += 1;
+    }
+    playlist[pick].bvid.clone()
+}
+
 /// Normalise the count of warmed seek positions.
 ///
 /// The value arrives both from JSON (a hand-edited or older file can hold
@@ -1470,6 +1524,7 @@ impl Default for Settings {
             net_threads: default_net_threads(),
             playlist: Vec::new(),
             playlist_current: None,
+            playlist_next: String::new(),
             play_mode: default_play_mode(),
             playlist_autoplay: default_playlist_autoplay(),
             playlist_random: default_playlist_random(),
@@ -1551,6 +1606,13 @@ pub fn load() -> Settings {
     let loop_mode = resolve_loop_mode(settings.loop_mode, settings.loop_one);
     let (playlist, playlist_current) =
         normalise_playlist_state(settings.playlist, settings.playlist_current);
+    let playlist_random = playlist_migration.map_or(settings.playlist_random, |(_, random)| random);
+    let playlist_next = normalise_playlist_next(
+        &playlist,
+        playlist_current,
+        playlist_random,
+        &settings.playlist_next,
+    );
     let loaded = Settings {
         danmaku_opacity: settings.danmaku_opacity.min(100),
         danmaku_font: normalise_danmaku_font(settings.danmaku_font),
@@ -1606,10 +1668,11 @@ pub fn load() -> Settings {
         net_threads: normalise_net_threads(settings.net_threads),
         playlist,
         playlist_current,
+        playlist_next,
         play_mode: normalise_play_mode(settings.play_mode),
         playlist_autoplay: playlist_migration
             .map_or(settings.playlist_autoplay, |(autoplay, _)| autoplay),
-        playlist_random: playlist_migration.map_or(settings.playlist_random, |(_, random)| random),
+        playlist_random,
         playlist_mode_rev: PLAYLIST_MODE_REV,
         loop_one: loop_mode == LOOP_ONE,
         loop_mode,
@@ -1687,6 +1750,7 @@ pub fn load() -> Settings {
     if loaded.theme != stored_theme
         || interp_migration.is_some()
         || playlist_migration.is_some()
+        || loaded.playlist_next != settings.playlist_next
         || removed_interp_120
         || settings.player_enhance != loaded.player_enhance
         || font_migration
@@ -2434,6 +2498,39 @@ mod tests {
         assert_eq!(current, Some(0));
         let (_, none) = normalise_playlist_state(vec![queued("BV1")], None);
         assert_eq!(none, None);
+    }
+
+    #[test]
+    fn playlist_next_follows_the_sequential_row() {
+        let list = vec![queued("BV1"), queued("BV2"), queued("BV3")];
+        assert_eq!(
+            normalise_playlist_next(&list, Some(0), false, ""),
+            "BV2"
+        );
+        assert_eq!(
+            normalise_playlist_next(&list, Some(2), false, "BV1"),
+            ""
+        );
+        assert_eq!(normalise_playlist_next(&list, None, false, ""), "");
+    }
+
+    #[test]
+    fn playlist_next_keeps_a_valid_random_pick_and_rerolls_current() {
+        let list = vec![queued("BV1"), queued("BV2"), queued("BV3")];
+        // A pre-picked row is stable across ticks.
+        assert_eq!(
+            normalise_playlist_next(&list, Some(0), true, "BV3"),
+            "BV3"
+        );
+        // The current row cannot also be the next row; a new one is chosen.
+        let rerolled = normalise_playlist_next(&list, Some(0), true, "BV1");
+        assert_ne!(rerolled, "BV1");
+        assert!(list.iter().any(|entry| entry.bvid == rerolled));
+        // Turning random off falls back to the sequential row.
+        assert_eq!(
+            normalise_playlist_next(&list, Some(0), false, "BV3"),
+            "BV2"
+        );
     }
 
     #[test]
