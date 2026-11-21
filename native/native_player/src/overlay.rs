@@ -2125,7 +2125,10 @@ impl Overlay {
                 );
             }
 
-            if !model.mini && !model.fullscreen {
+            // The close button is part of the auto-hiding chrome: it appears
+            // and disappears with the bottom toolbar instead of staying on
+            // the picture.
+            if !model.mini && !model.fullscreen && model.chrome_shown {
                 self.draw_top_strip(model, &layout);
             }
             if model.sidebar_open && !model.mini {

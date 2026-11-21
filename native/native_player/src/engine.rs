@@ -947,6 +947,8 @@ enum QaKind {
     DmHistoryDate,
     DmHistoryClose,
     Chrome,
+    /// QA only: hide the toolbar + close button for a screenshot.
+    ChromeHide,
     CommentsTime,
     Like,
     Coin,
@@ -6749,7 +6751,7 @@ impl Engine {
             return;
         }
         if !self.fullscreen {
-            if layout.top_close.contains(px, py) {
+            if self.chrome_shown && layout.top_close.contains(px, py) {
                 log::line("window close button");
                 window::close_window(self.hwnd);
                 return;
@@ -9913,6 +9915,12 @@ impl Engine {
                     self.last_mouse_activity = Instant::now();
                     self.ui_dirty = true;
                 }
+                QaKind::ChromeHide => {
+                    log::line("qa chrome hidden");
+                    self.chrome_shown = false;
+                    self.pointer = None;
+                    self.ui_dirty = true;
+                }
                 QaKind::CommentsTime => {
                     log::line("qa comments time");
                     self.set_comments_sort(false);
@@ -10331,6 +10339,7 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
             "dm_history_date" | "dmhistorydate" => QaKind::DmHistoryDate,
             "dm_history_close" | "dmhistoryclose" => QaKind::DmHistoryClose,
             "chrome" => QaKind::Chrome,
+            "chrome_hide" | "chromehide" | "nochrome" => QaKind::ChromeHide,
             "comments_time" | "commentstime" => QaKind::CommentsTime,
             "like" => QaKind::Like,
             "coin" => QaKind::Coin,
