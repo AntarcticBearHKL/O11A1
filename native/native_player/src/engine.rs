@@ -78,6 +78,26 @@ const AV_DRIFT_MS: u64 = 200;
 /// A picture may trail the device clock by this much before the engine treats
 /// it as a desync instead of normal decode jitter.
 const AV_VIDEO_LAG_MS: u64 = 250;
+/// The picture must be this far behind before the buffer guard freezes the
+/// sound. Waiting for an empty (zero-frame) ring already costs ~200 ms of
+/// audio lead; two frames is the last point before the sound runs away.
+const BUFFER_LOW_FRAMES: usize = 2;
+/// Resume only when the decoder has rebuilt a real lead. A single frame is
+/// not enough to survive the next cache chunk; eight frames is ~130 ms at
+/// 60 fps and hides the 100 ms waveOut pause/resume quantisation.
+const BUFFER_RESUME_FRAMES: usize = 8;
+/// No new picture for this long with a nearly empty ring means the reader is
+/// waiting on the network, not that the GPU hit a one-frame hitch.
+const BUFFER_LOW_MS: u64 = 400;
+/// While buffer-paused, wait until this much contiguous video is on disk.
+/// Resuming as soon as the ring refills makes a link that is slower than the
+/// bitrate pause and resume every few hundred milliseconds; a real lead turns
+/// that into a few seconds of smooth playback between waits.
+const BUFFER_LEAD_MS: u64 = 2_500;
+/// Never hold the sound longer than this for a cache lead. The loopback server
+/// proxies a stuck chunk after a few seconds, so the ring can be full while the
+/// chunk is still not marked done.
+const BUFFER_WAIT_MAX_MS: u64 = 8_000;
 /// How long the picture may sit past `AV_VIDEO_LAG_MS` while frames are still
 /// arriving before the engine drops the gap. A single GPU/engine hitch must
 /// not cost a seek; a decoder that cannot keep up must.
@@ -421,10 +441,6 @@ struct Engine {
     audio_master: bool,
     last_drift_log: Option<Instant>,
     last_stall_log: Option<Instant>,
-    /// Last automatic recovery of a wedged playback clock. The watchdog must
-    /// never seek more often than this: a genuinely broken decoder should be
-    /// reported once, not turned into a seek loop.
-    last_stall_restart: Option<Instant>,
     /// Last hard A/V resync; throttled so a slow decoder cannot thrash seeks.
     last_av_resync: Option<Instant>,
     /// The picture first went (and stayed) more than `AV_VIDEO_LAG_MS`
@@ -741,6 +757,10 @@ struct VideoResync {
 /// pause starts a grace period for the decoder to reach the frozen clock.
 struct StallPause {
     first_frame_at: Option<Instant>,
+    /// When the pause started. A buffer wait on a cache chunk that never
+    /// completes must not hold the sound forever; the proxy path can still
+    /// feed the ring after the cache gave up.
+    since: Instant,
 }
 
 /// A picture that stays more than `AV_VIDEO_LAG_MS` behind the sound while
@@ -755,6 +775,14 @@ fn picture_lag_requires_catch_up(
     frames_flowing
         && lag_ms > AV_VIDEO_LAG_MS
         && held_for >= Duration::from_millis(AV_VIDEO_LAG_HOLD_MS)
+}
+
+/// Buffer guard threshold. An empty ring for 200 ms is already a starved
+/// reader; two frames may sit for 400 ms while the presenter still has
+/// something to show. Anything deeper is jitter, not a stall.
+fn buffer_is_low(queue_len: usize, no_picture_ms: u64) -> bool {
+    (queue_len == 0 && no_picture_ms >= 200)
+        || (queue_len <= BUFFER_LOW_FRAMES && no_picture_ms >= BUFFER_LOW_MS)
 }
 
 struct MiniSaved {
@@ -1110,7 +1138,6 @@ impl Engine {
             audio_master: false,
             last_drift_log: None,
             last_stall_log: None,
-            last_stall_restart: None,
             last_av_resync: None,
             video_lag_since: None,
             video_resync: None,
@@ -4782,85 +4809,21 @@ impl Engine {
         }
     }
 
-    /// Last-resort recovery for a wedged session.
-    ///
-    /// The decoder can keep a full ring while the presentation clock stops
-    /// moving (a paused waveOut clock, a lost device position, or a stale A/V
-    /// resume). The normal stall guard only covers an *empty* ring, so that
-    /// state used to sit on the buffering card forever even though decoding was
-    /// healthy. A restart at the current position rebuilds both the video and
-    /// audio sessions; it is rate-limited so a genuinely broken source reports
-    /// an error instead of turning into a seek loop.
-    fn recover_wedged_clock(&mut self, position: u64, queue_len: usize, queue_closed: bool) -> bool {
-        if !self.playing
-            || self.starting
-            || self.seek_in_flight
-            || self.video_resync.is_some()
-            || self.ab_swap_wait.is_some()
-            || self.interacting
-            || self.is_live
-            || self.ended
-        {
-            return false;
+    /// Contiguous cached video ahead of the current position, in milliseconds.
+    /// `None` when the source is not cached or the range is served through the
+    /// CDN proxy, where the local lead is meaningless.
+    fn cache_lead_ms(&self) -> Option<u64> {
+        if !self.source.remote || self.source.video_bitrate == 0 {
+            return None;
         }
-        if queue_closed {
-            return false;
+        let key = crate::source::media_cache_key(&self.source, false)?;
+        let bytes_per_ms = self.source.video_bitrate as u128 / 8_000;
+        if bytes_per_ms == 0 {
+            return None;
         }
-        let no_picture_for = self
-            .last_source_present
-            .map(|at| at.elapsed())
-            .unwrap_or_default();
-        // Empty ring is normally the network/buffer path, which the normal
-        // stall guard owns. On a local source it can only be a stuck decoder or
-        // a stopped clock, so allow the recovery there as well.
-        let local_dry_stall = !self.source.remote && self.stalled && no_picture_for >= Duration::from_secs(8);
-        if queue_len == 0 && !local_dry_stall {
-            return false;
-        }
-        let Some(last_present) = self.last_source_present else {
-            return false;
-        };
-        if last_present.elapsed() < Duration::from_secs(5) {
-            return false;
-        }
-        if self
-            .last_stall_restart
-            .map(|at| at.elapsed() < Duration::from_secs(8))
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        let front_ts = self
-            .decoder
-            .as_ref()
-            .and_then(|decoder| decoder.queue.front_ts());
-        let audio_ms = self
-            .audio
-            .as_ref()
-            .map(|audio| audio.clock.position_ms.load(Ordering::SeqCst))
-            .unwrap_or(0);
-        let audio_playing = self
-            .audio
-            .as_ref()
-            .map(|audio| audio.clock.playing.load(Ordering::SeqCst))
-            .unwrap_or(false);
-        let starved = self
-            .audio
-            .as_ref()
-            .map(|audio| audio.clock.starved_ms.load(Ordering::SeqCst))
-            .unwrap_or(0);
-        log::line(&format!(
-            "playback watchdog restart position_ms={position} queue={queue_len} front_ts={front_ts:?} last_frame_ts={} audio_ms={audio_ms} audio_playing={} starved_ms={starved} stalled={}",
-            self.last_frame_ts,
-            u8::from(audio_playing),
-            u8::from(self.stalled)
-        ));
-        self.last_stall_restart = Some(Instant::now());
-        if let Err(error) = self.restart_at(position) {
-            log::line(&format!("playback watchdog restart failed: {error:#}"));
-            self.report_error("播放时钟卡死，自动恢复失败，请点击重试");
-        }
-        true
+        let offset = (self.position_ms as u128 * bytes_per_ms) as u64;
+        let lead = crate::mediacache::lead_bytes(&key, offset)?;
+        Some((lead as u128 / bytes_per_ms) as u64)
     }
 
     /// Take decoded frames due on the current presentation clock and present
@@ -5064,25 +5027,31 @@ impl Engine {
         let at_end = queue_closed_now
             && queue_len_now == 0
             && (self.duration_ms == 0 || position + 800 >= self.duration_ms);
-        if self.recover_wedged_clock(position, queue_len_now, queue_closed_now) {
-            return;
-        }
         // Decoder/reader dry: stop the device clock and show the buffer card
         // instead of letting audio run away from a frozen picture. This is the
         // lip-sync guard for a network slower than the video bitrate.
+        //
+        // The old guard waited for `queue == 0`, by which point the presenter
+        // had already consumed the last ~200 ms of pictures and the sound was
+        // up to a second ahead. It then needed a video catch-up seek, which
+        // dropped content and repeated at every cache boundary. Pausing at two
+        // frames keeps the audio lead inside one waveOut quantum, so the two
+        // clocks can resume together at the same position.
+        let no_picture_for = self
+            .last_source_present
+            .map(|at| at.elapsed())
+            .unwrap_or_default();
+        let buffer_low = buffer_is_low(queue_len_now, no_picture_for.as_millis() as u64);
         if self.audio_position().is_some()
             && !self.audio_only
             && !at_end
-            && queue_len_now == 0
-            && self
-                .last_source_present
-                .map(|at| at.elapsed() >= Duration::from_millis(650))
-                .unwrap_or(false)
+            && buffer_low
             && !self.stall_audio_paused
         {
             self.stall_audio_paused = true;
             self.stall_pause = Some(StallPause {
                 first_frame_at: None,
+                since: Instant::now(),
             });
             self.stalled = true;
             self.ui_dirty = true;
@@ -5090,11 +5059,13 @@ impl Engine {
                 audio.send(AudioCommand::Pause);
             }
             log::line(&format!(
-                "buffer pause video-dry position_ms={position} audio_ms={}",
+                "buffer pause video-low position_ms={position} queue={queue_len_now} no_picture_ms={} audio_ms={} lead_ms={:?}",
+                no_picture_for.as_millis(),
                 self.audio
                     .as_ref()
                     .map(|audio| audio.clock.position_ms.load(Ordering::SeqCst))
-                    .unwrap_or(0)
+                    .unwrap_or(0),
+                self.cache_lead_ms()
             ));
         }
 
@@ -5151,9 +5122,19 @@ impl Engine {
         if self.interacting {
             self.video_lag_since = None;
         } else if self.stall_audio_paused {
-            if lag <= AV_VIDEO_LAG_MS {
+            let queue_ready = queue_len >= BUFFER_RESUME_FRAMES;
+            let lead_ready = self
+                .cache_lead_ms()
+                .map(|lead| lead >= BUFFER_LEAD_MS)
+                .unwrap_or(true);
+            let waited_out = self
+                .stall_pause
+                .as_ref()
+                .map(|pause| pause.since.elapsed() >= Duration::from_millis(BUFFER_WAIT_MAX_MS))
+                .unwrap_or(true);
+            if queue_ready && (lead_ready || waited_out) && lag <= AV_VIDEO_LAG_MS {
                 self.resume_audio_with_picture(position);
-            } else {
+            } else if queue_ready && (lead_ready || waited_out) {
                 // The decoder is alive again but cannot reach the frozen
                 // clock (hardware decode below real time). Give it a short
                 // grace to skip the backlog, then jump the picture there
@@ -5174,6 +5155,9 @@ impl Engine {
                     return;
                 }
             }
+            // Queue still refilling: stay paused. A network stall is not a
+            // reason to seek; seeking here would skip content and land on the
+            // same missing chunk again.
         } else if self.playing
             && !self.audio_only
             && self.audio_position().is_some()
@@ -9966,6 +9950,15 @@ mod tests {
             true,
             Duration::from_millis(AV_VIDEO_LAG_HOLD_MS)
         ));
+    }
+
+    #[test]
+    fn buffer_guard_needs_a_real_dry_ring() {
+        assert!(!buffer_is_low(0, 150));
+        assert!(buffer_is_low(0, 200));
+        assert!(!buffer_is_low(2, 399));
+        assert!(buffer_is_low(2, 400));
+        assert!(!buffer_is_low(3, 5_000));
     }
 
     #[test]

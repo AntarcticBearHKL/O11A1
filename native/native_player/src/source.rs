@@ -362,7 +362,12 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
                 unsupported_codec_summary(&info)
             );
         }
-        let requested_codec = config.quality_codecid.unwrap_or(7);
+        // `0` means automatic: pick the most efficient codec the GPU can
+        // decode at the chosen resolution. Defaulting to AVC made a 4K stream
+        // 22.4 Mbit/s when the HEVC representation of the same 4K picture is
+        // 10.3 Mbit/s and AV1 is 9.8 Mbit/s. At 4K that difference is the
+        // difference between a cache that keeps up and one that does not.
+        let requested_codec = config.quality_codecid.unwrap_or(0);
         let track = if let Some(height) = config.quality_height {
             preferred_height_track(&tracks, height, requested_codec)
         } else {
@@ -520,32 +525,51 @@ fn preferred_height_track<'a>(
     if tracks.is_empty() {
         return None;
     }
-    let key = |track: &&&o11a1::bilibili::VideoTrack| {
-        (
-            track.height,
-            u8::from(track.codecid == codec),
-            track.bandwidth,
-        )
+    // `0` means the highest resolution the GPU accepted. Otherwise take the
+    // highest row at or below the requested height, and fall back to the
+    // smallest row when the request is below every stream.
+    let chosen_height = if height == 0 {
+        tracks.iter().map(|track| track.height).max()?
+    } else {
+        tracks
+            .iter()
+            .filter(|track| track.height <= height)
+            .map(|track| track.height)
+            .max()
+            .or_else(|| tracks.iter().map(|track| track.height).min())?
     };
-    if height == 0 {
-        return tracks.iter().max_by_key(key).copied();
+    let at_height = tracks.iter().filter(|track| track.height == chosen_height);
+    if codec != 0 {
+        if let Some(track) = at_height
+            .clone()
+            .filter(|track| track.codecid == codec)
+            .max_by_key(|track| track.bandwidth)
+        {
+            return Some(*track);
+        }
+        // The requested codec is not available at this height; use the
+        // automatic choice rather than dropping to a lower resolution.
     }
-    tracks
-        .iter()
-        .filter(|track| track.height <= height)
-        .max_by_key(key)
+    at_height
+        .min_by_key(|track| (auto_codec_rank(track.codecid), track.bandwidth))
         .copied()
-        .or_else(|| {
-            tracks
-                .iter()
-                .min_by_key(|track| (track.height, track.bandwidth))
-                .copied()
-        })
+}
+
+/// HEVC first, then AV1, then AVC. All three are hardware-decoded here; HEVC
+/// is the most mature D3D11VA path and its 4K representation is about half
+/// the AVC bitrate.
+fn auto_codec_rank(codecid: i64) -> u8 {
+    match codecid {
+        12 => 0, // HEVC
+        13 => 1, // AV1
+        7 => 2,  // AVC
+        _ => 3,
+    }
 }
 
 /// The `PlayInfo::video_track_for` policy restricted to the streams this GPU
-/// accepted: an explicit codec wins, otherwise the smallest stream at that
-/// quality (fewer stalls at the same resolution).
+/// accepted: an explicit codec wins, otherwise the most efficient codec at
+/// that quality (fewer stalls at the same picture).
 fn track_for_qn<'a>(
     tracks: &[&'a o11a1::bilibili::VideoTrack],
     qn: i64,
@@ -563,7 +587,7 @@ fn track_for_qn<'a>(
     tracks
         .iter()
         .filter(|track| track.id == qn)
-        .min_by_key(|track| track.bandwidth)
+        .min_by_key(|track| (auto_codec_rank(track.codecid), track.bandwidth))
         .copied()
 }
 

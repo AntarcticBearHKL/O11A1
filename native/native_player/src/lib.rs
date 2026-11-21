@@ -105,7 +105,8 @@ pub struct PlayerConfig {
     /// the standalone player window with its native UI.
     pub host: Option<PlayerHost>,
     /// Video codec preference for the initial open (`7` AVC, `12` HEVC,
-    /// `13` AV1, `0` automatic). Defaults to AVC.
+    /// `13` AV1, `0` automatic). Automatic picks the most efficient hardware
+    /// codec at the selected resolution; HEVC is preferred, then AV1, then AVC.
     pub quality_codecid: Option<i64>,
     /// Initial DASH audio track index; `None` picks the best non-VIP stream.
     pub audio_index: Option<usize>,

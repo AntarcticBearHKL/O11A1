@@ -20,12 +20,12 @@ use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, CONTENT_RANGE, RANGE,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, CONTENT_RANGE, RANGE,
 };
 use reqwest::StatusCode;
 
@@ -42,6 +42,22 @@ const MIN_CACHE_BYTES: u64 = 512 * 1024;
 /// can lower this, never raise it.
 const MAX_WORKERS: usize = 8;
 const READ_CHUNK: usize = 256 * 1024;
+/// A reader waits at most this long for one cache chunk before it asks the
+/// loopback server to fetch that range straight from the CDN. A worker stuck
+/// on a throttled connection must never freeze the picture for its full
+/// 45-second HTTP timeout.
+const READY_TIMEOUT: Duration = Duration::from_secs(4);
+/// Give a range several chances before declaring that one chunk unavailable.
+/// Other workers keep filling the rest of the file; one bad range no longer
+/// stops the whole download.
+const CHUNK_ATTEMPTS: u32 = 6;
+/// Workers prefer chunks within this many chunks ahead of the last read.
+/// Far-away chunks would only grow the file behind the playhead while the
+/// decoder waits for the next few hundred kilobytes.
+const CURSOR_WINDOW: usize = 64;
+/// Bump when the completed-chunk journal changes meaning. Old partial caches
+/// have no version line and are restarted instead of being trusted.
+const STATE_VERSION: &str = "v2";
 const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
      AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
@@ -50,6 +66,9 @@ enum ChunkState {
     Pending,
     Active,
     Done,
+    /// Repeated range attempts failed. Readers fetch this range through the
+    /// CDN proxy; the rest of the cache stays usable and keeps downloading.
+    Failed,
 }
 
 struct MediaState {
@@ -60,6 +79,9 @@ struct MediaState {
     /// A reader asked for this chunk; workers pick it before the next
     /// sequential chunk so seeking feels immediate.
     priority: Option<usize>,
+    /// Last chunk a reader needed. Workers fill forward from here rather than
+    /// from byte zero, so a seek starts downloading where the picture is.
+    cursor: usize,
 }
 
 pub struct CachedMedia {
@@ -70,6 +92,10 @@ pub struct CachedMedia {
     state: Mutex<MediaState>,
     ready: Condvar,
     stop: AtomicBool,
+    /// Append-only completion journal. Rewriting the whole `11k`-line list
+    /// after every 512 KB chunk was O(n²) disk work and serialized readers
+    /// behind the state lock; appending one index is constant work.
+    journal: Mutex<Option<File>>,
     /// The original CDN resource. If a cache chunk cannot be fetched (a CDN
     /// reset, a throttled range, a stale signed URL after a long pause), the
     /// loopback server proxies the missing range directly instead of killing
@@ -122,20 +148,68 @@ fn state_for(dir: &std::path::Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.state"))
 }
 
-fn write_state_file(id: &str, total: u64, chunks: &[ChunkState]) {
-    let Ok(dir) = cache_dir() else {
-        return;
+/// Open the append-only journal. `fresh` truncates an old file and writes the
+/// version header; otherwise the existing header is kept and new indices are
+/// appended. One short write per finished chunk replaces rewriting the whole
+/// list, and a crash loses at most the chunks still in flight.
+fn open_journal(dir: &std::path::Path, id: &str, total: u64, fresh: bool) -> Option<File> {
+    let path = state_for(dir, id);
+    let opened = if fresh {
+        File::create(&path)
+    } else {
+        OpenOptions::new().append(true).open(&path)
     };
-    let Ok(mut file) = File::create(state_for(&dir, id)) else {
-        return;
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) => {
+            log::line(&format!(
+                "media cache journal open failed id={id} path={} err={error}",
+                path.display()
+            ));
+            return None;
+        }
     };
-    let _ = writeln!(file, "{total}");
-    let _ = writeln!(file, "{CHUNK_BYTES}");
-    for (index, chunk) in chunks.iter().enumerate() {
-        if *chunk == ChunkState::Done {
-            let _ = writeln!(file, "{index}");
+    if file.metadata().map(|meta| meta.len()).unwrap_or(0) == 0 {
+        let header = format!("{STATE_VERSION}\n{total}\n{CHUNK_BYTES}\n");
+        if let Err(error) = file.write_all(header.as_bytes()) {
+            log::line(&format!(
+                "media cache journal header failed id={id} err={error}"
+            ));
+            return None;
         }
     }
+    log::line(&format!(
+        "media cache journal ready id={id} fresh={fresh} path={} bytes={}",
+        path.display(),
+        file.metadata().map(|meta| meta.len()).unwrap_or(0)
+    ));
+    Some(file)
+}
+
+fn read_resume_state(path: &std::path::Path, total_hint: Option<u64>) -> Option<(u64, Vec<usize>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != STATE_VERSION {
+        return None;
+    }
+    let total = lines.next()?.trim().parse::<u64>().ok()?;
+    if total_hint.is_some_and(|hint| hint != total) {
+        return None;
+    }
+    if lines.next()?.trim().parse::<u64>().ok()? != CHUNK_BYTES {
+        return None;
+    }
+    let count = chunks_for(total);
+    let mut done: Vec<usize> = lines
+        .filter_map(|line| line.trim().parse::<usize>().ok())
+        .filter(|index| *index < count)
+        .collect();
+    // A journal can contain the same index more than once if a process died
+    // after marking a chunk done but before its state was compacted. Dedupe
+    // so `resumed_chunks` and the progress math stay truthful.
+    done.sort_unstable();
+    done.dedup();
+    Some((total, done))
 }
 
 /// Return a loopback URL that ffmpeg can read, starting the parallel download
@@ -181,6 +255,50 @@ pub fn progress(key: &str) -> Option<(u64, u64)> {
         }
     }
     Some((done, media.total))
+}
+
+/// Contiguous bytes ready from `offset` forward. A hole stops the count: data
+/// beyond a missing chunk cannot be played without a seek, even if it is on
+/// disk. The engine uses this to wait for a real cache lead instead of
+/// resuming on the first eight decoded frames and stalling again immediately.
+pub fn lead_bytes(key: &str, offset: u64) -> Option<u64> {
+    let id = media_id(key);
+    let media = registry().lock().ok().and_then(|map| map.get(&id).cloned())?;
+    let state = media.state.lock().ok()?;
+    let start = (offset / media.chunk) as usize;
+    if state.chunks.get(start) == Some(&ChunkState::Failed) {
+        // The reader will proxy this range; there is no local lead to wait
+        // for, but playback can still continue at network speed.
+        return None;
+    }
+    Some(contiguous_lead(
+        &state.chunks,
+        media.chunk,
+        media.total,
+        offset,
+    ))
+}
+
+fn contiguous_lead(chunks: &[ChunkState], chunk: u64, total: u64, offset: u64) -> u64 {
+    if offset >= total {
+        return 0;
+    }
+    let start = (offset / chunk) as usize;
+    let mut bytes = 0u64;
+    for (index, state) in chunks.iter().enumerate().skip(start) {
+        if *state != ChunkState::Done {
+            break;
+        }
+        let chunk_start = index as u64 * chunk;
+        let chunk_end = (chunk_start + chunk).min(total);
+        let from = if index == start {
+            offset.max(chunk_start)
+        } else {
+            chunk_start
+        };
+        bytes = bytes.saturating_add(chunk_end.saturating_sub(from));
+    }
+    bytes
 }
 
 /// Wait until a cached key is complete (or failed). Used by the playlist
@@ -241,8 +359,10 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
     // ("end of file before message length reached"), which used to abort a
     // whole 4K video. One connection per worker is what download managers do.
     let client = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(10))
+        // One 512 KB range. A stalled CDN connection has to give up quickly:
+        // 300 seconds let a single wedged worker hide the whole read-ahead.
+        .timeout(Duration::from_secs(45))
         .http1_only()
         .build()
         .ok()?;
@@ -264,9 +384,11 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
                         done: true,
                         error: None,
                         priority: None,
+                        cursor: 0,
                     }),
                     ready: Condvar::new(),
                     stop: AtomicBool::new(false),
+                    journal: Mutex::new(None),
                     url: url.to_string(),
                     headers: header_map.clone(),
                     client: client.clone(),
@@ -279,36 +401,27 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
         }
     }
 
-    // Resume an interrupted parallel download. The `.state` file is a total
-    // line followed by one completed chunk index per line. A chunk is only
-    // listed after its whole range reached the sparse file, so a crash can
-    // lose at most the chunks that were in flight.
+    // Resume an interrupted parallel download. The `.state` journal is a
+    // version line, the total, the chunk size, then one completed index per
+    // line. A chunk is only appended after its whole range reached the
+    // sparse file, so a crash can lose at most the chunks that were in flight.
     let mut resume: Option<(u64, Vec<usize>)> = None;
     if let Ok(text) = std::fs::read_to_string(&state_path) {
-        let mut lines = text.lines();
-        if let Some(total) = lines.next().and_then(|line| line.trim().parse::<u64>().ok()) {
-            let state_chunk = lines.next().and_then(|line| line.trim().parse::<u64>().ok());
-            if state_chunk == Some(CHUNK_BYTES)
-                && total >= MIN_CACHE_BYTES
-                && file_len(&path) == Some(total)
-            {
-                let count = chunks_for(total);
-                let done: Vec<usize> = lines
-                    .filter_map(|line| line.trim().parse::<usize>().ok())
-                    .filter(|index| *index < count)
-                    .collect();
-                resume = Some((total, done));
+        if let Some(header_total) = text.lines().nth(1).and_then(|line| line.trim().parse::<u64>().ok()) {
+            if file_len(&path) == Some(header_total) && header_total >= MIN_CACHE_BYTES {
+                resume = read_resume_state(&state_path, Some(header_total));
             }
         }
     }
 
-    let (total, done, file) = if let Some((total, done)) = resume {
+    let (total, done, file, journal) = if let Some((total, done)) = resume {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .ok()?;
-        (total, done, file)
+        let journal = open_journal(&dir, &id, total, false)?;
+        (total, done, file, journal)
     } else {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&marker);
@@ -327,11 +440,8 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
         if file.set_len(total).is_err() {
             return None;
         }
-        if let Ok(mut state) = File::create(&state_path) {
-            let _ = writeln!(state, "{total}");
-            let _ = writeln!(state, "{CHUNK_BYTES}");
-        }
-        (total, Vec::new(), file)
+        let journal = open_journal(&dir, &id, total, true)?;
+        (total, Vec::new(), file, journal)
     };
     let chunks = chunks_for(total);
     let mut chunk_states = vec![ChunkState::Pending; chunks];
@@ -363,9 +473,11 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
             done: complete,
             error: None,
             priority: None,
+            cursor: 0,
         }),
         ready: Condvar::new(),
         stop: AtomicBool::new(false),
+        journal: Mutex::new(Some(journal)),
         url: url.to_string(),
         headers: header_map.clone(),
         client: client.clone(),
@@ -383,6 +495,9 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
         .prefetch_connections
         .clamp(1, MAX_WORKERS as u32) as usize;
     let workers = workers.min(chunks).max(1);
+    log::line(&format!(
+        "media cache start id={id} bytes={total} chunks={chunks} workers={workers} resumed={resumed_chunks}"
+    ));
     for _ in 0..workers {
         let media = media.clone();
         let url = url.to_string();
@@ -430,6 +545,11 @@ fn header_map(headers: &[(String, String)]) -> HeaderMap {
             map.insert("user-agent", value);
         }
     }
+    // Range offsets are useless if the response is compressed: the bytes on
+    // the wire would no longer match the media file's offsets.
+    if !map.contains_key(ACCEPT_ENCODING) {
+        map.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    }
     map
 }
 
@@ -464,16 +584,34 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
             let Ok(mut state) = media.state.lock() else {
                 break;
             };
-            if state.failed || state.done {
-                None
-            } else {
-                let priority = state.priority.take();
-                let candidate = priority
+            loop {
+                if state.failed || state.done {
+                    break None;
+                }
+                let candidate = state
+                    .priority
+                    .take()
                     .filter(|index| {
                         *index < state.chunks.len()
                             && state.chunks[*index] == ChunkState::Pending
                     })
                     .or_else(|| {
+                        // Fill forward from the last byte a reader asked for.
+                        // Downloading from byte zero while the picture is at
+                        // minute 15 only grows the wrong end of the file.
+                        let start = state.cursor.min(state.chunks.len());
+                        let end = (start + CURSOR_WINDOW).min(state.chunks.len());
+                        (start..end).find(|index| state.chunks[*index] == ChunkState::Pending)
+                    })
+                    .or_else(|| {
+                        let start = state.cursor.min(state.chunks.len());
+                        (0..start).find(|index| state.chunks[*index] == ChunkState::Pending)
+                    })
+                    .or_else(|| {
+                        // The window around the cursor is already complete
+                        // (a long resume, or the reader is far behind the
+                        // download front). Keep the remaining workers busy
+                        // instead of parking the whole pool.
                         state
                             .chunks
                             .iter()
@@ -482,9 +620,27 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
                 match candidate {
                     Some(index) => {
                         state.chunks[index] = ChunkState::Active;
-                        Some(index)
+                        break Some(index);
                     }
-                    None => None,
+                    None => {
+                        // Nothing pending right now. If another worker is still
+                        // fetching, wait for it instead of retiring this worker
+                        // and leaving the pool empty for the next chunk.
+                        let all_settled = state
+                            .chunks
+                            .iter()
+                            .all(|chunk| matches!(chunk, ChunkState::Done | ChunkState::Failed));
+                        if all_settled {
+                            break None;
+                        }
+                        state = match media
+                            .ready
+                            .wait_timeout(state, Duration::from_millis(250))
+                        {
+                            Ok((next, _)) => next,
+                            Err(_) => break None,
+                        };
+                    }
                 }
             }
         };
@@ -495,10 +651,7 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
         let end = ((index as u64 + 1) * media.chunk - 1).min(media.total - 1);
         let mut last_error = String::new();
         let mut ok = false;
-        // A single flaky CDN connection used to abort the whole video after
-        // three tries. Eight backed-off attempts ride out a reset or a short
-        // CDN hiccup; only a genuinely unavailable range fails the media.
-        for attempt in 0..8 {
+        for attempt in 0..CHUNK_ATTEMPTS {
             match download_range(&media, &client, &url, &headers, start, end) {
                 Ok(()) => {
                     ok = true;
@@ -510,12 +663,12 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
                         "media cache range failed id={} chunk={index} attempt={attempt} err={last_error}",
                         media.id
                     ));
-                    let backoff = (300 * (attempt as u64 + 1)).min(2000);
+                    let backoff = (250 * (attempt as u64 + 1)).min(1_500);
                     std::thread::sleep(Duration::from_millis(backoff));
                 }
             }
         }
-        let done = {
+        let complete = {
             let Ok(mut state) = media.state.lock() else {
                 break;
             };
@@ -524,18 +677,30 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
                 let complete = state.chunks.iter().all(|chunk| *chunk == ChunkState::Done);
                 if complete {
                     state.done = true;
-                } else {
-                    write_state_file(&media.id, media.total, &state.chunks);
                 }
                 complete
             } else {
-                state.failed = true;
-                state.error = Some(last_error);
+                // One un-fetchable range must not stop the other workers or
+                // fail the whole media. Readers proxy this chunk from the CDN
+                // while the rest stays on the fast local path.
+                state.chunks[index] = ChunkState::Failed;
+                log::line(&format!(
+                    "media cache chunk unavailable id={} chunk={index} err={last_error}",
+                    media.id
+                ));
                 false
             }
         };
+        if ok {
+            media.append_done(index);
+        }
         media.ready.notify_all();
-        if done {
+        if complete {
+            // Drop the journal before removing it: Windows refuses to unlink
+            // a file that still has an open write handle.
+            if let Ok(mut journal) = media.journal.lock() {
+                *journal = None;
+            }
             if let Ok(dir) = cache_dir() {
                 let _ = std::fs::write(marker_for(&dir, &media.id), media.total.to_string());
                 let _ = std::fs::remove_file(state_for(&dir, &media.id));
@@ -568,18 +733,37 @@ fn download_range(
         .header(RANGE, format!("bytes={start}-{end}"))
         .send()
         .with_context(|| format!("range {start}-{end} {url}"))?;
-    if response.status() != StatusCode::PARTIAL_CONTENT
-        && response.status() != StatusCode::OK
+    let status = response.status();
+    if status != StatusCode::PARTIAL_CONTENT {
+        // A 200 here means the CDN ignored Range and is sending the file from
+        // byte zero. Writing that body at `start` shifts every byte and is a
+        // direct source of "Invalid data" packets in the hardware decoder.
+        // Accept it only for a request that really asked for the whole file.
+        if status == StatusCode::OK && start == 0 && end + 1 == media.total {
+            // Full-file body, offsets are correct.
+        } else {
+            bail!("http status {status} for range {start}-{end}");
+        }
+    }
+    if let Some(value) = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
     {
-        bail!("http status {}", response.status());
+        let expected = format!("bytes {start}-");
+        if !value.trim().starts_with(&expected) {
+            bail!("content-range mismatch: got {value:?} wanted {expected}...");
+        }
     }
     let mut offset = start;
+    let mut remaining = end - start + 1;
     let mut buffer = vec![0u8; READ_CHUNK];
-    loop {
+    while remaining > 0 {
         if media.stop.load(Ordering::SeqCst) {
             bail!("cancelled");
         }
-        let read = response.read(&mut buffer)?;
+        let want = (remaining as usize).min(buffer.len());
+        let read = response.read(&mut buffer[..want])?;
         if read == 0 {
             break;
         }
@@ -596,12 +780,14 @@ fn download_range(
             written += count;
             offset += count as u64;
         }
-        if offset > end + 1 {
-            bail!("range overflow");
-        }
+        remaining -= read as u64;
     }
-    if offset != end + 1 {
-        bail!("short range body: got {} expected {}", offset - start, end - start + 1);
+    if remaining != 0 {
+        bail!(
+            "short range body: got {} expected {}",
+            end - start + 1 - remaining,
+            end - start + 1
+        );
     }
     Ok(())
 }
@@ -613,6 +799,16 @@ impl CachedMedia {
 
     fn is_complete(&self) -> bool {
         self.state.lock().map(|state| state.done).unwrap_or(false)
+    }
+
+    /// Record one finished chunk. The journal is append-only and is not part
+    /// of the state lock, so a disk hiccup here cannot freeze readers.
+    fn append_done(&self, index: usize) {
+        if let Ok(mut journal) = self.journal.lock() {
+            if let Some(file) = journal.as_mut() {
+                let _ = writeln!(file, "{index}");
+            }
+        }
     }
 
     pub fn wait_complete(&self) -> Result<()> {
@@ -630,6 +826,22 @@ impl CachedMedia {
             if state.done {
                 return Ok(());
             }
+            // A range already marked unavailable is proxied during playback,
+            // but a background prefetch must not wait on it forever.
+            if !state
+                .chunks
+                .iter()
+                .any(|chunk| matches!(chunk, ChunkState::Pending | ChunkState::Active))
+            {
+                return Err(anyhow!(
+                    "media cache incomplete: {} chunks unavailable",
+                    state
+                        .chunks
+                        .iter()
+                        .filter(|chunk| **chunk == ChunkState::Failed)
+                        .count()
+                ));
+            }
             let (next, _) = self
                 .ready
                 .wait_timeout(state, Duration::from_millis(250))
@@ -638,17 +850,28 @@ impl CachedMedia {
         }
     }
 
-    fn wait_ready(&self, offset: u64) -> Result<()> {
+    /// `Ok(true)` means the chunk is on disk. `Ok(false)` means the reader
+    /// should proxy this range: the chunk failed or a worker is taking too
+    /// long. Waiting forever behind one slow HTTP connection was what turned a
+    /// transient CDN hiccup into a multi-second picture freeze.
+    fn wait_ready(&self, offset: u64, timeout: Duration) -> Result<bool> {
         if offset >= self.total {
-            return Ok(());
+            return Ok(true);
         }
         let index = (offset / self.chunk) as usize;
+        let deadline = Instant::now() + timeout;
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("media cache lock poisoned"))?;
-        if index < state.chunks.len() {
+        if index < state.chunks.len()
+            && matches!(state.chunks[index], ChunkState::Pending | ChunkState::Active)
+        {
             state.priority = Some(index);
+            state.cursor = index;
+            // Wake a parked worker now so a seek does not wait for its
+            // 250 ms timeout before the new playhead is fetched.
+            self.ready.notify_all();
         }
         loop {
             if state.failed {
@@ -657,17 +880,19 @@ impl CachedMedia {
                     state.error.clone().unwrap_or_default()
                 ));
             }
-            if state
-                .chunks
-                .get(index)
-                .map(|chunk| *chunk == ChunkState::Done)
-                .unwrap_or(true)
-            {
-                return Ok(());
+            match state.chunks.get(index) {
+                Some(ChunkState::Done) | None => return Ok(true),
+                Some(ChunkState::Failed) => return Ok(false),
+                Some(ChunkState::Pending | ChunkState::Active) => {}
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let wait = (deadline - now).min(Duration::from_millis(100));
             let (next, _) = self
                 .ready
-                .wait_timeout(state, Duration::from_millis(200))
+                .wait_timeout(state, wait)
                 .map_err(|_| anyhow!("media cache wait poisoned"))?;
             state = next;
         }
@@ -792,13 +1017,24 @@ fn serve(mut stream: TcpStream) -> Result<()> {
     let mut offset = start;
     let mut buffer = vec![0u8; READ_CHUNK];
     while offset <= end {
-        if let Err(error) = media.wait_ready(offset) {
-            log::line(&format!(
-                "media cache proxy fallback id={} offset={offset} end={end} err={error:#}",
-                media.id
-            ));
-            media.proxy_body(&mut stream, offset, end)?;
-            return Ok(());
+        match media.wait_ready(offset, READY_TIMEOUT) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::line(&format!(
+                    "media cache proxy fallback id={} offset={offset} end={end} reason=slow",
+                    media.id
+                ));
+                media.proxy_body(&mut stream, offset, end)?;
+                return Ok(());
+            }
+            Err(error) => {
+                log::line(&format!(
+                    "media cache proxy fallback id={} offset={offset} end={end} err={error:#}",
+                    media.id
+                ));
+                media.proxy_body(&mut stream, offset, end)?;
+                return Ok(());
+            }
         }
         // Never read past the chunk just waited for: the sparse file has a
         // hole for every chunk still downloading, and returning those zeros
@@ -812,7 +1048,15 @@ fn serve(mut stream: TcpStream) -> Result<()> {
         let want = (stop - offset).min(buffer.len() as u64) as usize;
         let read = media.file.seek_read(&mut buffer[..want], offset)?;
         if read == 0 {
-            break;
+            // The file is sized to the full media, so a zero read means the
+            // chunk is not really there. Proxy the rest instead of closing the
+            // connection and making ffmpeg treat the stream as ended.
+            log::line(&format!(
+                "media cache short read id={} offset={offset} end={end}",
+                media.id
+            ));
+            media.proxy_body(&mut stream, offset, end)?;
+            return Ok(());
         }
         stream.write_all(&buffer[..read])?;
         offset += read as u64;
@@ -916,6 +1160,46 @@ mod tests {
             Some((990, 999))
         );
         assert_eq!(parse_range("GET /x HTTP/1.1\r\n", total), None);
+    }
+
+    #[test]
+    fn journal_has_a_header_and_resumes() {
+        let dir = std::env::temp_dir().join(format!(
+            "o11a1-journal-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut file = open_journal(&dir, "media", 10 * CHUNK_BYTES, true).unwrap();
+            writeln!(file, "7").unwrap();
+            writeln!(file, "3").unwrap();
+            writeln!(file, "7").unwrap();
+        }
+        let text = std::fs::read_to_string(dir.join("media.state")).unwrap();
+        assert!(
+            text.starts_with("v2\n5242880\n524288\n"),
+            "unexpected journal: {text:?}"
+        );
+        let (total, done) =
+            read_resume_state(&dir.join("media.state"), Some(10 * CHUNK_BYTES)).unwrap();
+        assert_eq!(total, 10 * CHUNK_BYTES);
+        assert_eq!(done, vec![3, 7]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lead_stops_at_the_first_missing_chunk() {
+        let chunks = vec![
+            ChunkState::Done,
+            ChunkState::Done,
+            ChunkState::Pending,
+            ChunkState::Done,
+        ];
+        assert_eq!(contiguous_lead(&chunks, 10, 40, 0), 20);
+        assert_eq!(contiguous_lead(&chunks, 10, 40, 5), 15);
+        assert_eq!(contiguous_lead(&chunks, 10, 40, 20), 0);
+        assert_eq!(contiguous_lead(&chunks, 10, 40, 40), 0);
     }
 
     #[test]

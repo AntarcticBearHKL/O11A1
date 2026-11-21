@@ -49,6 +49,10 @@ use crate::log;
 const AV_NOPTS_VALUE: i64 = i64::MIN;
 const AVERROR_EAGAIN: c_int = -11;
 const AVERROR_EOF: c_int = -541_478_725;
+/// A corrupt packet at a cache seam is recoverable. Only a stream that keeps
+/// failing for this many packets (about 15 seconds at 60 fps) is treated as a
+/// dead decoder, so a single bad access unit can never end the session.
+const MAX_PACKET_ERRORS: u32 = 900;
 const AV_TIME_BASE_Q_DEN: i64 = 1_000;
 
 /// The same `AVD3D11VADeviceContext` FFmpeg's `hwcontext_d3d11va.h` declares.
@@ -247,6 +251,11 @@ struct NativeDecoder {
     fallback_ms: u64,
     eof: bool,
     flushed: bool,
+    /// Consecutive corrupt packets. A damaged access unit is skipped until
+    /// the next keyframe; only a stream that never recovers is fatal.
+    packet_errors: u32,
+    /// The decoder lost reference frames and must wait for a keyframe.
+    need_keyframe: bool,
 }
 
 unsafe impl Send for NativeDecoder {}
@@ -283,6 +292,13 @@ impl NativeDecoder {
             set("rw_timeout", "15000000");
             set("probesize", "1000000");
             set("analyzeduration", "1000000");
+            // The cache is filled while playback runs. A range that arrives
+            // while its neighbours are still on the wire can leave one bad
+            // packet at the seam; the external ffmpeg path already uses this
+            // flag, and without it the hardware decoder exited on the first
+            // bad access unit instead of waiting for the next keyframe.
+            set("fflags", "+discardcorrupt");
+            set("max_error_rate", "1.0");
             let header_text = crate::proc::header_string(headers);
             if !header_text.is_empty() {
                 set("headers", &header_text);
@@ -433,6 +449,10 @@ impl NativeDecoder {
         unsafe {
             (*codec).pkt_timebase = time_base;
             (*codec).get_format = Some(get_format);
+            // A packet that arrives at a cache-chunk seam must be concealed or
+            // skipped, not treated as a fatal decoder error. The external
+            // ffmpeg path runs with the same permissive policy.
+            (*codec).err_recognition = ff::AV_EF_IGNORE_ERR;
             // The decoder's internal pool is static for D3D11VA. A 12-picture
             // presenter ring plus B-frame reordering must never exhaust it.
             (*codec).extra_hw_frames = 24;
@@ -542,6 +562,8 @@ impl NativeDecoder {
             fallback_ms: start_ms,
             eof: false,
             flushed: false,
+            packet_errors: 0,
+            need_keyframe: false,
         };
 
         if start_ms > 0 && !live {
@@ -634,6 +656,8 @@ impl NativeDecoder {
             }
             let received = unsafe { ff::avcodec_receive_frame(self.codec, self.frame) };
             if received == 0 {
+                self.packet_errors = 0;
+                self.need_keyframe = false;
                 let timestamp = self.timestamp_ms(self.frame);
                 let frame = AVFrameRef::clone_from(self.frame)?;
                 unsafe { ff::av_frame_unref(self.frame) };
@@ -646,10 +670,26 @@ impl NativeDecoder {
                 return Ok(None);
             }
             if received != AVERROR_EAGAIN {
-                return Err(anyhow!(
-                    "avcodec_receive_frame failed: {}",
-                    ff_error(received)
-                ));
+                self.packet_errors = self.packet_errors.saturating_add(1);
+                if self.packet_errors <= 3 || self.packet_errors % 60 == 0 {
+                    log::line(&format!(
+                        "zerocopy skipped receive error count={} err={}",
+                        self.packet_errors,
+                        ff_error(received)
+                    ));
+                }
+                if self.packet_errors > MAX_PACKET_ERRORS {
+                    return Err(anyhow!(
+                        "avcodec_receive_frame kept failing: {}",
+                        ff_error(received)
+                    ));
+                }
+                // The decoder lost its reference state. Drop the queued
+                // pictures, wait for the next keyframe, and keep the audio
+                // clock running instead of tearing the whole session down.
+                unsafe { ff::avcodec_flush_buffers(self.codec) };
+                self.need_keyframe = true;
+                continue;
             }
             if self.eof {
                 return Ok(None);
@@ -668,13 +708,34 @@ impl NativeDecoder {
                 unsafe { ff::av_packet_unref(self.packet) };
                 continue;
             }
+            let keyframe = unsafe { (*self.packet).flags & ff::AV_PKT_FLAG_KEY != 0 };
+            if self.need_keyframe && !keyframe {
+                unsafe { ff::av_packet_unref(self.packet) };
+                continue;
+            }
             let sent = unsafe { ff::avcodec_send_packet(self.codec, self.packet) };
             unsafe { ff::av_packet_unref(self.packet) };
             if sent < 0 && sent != AVERROR_EAGAIN {
-                return Err(anyhow!(
-                    "avcodec_send_packet failed: {}",
-                    ff_error(sent)
-                ));
+                self.packet_errors = self.packet_errors.saturating_add(1);
+                if self.packet_errors <= 3 || self.packet_errors % 60 == 0 {
+                    log::line(&format!(
+                        "zerocopy skipped packet error count={} err={}",
+                        self.packet_errors,
+                        ff_error(sent)
+                    ));
+                }
+                if self.packet_errors > MAX_PACKET_ERRORS {
+                    return Err(anyhow!(
+                        "avcodec_send_packet kept failing: {}",
+                        ff_error(sent)
+                    ));
+                }
+                // A single malformed access unit is simply dropped. Only a
+                // run of failures means the reference state is unusable.
+                if self.packet_errors >= 3 {
+                    unsafe { ff::avcodec_flush_buffers(self.codec) };
+                    self.need_keyframe = true;
+                }
             }
         }
     }
