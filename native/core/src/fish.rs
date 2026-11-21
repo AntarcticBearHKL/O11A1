@@ -270,6 +270,9 @@ pub enum FishState {
     /// `deepseek_key` is empty: no network at all until the user adds one.
     NeedsKey,
     Running,
+    /// The queue is empty but auto-fill is on: the worker stays alive and
+    /// waits for the page to feed it the next video.
+    Waiting,
     Paused,
     /// The engine stopped on a fatal problem (e.g. `fish.db` became unwritable).
     Error(String),
@@ -500,6 +503,9 @@ struct EngineConfig {
     instruction: String,
     budget_videos: u32,
     interval_ms: u64,
+    /// Keep the worker alive when the queue empties; the page's auto-filler
+    /// feeds it the next random unwatched video.
+    autofill: bool,
     endpoint: String,
     /// 看片力度 + ASR/视觉参数，passed to `fishwatch` unchanged.
     watch: WatchConfig,
@@ -516,6 +522,7 @@ impl EngineConfig {
             instruction: settings::normalise_fish_instruction(&settings.fish_instruction),
             budget_videos: settings::normalise_fish_budget(settings.fish_budget_videos),
             interval_ms: settings::normalise_fish_interval(settings.fish_interval_ms),
+            autofill: settings.fish_autofill,
             endpoint: endpoint.clone(),
             watch: watch_config_from_settings(settings, &key, &model, &endpoint),
         }
@@ -847,6 +854,8 @@ struct Asked {
     content: String,
     tokens_in: u64,
     tokens_out: u64,
+    /// The raw response body (pretty printed when it is valid JSON).
+    response: String,
 }
 
 /// The 养鱼 engine. Build it once via [`FishEngine::open`] and share the `Arc`.
@@ -1080,9 +1089,31 @@ impl FishEngine {
         }
         let db = self.lock_db()?;
         let row: Option<String> = db
-            .query_row("SELECT bvid FROM watched WHERE bvid = ?1", params![bvid], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT bvid FROM watched WHERE bvid = ?1",
+                params![bvid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some())
+    }
+
+    /// True while the row is anywhere in the queue (pending / running / error).
+    /// Auto-fill uses this together with [`FishEngine::is_watched`] so it never
+    /// feeds a video that is already in the database queue; retrying an error
+    /// stays an explicit action.
+    pub fn is_queued(&self, bvid: &str) -> Result<bool> {
+        let bvid = bvid.trim();
+        if bvid.is_empty() {
+            return Ok(false);
+        }
+        let db = self.lock_db()?;
+        let row: Option<String> = db
+            .query_row(
+                "SELECT bvid FROM queue WHERE bvid = ?1",
+                params![bvid],
+                |row| row.get(0),
+            )
             .optional()?;
         Ok(row.is_some())
     }
@@ -1253,11 +1284,22 @@ impl FishEngine {
         self.publish();
     }
 
-    fn enqueue_inner(&self, items: &[FeedItem], force: bool) -> Result<()> {
+    /// Feed exactly one video (the auto-filler path). Returns false when the
+    /// seven-day dedupe skipped it, so the page can try another candidate.
+    pub fn enqueue_one(&self, item: &FeedItem) -> Result<bool> {
+        let accepted = self.enqueue_inner(std::slice::from_ref(item), false)?;
+        if accepted > 0 {
+            self.publish();
+        }
+        Ok(accepted > 0)
+    }
+
+    fn enqueue_inner(&self, items: &[FeedItem], force: bool) -> Result<usize> {
         let at = now();
         let mut db = self.lock_db()?;
         let tx = db.transaction()?;
         let total = items.len() as i64;
+        let mut accepted = 0usize;
         for (index, item) in items.iter().enumerate() {
             let bvid = item.bvid.trim();
             if bvid.is_empty() {
@@ -1303,7 +1345,7 @@ impl FishEngine {
             // Earlier feed cards get higher priority: the fish walks the feed in
             // the order the user would have scrolled it.
             let priority = total - index as i64;
-            tx.execute(
+            let changed = tx.execute(
                 "INSERT INTO queue (bvid, state, priority, attempts, last_error, updated_at) \
                  VALUES (?1, 'pending', ?2, 0, NULL, ?3) \
                  ON CONFLICT(bvid) DO UPDATE SET \
@@ -1312,9 +1354,12 @@ impl FishEngine {
                  updated_at = excluded.updated_at",
                 params![bvid, priority, at],
             )?;
+            if changed > 0 {
+                accepted += 1;
+            }
         }
         tx.commit()?;
-        Ok(())
+        Ok(accepted)
     }
 
     /// Replace the 鱼主人的指令 and persist it (settings, when this engine owns
@@ -1496,12 +1541,29 @@ impl FishEngine {
                 self.set_state_if_current(generation, FishState::NeedsKey);
                 return;
             }
-            if looked >= config.budget_videos.max(1) {
+            if !config.autofill && looked >= config.budget_videos.max(1) {
                 crate::debug_log(&format!("fish run budget={} reached", looked));
                 self.set_state_if_current(generation, FishState::Idle);
                 return;
             }
             let Some(job) = self.pop_next() else {
+                if config.autofill {
+                    // A continuous run has no budget and no exit on an empty
+                    // queue: the page's auto-filler adds the next unwatched
+                    // video while the worker waits here.
+                    let already_waiting = self
+                        .state
+                        .lock()
+                        .map(|guard| *guard == FishState::Waiting)
+                        .unwrap_or(false);
+                    if !already_waiting {
+                        self.set_state_if_current(generation, FishState::Waiting);
+                    }
+                    if self.sleep_interval(500) {
+                        return;
+                    }
+                    continue;
+                }
                 self.set_state_if_current(generation, FishState::Idle);
                 return;
             };
@@ -1722,8 +1784,12 @@ impl FishEngine {
         self.progress_note("材料已齐 · 正在请求 DeepSeek 判定…");
         let (system, user) = build_prompt(&materials, &config.instruction);
         let model = config.model.trim();
-        let prompt_chars = system.chars().count() + user.chars().count();
-        self.agent_begin_thinking(model, prompt_chars);
+        let request = deepseek_request(model, &system, &user);
+        let request_json = clip(
+            &serde_json::to_string_pretty(&request).unwrap_or_default(),
+            24_000,
+        );
+        self.agent_begin_thinking(model, &system, &user, &request_json);
         let ask_started = Instant::now();
         let asked = runtime().block_on(async {
             let ask = self.ask(config, model, &system, &user);
@@ -1744,6 +1810,7 @@ impl FishEngine {
             asked.tokens_in,
             asked.tokens_out,
             asked.content.chars().count(),
+            &asked.response,
         );
         let parsed = parse_verdict(&asked.content);
         if parsed.verdict == "也许" && parsed.reasons.is_empty() {
@@ -1841,18 +1908,7 @@ impl FishEngine {
         system: &str,
         user: &str,
     ) -> Result<Asked> {
-        let body = serde_json::json!({
-            "model": model,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user },
-            ],
-            "response_format": { "type": "json_object" },
-            "temperature": 0.3,
-            "max_tokens": 800,
-            "thinking": { "type": "disabled" },
-            "stream": false,
-        });
+        let body = deepseek_request(model, system, user);
         let response = self
             .http
             .post(&config.endpoint)
@@ -1883,10 +1939,15 @@ impl FishEngine {
             return Err(anyhow!("DeepSeek 返回了空内容"));
         }
         let usage = parsed.usage.unwrap_or_default();
+        let response = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .unwrap_or_else(|| clip(&text, 24_000));
         Ok(Asked {
             content,
             tokens_in: usage.prompt_tokens,
             tokens_out: usage.completion_tokens,
+            response,
         })
     }
 
@@ -2174,10 +2235,10 @@ impl FishEngine {
         self.publish_throttled();
     }
 
-    fn agent_begin_thinking(&self, model: &str, prompt_chars: usize) {
+    fn agent_begin_thinking(&self, model: &str, system: &str, user: &str, request: &str) {
         if let Ok(mut slot) = self.agent.lock() {
             if let Some(agent) = slot.as_mut() {
-                agent.begin_thinking(model, prompt_chars);
+                agent.begin_thinking(model, system, user, request);
             }
         }
         self.publish();
@@ -2189,10 +2250,11 @@ impl FishEngine {
         tokens_in: u64,
         tokens_out: u64,
         answer_chars: usize,
+        response: &str,
     ) {
         if let Ok(mut slot) = self.agent.lock() {
             if let Some(agent) = slot.as_mut() {
-                agent.finish_thinking(ms, tokens_in, tokens_out, answer_chars);
+                agent.finish_thinking(ms, tokens_in, tokens_out, answer_chars, response);
             }
         }
         self.publish();
@@ -2685,6 +2747,23 @@ fn stub_materials(materials: &mut Materials) {
 // ---------------------------------------------------------------------------
 // Prompt
 // ---------------------------------------------------------------------------
+
+/// The exact OpenAI-compatible body sent to DeepSeek. `ask` posts it and the
+/// transcript prints the same object as the thinking card's request.
+fn deepseek_request(model: &str, system: &str, user: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        "response_format": { "type": "json_object" },
+        "temperature": 0.3,
+        "max_tokens": 800,
+        "thinking": { "type": "disabled" },
+        "stream": false,
+    })
+}
 
 /// Build `(system, user)` for one video. The material sections always appear in
 /// the same order and the 鱼主人的指令 is the last one before the output schema.
@@ -3798,6 +3877,18 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_one_marks_the_row_as_queued() {
+        let path = temp_db("enqueue-one");
+        let engine = FishEngine::open_at(&path).expect("open");
+        let item = feed("BV1ONE", "auto filler");
+        assert!(!engine.is_queued("BV1ONE").expect("check"));
+        assert!(engine.enqueue_one(&item).expect("enqueue"));
+        assert!(engine.is_queued("BV1ONE").expect("check queued"));
+        assert!(!engine.is_watched("BV1ONE").expect("check watched"));
+        cleanup(&path);
+    }
+
+    #[test]
     fn newest_verdict_replaces_the_feed_row_and_history_is_kept() {
         let path = temp_db("supersede");
         let engine = FishEngine::open_at(&path).expect("open");
@@ -4155,6 +4246,8 @@ mod tests {
             total: 3,
             state: "ok",
             detail: "cid=1 · 3:00".to_string(),
+            arguments: "{\"bvid\":\"BV1\"}".to_string(),
+            output: "{\"cid\":1}".to_string(),
             ms: 12,
             bytes: 100,
             tokens: 0,
@@ -4333,6 +4426,7 @@ mod tests {
                 instruction: TEST_INSTRUCTION.to_string(),
                 budget_videos: 10,
                 interval_ms: 20,
+                autofill: false,
                 endpoint: server.endpoint(),
                 watch: WatchConfig::default(),
             },
@@ -4448,6 +4542,7 @@ mod tests {
                 instruction: TEST_INSTRUCTION.to_string(),
                 budget_videos: 5,
                 interval_ms: 10,
+                autofill: false,
                 endpoint: server.endpoint(),
                 watch: WatchConfig::default(),
             },
@@ -4557,6 +4652,7 @@ mod tests {
                 instruction: TEST_INSTRUCTION.to_string(),
                 budget_videos: 1,
                 interval_ms: 10,
+                autofill: false,
                 endpoint: format!("http://127.0.0.1:{port}/chat/completions"),
                 watch: WatchConfig::default(),
             },
@@ -4684,6 +4780,7 @@ mod tests {
                 instruction: settings::default_fish_instruction(),
                 budget_videos: 1,
                 interval_ms: 500,
+                autofill: false,
                 endpoint: DEEPSEEK_URL.to_string(),
                 watch,
             },
@@ -4779,6 +4876,7 @@ mod tests {
                 instruction: settings::default_fish_instruction(),
                 budget_videos: 1,
                 interval_ms: 1_500,
+                autofill: false,
                 endpoint: DEEPSEEK_URL.to_string(),
                 watch: WatchConfig::default(),
             },

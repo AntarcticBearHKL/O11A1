@@ -188,6 +188,12 @@ pub struct StepProgress {
     pub state: &'static str,
     /// User-facing detail for an ok step, or the reason for a skip/failure.
     pub detail: String,
+    /// Tool-call arguments as pretty JSON (`{"bvid":…,"cid":…}`). This is what
+    /// the detailed transcript prints above the result.
+    pub arguments: String,
+    /// Tool result as pretty JSON (what the step actually gathered). Empty
+    /// while the step is running.
+    pub output: String,
     pub ms: u64,
     pub bytes: u64,
     pub tokens: u64,

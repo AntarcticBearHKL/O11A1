@@ -345,6 +345,17 @@ pub struct Settings {
     /// [`normalise_fish_sources`] 去掉未知位，空掩码回落到首页。
     #[serde(default = "default_fish_sources")]
     pub fish_sources: u32,
+    /// 自动填充：开始后队列空了继续等待，由界面从来源随机投喂未看过的
+    /// 视频。默认开启，点「开始 agent」就能一直运作。
+    #[serde(default = "default_true")]
+    pub fish_autofill: bool,
+    /// 自动填充来源：`home` 首页视频流 / `favorites` 收藏夹推荐流。见
+    /// [`normalise_fish_autofill_source`]。
+    #[serde(default = "default_fish_autofill_source")]
+    pub fish_autofill_source: String,
+    /// 收藏夹推荐流使用的收藏夹 id；`0` = 尚未选择。
+    #[serde(default)]
+    pub fish_autofill_folder: i64,
     /// 播放器选用的音频音质档位（Bilibili 的 `audio` id）。`0` = 自动（视频
     /// 提供的最好一档）；其余见 [`AUDIO_QUALITIES`]。见
     /// [`normalise_audio_quality`]。
@@ -579,6 +590,8 @@ pub const FISH_SOURCE_FOLLOW: u32 = 2;
 pub const FISH_SOURCE_FAV: u32 = 4;
 /// 已知喂食来源的全部位。
 pub const FISH_SOURCES_ALL: u32 = FISH_SOURCE_HOME | FISH_SOURCE_FOLLOW | FISH_SOURCE_FAV;
+/// 自动填充来源：首页视频流 / 收藏夹推荐流。
+pub const FISH_AUTOFILL_SOURCES: [&str; 2] = ["home", "favorites"];
 /// 看片力度里的「自定义」档位值；`0..=4` 是 T0–T4。
 pub const FISH_TIER_CUSTOM: u32 = 5;
 /// ASR 引擎的可选值。
@@ -987,6 +1000,11 @@ pub fn default_fish_sources() -> u32 {
     FISH_SOURCE_HOME
 }
 
+/// 自动填充默认从首页视频流挑片。
+pub fn default_fish_autofill_source() -> String {
+    "home".to_string()
+}
+
 fn default_fish_budget_videos() -> u32 {
     40
 }
@@ -1179,6 +1197,16 @@ pub fn normalise_fish_sources(value: u32) -> u32 {
         default_fish_sources()
     } else {
         known
+    }
+}
+
+/// 自动填充来源只接受 `home` / `favorites`，其余值回落到首页视频流。
+pub fn normalise_fish_autofill_source(value: &str) -> String {
+    let trimmed = value.trim();
+    if FISH_AUTOFILL_SOURCES.contains(&trimmed) {
+        trimmed.to_string()
+    } else {
+        default_fish_autofill_source()
     }
 }
 
@@ -1543,6 +1571,9 @@ impl Default for Settings {
             fish_auto_feed: false,
             fish_feed_time: default_fish_feed_time(),
             fish_sources: default_fish_sources(),
+            fish_autofill: true,
+            fish_autofill_source: default_fish_autofill_source(),
+            fish_autofill_folder: 0,
             audio_quality: 0,
             hide_live_tab: default_hide_live_tab(),
             hide_pgc_tab: default_hide_pgc_tab(),
@@ -1695,6 +1726,9 @@ pub fn load() -> Settings {
         fish_auto_feed: settings.fish_auto_feed,
         fish_feed_time: normalise_fish_time(&settings.fish_feed_time),
         fish_sources: normalise_fish_sources(settings.fish_sources),
+        fish_autofill: settings.fish_autofill,
+        fish_autofill_source: normalise_fish_autofill_source(&settings.fish_autofill_source),
+        fish_autofill_folder: settings.fish_autofill_folder.max(0),
         audio_quality: normalise_audio_quality(settings.audio_quality),
         hide_live_tab: normalise_hide_live_tab(settings.hide_live_tab),
         hide_pgc_tab: normalise_hide_pgc_tab(settings.hide_pgc_tab),
@@ -2376,7 +2410,10 @@ mod tests {
 
     #[test]
     fn loop_menu_order_is_loop_continue_part_pause() {
-        assert_eq!(LOOP_MENU_ORDER, [LOOP_ONE, LOOP_NEXT, LOOP_NEXT_PART, LOOP_PAUSE]);
+        assert_eq!(
+            LOOP_MENU_ORDER,
+            [LOOP_ONE, LOOP_NEXT, LOOP_NEXT_PART, LOOP_PAUSE]
+        );
     }
 
     #[test]
@@ -2503,14 +2540,8 @@ mod tests {
     #[test]
     fn playlist_next_follows_the_sequential_row() {
         let list = vec![queued("BV1"), queued("BV2"), queued("BV3")];
-        assert_eq!(
-            normalise_playlist_next(&list, Some(0), false, ""),
-            "BV2"
-        );
-        assert_eq!(
-            normalise_playlist_next(&list, Some(2), false, "BV1"),
-            ""
-        );
+        assert_eq!(normalise_playlist_next(&list, Some(0), false, ""), "BV2");
+        assert_eq!(normalise_playlist_next(&list, Some(2), false, "BV1"), "");
         assert_eq!(normalise_playlist_next(&list, None, false, ""), "");
     }
 
@@ -2518,19 +2549,13 @@ mod tests {
     fn playlist_next_keeps_a_valid_random_pick_and_rerolls_current() {
         let list = vec![queued("BV1"), queued("BV2"), queued("BV3")];
         // A pre-picked row is stable across ticks.
-        assert_eq!(
-            normalise_playlist_next(&list, Some(0), true, "BV3"),
-            "BV3"
-        );
+        assert_eq!(normalise_playlist_next(&list, Some(0), true, "BV3"), "BV3");
         // The current row cannot also be the next row; a new one is chosen.
         let rerolled = normalise_playlist_next(&list, Some(0), true, "BV1");
         assert_ne!(rerolled, "BV1");
         assert!(list.iter().any(|entry| entry.bvid == rerolled));
         // Turning random off falls back to the sequential row.
-        assert_eq!(
-            normalise_playlist_next(&list, Some(0), false, "BV3"),
-            "BV2"
-        );
+        assert_eq!(normalise_playlist_next(&list, Some(0), false, "BV3"), "BV2");
     }
 
     #[test]
@@ -2887,6 +2912,21 @@ mod tests {
             Err(_) => Settings::default(),
         };
         assert_eq!(legacy.fish_tier, 1);
+    }
+
+    #[test]
+    fn autofill_defaults_on_and_normalises_source() {
+        let defaults = Settings::default();
+        assert!(defaults.fish_autofill);
+        assert_eq!(defaults.fish_autofill_source, "home");
+        assert_eq!(defaults.fish_autofill_folder, 0);
+        assert_eq!(normalise_fish_autofill_source("favorites"), "favorites");
+        assert_eq!(normalise_fish_autofill_source("  HOME "), "home");
+        assert_eq!(normalise_fish_autofill_source("nonsense"), "home");
+        let legacy: Settings = serde_json::from_str(r#"{ "page_size": 24 }"#).expect("old file");
+        assert!(legacy.fish_autofill);
+        assert_eq!(legacy.fish_autofill_source, "home");
+        assert_eq!(legacy.fish_autofill_folder, 0);
     }
 
     #[test]

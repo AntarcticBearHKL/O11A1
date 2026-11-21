@@ -32,6 +32,12 @@ pub struct AgentStepView {
     pub state: String,
     /// Preview and expanded body share this line; tool cards add the cost.
     pub detail: String,
+    /// Tool-call arguments (pretty JSON): what the watch step asked Bilibili
+    /// for, or the raw DeepSeek request body for the thinking row.
+    pub arguments: String,
+    /// Tool result (pretty JSON): the material the step actually produced, or
+    /// the raw DeepSeek response for the thinking row. Empty while running.
+    pub output: String,
     pub ms: u64,
     pub bytes: u64,
     pub tokens: u64,
@@ -62,6 +68,10 @@ pub struct AgentView {
     pub duration_s: u64,
     /// The instruction the model was asked to follow.
     pub instruction: String,
+    /// The exact `system` message sent to DeepSeek.
+    pub system_prompt: String,
+    /// The exact `user` message: video materials + the owner's instruction.
+    pub user_prompt: String,
     pub model: String,
     /// `running` | `done` | `cancelled` | `error`.
     pub state: String,
@@ -125,6 +135,8 @@ impl AgentView {
             meta: label.to_string(),
             state: event.state.to_string(),
             detail: event.detail.clone(),
+            arguments: event.arguments.clone(),
+            output: event.output.clone(),
             ms: event.ms,
             bytes: event.bytes,
             tokens: event.tokens,
@@ -146,7 +158,12 @@ impl AgentView {
     }
 
     /// The material gathering finished; the DeepSeek call is now in flight.
-    pub fn begin_thinking(&mut self, model: &str, prompt_chars: usize) {
+    /// The exact system/user messages and the serialized request body are kept
+    /// on the transcript so the UI can open the whole prompt, not a preview.
+    pub fn begin_thinking(&mut self, model: &str, system: &str, user: &str, request: &str) {
+        let prompt_chars = system.chars().count() + user.chars().count();
+        self.system_prompt = system.to_string();
+        self.user_prompt = user.to_string();
         let detail = format!("材料已齐 · 提示词 {prompt_chars} 字符，等待 DeepSeek 判定…");
         self.model = model.to_string();
         let step = AgentStepView {
@@ -156,6 +173,7 @@ impl AgentView {
             meta: model.to_string(),
             state: "running".to_string(),
             detail: detail.clone(),
+            arguments: request.to_string(),
             ..AgentStepView::default()
         };
         match self.steps.iter().position(|row| row.id == step.id) {
@@ -167,27 +185,31 @@ impl AgentView {
         self.updated_at = unix_now();
     }
 
-    /// DeepSeek answered. The thinking row keeps the timing and usage numbers.
+    /// DeepSeek answered. The thinking row keeps the timing, usage numbers and
+    /// the raw response body.
     pub fn finish_thinking(
         &mut self,
         ms: u64,
         tokens_in: u64,
         tokens_out: u64,
         answer_chars: usize,
+        response: &str,
     ) {
-        let detail = format!(
-            "收到 {answer_chars} 字符 · 输入 {tokens_in} tok · 输出 {tokens_out} tok"
-        );
+        let detail =
+            format!("收到 {answer_chars} 字符 · 输入 {tokens_in} tok · 输出 {tokens_out} tok");
         if let Some(step) = self.steps.iter_mut().find(|row| row.id == THINK_STEP_ID) {
             step.state = "ok".to_string();
             step.meta = "完成".to_string();
             step.detail = detail.clone();
+            step.output = response.to_string();
             step.ms = ms;
             step.tokens = tokens_in.saturating_add(tokens_out);
         }
         self.tokens_in = self.tokens_in.saturating_add(tokens_in);
         self.tokens_out = self.tokens_out.saturating_add(tokens_out);
-        self.cost_tokens = self.cost_tokens.saturating_add(tokens_in.saturating_add(tokens_out));
+        self.cost_tokens = self
+            .cost_tokens
+            .saturating_add(tokens_in.saturating_add(tokens_out));
         self.note = detail;
         self.updated_at = unix_now();
     }
@@ -267,6 +289,8 @@ mod tests {
             total: 3,
             state,
             detail: detail.to_string(),
+            arguments: String::new(),
+            output: String::new(),
             ms: 120,
             bytes: 2_048,
             tokens: 0,
@@ -279,10 +303,11 @@ mod tests {
 
     #[test]
     fn steps_keep_the_watch_plan_order() {
-        let mut agent = AgentView::begin("BV1", "标题", "UP", "cover", 90, "指令", "deepseek-flash");
+        let mut agent =
+            AgentView::begin("BV1", "标题", "UP", "cover", 90, "指令", "deepseek-flash");
         agent.apply_step(&progress(StepId::Comments, "ok", "30 条"));
         agent.apply_step(&progress(StepId::Meta, "ok", "12 万播放"));
-        agent.begin_thinking("deepseek-flash", 1_200);
+        agent.begin_thinking("deepseek-flash", "system", "user", "{\"model\":\"x\"}");
 
         let ids: Vec<&str> = agent.steps.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(ids, vec!["meta", "comments", THINK_STEP_ID]);
@@ -295,8 +320,8 @@ mod tests {
     #[test]
     fn thinking_and_reply_carry_usage() {
         let mut agent = AgentView::begin("BV1", "标题", "UP", "", 90, "", "deepseek-chat");
-        agent.begin_thinking("deepseek-chat", 900);
-        agent.finish_thinking(1_500, 1_234, 56, 180);
+        agent.begin_thinking("deepseek-chat", "system", "user", "{\"model\":\"x\"}");
+        agent.finish_thinking(1_500, 1_234, 56, 180, "{\"score\":8}");
         agent.finish_reply(AgentReplyView {
             score: 8.0,
             verdict: "看".to_string(),
@@ -313,11 +338,42 @@ mod tests {
         assert_eq!(agent.tokens_in, 1_234);
         assert_eq!(agent.tokens_out, 56);
         assert_eq!(agent.cost_tokens, 1_290);
-        let think = agent.steps.iter().find(|row| row.id == THINK_STEP_ID).unwrap();
+        let think = agent
+            .steps
+            .iter()
+            .find(|row| row.id == THINK_STEP_ID)
+            .unwrap();
         assert_eq!(think.state, "ok");
         assert_eq!(think.tokens, 1_290);
         assert!(think.detail.contains("收到 180 字符"));
         assert_eq!(agent.reply.as_ref().unwrap().score, 8.0);
+    }
+
+    #[test]
+    fn thinking_keeps_the_exact_prompts_and_raw_bodies() {
+        let mut agent = AgentView::begin("BV1", "标题", "UP", "", 90, "", "deepseek-flash");
+        agent.begin_thinking(
+            "deepseek-flash",
+            "系统提示",
+            "用户材料",
+            "{\"messages\":[]}",
+        );
+        assert_eq!(agent.system_prompt, "系统提示");
+        assert_eq!(agent.user_prompt, "用户材料");
+        let think = agent
+            .steps
+            .iter()
+            .find(|row| row.id == THINK_STEP_ID)
+            .unwrap();
+        assert_eq!(think.arguments, "{\"messages\":[]}");
+        assert!(think.output.is_empty());
+        agent.finish_thinking(10, 1, 2, 3, "{\"score\":8}");
+        let think = agent
+            .steps
+            .iter()
+            .find(|row| row.id == THINK_STEP_ID)
+            .unwrap();
+        assert_eq!(think.output, "{\"score\":8}");
     }
 
     #[test]

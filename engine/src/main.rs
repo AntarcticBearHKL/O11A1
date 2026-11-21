@@ -58,6 +58,23 @@ fn unum(params: &Value, key: &str) -> u64 {
     params.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// Pick a uniformly random index without adding a crate. `RandomState` seeds
+/// itself from the OS, and the clock keeps two calls in the same process apart.
+fn random_index(len: usize) -> usize {
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if len <= 1 {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    hasher.write_u128(now);
+    (hasher.finish() as usize) % len
+}
+
 fn flag(params: &Value, key: &str) -> bool {
     params.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
@@ -1336,6 +1353,9 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                     "fish_budget_videos": settings.fish_budget_videos,
                     "fish_interval_ms": settings.fish_interval_ms,
                     "fish_sources": settings.fish_sources,
+                    "fish_autofill": settings.fish_autofill,
+                    "fish_autofill_source": settings.fish_autofill_source,
+                    "fish_autofill_folder": settings.fish_autofill_folder,
                     "fish_tier": settings.fish_tier,
                     "fish_asr_enabled": settings.fish_asr_enabled,
                     "fish_asr_engine": settings.fish_asr_engine,
@@ -1357,14 +1377,20 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         "fish.tools" => Ok(json!(o11a1::fishwatch::tool_catalog())),
         "fish.feed.next" => {
             let session = app.session().await?;
-            let items = session
-                .homepage_feed_from(0, &|_, _| {})
-                .await
-                .map_err(e)?;
+            let items = session.homepage_feed_from(0, &|_, _| {}).await.map_err(e)?;
             let engine = fish_engine(app).await?;
-            let next = items
+            let unwatched: Vec<bili::FeedVideo> = items
                 .into_iter()
-                .find(|item| !engine.is_watched(&item.bvid).unwrap_or(false));
+                .filter(|item| {
+                    !engine.is_watched(&item.bvid).unwrap_or(false)
+                        && !engine.is_queued(&item.bvid).unwrap_or(false)
+                })
+                .collect();
+            let next = if unwatched.is_empty() {
+                None
+            } else {
+                Some(unwatched[random_index(unwatched.len())].clone())
+            };
             Ok(json!(next))
         }
         "fish.follows" => {
@@ -1396,7 +1422,8 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             let engine = fish_engine(app).await?;
             let bvid = text(&params, "bvid");
             let watched = engine.is_watched(&bvid).map_err(e)?;
-            Ok(json!({ "bvid": bvid, "watched": watched }))
+            let queued = engine.is_queued(&bvid).map_err(e)?;
+            Ok(json!({ "bvid": bvid, "watched": watched, "queued": queued }))
         }
         "fish.watched.mark" => {
             let engine = fish_engine(app).await?;
@@ -1603,6 +1630,19 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             let engine = fish_engine(app).await?;
             engine.enqueue(&items);
             Ok(json!({ "queued": items.len(), "snapshot": engine.snapshot() }))
+        }
+        "fish.enqueue.item" => {
+            let item: bili::FeedVideo = params
+                .get("item")
+                .cloned()
+                .ok_or_else(|| "缺少 item".to_string())
+                .and_then(|value| serde_json::from_value(value).map_err(e))?;
+            if item.bvid.trim().is_empty() {
+                return Err("item.bvid 为空".to_string());
+            }
+            let engine = fish_engine(app).await?;
+            let queued = engine.enqueue_one(&item).map_err(e)?;
+            Ok(json!({ "queued": queued, "bvid": item.bvid, "snapshot": engine.snapshot() }))
         }
         "fish.clear" => {
             let engine = fish_engine(app).await?;

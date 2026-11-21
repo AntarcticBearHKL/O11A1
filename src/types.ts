@@ -68,6 +68,9 @@ export interface Settings {
   fish_auto_feed: boolean;
   fish_feed_time: string;
   fish_sources: number;
+  fish_autofill: boolean;
+  fish_autofill_source: 'home' | 'favorites';
+  fish_autofill_folder: number;
   audio_quality: number;
   hide_live_tab: boolean;
   hide_pgc_tab: boolean;
@@ -426,6 +429,12 @@ export interface FishAgentStep {
   meta: string;
   state: string;
   detail: string;
+  /// Tool-call arguments (pretty JSON): the watch-step request, or the raw
+  /// DeepSeek request body for the thinking row.
+  arguments: string;
+  /// Tool result (pretty JSON): the material produced, or the raw DeepSeek
+  /// response for the thinking row.
+  output: string;
   ms: number;
   bytes: number;
   tokens: number;
@@ -454,6 +463,10 @@ export interface FishAgent {
   cover: string;
   duration_s: number;
   instruction: string;
+  /// The exact `system` message sent to DeepSeek.
+  system_prompt: string;
+  /// The exact `user` message: materials + the owner's instruction.
+  user_prompt: string;
   model: string;
   state: string;
   started_at: number;

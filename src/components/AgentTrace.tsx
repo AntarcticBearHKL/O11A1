@@ -1,9 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { CoverImage } from './CoverImage';
+import { JsonView } from './JsonView';
 import { formatCount, formatDuration } from '../api';
 import type { FishAgent, FishAgentReply, FishAgentStep } from '../types';
 
-/// One tool / thinking row inside the process group.
+/// One tool / thinking row inside the process group. Expanding it prints the
+/// exact request arguments and the result the tool produced, not just a
+/// one-line summary.
 function AgentStepRow({
   step,
   open,
@@ -14,12 +17,14 @@ function AgentStepRow({
   onToggle: () => void;
 }) {
   const state = STATE_LABEL[step.state] || STATE_LABEL.running;
+  const thinking = step.kind === 'thinking';
   return (
     <div className={`agent-card agent-step ${step.kind} ${step.state} ${open ? 'open' : ''}`}>
       <button className="agent-card-head" type="button" onClick={onToggle} aria-expanded={open}>
         <span className={`agent-dot ${step.kind} ${step.state}`} />
         <span className="agent-title">{step.title}</span>
         <span className={`agent-badge ${state.tone}`}>{state.label}</span>
+        <span className="agent-meta">{thinking ? step.meta : step.id}</span>
         <span className="agent-preview">{step.detail}</span>
         <span className="agent-tail">
           {step.ms ? <span className="agent-timing">{formatMs(step.ms)}</span> : null}
@@ -29,16 +34,72 @@ function AgentStepRow({
         <Chevron open={open} />
       </button>
       {open ? (
-        <div className="agent-card-body">
+        <div className="agent-card-body agent-tool-body">
+          <div className="agent-io">
+            <div className="agent-io-label">{thinking ? '请求体 · request' : '调用参数'}</div>
+            <JsonView text={step.arguments} empty="(没有记录参数)" />
+          </div>
+          <div className="agent-io">
+            <div className="agent-io-label">{thinking ? '响应体 · response' : '返回结果'}</div>
+            {step.output ? (
+              <JsonView text={step.output} />
+            ) : (
+              <div className="agent-io-wait">
+                {step.state === 'running' ? '等待工具返回…' : '(空)'}
+              </div>
+            )}
+          </div>
           <div className="agent-detail-row"><span>说明</span><span>{step.detail || '—'}</span></div>
           <div className="agent-detail-row"><span>状态</span><span>{state.label}</span></div>
           <div className="agent-detail-row">
             <span>耗时 / 数据</span>
-            <span>{[step.ms ? formatMs(step.ms) : '', step.bytes ? formatBytes(step.bytes) : ''].filter(Boolean).join(' · ') || '—'}</span>
+            <span>
+              {[step.ms ? formatMs(step.ms) : '', step.bytes ? formatBytes(step.bytes) : '']
+                .filter(Boolean)
+                .join(' · ') || '—'}
+            </span>
           </div>
           {step.tokens ? (
             <div className="agent-detail-row"><span>模型 tokens</span><span>{formatCount(step.tokens)}</span></div>
           ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/// System / user prompt card. The text is kept verbatim; the scroll box exists
+/// because a materials prompt can be several thousand characters long.
+function PromptDoc({
+  title,
+  meta,
+  tone,
+  text,
+  open,
+  onToggle,
+}: {
+  title: string;
+  meta: string;
+  tone: string;
+  text: string;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={`agent-card prompt-doc ${tone} ${open ? 'open' : ''}`}>
+      <button className="agent-card-head" type="button" onClick={onToggle} aria-expanded={open}>
+        <span className={`agent-dot ${tone}`} />
+        <span className="agent-title">{title}</span>
+        <span className="agent-meta">{meta}</span>
+        <span className="agent-preview">{previewLine(text)}</span>
+        <span className="agent-tail">
+          <span className="agent-usage">{text.length} 字符</span>
+        </span>
+        <Chevron open={open} />
+      </button>
+      {open ? (
+        <div className="agent-prompt-doc">
+          <pre>{text || '（这次运行没有保存提示词）'}</pre>
         </div>
       ) : null}
     </div>
@@ -92,6 +153,7 @@ function Chevron({ open }: { open: boolean }) {
 
 const STATE_LABEL: Record<string, { label: string; tone: string }> = {
   running: { label: '运行中', tone: 'running' },
+  waiting: { label: '等待投喂', tone: 'running' },
   ok: { label: '完成', tone: 'ok' },
   skipped: { label: '跳过', tone: 'skipped' },
   failed: { label: '失败', tone: 'failed' },
@@ -99,6 +161,15 @@ const STATE_LABEL: Record<string, { label: string; tone: string }> = {
   cancelled: { label: '已取消', tone: 'skipped' },
   error: { label: '出错', tone: 'failed' },
 };
+
+function previewLine(text: string): string {
+  for (const raw of String(text || '').replace(/\r\n/g, '\n').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    return line.length > 90 ? `${line.slice(0, 89)}…` : line;
+  }
+  return '';
+}
 
 function formatMs(ms: number): string {
   if (!ms) return '';
@@ -116,15 +187,16 @@ function formatBytes(bytes: number): string {
 
 /// 养鱼 · Agent 看片过程.
 ///
-/// The chat surface mirrors the yah composer logic: a prompt card, one
-/// collapsible process group whose rows are the watch-plan tools plus the
-/// DeepSeek thinking row, and the final answer card. Rows expand in place,
-/// the thread follows the tail only while the reader stays at the bottom, and
-/// a run that ends without a verdict closes into a red (error) or quiet
-/// (cancelled) card instead of leaving a spinner behind.
+/// The chat surface mirrors the yah transcript: the feed card, the exact
+/// system/user prompts, one collapsible process group whose tool rows expose
+/// arguments and results, the DeepSeek request/response and the final answer.
+/// A prompt card or a tool row can be opened independently; the thread follows
+/// the tail only while the reader stays at the bottom.
 export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; full?: boolean }) {
   const [processOpen, setProcessOpen] = useState(true);
   const [expanded, setExpanded] = useState<string[]>([]);
+  const [systemOpen, setSystemOpen] = useState(true);
+  const [userOpen, setUserOpen] = useState(true);
   const threadRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
@@ -132,12 +204,15 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
   const steps = agent?.steps || [];
   const failed = steps.filter((step) => step.state === 'failed').length;
   const skipped = steps.filter((step) => step.state === 'skipped').length;
+  // A cheap signature that changes when a row's state/detail moves, so the
+  // tail keeps following even when several updates land in the same second.
+  const signature = steps.map((step) => `${step.id}:${step.state}:${step.detail}:${step.ms}`).join('|');
 
   useEffect(() => {
     if (!stick.current) return;
     const node = threadRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [agent?.updated_at, steps.length, agent?.state, processOpen, expanded.length]);
+  }, [agent?.updated_at, steps.length, agent?.state, signature]);
 
   const toggleStep = (id: string) => {
     setExpanded((current) => current.includes(id) ? current.filter((row) => row !== id) : [...current, id]);
@@ -176,7 +251,7 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
         {!agent ? (
           <div className="agent-empty">
             <div className="agent-empty-title">还没有开始看片</div>
-            <div className="agent-empty-hint">点「开始」或「投喂首页推荐」，这里会实时显示 DeepSeek 的看片过程。</div>
+            <div className="agent-empty-hint">点「开始 agent」，自动填充器会持续投喂未看过的视频，这里实时显示完整提示词、工具调用和 DeepSeek 判定。</div>
           </div>
         ) : (
           <>
@@ -199,6 +274,27 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
               </div>
             </div>
 
+            {agent.system_prompt || agent.user_prompt ? (
+              <>
+                <PromptDoc
+                  title="系统提示词"
+                  meta="system"
+                  tone="system"
+                  text={agent.system_prompt}
+                  open={systemOpen}
+                  onToggle={() => setSystemOpen((open) => !open)}
+                />
+                <PromptDoc
+                  title="用户提示词"
+                  meta="user · 材料 + 指令"
+                  tone="user"
+                  text={agent.user_prompt}
+                  open={userOpen}
+                  onToggle={() => setUserOpen((open) => !open)}
+                />
+              </>
+            ) : null}
+
             {steps.length ? (
               <div className={`agent-process ${processOpen ? '' : 'collapsed'}`}>
                 <button
@@ -207,7 +303,7 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
                   aria-expanded={processOpen}
                   onClick={() => setProcessOpen((open) => !open)}
                 >
-                  <span className={`agent-process-dot ${agent.state === 'running' ? 'live' : ''}`} />
+                  <span className={`agent-process-dot ${agent.state === 'running' || agent.state === 'waiting' ? 'live' : ''}`} />
                   <span className="agent-process-label">过程</span>
                   <span className="agent-process-count">{steps.length}</span>
                   {failed ? <span className="agent-process-error"><i />{failed} 失败</span> : null}
@@ -232,7 +328,7 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
 
             {agent.reply ? (
               <AgentReplyCard reply={agent.reply} model={agent.model} />
-            ) : agent.state === 'running' ? (
+            ) : agent.state === 'running' || agent.state === 'waiting' ? (
               <div className="agent-waiting">
                 <span className="agent-dot thinking running" />
                 <span className="agent-waiting-text">{agent.note || '正在思考…'}</span>

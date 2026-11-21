@@ -603,6 +603,7 @@ fn publish_running(
     hook: &Option<ProgressHook>,
     gathered: &Gathered,
     reports: &[StepReport],
+    config: &WatchConfig,
     id: StepId,
     index: usize,
     total: usize,
@@ -615,6 +616,7 @@ fn publish_running(
         total,
         state: "running",
         detail: String::new(),
+        arguments: step_arguments(id, &gathered.meta, config),
         coverage,
         cost_ms,
         cost_bytes,
@@ -627,6 +629,7 @@ fn publish_finished(
     hook: &Option<ProgressHook>,
     gathered: &Gathered,
     reports: &[StepReport],
+    config: &WatchConfig,
     report: &StepReport,
     index: usize,
     total: usize,
@@ -643,6 +646,8 @@ fn publish_finished(
         } else {
             report.reason.clone()
         },
+        arguments: step_arguments(report.id, &gathered.meta, config),
+        output: step_output(report.id, gathered, report),
         ms: report.ms,
         bytes: report.bytes,
         tokens: report.tokens,
@@ -651,6 +656,172 @@ fn publish_finished(
         cost_bytes,
         cost_tokens,
     });
+}
+
+/// The concrete call behind a watch step, printed as the tool card's
+/// `调用参数`. It is deliberately small: the material itself is the result.
+fn step_arguments(id: StepId, meta: &Meta, config: &WatchConfig) -> String {
+    let value = match id {
+        StepId::Meta => serde_json::json!({
+            "tool": "meta",
+            "bvid": meta.bvid,
+            "cid": meta.cid,
+        }),
+        StepId::Subtitle => serde_json::json!({
+            "tool": "subtitle",
+            "bvid": meta.bvid,
+            "cid": meta.cid,
+            "source": "conclusion",
+        }),
+        StepId::Outline => serde_json::json!({
+            "tool": "outline",
+            "bvid": meta.bvid,
+            "cid": meta.cid,
+            "source": "conclusion",
+        }),
+        StepId::Comments => serde_json::json!({
+            "tool": "comments",
+            "bvid": meta.bvid,
+            "aid": meta.aid,
+            "cid": meta.cid,
+            "sort": "likes",
+        }),
+        StepId::Asr => serde_json::json!({
+            "tool": "asr",
+            "bvid": meta.bvid,
+            "cid": meta.cid,
+            "model": config.asr.model,
+            "device": config.asr.device,
+        }),
+        StepId::Frames => serde_json::json!({
+            "tool": "frames",
+            "bvid": meta.bvid,
+            "cid": meta.cid,
+            "interval_s": if config.vision.interval_s == 0 {
+                "auto".to_string()
+            } else {
+                config.vision.interval_s.to_string()
+            },
+        }),
+    };
+    pretty_json(value)
+}
+
+/// The material a finished step actually produced, printed as the tool card's
+/// `返回结果`. Text channels are clipped so one transcript cannot make every
+/// one-second snapshot poll huge.
+fn step_output(id: StepId, gathered: &Gathered, report: &StepReport) -> String {
+    if report.state != "ok" {
+        return pretty_json(serde_json::json!({
+            "state": report.state,
+            "reason": report.reason,
+            "detail": report.detail,
+        }));
+    }
+    let meta = &gathered.meta;
+    let value = match id {
+        StepId::Meta => serde_json::json!({
+            "bvid": meta.bvid,
+            "cid": meta.cid,
+            "aid": meta.aid,
+            "title": meta.title,
+            "up_name": meta.up_name,
+            "up_mid": meta.up_mid,
+            "duration_s": meta.duration_s,
+            "duration": mmss(meta.duration_s),
+            "view": meta.view,
+            "pub_ts": meta.pub_ts,
+            "tname": meta.tname,
+            "desc": clip_text(&meta.desc, 500),
+        }),
+        StepId::Subtitle | StepId::Asr => serde_json::json!({
+            "source": if gathered.transcript_source.is_empty() {
+                "unknown"
+            } else {
+                gathered.transcript_source.as_str()
+            },
+            "segments": gathered.transcript_segments.len(),
+            "chars": gathered.transcript.chars().count(),
+            "text": clip_text(&gathered.transcript, 3_000),
+        }),
+        StepId::Outline => serde_json::json!({
+            "section_count": gathered.outline.len(),
+            "sections": gathered
+                .outline
+                .iter()
+                .map(|section| {
+                    serde_json::json!({
+                        "at": mmss(section.timestamp),
+                        "title": section.title,
+                        "points": section
+                            .points
+                            .iter()
+                            .map(|point| serde_json::json!({
+                                "at": mmss(point.timestamp),
+                                "content": clip_text(&point.content, 200),
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+        StepId::Comments => serde_json::json!({
+            "comment_count": gathered.comments.len(),
+            "comments": gathered
+                .comments
+                .iter()
+                .take(12)
+                .map(|comment| serde_json::json!({
+                    "like": comment.like,
+                    "text": clip_text(&comment.text, 160),
+                }))
+                .collect::<Vec<_>>(),
+            "danmaku_peaks": gathered
+                .danmaku
+                .iter()
+                .map(|peak| serde_json::json!({
+                    "minute": peak.minute,
+                    "count": peak.count,
+                    "sample": clip_text(&peak.sample, 120),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        StepId::Frames => match &gathered.frames {
+            Some(frames) => serde_json::json!({
+                "frames": frames.frames,
+                "batches": frames.batches,
+                "interval_s": frames.interval_s,
+                "video_bytes": frames.video_bytes,
+                "image_bytes": frames.image_bytes,
+                "tokens": frames.tokens,
+                "observations": clip_text(&frames.observations, 3_000),
+            }),
+            None => serde_json::json!({
+                "frames": 0,
+                "detail": report.detail,
+            }),
+        },
+    };
+    pretty_json(value)
+}
+
+fn pretty_json(value: serde_json::Value) -> String {
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn clip_text(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +867,15 @@ impl WatchRun {
         for report in self.plan.pre_skips.clone() {
             index += 1;
             reports.push(report.clone());
-            publish_finished(&hook, &self.ctx.gathered, &reports, &report, index, total);
+            publish_finished(
+                &hook,
+                &self.ctx.gathered,
+                &reports,
+                &self.ctx.config,
+                &report,
+                index,
+                total,
+            );
         }
 
         let steps: Vec<Box<dyn Step>> = std::mem::take(&mut self.plan.steps);
@@ -706,12 +885,28 @@ impl WatchRun {
             if self.ctx.cancelled() {
                 let report = StepReport::skipped(id, "已取消");
                 reports.push(report.clone());
-                publish_finished(&hook, &self.ctx.gathered, &reports, &report, index, total);
+                publish_finished(
+                    &hook,
+                    &self.ctx.gathered,
+                    &reports,
+                    &self.ctx.config,
+                    &report,
+                    index,
+                    total,
+                );
                 continue;
             }
             let started = Instant::now();
             self.ctx.current = Some((id, index, total));
-            publish_running(&hook, &self.ctx.gathered, &reports, id, index, total);
+            publish_running(
+                &hook,
+                &self.ctx.gathered,
+                &reports,
+                &self.ctx.config,
+                id,
+                index,
+                total,
+            );
             let result = tokio::time::timeout(step.timeout(), step.run(&mut self.ctx)).await;
             self.ctx.current = None;
             let ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -733,6 +928,7 @@ impl WatchRun {
                             &hook,
                             &self.ctx.gathered,
                             &reports,
+                            &self.ctx.config,
                             &report,
                             index,
                             total,
@@ -775,7 +971,15 @@ impl WatchRun {
             report.ms = ms;
             // A failed step still contributes its measured time/bytes.
             reports.push(report.clone());
-            publish_finished(&hook, &self.ctx.gathered, &reports, &report, index, total);
+            publish_finished(
+                &hook,
+                &self.ctx.gathered,
+                &reports,
+                &self.ctx.config,
+                &report,
+                index,
+                total,
+            );
         }
         reports.sort_by_key(|report| {
             StepId::ALL
@@ -822,6 +1026,38 @@ impl WatchRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_trace_arguments_and_output_are_json() {
+        let mut gathered = Gathered::default();
+        gathered.meta = Meta {
+            bvid: "BV1TRACE".to_string(),
+            cid: 7,
+            aid: 8,
+            title: "标题".to_string(),
+            up_name: "UP".to_string(),
+            duration_s: 90,
+            view: 12_000,
+            tname: "科技".to_string(),
+            ..Meta::default()
+        };
+        let config = WatchConfig::default();
+        let arguments = step_arguments(StepId::Comments, &gathered.meta, &config);
+        let parsed: serde_json::Value = serde_json::from_str(&arguments).expect("arguments json");
+        assert_eq!(parsed.get("cid").and_then(|value| value.as_u64()), Some(7));
+        assert_eq!(parsed.get("sort").and_then(|value| value.as_str()), Some("likes"));
+
+        let output = step_output(StepId::Comments, &gathered, &StepReport::ok(StepId::Comments));
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("output json");
+        assert_eq!(
+            parsed.get("comment_count").and_then(|value| value.as_u64()),
+            Some(0)
+        );
+
+        let skipped = StepReport::skipped(StepId::Asr, "未下载模型");
+        let output = step_output(StepId::Asr, &gathered, &skipped);
+        assert!(output.contains("未下载模型"));
+    }
 
     #[test]
     fn only_selects_exactly_one_tool() {

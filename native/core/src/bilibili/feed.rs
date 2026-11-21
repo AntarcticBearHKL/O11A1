@@ -1,7 +1,7 @@
 //!  首页与视频：信息流、分区、排行、视频详情、播放地址(playurl)、画质档位与 CDN 选路。
 
 use super::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Upper bound for `BILI_FEED_PAGES` (each page is one signed request).
 const MAX_FEED_PAGES: usize = 8;
@@ -2791,7 +2791,7 @@ impl Session {
 // 收藏推荐 QA hook
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FeedVideo {
     pub bvid: String,
     pub cid: u64,
