@@ -4362,7 +4362,8 @@ html, body, #root {
   gap: 30px 18px;
 }
 .home-feed .video-card {
-  padding: 8px 8px 6px;
+  padding: 0;
+  overflow: hidden;
   border-radius: 24px;
   background: color-mix(in srgb, var(--card-solid) 56%, transparent);
   border: 1px solid var(--card-border);
@@ -4390,7 +4391,9 @@ html, body, #root {
   border-radius: 26px;
 }
 .home-feed .video-card .cover {
-  border-radius: 16px;
+  /* The preview is the top edge of the card: no left/right/top padding, and
+     the top corners follow the glass shell's inner radius. */
+  border-radius: 23px 23px 0 0;
   box-shadow: none;
 }
 .home-feed .video-card:hover .cover {
@@ -4398,7 +4401,7 @@ html, body, #root {
 }
 .home-feed .video-card .body {
   height: auto;
-  padding: 10px 4px 4px;
+  padding: 10px 12px 12px;
 }
 .home-feed .video-card .video-meta {
   margin-top: 6px;
@@ -4429,14 +4432,14 @@ html, body, #root {
     gap: 20px 12px;
   }
   .home-feed .video-card {
-    padding: 6px 6px 4px;
+    padding: 0;
     border-radius: 20px;
   }
   .home-feed .video-card .cover {
-    border-radius: 13px;
+    border-radius: 19px 19px 0 0;
   }
   .home-feed .video-card .body {
-    padding: 8px 2px 2px;
+    padding: 9px 10px 10px;
   }
   .home-feed .video-card .video-title {
     font-size: 12.5px;
