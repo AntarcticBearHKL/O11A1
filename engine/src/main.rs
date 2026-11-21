@@ -308,6 +308,10 @@ fn player_json(id: &str, player: &Player) -> Value {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The video window is created by this sidecar, not by Electron. Join the
+    // shell's taskbar group before the first window exists so one O11A1 button
+    // holds both the main window and the player previews.
+    native_player::join_shell_taskbar_group();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind control port")?;

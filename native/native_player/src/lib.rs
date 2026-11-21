@@ -59,6 +59,12 @@ pub fn drag_window(hwnd: isize) {
     window::drag_window(windows::Win32::Foundation::HWND(hwnd as *mut _));
 }
 
+/// Put this process's windows in the Electron shell's taskbar group. Called by
+/// the sidecar at startup, before any player window exists, and idempotent.
+pub fn join_shell_taskbar_group() {
+    window::join_shell_taskbar_group();
+}
+
 pub use danmaku::DanmakuHit;
 pub use engine::Command;
 use engine::SharedState;

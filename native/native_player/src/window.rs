@@ -32,6 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
     TRACKMOUSEEVENT, VK_LBUTTON, VK_SHIFT,
 };
+use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconFromResourceEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
@@ -168,6 +169,28 @@ fn set_window_icon(hwnd: HWND) {
 
 /// Cascade standalone player windows like the old native client.
 static WINDOW_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// The Electron shell registers this AppUserModelID
+/// (`app.setAppUserModelId` in `electron/main.cjs`, and the installer's appId).
+/// Windows groups taskbar buttons by AppUserModelID, not by process, so the
+/// sidecar engine must join the same group. Without this the standalone player
+/// is a second O11A1 button next to the main window instead of folding into
+/// its previews.
+const APP_USER_MODEL_ID: &str = "com.o11a1.electron";
+
+/// Join the Electron shell's taskbar group. Safe to call more than once: the
+/// AppUserModelID is process-wide, so the first call wins and later ones are
+/// no-ops.
+pub fn join_shell_taskbar_group() {
+    static JOINED: OnceLock<()> = OnceLock::new();
+    JOINED.get_or_init(|| unsafe {
+        let id: Vec<u16> = APP_USER_MODEL_ID
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR(id.as_ptr()));
+    });
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum InputEvent {
@@ -1399,6 +1422,9 @@ pub fn create(
     client_width: u32,
     client_height: u32,
 ) -> Result<(HWND, Arc<WindowEvents>)> {
+    // Must happen before the first top-level window exists in this process, or
+    // the taskbar has already decided the engine is its own app.
+    join_shell_taskbar_group();
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = w!("O11A1NativePlayer");
