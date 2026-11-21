@@ -256,7 +256,7 @@ export default function SettingsPage() {
                   <option value={13}>AV1</option>
                 </select>
               </SettingsRow>
-              <SettingsRow name="按屏幕分辨率解码" desc="最高不超过当前显示器高度：1080P 屏按 1080P，4K 屏按 4K；关闭固定 1080P。4K 源在 1080P 屏上不再白解 4K">
+              <SettingsRow name="原始分辨率解码" desc="开启按片源分辨率（最高 4K）解码，CPU 占用高；关闭最多 1080P，4K 60 帧更稳">
                 <Toggle on={settings.player_native_size} onChange={(value) => saveSettings({ player_native_size: value })} />
               </SettingsRow>
               <SettingsRow name="硬件解码" desc="使用 D3D11VA / Media Foundation">

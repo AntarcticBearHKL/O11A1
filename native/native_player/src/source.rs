@@ -4,7 +4,6 @@
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CYSCREEN};
 
 use crate::format::fit_capped;
 use crate::hwdecode;
@@ -22,27 +21,16 @@ const DECODE_MAX_H: u32 = 2160;
 /// display's own height. off: the 1080p cap. The picture now stays on the GPU
 /// for conversion/interpolation/enhancement, so the cap is about the NV12
 /// pipe, upload bandwidth and CPU, not decode capability.
-fn decode_cap_for() -> (u32, u32) {
-    let native_size = o11a1::settings::load().player_native_size;
-    if !native_size {
-        return (1920, 1080);
-    }
-    // Never decode above the display's own height. On a 1080p screen a 4K
-    // source was being decoded at 3840x2160 and then downscaled for display:
-    // four times the NV12 pipe, upload and interpolation work for pixels the
-    // panel cannot show. A 4K display still gets the full 2160p path.
-    let display_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let cap_h = if display_h > 0 {
-        (display_h as u32).clamp(720, DECODE_MAX_H)
+fn decode_cap(native_size: bool) -> (u32, u32) {
+    if native_size {
+        (DECODE_MAX_W, DECODE_MAX_H)
     } else {
-        DECODE_MAX_H
-    };
-    let cap = (DECODE_MAX_W, cap_h);
-    log::line(&format!(
-        "decode cap native=1 display_h={display_h} cap={}x{}",
-        cap.0, cap.1
-    ));
-    cap
+        (1920, 1080)
+    }
+}
+
+fn decode_cap_for() -> (u32, u32) {
+    decode_cap(o11a1::settings::load().player_native_size)
 }
 
 /// One selectable DASH video representation, copied out of `PlayInfo` so the

@@ -88,6 +88,7 @@
 - **0.8.3 缓存直读热修**：完整缓存返回本地路径后，ffmpeg 仍按 `remote` 加 `-reconnect` / `-headers`，本地输入直接报 `Option reconnect not found` 并显示「GPU 硬解失败」。现在按解析后的 URL 判断：`proc::is_local` 为真时不再加网络参数和 CDN headers，视频与音频两条 ffmpeg 都修；完整缓存直读本地文件实测 60fps。
 - **0.8.4 精准面板对齐**：A / B 两个按钮的左右外沿现在和下面的帧标尺完全同宽（A 左沿 = 标尺左沿，B 右沿 = 标尺右沿），清空按钮和右侧「1 帧」单位框同列同宽；单位框去掉下拉三角，文字在框内水平垂直居中。
 - **0.8.5 按屏幕分辨率解码**：「按屏幕分辨率解码」开启时不再无条件解 4K，而是取片源与显示器高度的较小值：1080P 屏上的 4K 源解码为 1920×1080，4K 屏仍为 3840×2160。4K60 本地源实测 60fps、`dropped=0`，播放器主线程约 15–25% 单核（原来约 66%），ffmpeg 管道也从 12.4MB/帧降到 3.1MB/帧。这是 CPU 优化，不是零拷贝；零拷贝仍是独立分支任务。
+- **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **A/V 同步**：音频设备时钟是唯一主时钟（有音频时 `position_now` 始终读设备位置，不再依赖 `audio_master` 开关）；视频按音频位置取帧，晚到帧直接丢弃。
   视频解码跟不上实时（4K / 硬解降速）时，画面时间戳会持续落后音频，旧实现会把每个解码出来的帧依次播放，形成“视频慢放、声音正常”的永久漂移；
   现在画面落后超过 250ms 且持续 900ms，就把视频单独 seek 到音频位置并丢掉无法实时解码的区间（音频只为这次短 seek 暂停，落地后一起恢复），2 秒内不会重复 seek。
@@ -123,7 +124,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.8.5.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.8.6.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
