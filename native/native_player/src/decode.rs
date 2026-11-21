@@ -273,7 +273,7 @@ impl VideoDecoder {
             .arg("1000000")
             .arg("-fflags")
             .arg("+discardcorrupt");
-        if spec.remote {
+        if !proc::is_local(&url) {
             proc::network_args(&mut command);
             let headers = proc::header_string(&spec.headers);
             if !headers.is_empty() {

@@ -85,6 +85,7 @@
 - **0.8.1 4K 缓存抗抖**：Range 下载改成 8 个 HTTP/1.1 连接（每连接独立，避免 HTTP/2 多路复用被 CDN 重置），worker 线程降到 BELOW_NORMAL，解码 ffmpeg 提到 ABOVE_NORMAL、管道读线程 ABOVE_NORMAL；单块失败重试 8 次并指数退避，仍失败时 loopback 代理直接回源该区间，不再判死整个视频；代理读块从 64KB 提到 256KB。4K60 冷缓存首播 45 秒 `dropped=0`，缓存完成前也保持 60fps。
 - **0.8.2 首页 / UI CPU**：首页封面预热在 `onload` / `onerror` 里执行 `image.src = ''`；空串被解析成文档 URL，加载失败又触发 `onerror`，形成无限图片错误循环。首页 renderer 固定吃满一个核心并以约 12 MB/s 持续写 I/O，从打开首页起整机就变慢。现在只解绑 handler，不碰 `src`；实测首页 renderer 100% → 0%。原生播放器 overlay 从无条件 120Hz 改成自适应网格：chrome 隐藏时 10Hz，菜单 / 侧栏 / OSD / 加载 / 错误 / 拖拽 / 悬停时 60–120Hz。完整缓存改为直接读本地文件，不再走 loopback HTTP 代理。
 - **0.8.2 4K60 CPU 实测**：i7-8700 + RTX 4060 Ti，本地 4K60 H.264、关闭插帧和增强：稳定 60fps、`dropped=0`、帧队列 15；播放器主线程约 66% 单核，ffmpeg 约 115% 单核，整机约 1.8 个逻辑核，不再占满 CPU。
+- **0.8.3 缓存直读热修**：完整缓存返回本地路径后，ffmpeg 仍按 `remote` 加 `-reconnect` / `-headers`，本地输入直接报 `Option reconnect not found` 并显示「GPU 硬解失败」。现在按解析后的 URL 判断：`proc::is_local` 为真时不再加网络参数和 CDN headers，视频与音频两条 ffmpeg 都修；完整缓存直读本地文件实测 60fps。
 - **A/V 同步**：音频设备时钟是唯一主时钟（有音频时 `position_now` 始终读设备位置，不再依赖 `audio_master` 开关）；视频按音频位置取帧，晚到帧直接丢弃。
   视频解码跟不上实时（4K / 硬解降速）时，画面时间戳会持续落后音频，旧实现会把每个解码出来的帧依次播放，形成“视频慢放、声音正常”的永久漂移；
   现在画面落后超过 250ms 且持续 900ms，就把视频单独 seek 到音频位置并丢掉无法实时解码的区间（音频只为这次短 seek 暂停，落地后一起恢复），2 秒内不会重复 seek。
@@ -120,7 +121,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.8.2.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.8.3.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。

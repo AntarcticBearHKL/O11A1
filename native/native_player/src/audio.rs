@@ -156,7 +156,7 @@ impl Session {
             .arg("500000")
             .arg("-analyzeduration")
             .arg("500000");
-        if remote {
+        if remote && !proc::is_local(url) {
             proc::network_args(&mut command);
             let headers = proc::header_string(headers);
             if !headers.is_empty() {
