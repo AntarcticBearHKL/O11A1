@@ -4981,6 +4981,43 @@ impl Engine {
         }
     }
 
+    /// Whether the current video representation is fully on disk. Used to hide
+    /// the live transfer speed once there is nothing left to download.
+    fn current_cache_complete(&self) -> bool {
+        let Some(key) = crate::source::media_cache_key(&self.source, false) else {
+            return false;
+        };
+        crate::mediacache::progress(&key)
+            .map(|(done, total)| total > 0 && done >= total)
+            .unwrap_or(false)
+    }
+
+    /// How many seconds of the next part are already in its cache. `None`
+    /// before the ten-second prefetcher starts; `Some(0.0)` while its source is
+    /// still resolving or its first range request is in flight.
+    fn next_page_preload_s(&self) -> Option<f64> {
+        if self.next_page_prefetch.is_none() {
+            return None;
+        }
+        let slot = self.next_page_source.lock().ok()?;
+        let Some((_, source)) = slot.as_ref() else {
+            return Some(0.0);
+        };
+        let key = crate::source::media_cache_key(source, false)?;
+        let bytes = crate::mediacache::lead_bytes(&key, 0).unwrap_or(0);
+        let bps = source.video_bitrate;
+        if bps == 0 {
+            return Some(0.0);
+        }
+        let seconds = bytes as f64 * 8.0 / bps as f64;
+        let duration = source.duration_ms as f64 / 1000.0;
+        Some(if duration > 0.0 {
+            seconds.min(duration)
+        } else {
+            seconds
+        })
+    }
+
     /// Take decoded frames due on the current presentation clock and present
     /// them; also drive the interpolation grid.
     fn poll_picture(&mut self) {
@@ -9263,8 +9300,10 @@ impl Engine {
             net_bps: self.net_bps,
             net_lead_s: self
                 .cache_lead_ms()
-                .map(|ms| (ms as f64 / 1000.0).min(99.9))
+                .map(|ms| ms as f64 / 1000.0)
                 .unwrap_or(self.net_lead_s),
+            next_preload_s: self.next_page_preload_s(),
+            cache_complete: self.current_cache_complete(),
             download_streams: usize::from(self.decoder.is_some())
                 + usize::from(self.audio.is_some())
                 + usize::from(self.loop_prefetch.is_some()),

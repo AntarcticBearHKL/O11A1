@@ -1310,6 +1310,12 @@ pub struct UiModel {
     /// Estimated downloaded lead in seconds, from the bytes ffmpeg has read
     /// versus the media time already played.
     pub net_lead_s: f64,
+    /// Next part preload duration in seconds. `None` until the ten-second
+    /// prefetcher starts; the HUD shows a dash in that state.
+    pub next_preload_s: Option<f64>,
+    /// The current video cache is fully on disk: the HUD's live transfer
+    /// number is no longer meaningful and shows a dash.
+    pub cache_complete: bool,
     /// Active video/audio/prefetch stream processes.
     pub download_streams: usize,
 }
@@ -2297,7 +2303,7 @@ impl Overlay {
     unsafe fn draw_fps_hud(&self, model: &UiModel, layout: &Layout) {
         let s = layout.scale;
         let width = 210.0 * s;
-        let height = 91.0 * s;
+        let height = 108.0 * s;
         let right = if model.fullscreen {
             layout.stage.right - 12.0 * s
         } else {
@@ -2332,7 +2338,16 @@ impl Overlay {
         let mut line_top = rect.top + 3.0 * s;
         let video_bitrate = model.video_bitrate;
         let total_bps = model.video_bitrate + model.audio_bitrate;
-        let network = if model.net_bps > 0.0 {
+        let network = if model.cache_complete {
+            // The whole video representation is on disk; there is no live
+            // transfer to report. Keep the stream demand visible after the
+            // dash so the line still explains the bitrate.
+            if total_bps > 0 {
+                format!("— / {}", format_bitrate(video_bitrate))
+            } else {
+                "—".to_string()
+            }
+        } else if model.net_bps > 0.0 {
             // Actual cache worker read rate in bits per second, plus how many
             // times the stream's own demand that is. The scheduler targets
             // 1.5x; this line makes it visible instead of guessing.
@@ -2372,15 +2387,28 @@ impl Overlay {
         } else {
             30.0
         };
-        // Prefer the network lead (bytes read ahead of the media clock); the
-        // decoded six-frame ring is the floor when the bitrate is unknown.
+        // The cache lead is a real duration, not a percentage: show the whole
+        // downloaded span even when it is longer than a minute. Complete media
+        // reports its remaining duration / the whole next part.
+        let duration_text = |seconds: f64| {
+            if seconds < 60.0 {
+                format!("{seconds:.1} s")
+            } else {
+                format_time((seconds * 1000.0).round() as u64)
+            }
+        };
         let decoded = (model.queue_len as f64 + 1.0) / fps;
-        let buffered = model.net_lead_s.max(decoded).min(99.9);
+        let buffered = model.net_lead_s.max(decoded);
+        let next_preload = match model.next_preload_s {
+            Some(seconds) => format!("下一P预加载 {}", duration_text(seconds)),
+            None => "下一P预加载 —".to_string(),
+        };
         let lines = [
             format!("画面 FPS {:.1} · {:.1} ms", model.fps, ms),
             format!("弹幕 FPS {:.1}", model.danmaku_fps),
             network,
-            format!("缓冲 {:.1} s", buffered),
+            format!("缓冲 {}", duration_text(buffered)),
+            next_preload,
             format!("UI FPS {:.1}", model.ui_fps),
         ];
         for text in lines {
@@ -4091,7 +4119,11 @@ impl Overlay {
         row(
             "缓冲",
             &if model.source_remote {
-                format!("{:.1} s", lead_s.min(99.9))
+                if lead_s < 60.0 {
+                    format!("{lead_s:.1} s")
+                } else {
+                    format_time((lead_s * 1000.0).round() as u64)
+                }
             } else {
                 "本地".to_string()
             },
