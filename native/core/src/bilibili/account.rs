@@ -1,6 +1,7 @@
 //!  账号与互动：登录态、收藏、历史、稍后再看、关注/粉丝、动态、消息、私信与评论。
 
 use super::*;
+use futures::StreamExt;
 use serde::Serialize;
 
 /// Folder list cache TTL (one entry per `mid`).
@@ -1868,7 +1869,41 @@ impl Session {
             bail!("获取私信会话失败（code={}）", body.code);
         }
         let list = body.data.map(|data| data.session_list).unwrap_or_default();
-        Ok(list.into_iter().map(dm_session_from).collect())
+        let mut sessions: Vec<DmSession> = list.into_iter().map(dm_session_from).collect();
+        // Normal user sessions do not carry a name in the session payload.
+        // Resolve one card per session, a few at a time, and keep the list
+        // usable when Bilibili rate-limits a lookup: that row falls back to
+        // "未知用户" instead of inventing `用户<id>`. Only owned ids cross the
+        // await, so the control-connection future stays `Send`.
+        let talkers: Vec<(usize, i64)> = sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| {
+                session.talker_id > 0 && session.name.trim().is_empty()
+            })
+            .map(|(index, session)| (index, session.talker_id))
+            .collect();
+        let cards = futures::stream::iter(talkers)
+            .map(|(index, talker_id)| async move {
+                let card = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    self.user_card(talker_id),
+                )
+                .await;
+                (index, card)
+            })
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+        for (index, card) in cards {
+            if let Ok(Ok((name, face, _, _))) = card {
+                if !name.trim().is_empty() {
+                    sessions[index].name = name;
+                    sessions[index].face = face;
+                }
+            }
+        }
+        Ok(sessions)
     }
 }
 
@@ -3768,6 +3803,10 @@ pub struct DmSession {
     pub at_time: i64,
     pub unread: i64,
     pub preview: String,
+    /// Display name resolved from the session payload or the user's card.
+    /// Empty when the lookup failed; the UI must not invent `用户<id>`.
+    pub name: String,
+    pub face: String,
 }
 
 /// One private-message entry (READ ONLY).
@@ -4048,6 +4087,20 @@ struct DmSessionRaw {
     unread_count: i64,
     #[serde(default)]
     last_msg: Option<serde_json::Value>,
+    /// System sessions carry their display name here; normal user sessions
+    /// do not, so their name is resolved with one card lookup per session.
+    #[serde(default)]
+    account_info: Option<DmAccountInfoRaw>,
+}
+
+#[derive(Deserialize, Default)]
+struct DmAccountInfoRaw {
+    #[serde(default)]
+    name: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    pic_url: String,
+    #[serde(default, deserialize_with = "de_string_lenient")]
+    face: String,
 }
 
 #[derive(Deserialize)]
@@ -4438,11 +4491,25 @@ fn dm_session_from(raw: DmSessionRaw) -> DmSession {
         .as_ref()
         .and_then(dm_content_text)
         .unwrap_or_default();
+    let (name, face) = raw
+        .account_info
+        .as_ref()
+        .map(|info| {
+            let avatar = if !info.pic_url.trim().is_empty() {
+                &info.pic_url
+            } else {
+                &info.face
+            };
+            (info.name.trim().to_string(), normalize_url(avatar))
+        })
+        .unwrap_or_default();
     DmSession {
         talker_id: raw.talker_id,
         at_time: raw.at_time,
         unread: raw.unread_count,
         preview,
+        name,
+        face,
     }
 }
 

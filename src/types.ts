@@ -381,6 +381,8 @@ export interface DmSession {
   at_time: number;
   unread: number;
   preview: string;
+  name: string;
+  face: string;
 }
 
 export interface DmMessage {
@@ -389,6 +391,7 @@ export interface DmMessage {
   timestamp: number;
   seqno: number;
   msg_type: number;
+  msg_status: number;
 }
 
 export interface DmPage {
