@@ -870,6 +870,9 @@ enum QaKind {
     Shot,
     Stats,
     Mute,
+    /// QA only: set a mid-level volume and keep the wheel OSD up long enough
+    /// for a screenshot.
+    Volume,
     Fullscreen,
     Danmaku,
     DanmakuOff,
@@ -9489,6 +9492,13 @@ impl Engine {
                     }
                 }
                 QaKind::Mute => self.toggle_mute(),
+                QaKind::Volume => {
+                    log::line("qa volume osd");
+                    self.set_volume(62);
+                    self.volume_wheel_until =
+                        Some(Instant::now() + Duration::from_secs(6));
+                    self.ui_dirty = true;
+                }
                 QaKind::Fullscreen => self.toggle_fullscreen(),
                 QaKind::Danmaku => {
                     log::line("qa danmaku on");
@@ -10125,6 +10135,7 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
             "shot" | "screenshot" => QaKind::Shot,
             "stats" => QaKind::Stats,
             "mute" => QaKind::Mute,
+            "volume" | "vol" => QaKind::Volume,
             "fullscreen" | "fs" => QaKind::Fullscreen,
             "danmaku" | "dm" => QaKind::Danmaku,
             "danmakuoff" | "dmoff" => QaKind::DanmakuOff,

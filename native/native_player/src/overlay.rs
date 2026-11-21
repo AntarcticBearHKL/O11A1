@@ -1389,6 +1389,14 @@ pub struct Overlay {
     hud_bg: ID2D1SolidColorBrush,
     hud_text: ID2D1SolidColorBrush,
     track: ID2D1SolidColorBrush,
+    /// Glass base of the wheel volume capsule. Warm paper in light mode, dark
+    /// chrome in dark mode; deliberately more transparent than `chrome`, so the
+    /// video stream stays visible behind the bar.
+    volume_glass: ID2D1SolidColorBrush,
+    /// Empty part of the wheel volume capsule. Unlike `track` (used by opaque
+    /// paper panels) this stays translucent, so the video stream keeps showing
+    /// through the glass.
+    volume_track: ID2D1SolidColorBrush,
     chrome: ID2D1SolidColorBrush,
     chrome_soft: ID2D1SolidColorBrush,
     sidebar_line: ID2D1SolidColorBrush,
@@ -1574,6 +1582,8 @@ impl Overlay {
             let hud_bg = solid(&render_target, color(12, 14, 19, 0.88))?;
             let hud_text = solid(&render_target, color(216, 255, 223, 0.94))?;
             let track = solid(&render_target, color(255, 255, 255, 0.34))?;
+            let volume_glass = solid(&render_target, color(15, 16, 19, 0.48))?;
+            let volume_track = solid(&render_target, color(255, 255, 255, 0.10))?;
             let chrome = solid(&render_target, color(18, 19, 24, 0.74))?;
             let chrome_soft = solid(&render_target, color(20, 22, 28, 0.72))?;
             let sidebar_line = solid(&render_target, color(255, 255, 255, 0.08))?;
@@ -1748,6 +1758,8 @@ impl Overlay {
                 hud_bg,
                 hud_text,
                 track,
+                volume_glass,
+                volume_track,
                 chrome,
                 chrome_soft,
                 sidebar_line,
@@ -1946,6 +1958,16 @@ impl Overlay {
             let _ = self.panel_border.SetColor(&chrome[3]);
             let _ = self.chip.SetColor(&chrome[4]);
             let _ = self.track.SetColor(&chrome[5]);
+            let _ = self.volume_glass.SetColor(&if light {
+                color(250, 248, 244, 0.46)
+            } else {
+                color(15, 16, 19, 0.48)
+            });
+            let _ = self.volume_track.SetColor(&if light {
+                color(0, 0, 0, 0.08)
+            } else {
+                color(255, 255, 255, 0.10)
+            });
             let _ = self.text.SetColor(&chrome[6]);
             let _ = self.text_dim.SetColor(&chrome[7]);
             let _ = self.text_faint.SetColor(&chrome[8]);
@@ -5832,17 +5854,19 @@ impl Overlay {
         self.text_centered(&label, rect, &self.hint_format, &self.sidebar_text);
     }
 
-    /// Wheel volume feedback: only the vertical level bar itself at the
-    /// picture's right edge — no card, no rim. The track brush is rebound by
-    /// `apply_sidebar_theme` every frame, so the empty part follows the
-    /// current theme while the filled part stays accent blue.
+    /// Wheel volume feedback: one full-bleed vertical capsule at the picture's
+    /// right edge. The capsule itself is the bar — no wider card around it —
+    /// so the track and the accent fill span its whole width. Its glass base
+    /// is rebound by `apply_sidebar_theme` every frame: warm translucent paper
+    /// in light mode, dark chrome in dark mode, with the video stream still
+    /// visible through both.
     unsafe fn draw_volume_osd(&self, model: &UiModel, layout: &Layout) {
         if !model.volume_wheel {
             return;
         }
         let s = layout.scale;
         let stage = layout.stage;
-        let track_w = 14.0 * s;
+        let track_w = 26.0 * s;
         let track_h = (260.0 * s).min((stage.height() - 210.0 * s).max(120.0 * s));
         let right = stage.right - 24.0 * s;
         let centered_top = stage.top + (stage.height() - track_h) * 0.5;
@@ -5861,7 +5885,14 @@ impl Overlay {
             radiusX: track_w * 0.5,
             radiusY: track_w * 0.5,
         };
-        self.d2d.FillRoundedRectangle(&bar_round, &self.track);
+        // Glass base: theme-aware and translucent, so the moving picture stays
+        // part of the surface instead of being covered by opaque paper.
+        self.d2d
+            .FillRoundedRectangle(&bar_round, &self.volume_glass);
+        // The empty part is the same capsule, only tinted. A separate card
+        // would shrink the bar, which is exactly what this design avoids.
+        self.d2d
+            .FillRoundedRectangle(&bar_round, &self.volume_track);
 
         let fraction = if model.muted {
             0.0
@@ -5883,6 +5914,9 @@ impl Overlay {
             };
             self.d2d.FillRoundedRectangle(&fill_round, &self.accent_blue);
         }
+        // Rim last so the capsule keeps its edge at 100% volume.
+        self.d2d
+            .DrawRoundedRectangle(&bar_round, &self.panel_border, 1.0 * s, None);
     }
 
     unsafe fn draw_loop_menu(&self, model: &UiModel, layout: &Layout) {
