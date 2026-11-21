@@ -262,6 +262,9 @@ export default function SettingsPage() {
               <SettingsRow name="硬件解码" desc="使用 D3D11VA / Media Foundation">
                 <Toggle on={settings.hwaccel} onChange={(value) => saveSettings({ hwaccel: value })} />
               </SettingsRow>
+              <SettingsRow name="零拷贝解码" desc="进程内 D3D11VA：解码画面直接留在显卡上；不兼容的片源自动回退 ffmpeg 管道">
+                <Toggle on={settings.player_mf_decode} onChange={(value) => saveSettings({ player_mf_decode: value })} />
+              </SettingsRow>
             </div>
           ) : null}
 

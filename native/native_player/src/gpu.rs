@@ -13,11 +13,16 @@ use windows::core::{IUnknown, Interface, BOOL};
 use windows::Win32::Foundation::{HANDLE, HWND, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
-    ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11CreateDevice, ID3D11Buffer, ID3D11ClassLinkage, ID3D11Device, ID3D11DeviceContext,
+    ID3D11PixelShader, ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
+use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
@@ -34,12 +39,10 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::Threading::{WaitForSingleObject, THREAD_PRIORITY_HIGHEST};
 use windows_numerics::Matrix3x2;
 
-#[cfg(test)]
-use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
-
 use crate::enhance::{EnhanceMode, EnhancePipeline, VideoPasses};
-use crate::interp::{self, Signature};
+use crate::interp::{self, Signature, SIG_COLS, SIG_LEN, SIG_ROWS};
 use crate::log;
+use crate::zerocopy::HWFrame;
 
 pub struct Gpu {
     pub device: ID3D11Device,
@@ -54,20 +57,52 @@ impl Gpu {
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
             let mut level = D3D_FEATURE_LEVEL_11_0;
-            D3D11CreateDevice(
+            let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+            let mut result = D3D11CreateDevice(
                 None,
                 D3D_DRIVER_TYPE_HARDWARE,
                 Default::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                flags,
                 Some(&[D3D_FEATURE_LEVEL_11_0]),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
                 Some(&mut level),
                 Some(&mut context),
-            )?;
+            );
+            if result.is_err() {
+                // VIDEO_SUPPORT is only needed by the in-process decoder. Keep
+                // the window and the external fallback working on drivers that
+                // reject the flag.
+                device = None;
+                context = None;
+                result = D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    Default::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    Some(&[D3D_FEATURE_LEVEL_11_0]),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    Some(&mut level),
+                    Some(&mut context),
+                );
+            }
+            result?;
             let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice returned no device"))?;
             let context =
                 context.ok_or_else(|| anyhow!("D3D11CreateDevice returned no context"))?;
+            // libavcodec's D3D11VA decoder runs on its reader thread while the
+            // pacer keeps submitting video/UI work on the window thread. The
+            // D3D10 multithread interface serialises the immediate context for
+            // exactly this case (FFmpeg's own device creation enables it too).
+            match device.cast::<ID3D10Multithread>() {
+                Ok(multithread) => {
+                    let _ = multithread.SetMultithreadProtected(true);
+                }
+                Err(error) => log::line(&format!(
+                    "D3D11 multithread protection unavailable: {error}"
+                )),
+            }
             // The pacer does one GPU submission per output tick; highest
             // priority keeps it ahead of ordinary UI work.
             let _ = windows::Win32::System::Threading::SetThreadPriority(
@@ -123,6 +158,177 @@ impl Gpu {
                 waiter = swap2.GetFrameLatencyWaitableObject().0 as isize;
             }
             Ok((swap, waiter))
+        }
+    }
+}
+
+/// 32×18 luma probe for scene-cut detection on hardware frames. The full
+/// picture never leaves the GPU; one tiny pass writes the sampled grid to an R8
+/// target, a 576-byte staging readback moves it to the CPU.
+pub struct SignatureProbe {
+    context: ID3D11DeviceContext,
+    vertex: ID3D11VertexShader,
+    pixel: ID3D11PixelShader,
+    dims: ID3D11Buffer,
+    target: ID3D11Texture2D,
+    rtv: ID3D11RenderTargetView,
+    staging: ID3D11Texture2D,
+}
+
+impl SignatureProbe {
+    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<Self> {
+        let source = include_str!("shaders/enhance.hlsl");
+        let vs_code = crate::enhance::compile(source, "vs_main", "vs_5_0")?;
+        let vertex = unsafe {
+            let mut shader: Option<ID3D11VertexShader> = None;
+            device
+                .CreateVertexShader(&vs_code, None::<&ID3D11ClassLinkage>, Some(&mut shader))
+                .map_err(|error| anyhow!("signature vertex shader: {error}"))?;
+            shader.ok_or_else(|| anyhow!("signature vertex shader missing"))?
+        };
+        let pixel = crate::enhance::pixel_shader(device, source, "sig_main")?;
+        let initial = [0f32; 8];
+        let dims = unsafe {
+            let description = D3D11_BUFFER_DESC {
+                ByteWidth: 32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: initial.as_ptr() as *const c_void,
+                SysMemPitch: 0,
+                SysMemSlicePitch: 0,
+            };
+            let mut buffer: Option<ID3D11Buffer> = None;
+            device
+                .CreateBuffer(&description, Some(&data), Some(&mut buffer))
+                .map_err(|error| anyhow!("signature constant buffer: {error}"))?;
+            buffer.ok_or_else(|| anyhow!("signature constant buffer missing"))?
+        };
+        let target_description = D3D11_TEXTURE2D_DESC {
+            Width: SIG_COLS as u32,
+            Height: SIG_ROWS as u32,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let target = unsafe {
+            let mut texture: Option<ID3D11Texture2D> = None;
+            device
+                .CreateTexture2D(&target_description, None, Some(&mut texture))
+                .map_err(|error| anyhow!("signature target: {error}"))?;
+            texture.ok_or_else(|| anyhow!("signature target missing"))?
+        };
+        let rtv = unsafe {
+            let mut view: Option<ID3D11RenderTargetView> = None;
+            device
+                .CreateRenderTargetView(&target, None, Some(&mut view))
+                .map_err(|error| anyhow!("signature RTV: {error}"))?;
+            view.ok_or_else(|| anyhow!("signature RTV missing"))?
+        };
+        let staging = unsafe {
+            let description = D3D11_TEXTURE2D_DESC {
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..target_description
+            };
+            let mut texture: Option<ID3D11Texture2D> = None;
+            device
+                .CreateTexture2D(&description, None, Some(&mut texture))
+                .map_err(|error| anyhow!("signature staging: {error}"))?;
+            texture.ok_or_else(|| anyhow!("signature staging missing"))?
+        };
+        Ok(Self {
+            context: context.clone(),
+            vertex,
+            pixel,
+            dims,
+            target,
+            rtv,
+            staging,
+        })
+    }
+
+    pub fn measure(
+        &self,
+        luma: &ID3D11ShaderResourceView,
+        width: u32,
+        height: u32,
+    ) -> Result<Signature> {
+        if width < 2 || height < 2 {
+            return Ok([0u8; SIG_LEN]);
+        }
+        let dims = [
+            width.saturating_sub(1) as f32,
+            height.saturating_sub(1) as f32,
+            width as f32,
+            height as f32,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+        ];
+        unsafe {
+            self.context.UpdateSubresource(
+                &self.dims,
+                0,
+                None,
+                dims.as_ptr() as *const c_void,
+                0,
+                0,
+            );
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: SIG_COLS as f32,
+                Height: SIG_ROWS as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            self.context.RSSetViewports(Some(&[viewport]));
+            self.context
+                .OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
+            self.context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context.IASetInputLayout(None);
+            self.context.VSSetShader(&self.vertex, None);
+            self.context.PSSetShader(&self.pixel, None);
+            self.context
+                .VSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
+            self.context
+                .PSSetConstantBuffers(0, Some(&[Some(self.dims.clone())]));
+            self.context
+                .PSSetShaderResources(0, Some(&[Some(luma.clone())]));
+            self.context.Draw(3, 0);
+            self.context.PSSetShaderResources(0, Some(&[None]));
+            self.context.OMSetRenderTargets(None, None);
+            self.context.CopyResource(&self.staging, &self.target);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|error| anyhow!("map signature staging: {error}"))?;
+            let mut signature = [0u8; SIG_LEN];
+            let start = mapped.pData as *const u8;
+            for row in 0..SIG_ROWS {
+                let source = start.add(row * mapped.RowPitch as usize);
+                for col in 0..SIG_COLS {
+                    signature[row * SIG_COLS + col] = *source.add(col);
+                }
+            }
+            self.context.Unmap(&self.staging, 0);
+            Ok(signature)
         }
     }
 }
@@ -211,6 +417,9 @@ struct FramePool {
     pictures: Vec<Picture>,
     /// Result of the 插帧 blend for the current tick.
     mix: Picture,
+    /// 32×18 luma probe for hardware frames. Created once; a failure only
+    /// disables cut detection, never playback.
+    signature: Option<SignatureProbe>,
     next: usize,
     passes: VideoPasses,
 }
@@ -227,6 +436,13 @@ impl FramePool {
         }
         let mix = Picture::new(&gpu.device, width, height)?;
         let passes = VideoPasses::new(&gpu.device, &gpu.context, width, height)?;
+        let signature = match SignatureProbe::new(&gpu.device, &gpu.context) {
+            Ok(probe) => Some(probe),
+            Err(error) => {
+                log::line(&format!("signature probe unavailable: {error:#}"));
+                None
+            }
+        };
         log::line(&format!(
             "video frames slots={FRAME_SLOTS} size={width}x{height} nv12=R8+R8G8 picture=BGRA"
         ));
@@ -236,8 +452,32 @@ impl FramePool {
             planes,
             pictures,
             mix,
+            signature,
             next: 0,
             passes,
+        })
+    }
+
+    /// Convert a D3D11VA picture into the BGRA frame ring. The decoder's NV12
+    /// or P010 texture is sampled directly; there is no `UpdateSubresource`.
+    fn upload_hw(&mut self, hw: &HWFrame, ts_ms: u64) -> Result<GpuFrame> {
+        let slot = self.next;
+        self.next = (self.next + 1) % self.pictures.len();
+        self.passes.convert_hw(
+            &hw.y_srv,
+            &hw.uv_srv,
+            hw.p010,
+            &self.pictures[slot].rtv,
+        );
+        let signature = self
+            .signature
+            .as_ref()
+            .and_then(|probe| probe.measure(&hw.y_srv, hw.width, hw.height).ok())
+            .unwrap_or(hw.signature);
+        Ok(GpuFrame {
+            slot,
+            ts_ms,
+            signature,
         })
     }
 
@@ -459,6 +699,12 @@ impl VideoSurface {
     /// no release bookkeeping is needed.
     pub fn upload(&mut self, gpu: &Gpu, nv12: &[u8], ts_ms: u64) -> Result<GpuFrame> {
         self.pool.upload(gpu, nv12, ts_ms)
+    }
+
+    /// Present a D3D11VA picture without a CPU download. The picture is
+    /// converted by the same shader ring the external pipe feeds.
+    pub fn upload_hw(&mut self, hw: &HWFrame, ts_ms: u64) -> Result<GpuFrame> {
+        self.pool.upload_hw(hw, ts_ms)
     }
 
     pub fn wait_frame(&self) -> bool {

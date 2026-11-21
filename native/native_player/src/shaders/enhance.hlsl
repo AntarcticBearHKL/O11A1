@@ -22,6 +22,11 @@ cbuffer Dims : register(b0)
 
 Texture2D<float4> tex_src : register(t0);
 Texture2D<float4> tex_aux : register(t1);
+// D3D11VA slices arrive as a one-element view of a texture array (plane 0 is
+// luma, plane 1 is chroma). The same registers are used because a pass only
+// binds one of the two families at a time.
+Texture2DArray<float4> tex_y_hw : register(t0);
+Texture2DArray<float4> tex_uv_hw : register(t1);
 
 float4 L(Texture2D<float4> tex, int2 p)
 {
@@ -80,6 +85,60 @@ float4 nv12_main(float4 frag : SV_Position) : SV_Target
     float gg = luma - (48.0 * cb + 120.0 * cr) / 256.0;
     float bb = luma + cb * (475.0 / 256.0);
     return float4(saturate(rr / 255.0), saturate(gg / 255.0), saturate(bb / 255.0), 1.0);
+}
+
+// ------------------------------------------------------ NV12 -> BGRA (D3D11VA)
+// Same BT.709 limited-range maths as `nv12_main`, reading a D3D11VA texture
+// array slice directly. `Load(int4(x, y, array, mip))`; the SRV has
+// ArraySize=1 and FirstArraySlice=<decoded slice>, so array index 0 is the
+// picture.
+float4 nv12_hw_main(float4 frag : SV_Position) : SV_Target
+{
+    int2 p = int2(frag.xy);
+    float yy = tex_y_hw.Load(int4(p, 0, 0)).x * 255.0;
+    float2 uv = tex_uv_hw.Load(int4(p / 2, 0, 0)).rg * 255.0;
+    float luma = (yy - 16.0) * (298.0 / 256.0);
+    float cb = uv.x - 128.0;
+    float cr = uv.y - 128.0;
+    float rr = luma + cr * (403.0 / 256.0);
+    float gg = luma - (48.0 * cb + 120.0 * cr) / 256.0;
+    float bb = luma + cb * (475.0 / 256.0);
+    return float4(saturate(rr / 255.0), saturate(gg / 255.0), saturate(bb / 255.0), 1.0);
+}
+
+// ------------------------------------------------------- P010 -> BGRA (10-bit)
+// P010 stores 10-bit limited-range values in the high bits of 16-bit lanes:
+// Y 64..940, chroma 64..960 around 512. Scale back to the 8-bit code then use
+// the same coefficients as the NV12 path.
+float4 p010_hw_main(float4 frag : SV_Position) : SV_Target
+{
+    int2 p = int2(frag.xy);
+    float yy = tex_y_hw.Load(int4(p, 0, 0)).x * (65535.0 / 64.0);
+    float2 uv = tex_uv_hw.Load(int4(p / 2, 0, 0)).rg * (65535.0 / 64.0);
+    float luma = (yy - 64.0) * (298.0 / 1024.0);
+    float cb = (uv.x - 512.0) * 0.25;
+    float cr = (uv.y - 512.0) * 0.25;
+    float rr = luma + cr * (403.0 / 256.0);
+    float gg = luma - (48.0 * cb + 120.0 * cr) / 256.0;
+    float bb = luma + cb * (475.0 / 256.0);
+    return float4(saturate(rr / 255.0), saturate(gg / 255.0), saturate(bb / 255.0), 1.0);
+}
+
+// -------------------------------------------------- scene-cut probe (D3D11VA)
+// The CPU path samples a 32x18 luma grid while uploading. Hardware pictures
+// never come back to the CPU, so a 32x18 R8 target is rendered with the same
+// grid and copied to a tiny staging texture once per frame.
+#define SIG_COLS 32
+#define SIG_ROWS 18
+
+float4 sig_main(float4 frag : SV_Position) : SV_Target
+{
+    int2 p = int2(frag.xy);
+    int x = ((2 * p.x + 1) * (int)dims.z) / (2 * SIG_COLS);
+    int y = ((2 * p.y + 1) * (int)dims.w) / (2 * SIG_ROWS);
+    x = clamp(x, 0, (int)dims.z - 1);
+    y = clamp(y, 0, (int)dims.w - 1);
+    return float4(tex_y_hw.Load(int4(x, y, 0, 0)).xxx, 1.0);
 }
 
 // ------------------------------------------------------- AMD CAS (锐化)

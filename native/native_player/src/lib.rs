@@ -39,6 +39,7 @@ mod speed;
 mod state;
 mod storyboard;
 mod window;
+mod zerocopy;
 
 /// Release the bundled font resources at process exit.
 pub fn unload_player_fonts() {

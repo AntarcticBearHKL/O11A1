@@ -125,7 +125,13 @@ function startEngine() {
     BILI_FEED_PAGES: '1',
   };
   const ffmpeg = findFfmpegDir();
-  if (ffmpeg) env.BILI_FFMPEG_DIR = ffmpeg;
+  if (ffmpeg) {
+    env.BILI_FFMPEG_DIR = ffmpeg;
+    // libavcodec/libavformat are linked into o11a1-engine and load at process
+    // start, before main.cjs can call SetDllDirectory. The Windows loader
+    // searches PATH, so put the same folder that holds ffmpeg.exe first.
+    env.PATH = `${ffmpeg};${env.PATH || ''}`;
+  }
   engineProcess = spawn(exe, [], {
     cwd: path.dirname(exe),
     env,

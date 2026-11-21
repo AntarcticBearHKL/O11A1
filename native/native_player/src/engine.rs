@@ -26,7 +26,7 @@ use crate::danmaku::{
     convert_item, Band, DanmakuHit, DanmakuItem, DanmakuModel, DanmakuOverlay, DanmakuSettings,
     LongPress,
 };
-use crate::decode::{DecodedFrame, VideoDecoder, VideoSpec};
+use crate::decode::{DecodedFrame, FrameData, VideoDecoder, VideoSpec};
 use crate::detail::{CommentData, DetailEvent, DetailRequest};
 use crate::enhance::{EnhanceMode, EnhancePipeline};
 use crate::format::{clamp_seek, format_time};
@@ -1376,6 +1376,7 @@ impl Engine {
             height: self.source.height,
             fps: self.source.fps,
             speed: self.speed as f64,
+            live: self.is_live,
             cache_key: if self.is_live {
                 None
             } else {
@@ -1513,8 +1514,14 @@ impl Engine {
     fn open_sessions(&mut self, start_ms: u64, gate_open: bool) -> Result<()> {
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        let decoder = VideoDecoder::spawn(&self.video_spec(), start_ms, generation, gate_open)
-            .with_context(|| format!("open video decoder at {start_ms} ms"))?;
+        let decoder = VideoDecoder::spawn(
+            &self.video_spec(),
+            start_ms,
+            generation,
+            gate_open,
+            &self.gpu,
+        )
+        .with_context(|| format!("open video decoder at {start_ms} ms"))?;
         self.decoder = Some(decoder);
 
         // Above 2× the sound is unintelligible and its reader becomes the
@@ -1594,7 +1601,7 @@ impl Engine {
             // same position instead of ~400 ms apart.
             audio.send(AudioCommand::Pause);
         }
-        let decoder = VideoDecoder::spawn(&self.video_spec(), target, generation, false)
+        let decoder = VideoDecoder::spawn(&self.video_spec(), target, generation, false, &self.gpu)
             .with_context(|| format!("restart video decoder at {target} ms"))?;
         self.decoder = Some(decoder);
         self.session_started = Instant::now();
@@ -1918,7 +1925,7 @@ impl Engine {
         // loops then get the whole span as load budget instead of the old
         // 1.2 s tail (and loops under 1.6 s no longer skip prefetch entirely).
         let generation = self.generation.wrapping_add(1);
-        match VideoDecoder::spawn(&self.video_spec(), a, generation, true) {
+        match VideoDecoder::spawn(&self.video_spec(), a, generation, true, &self.gpu) {
             Ok(decoder) => {
                 self.loop_prefetch = Some(decoder);
                 log::line(&format!(
@@ -1996,6 +2003,13 @@ impl Engine {
 
     fn cache_ab_frame(&mut self, frame: &DecodedFrame) {
         if self.ab_cache_playing {
+            return;
+        }
+        // Hardware frames pin slices from the decoder's fixed D3D11VA pool.
+        // Keeping a two-second A/B span in GPU memory would starve the decoder;
+        // the zero-copy path uses the prefetch decoder for A/B instead.
+        if frame.data.is_gpu() {
+            self.ab_cache = None;
             return;
         }
         let Some((a, b)) = self.ab_range() else {
@@ -4000,7 +4014,14 @@ impl Engine {
         if grid {
             self.next = None;
             self.next_tick_at = Some(Instant::now());
-            self.fill_next(self.position_now().saturating_add(INTERP_LOOKAHEAD_MS));
+            // A fresh session may already have its first source picture in the
+            // queue. Parking it in `next` here used to strand it: the starting
+            // branch only looked at the decoder queue, and `poll_interp` does
+            // nothing until `cur` exists. Wait for the first picture to be
+            // shown, then the tick fills the lookahead normally.
+            if self.cur.is_some() {
+                self.fill_next(self.position_now().saturating_add(INTERP_LOOKAHEAD_MS));
+            }
         } else {
             // A lookahead frame may have been consumed from the queue; show it
             // now so switching never skips a source picture.
@@ -5257,17 +5278,19 @@ impl Engine {
         }
     }
 
-    /// Upload one NV12 frame into the GPU frame ring and convert it to BGRA
-    /// with the NV12 shader. Keeping the conversion here (instead of in the
-    /// presenter) lets `next` be ready before the tick that needs it.
+    /// Convert one decoded picture into the BGRA frame ring. CPU frames are
+    /// uploaded as before; D3D11VA frames are sampled directly by the NV12 or
+    /// P010 shader, so this is the only per-picture GPU work and no bytes cross
+    /// the bus.
     fn prepare_frame(&mut self, frame: DecodedFrame) -> Option<GpuFrame> {
         if self.source.width == 0 || self.source.height == 0 {
             return None;
         }
-        match self
-            .video
-            .upload(&self.gpu, &frame.data, frame.ts_ms)
-        {
+        let result = match &frame.data {
+            FrameData::Cpu(data) => self.video.upload(&self.gpu, data, frame.ts_ms),
+            FrameData::Gpu(hw) => self.video.upload_hw(hw, frame.ts_ms),
+        };
+        match result {
             Ok(prepared) => Some(prepared),
             Err(error) => {
                 log::line(&format!("gpu frame upload failed: {error:#}"));
@@ -5375,7 +5398,7 @@ impl Engine {
                 .unwrap_or(0),
             self.last_frame_ts
         ));
-        match VideoDecoder::spawn(&self.video_spec(), target, generation, true) {
+        match VideoDecoder::spawn(&self.video_spec(), target, generation, true, &self.gpu) {
             Ok(decoder) => {
                 self.decoder = Some(decoder);
                 self.video_resync = Some(VideoResync {

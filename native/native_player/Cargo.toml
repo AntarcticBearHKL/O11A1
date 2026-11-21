@@ -24,6 +24,7 @@ windows = { version = "0.62", features = [
     "Foundation",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
@@ -46,3 +47,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-numerics = "0.3"
+# In-process video decoding: libavformat demuxes into libavcodec D3D11VA,
+# which hands the player's own D3D11 textures to the NV12/P010 shaders.
+ffmpeg-sys-next = "8.1"

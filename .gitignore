@@ -14,6 +14,7 @@ engine-*.txt
 test-*.txt
 
 native/target/
+native/ffmpeg81/
 native/core/settings.json
 native/core/player_state.json
 native/core/accounts.json

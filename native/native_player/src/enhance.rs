@@ -161,7 +161,7 @@ fn d3d_module() -> Result<HMODULE> {
     }
 }
 
-fn compile(source: &str, entry: &str, target: &str) -> Result<Vec<u8>> {
+pub(crate) fn compile(source: &str, entry: &str, target: &str) -> Result<Vec<u8>> {
     static CACHE: OnceLock<Mutex<HashMap<(String, String), Result<Vec<u8>, String>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -242,7 +242,11 @@ fn compile_uncached(source: &str, entry: &str, target: &str) -> Result<Vec<u8>> 
 const ENHANCE_HLSL: &str = include_str!("shaders/enhance.hlsl");
 const ANIME4K_S_HLSL: &str = include_str!("shaders/anime4k_restore_s.hlsl");
 
-fn pixel_shader(device: &ID3D11Device, source: &str, entry: &str) -> Result<ID3D11PixelShader> {
+pub(crate) fn pixel_shader(
+    device: &ID3D11Device,
+    source: &str,
+    entry: &str,
+) -> Result<ID3D11PixelShader> {
     let code = compile(source, entry, "ps_5_0")?;
     unsafe {
         let mut shader: Option<ID3D11PixelShader> = None;
@@ -561,6 +565,9 @@ pub struct VideoPasses {
     blend: ID3D11PixelShader,
     /// `nv12_main`: Y + UV planes -> BGRA.
     nv12: ID3D11PixelShader,
+    /// `nv12_hw_main` / `p010_hw_main`: D3D11VA array slices -> BGRA.
+    nv12_hw: ID3D11PixelShader,
+    p010_hw: ID3D11PixelShader,
     dims: ID3D11Buffer,
 }
 
@@ -584,6 +591,8 @@ impl VideoPasses {
         let copy = pixel_shader(device, ENHANCE_HLSL, "brightness_main")?;
         let blend = pixel_shader(device, ENHANCE_HLSL, "blend_main")?;
         let nv12 = pixel_shader(device, ENHANCE_HLSL, "nv12_main")?;
+        let nv12_hw = pixel_shader(device, ENHANCE_HLSL, "nv12_hw_main")?;
+        let p010_hw = pixel_shader(device, ENHANCE_HLSL, "p010_hw_main")?;
         let initial = [0.0f32; 8];
         let dims = unsafe {
             let description = D3D11_BUFFER_DESC {
@@ -616,6 +625,8 @@ impl VideoPasses {
             copy,
             blend,
             nv12,
+            nv12_hw,
+            p010_hw,
             dims,
         })
     }
@@ -689,6 +700,19 @@ impl VideoPasses {
     ) {
         self.set_extra(0.0);
         self.pass(&self.nv12, &[y, uv], target);
+    }
+
+    /// Hardware NV12/P010 array slices -> BGRA, with no system-memory copy.
+    pub fn convert_hw(
+        &self,
+        y: &ID3D11ShaderResourceView,
+        uv: &ID3D11ShaderResourceView,
+        p010: bool,
+        target: &ID3D11RenderTargetView,
+    ) {
+        self.set_extra(0.0);
+        let shader = if p010 { &self.p010_hw } else { &self.nv12_hw };
+        self.pass(shader, &[y, uv], target);
     }
 
     /// `weight` is the weight of `b` in `0..=1`.

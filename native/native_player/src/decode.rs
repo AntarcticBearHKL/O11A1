@@ -17,16 +17,46 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::gpu::Gpu;
 use crate::log;
 use crate::proc;
+use crate::zerocopy::{HWFrame, ZeroCopySession};
+
+/// One decoded picture. The external ffmpeg pipe delivers CPU NV12 bytes; the
+/// in-process D3D11VA path delivers a texture + plane SRVs. Both feed the same
+/// bounded queue and presentation clock.
+#[derive(Clone)]
+pub enum FrameData {
+    Cpu(Arc<Vec<u8>>),
+    Gpu(Arc<HWFrame>),
+}
+
+impl FrameData {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Cpu(bytes) => bytes.len(),
+            Self::Gpu(frame) => frame.bytes,
+        }
+    }
+
+    pub fn is_gpu(&self) -> bool {
+        matches!(self, Self::Gpu(_))
+    }
+}
 
 /// One decoded picture on the pipe. `ts_ms` is on the media timeline.
 pub struct DecodedFrame {
-    /// Shared so the reader can recycle the buffer once the engine drops the
-    /// last reference. At 4K a fresh 12 MB allocation per frame costs enough
-    /// page faults to starve the 60 fps deadline.
-    pub data: Arc<Vec<u8>>,
+    pub data: FrameData,
     pub ts_ms: u64,
+}
+
+impl DecodedFrame {
+    pub fn duplicate(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            ts_ms: self.ts_ms,
+        }
+    }
 }
 
 struct QueueInner {
@@ -59,7 +89,7 @@ impl FrameQueue {
         })
     }
 
-    fn push(&self, frame: DecodedFrame) {
+    pub(crate) fn push(&self, frame: DecodedFrame) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -177,7 +207,7 @@ impl FrameQueue {
         self.inner.lock().map(|inner| inner.dropped).unwrap_or(0)
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.closed = true;
             self.ready.notify_all();
@@ -202,6 +232,9 @@ pub struct VideoSpec {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// Live streams must not seek and cannot be restarted at an arbitrary
+    /// position; the zero-copy decoder keeps the reconnect policy instead.
+    pub live: bool,
     /// Playback speed: the reader admits `fps * speed` frames per second so a
     /// 1.5×/2× session is not starved by its own pacing.
     pub speed: f64,
@@ -215,11 +248,22 @@ pub struct VideoSpec {
     pub hw_decoder: String,
 }
 
-/// One running ffmpeg video decoder + its reader.
+enum DecoderKind {
+    External {
+        child: Child,
+        reader: Option<JoinHandle<()>>,
+        stderr: Option<JoinHandle<()>>,
+        /// Last stderr lines from ffmpeg, so a hardware decoder that refuses a
+        /// profile can be reported instead of a generic "decoder ended".
+        stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    },
+    ZeroCopy(ZeroCopySession),
+}
+
+/// One running video decoder + its reader, either the in-process D3D11VA
+/// decoder or the external ffmpeg pipe used as fallback.
 pub struct VideoDecoder {
-    child: Child,
-    reader: Option<JoinHandle<()>>,
-    stderr: Option<JoinHandle<()>>,
+    kind: DecoderKind,
     stop: Arc<AtomicBool>,
     /// Closed while paused/seeking: the reader pushes one frame and then waits
     /// here instead of racing through the file (or dropping the first frames
@@ -227,19 +271,82 @@ pub struct VideoDecoder {
     pub gate: Arc<AtomicBool>,
     pub queue: Arc<FrameQueue>,
     pub generation: u64,
-    /// Last stderr lines from ffmpeg, so a hardware decoder that refuses a
-    /// profile can be reported instead of a generic "decoder ended".
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl VideoDecoder {
     /// PID of the child ffmpeg process, used for the live network read
-    /// counter in the debug HUD.
+    /// counter in the debug HUD. Zero for the in-process decoder.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        match &self.kind {
+            DecoderKind::External { child, .. } => child.id(),
+            DecoderKind::ZeroCopy(_) => 0,
+        }
     }
 
+    pub fn is_zero_copy(&self) -> bool {
+        matches!(self.kind, DecoderKind::ZeroCopy(_))
+    }
+
+    /// Try the in-process D3D11VA pipe first, then fall back to the external
+    /// ffmpeg rawvideo pipe for live streams, unsupported profiles or drivers
+    /// without D3D11 video support.
     pub fn spawn(
+        spec: &VideoSpec,
+        start_ms: u64,
+        generation: u64,
+        gate_open: bool,
+        gpu: &Gpu,
+    ) -> Result<Self> {
+        let zero_copy_requested = std::env::var("BILI_DECODE")
+            .map(|value| value.trim().to_ascii_lowercase() != "ffmpeg")
+            .unwrap_or(true)
+            && o11a1::settings::load().player_mf_decode;
+        let (url, _cached) = resolve_url(spec);
+        if zero_copy_requested {
+            let (_, queue_depth) = ring_plan(spec);
+            let queue = FrameQueue::new(queue_depth);
+            let gate = Arc::new(AtomicBool::new(gate_open));
+            let stop = Arc::new(AtomicBool::new(false));
+            match ZeroCopySession::open(
+                &url,
+                &spec.headers,
+                !proc::is_local(&url),
+                spec.live,
+                start_ms,
+                spec.fps,
+                spec.width,
+                spec.height,
+                generation,
+                queue.clone(),
+                gate.clone(),
+                stop.clone(),
+                gpu,
+            ) {
+                Ok(session) => {
+                    log::line(&format!(
+                        "decoder path=zerocopy gen={generation} start_ms={start_ms} ring={queue_depth} remote={} live={}",
+                        u8::from(spec.remote),
+                        u8::from(spec.live)
+                    ));
+                    return Ok(Self {
+                        kind: DecoderKind::ZeroCopy(session),
+                        stop,
+                        gate,
+                        queue,
+                        generation,
+                    });
+                }
+                Err(error) => {
+                    log::line(&format!(
+                        "decoder fallback path=ffmpeg gen={generation} reason={error:#}"
+                    ));
+                }
+            }
+        }
+        Self::spawn_external(spec, start_ms, generation, gate_open)
+    }
+
+    fn spawn_external(
         spec: &VideoSpec,
         start_ms: u64,
         generation: u64,
@@ -251,15 +358,7 @@ impl VideoDecoder {
         let target_w = spec.width.max(2) & !1;
         let target_h = spec.height.max(2) & !1;
         let frame_bytes = target_w as usize * target_h as usize * 3 / 2;
-        let url = if spec.remote {
-            spec.cache_key
-                .as_deref()
-                .and_then(|key| crate::mediacache::cached_url(&spec.url, &spec.headers, key))
-                .unwrap_or_else(|| spec.url.clone())
-        } else {
-            spec.url.clone()
-        };
-        let cached = url != spec.url;
+        let (url, cached) = resolve_url(spec);
         let scale = target_w != spec.source_width || target_h != spec.source_height;
         let mut command = proc::command("ffmpeg.exe");
         command
@@ -360,26 +459,8 @@ impl VideoDecoder {
         // A 250 ms ring gives the presenter a real jitter buffer. The old six
         // slots were exactly 100 ms at 60 fps, so one cache/disk/CPU hiccup
         // emptied the ring and `take_due_in_order` threw away five pictures in
-        // a row (the 4K cold-cache stutter). Deeper rings cost memory only:
-        // 15 x 12.4 MB at 4K60, ~50 MB at 1080p60.
-        let (frame_period, queue_depth) = {
-            let fps = if spec.fps.is_finite() && spec.fps > 1.0 {
-                spec.fps
-            } else {
-                30.0
-            };
-            let speed = if spec.speed.is_finite() && spec.speed > 0.0 {
-                spec.speed
-            } else {
-                1.0
-            };
-            let speed = crate::speed::clamp(speed as f32) as f64;
-            let wall_fps = fps.min(240.0) * speed;
-            (
-                Duration::from_secs_f64(1.0 / wall_fps),
-                (wall_fps * 0.25).ceil().clamp(6.0, 15.0) as usize,
-            )
-        };
+        // a row (the 4K cold-cache stutter). Deeper rings cost memory only.
+        let (frame_period, queue_depth) = ring_plan(spec);
         let queue = FrameQueue::new(queue_depth);
         log::line(&format!(
             "decoder ring gen={generation} depth={queue_depth} frame_bytes={frame_bytes}"
@@ -450,28 +531,28 @@ impl VideoDecoder {
                 .ok()
         });
         Ok(Self {
-            child,
-            reader: Some(reader),
-            stderr: stderr_thread.flatten(),
+            kind: DecoderKind::External {
+                child,
+                reader: Some(reader),
+                stderr: stderr_thread.flatten(),
+                stderr_tail,
+            },
             stop,
             gate,
             queue,
             generation,
-            stderr_tail,
         })
     }
 
     /// The last ffmpeg error lines, used to explain a failed hardware decode.
     pub fn stderr_tail(&self) -> String {
-        self.stderr_tail
-            .lock()
-            .map(|tail| {
-                tail.iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            })
-            .unwrap_or_default()
+        match &self.kind {
+            DecoderKind::External { stderr_tail, .. } => stderr_tail
+                .lock()
+                .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join(" | "))
+                .unwrap_or_default(),
+            DecoderKind::ZeroCopy(session) => session.last_error(),
+        }
     }
 
     /// Ask the child to stop, close its pipe and join both threads. Safe to call
@@ -480,14 +561,26 @@ impl VideoDecoder {
         if self.stop.swap(true, Ordering::SeqCst) {
             return;
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.queue.close();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            let _ = stderr.join();
+        match &mut self.kind {
+            DecoderKind::External {
+                child,
+                reader,
+                stderr,
+                ..
+            } => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.queue.close();
+                if let Some(reader) = reader.take() {
+                    let _ = reader.join();
+                }
+                if let Some(stderr) = stderr.take() {
+                    let _ = stderr.join();
+                }
+            }
+            DecoderKind::ZeroCopy(session) => {
+                session.stop();
+            }
         }
     }
 }
@@ -496,6 +589,43 @@ impl Drop for VideoDecoder {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Prefer the completed disk cache or the loopback cache server, exactly like
+/// the external pipe. `cached` reports whether the URL changed.
+fn resolve_url(spec: &VideoSpec) -> (String, bool) {
+    let url = if spec.remote {
+        spec.cache_key
+            .as_deref()
+            .and_then(|key| crate::mediacache::cached_url(&spec.url, &spec.headers, key))
+            .unwrap_or_else(|| spec.url.clone())
+    } else {
+        spec.url.clone()
+    };
+    let cached = url != spec.url;
+    (url, cached)
+}
+
+/// Frame period and queue depth for one session. Zero-copy keeps a slightly
+/// shorter ring than the CPU path: every slot pins a real D3D11 surface from
+/// the decoder's fixed pool, so twelve pictures is the safe maximum at 4K.
+fn ring_plan(spec: &VideoSpec) -> (Duration, usize) {
+    let fps = if spec.fps.is_finite() && spec.fps > 1.0 {
+        spec.fps
+    } else {
+        30.0
+    };
+    let speed = if spec.speed.is_finite() && spec.speed > 0.0 {
+        spec.speed
+    } else {
+        1.0
+    };
+    let speed = crate::speed::clamp(speed as f32) as f64;
+    let wall_fps = fps.min(240.0) * speed;
+    (
+        Duration::from_secs_f64(1.0 / wall_fps),
+        (wall_fps * 0.25).ceil().clamp(6.0, 12.0) as usize,
+    )
 }
 
 /// Bytes read by one process (network + local file), used by the debug HUD
@@ -587,7 +717,7 @@ fn read_frames(
         // Hand the frame over without a full-frame copy: the buffer goes back
         // to the pool once the engine is done with it.
         queue.push(DecodedFrame {
-            data: buffer.clone(),
+            data: FrameData::Cpu(buffer.clone()),
             ts_ms,
         });
         pool.push(buffer);
@@ -627,7 +757,7 @@ mod tests {
 
     fn frame(ts_ms: u64) -> DecodedFrame {
         DecodedFrame {
-            data: Arc::new(Vec::new()),
+            data: FrameData::Cpu(Arc::new(Vec::new())),
             ts_ms,
         }
     }
