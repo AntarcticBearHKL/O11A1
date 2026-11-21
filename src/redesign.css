@@ -4549,19 +4549,17 @@ html, body, #root {
   overflow: hidden;
   border-radius: 24px;
   background: color-mix(in srgb, var(--card-solid) 56%, transparent);
-  border: 1px solid var(--card-border);
+  border: 0;
   backdrop-filter: blur(14px) saturate(1.12);
   -webkit-backdrop-filter: blur(14px) saturate(1.12);
   transition:
     translate 0.26s var(--ease),
-    background 0.22s var(--ease),
-    border-color 0.22s var(--ease);
+    background 0.22s var(--ease);
 }
 .home-feed .video-card:hover {
   transform: none;
   translate: 0 -3px;
   background: color-mix(in srgb, var(--card-solid) 63%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 18%, var(--card-border));
 }
 .home-feed .video-card:focus-visible {
   border-radius: 26px;
@@ -4584,11 +4582,9 @@ html, body, #root {
 }
 [data-theme='dark'] .home-feed .video-card {
   background: color-mix(in srgb, var(--card-solid) 60%, transparent);
-  border-color: rgba(255, 255, 255, 0.10);
 }
 [data-theme='dark'] .home-feed .video-card:hover {
   background: color-mix(in srgb, var(--card-solid) 68%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 28%, rgba(255, 255, 255, 0.10));
 }
 @media (max-width: 1260px) {
   .home-feed .video-grid {
