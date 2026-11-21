@@ -995,6 +995,11 @@ em { font-style: normal; }
   flex-wrap: wrap;
   margin-bottom: 18px;
 }
+/* History has no page head, so its pager toolbar is the first row. Match the
+   18px gap below the toolbar with the gap above it instead of inheriting the
+   30px page-head offset. The doubled class also outranks the responsive
+   `.page` padding rules. */
+.page.page-history { padding-top: 90px; }
 .history-pager { display: flex; align-items: center; gap: 4px; }
 .history-page {
   min-width: 56px;

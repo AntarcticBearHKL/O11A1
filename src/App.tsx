@@ -953,7 +953,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
             </div>
           </header>
 
-          <main className="page">
+          <main className={`page${route.name === 'history' ? ' page-history' : ''}`}>
             <div className="page-inner" key={`${route.name}-${route.id}`}>
               {notice ? (
                 <div className="banner">
