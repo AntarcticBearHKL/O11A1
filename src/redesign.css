@@ -1359,7 +1359,8 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .video-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 46px 22px;
+  /* Flat grid: row and column breathing room are the same. */
+  gap: 24px;
 }
 .video-card {
   position: relative;
@@ -1381,19 +1382,10 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .video-card .cover {
   position: relative;
   flex: 0 0 auto;
-  aspect-ratio: 16 / 10;
+  aspect-ratio: 16 / 9;
   overflow: hidden;
   border-radius: 20px;
   background: var(--surface-2);
-  box-shadow:
-    0 1px 2px rgba(20, 18, 14, 0.04),
-    0 8px 18px -16px rgba(20, 18, 14, 0.18);
-  transition: box-shadow 0.3s var(--ease);
-}
-.video-card:hover .cover {
-  box-shadow:
-    0 2px 4px rgba(20, 18, 14, 0.06),
-    0 14px 28px -18px rgba(20, 18, 14, 0.24);
 }
 .video-card .cover img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.6s var(--ease); }
 .video-card:hover .cover img { transform: scale(1.045); }
@@ -2015,7 +2007,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   background-position: calc(100% - 15px) 12px, calc(100% - 10px) 12px;
 }
 
-.pgc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(146px, 1fr)); gap: 20px 14px; }
+.pgc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(146px, 1fr)); gap: 20px; }
 .pgc-card {
   position: relative;
   min-width: 0;
@@ -2035,7 +2027,6 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   overflow: hidden;
   border-radius: 20px;
   background: var(--surface-2);
-  box-shadow: 0 1px 2px rgba(30, 26, 20, 0.05), 0 12px 26px -18px rgba(30, 26, 20, 0.5);
 }
 .pgc-cover img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.55s var(--ease); }
 .pgc-card:hover .pgc-cover img { transform: scale(1.045); }
@@ -2063,7 +2054,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
   gap: 46px 22px;
 }
-.pgc-daily-card .pgc-cover { aspect-ratio: 16 / 10; }
+.pgc-daily-card .pgc-cover { aspect-ratio: 16 / 9; }
 .pgc-daily-card .pgc-body { padding: 12px 2px 10px; }
 .pgc-daily-card .video-title {
   min-height: 0;
@@ -3769,7 +3760,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   .app { grid-template-columns: minmax(0, 1fr); }
   .rail-item { height: 42px; font-size: 12.5px; }
   .page { padding: 98px 28px 124px; }
-  .video-grid { gap: 42px 16px; grid-template-columns: repeat(auto-fill, minmax(206px, 1fr)); }
+  .video-grid { gap: 20px; grid-template-columns: repeat(auto-fill, minmax(206px, 1fr)); }
   .pgc-grid { grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); }
 }
 
@@ -3808,7 +3799,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 
 @media (max-width: 720px) {
   .page { padding: 92px 18px 120px; }
-  .video-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px 12px; }
+  .video-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
   .video-title { font-size: 12.5px; }
   .dock { bottom: 16px; }
   .bottom-bar { height: 64px; padding: 6px 9px; gap: 7px; }
@@ -4359,7 +4350,7 @@ html, body, #root {
    26px blur) and only the shell is translucent; the cover stays opaque. */
 .home-feed .video-grid {
   grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
-  gap: 30px 18px;
+  gap: 24px;
 }
 .home-feed .video-card {
   padding: 0;
@@ -4367,25 +4358,18 @@ html, body, #root {
   border-radius: 24px;
   background: color-mix(in srgb, var(--card-solid) 56%, transparent);
   border: 1px solid var(--card-border);
-  box-shadow:
-    0 16px 36px -30px rgba(20, 18, 14, 0.44),
-    inset 0 1px 0 rgba(255, 255, 255, 0.46);
   backdrop-filter: blur(14px) saturate(1.12);
   -webkit-backdrop-filter: blur(14px) saturate(1.12);
   transition:
     translate 0.26s var(--ease),
     background 0.22s var(--ease),
-    border-color 0.22s var(--ease),
-    box-shadow 0.22s var(--ease);
+    border-color 0.22s var(--ease);
 }
 .home-feed .video-card:hover {
   transform: none;
   translate: 0 -3px;
   background: color-mix(in srgb, var(--card-solid) 63%, transparent);
   border-color: color-mix(in srgb, var(--accent) 18%, var(--card-border));
-  box-shadow:
-    0 22px 44px -30px rgba(20, 18, 14, 0.50),
-    inset 0 1px 0 rgba(255, 255, 255, 0.52);
 }
 .home-feed .video-card:focus-visible {
   border-radius: 26px;
@@ -4409,27 +4393,21 @@ html, body, #root {
 [data-theme='dark'] .home-feed .video-card {
   background: color-mix(in srgb, var(--card-solid) 60%, transparent);
   border-color: rgba(255, 255, 255, 0.10);
-  box-shadow:
-    0 18px 40px -30px rgba(0, 0, 0, 0.86),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 [data-theme='dark'] .home-feed .video-card:hover {
   background: color-mix(in srgb, var(--card-solid) 68%, transparent);
   border-color: color-mix(in srgb, var(--accent) 28%, rgba(255, 255, 255, 0.10));
-  box-shadow:
-    0 24px 48px -30px rgba(0, 0, 0, 0.90),
-    inset 0 1px 0 rgba(255, 255, 255, 0.10);
 }
 @media (max-width: 1260px) {
   .home-feed .video-grid {
     grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-    gap: 28px 16px;
+    gap: 20px;
   }
 }
 @media (max-width: 720px) {
   .home-feed .video-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 20px 12px;
+    gap: 14px;
   }
   .home-feed .video-card {
     padding: 0;

@@ -91,6 +91,11 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.17 视频卡改宽、去阴影、等距网格**：
+  - 所有标准视频卡的封面比例从 **16:10 改为 16:9**，画面更宽；PGC 每日卡也同步改为 16:9，普通 PGC 竖版海报保持 100:128。
+  - 扁平化：删除视频卡封面、PGC 封面、首页玻璃卡的普通/悬停/深色 box-shadow，只保留玻璃底色、1px 边框和封面内圆角；首页玻璃卡仍保留悬停背景和 3px 位移反馈。
+  - 网格行距和列距统一：桌面 `gap: 24px`，1260px 以下 `20px`，720px 以下 `14px`；PGC 网格改为 `20px`。首页玻璃网格和普通视频网格使用同一组等距值。
+  - 用真实构建 CSS 静态截图确认：16:9 封面、无阴影卡片、横纵间距一致，玻璃文字区仍满铺衔接。
 - **0.9.16 首页玻璃卡封面满铺**：首页卡片的 preview 不再有左/右/上内边距，封面直接贴住玻璃外壳边缘，只保留 23px 的顶部内圆角；卡片本身改为 `padding:0` + `overflow:hidden`，标题/信息区单独用 `10px 12px 12px` 内边距。卡片仍保留 1px 外边框和玻璃底，封面与玻璃背景之间没有白色留边；移动端同步改为 0 内边距、19px 顶部圆角、10px 横向文字内边距。用真实构建 CSS 截图确认封面与卡片左右上边缘齐平。
 - **0.9.15 首页整卡磨砂玻璃**：
   - 首页推荐流改用 **B 方案整卡玻璃**：只作用于 `.home-feed`，搜索、历史、收藏等页面继续保留原来的透明卡片。
@@ -185,7 +190,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.16.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.9.17.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
