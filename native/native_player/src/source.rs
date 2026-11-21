@@ -369,11 +369,18 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
         // difference between a cache that keeps up and one that does not.
         let requested_codec = config.quality_codecid.unwrap_or(0);
         let track = if let Some(height) = config.quality_height {
-            preferred_height_track(&tracks, height, requested_codec)
+            preferred_height_track(&tracks, height, requested_codec, Some((&bvid_owned, cid)))
         } else {
             let requested_qn = config.quality_qn.unwrap_or(80);
-            track_for_qn(&tracks, requested_qn, requested_codec)
-                .or_else(|| track_for_qn(&tracks, info.default_qn, requested_codec))
+            track_for_qn(&tracks, requested_qn, requested_codec, Some((&bvid_owned, cid)))
+                .or_else(|| {
+                    track_for_qn(
+                        &tracks,
+                        info.default_qn,
+                        requested_codec,
+                        Some((&bvid_owned, cid)),
+                    )
+                })
                 .or_else(|| tracks.first().copied())
         }
         .ok_or_else(|| anyhow!("playurl returned no supported video tracks"))?;
@@ -521,6 +528,7 @@ fn preferred_height_track<'a>(
     tracks: &[&'a o11a1::bilibili::VideoTrack],
     height: u32,
     codec: i64,
+    cache_base: Option<(&str, u64)>,
 ) -> Option<&'a o11a1::bilibili::VideoTrack> {
     if tracks.is_empty() {
         return None;
@@ -549,10 +557,32 @@ fn preferred_height_track<'a>(
         }
         // The requested codec is not available at this height; use the
         // automatic choice rather than dropping to a lower resolution.
+    } else if let Some((bvid, cid)) = cache_base {
+        // Reuse an already complete cache at this resolution before starting
+        // a fresh download for a different codec. This keeps a video the user
+        // already watched (possibly the old AVC cache) instant on upgrade,
+        // while new videos still prefer the half-bitrate HEVC stream.
+        for codecid in [12, 13, 7] {
+            if let Some(track) = at_height.clone().find(|track| {
+                track.codecid == codecid
+                    && crate::mediacache::is_complete_key(&track_cache_key(
+                        bvid, cid, track,
+                    ))
+            }) {
+                return Some(track);
+            }
+        }
     }
     at_height
         .min_by_key(|track| (auto_codec_rank(track.codecid), track.bandwidth))
         .copied()
+}
+
+fn track_cache_key(bvid: &str, cid: u64, track: &o11a1::bilibili::VideoTrack) -> String {
+    format!(
+        "{bvid}-{cid}-v{}-{}-{}x{}",
+        track.id, track.codecid, track.width, track.height
+    )
 }
 
 /// HEVC first, then AV1, then AVC. All three are hardware-decoded here; HEVC
@@ -574,6 +604,7 @@ fn track_for_qn<'a>(
     tracks: &[&'a o11a1::bilibili::VideoTrack],
     qn: i64,
     codec: i64,
+    cache_base: Option<(&str, u64)>,
 ) -> Option<&'a o11a1::bilibili::VideoTrack> {
     if codec != 0 {
         if let Some(track) = tracks
@@ -582,6 +613,18 @@ fn track_for_qn<'a>(
             .max_by_key(|track| track.bandwidth)
         {
             return Some(*track);
+        }
+    } else if let Some((bvid, cid)) = cache_base {
+        let at_qn = tracks.iter().filter(|track| track.id == qn);
+        for codecid in [12, 13, 7] {
+            if let Some(track) = at_qn.clone().find(|track| {
+                track.codecid == codecid
+                    && crate::mediacache::is_complete_key(&track_cache_key(
+                        bvid, cid, track,
+                    ))
+            }) {
+                return Some(track);
+            }
         }
     }
     tracks

@@ -301,6 +301,24 @@ fn contiguous_lead(chunks: &[ChunkState], chunk: u64, total: u64, offset: u64) -
     bytes
 }
 
+/// Completed/total bytes for a cache key in this process, if it exists.
+pub fn is_complete_key(key: &str) -> bool {
+    let id = media_id(key);
+    if let Some(media) = registry().lock().ok().and_then(|map| map.get(&id).cloned()) {
+        return media.is_complete();
+    }
+    let Ok(dir) = cache_dir() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(marker_for(&dir, &id)) else {
+        return false;
+    };
+    let Ok(total) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    total >= MIN_CACHE_BYTES && file_len(&path_for(&dir, &id)) == Some(total)
+}
+
 /// Wait until a cached key is complete (or failed). Used by the playlist
 /// prefetch worker so it does not steal bandwidth from the active video.
 pub fn wait_for_key(key: &str) {
