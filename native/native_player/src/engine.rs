@@ -7971,7 +7971,7 @@ impl Engine {
         {
             // GPU-only: a closed pipe with no picture means the hardware
             // decoder refused this stream/profile. Report the driver's own
-            // reason instead of waiting for the generic 15 s timeout.
+            // reason instead of waiting for the generic 30 s timeout.
             let tail = self
                 .decoder
                 .as_ref()
@@ -7986,7 +7986,7 @@ impl Engine {
         }
         if self.starting
             && self.cur.is_none()
-            && self.session_started.elapsed() >= Duration::from_secs(15)
+            && self.session_started.elapsed() >= Duration::from_secs(30)
         {
             self.report_error("视频加载超时，点击重试重新连接");
         }

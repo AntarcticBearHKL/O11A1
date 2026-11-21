@@ -302,14 +302,16 @@ impl VideoDecoder {
             .arg("-an")
             .arg("-sn")
             .arg("-dn");
-        command.arg("-vf").arg(if scale {
-            // Scale on the GPU before the download: the 1080p decode cap then
-            // moves 3 MB/frame over the pipe instead of downloading 4K and
-            // resizing on the CPU.
-            format!("scale_cuda={target_w}:{target_h},hwdownload,format=nv12")
-        } else {
-            "hwdownload,format=nv12".to_string()
-        });
+        // One GPU chain for every stream. `format=nv12` handles both cases:
+        // an 8-bit CUDA frame already is NV12 and `scale_cuda` passes it
+        // through untouched, while a 10-bit (P010/P016) frame is converted on
+        // the GPU instead of failing `hwdownload,format=nv12` (the old chain
+        // refused every 4K HDR / 10-bit HEVC or AV1 stream).
+        command
+            .arg("-vf")
+            .arg(format!(
+                "scale_cuda={target_w}:{target_h}:format=nv12,hwdownload,format=nv12"
+            ));
         command
             .arg("-fps_mode")
             .arg("passthrough")
@@ -332,16 +334,35 @@ impl VideoDecoder {
         let mut child = command
             .spawn()
             .with_context(|| format!("spawn ffmpeg for {url}"))?;
+        // The 4K pipe has ~2x realtime headroom. Let the decoder win over the
+        // background cache workers (which run below normal) instead of losing
+        // frames to scheduling noise.
+        #[cfg(windows)]
+        unsafe {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::System::Threading::{
+                SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS,
+            };
+            let handle = HANDLE(child.as_raw_handle() as _);
+            if let Err(error) = SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS) {
+                log::line(&format!("decoder priority failed: {error:#}"));
+            }
+        }
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("ffmpeg stdout missing"))?;
         let stderr = child.stderr.take();
-        let queue = FrameQueue::new(6);
         let stop = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(AtomicBool::new(gate_open));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-        let frame_period = {
+        // A 250 ms ring gives the presenter a real jitter buffer. The old six
+        // slots were exactly 100 ms at 60 fps, so one cache/disk/CPU hiccup
+        // emptied the ring and `take_due_in_order` threw away five pictures in
+        // a row (the 4K cold-cache stutter). Deeper rings cost memory only:
+        // 15 x 12.4 MB at 4K60, ~50 MB at 1080p60.
+        let (frame_period, queue_depth) = {
             let fps = if spec.fps.is_finite() && spec.fps > 1.0 {
                 spec.fps
             } else {
@@ -353,8 +374,16 @@ impl VideoDecoder {
                 1.0
             };
             let speed = crate::speed::clamp(speed as f32) as f64;
-            Duration::from_secs_f64(1.0 / (fps.min(240.0) * speed))
+            let wall_fps = fps.min(240.0) * speed;
+            (
+                Duration::from_secs_f64(1.0 / wall_fps),
+                (wall_fps * 0.25).ceil().clamp(6.0, 15.0) as usize,
+            )
         };
+        let queue = FrameQueue::new(queue_depth);
+        log::line(&format!(
+            "decoder ring gen={generation} depth={queue_depth} frame_bytes={frame_bytes}"
+        ));
         // QA hook: cap decode throughput to reproduce the 4K / slow-decoder
         // case where the picture cannot be produced in real time. Unset in
         // normal runs, so the reader never sleeps.
@@ -504,6 +533,15 @@ fn read_frames(
     frame_period: Duration,
     qa_delay: Duration,
 ) {
+    // The pipe reader is on the 4K critical path (12.4 MB per picture at
+    // 60 fps). Keep it above the background cache workers.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
     // Reusable frame buffers. A buffer is free once only this list holds it;
     // the engine drops its reference when it presents/replaces the picture.
     let mut pool: Vec<Arc<Vec<u8>>> = Vec::new();

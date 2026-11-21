@@ -36,8 +36,12 @@ use crate::log;
 const CHUNK_BYTES: u64 = 512 * 1024;
 /// Very small resources are not worth a cache file and a local server.
 const MIN_CACHE_BYTES: u64 = 512 * 1024;
-const MAX_WORKERS: usize = 16;
-const READ_CHUNK: usize = 64 * 1024;
+/// Eight HTTP/1.1 range workers: one connection each, enough parallel
+/// streams to saturate a normal CDN link without the HTTP/2 resets that made
+/// sixteen multiplexed ranges fail. The user's `prefetch_connections` setting
+/// can lower this, never raise it.
+const MAX_WORKERS: usize = 8;
+const READ_CHUNK: usize = 256 * 1024;
 const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
      AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
@@ -66,6 +70,13 @@ pub struct CachedMedia {
     state: Mutex<MediaState>,
     ready: Condvar,
     stop: AtomicBool,
+    /// The original CDN resource. If a cache chunk cannot be fetched (a CDN
+    /// reset, a throttled range, a stale signed URL after a long pause), the
+    /// loopback server proxies the missing range directly instead of killing
+    /// the whole video.
+    url: String,
+    headers: HeaderMap,
+    client: Client,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<CachedMedia>>>> = OnceLock::new();
@@ -211,6 +222,18 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
     let dir = cache_dir().ok()?;
     let path = path_for(&dir, &id);
     let marker = marker_for(&dir, &id);
+    let state_path = state_for(&dir, &id);
+    // HTTP/1.1 gives every range worker its own connection. Bilibili's CDN
+    // resets multiplexed HTTP/2 range bodies under eight-way concurrency
+    // ("end of file before message length reached"), which used to abort a
+    // whole 4K video. One connection per worker is what download managers do.
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .http1_only()
+        .build()
+        .ok()?;
+    let header_map = header_map(headers);
 
     // A completed file survives app restarts; no network request is needed.
     if let Ok(text) = std::fs::read_to_string(&marker) {
@@ -231,6 +254,9 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
                     }),
                     ready: Condvar::new(),
                     stop: AtomicBool::new(false),
+                    url: url.to_string(),
+                    headers: header_map.clone(),
+                    client: client.clone(),
                 });
                 if let Ok(mut map) = registry().lock() {
                     map.insert(id, media.clone());
@@ -239,13 +265,6 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
             }
         }
     }
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(300))
-        .build()
-        .ok()?;
-    let header_map = header_map(headers);
-    let state_path = state_for(&dir, &id);
 
     // Resume an interrupted parallel download. The `.state` file is a total
     // line followed by one completed chunk index per line. A chunk is only
@@ -334,6 +353,9 @@ fn prepare(url: &str, headers: &[(String, String)], key: &str) -> Option<Arc<Cac
         }),
         ready: Condvar::new(),
         stop: AtomicBool::new(false),
+        url: url.to_string(),
+        headers: header_map.clone(),
+        client: client.clone(),
     });
     if let Ok(mut map) = registry().lock() {
         if let Some(existing) = map.get(&id) {
@@ -411,6 +433,16 @@ fn content_range_total(text: &str) -> Option<u64> {
 }
 
 fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers: HeaderMap) {
+    // Cache prefetch is background work. Below-normal priority keeps the
+    // decoder, the pipe reader and the engine responsive while a 4K file is
+    // filling in; the download still uses every idle cycle.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
     loop {
         if media.stop.load(Ordering::SeqCst) {
             break;
@@ -450,7 +482,10 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
         let end = ((index as u64 + 1) * media.chunk - 1).min(media.total - 1);
         let mut last_error = String::new();
         let mut ok = false;
-        for attempt in 0..3 {
+        // A single flaky CDN connection used to abort the whole video after
+        // three tries. Eight backed-off attempts ride out a reset or a short
+        // CDN hiccup; only a genuinely unavailable range fails the media.
+        for attempt in 0..8 {
             match download_range(&media, &client, &url, &headers, start, end) {
                 Ok(()) => {
                     ok = true;
@@ -462,7 +497,8 @@ fn download_worker(media: Arc<CachedMedia>, client: Client, url: String, headers
                         "media cache range failed id={} chunk={index} attempt={attempt} err={last_error}",
                         media.id
                     ));
-                    std::thread::sleep(Duration::from_millis(400 + attempt as u64 * 500));
+                    let backoff = (300 * (attempt as u64 + 1)).min(2000);
+                    std::thread::sleep(Duration::from_millis(backoff));
                 }
             }
         }
@@ -619,6 +655,43 @@ impl CachedMedia {
             state = next;
         }
     }
+
+    /// Serve a range straight from the CDN. Called by the loopback server when
+    /// a cache chunk failed (a throttled range, a CDN reset, or a stale signed
+    /// URL). Playback continues at network speed instead of dying with
+    /// "stream ends prematurely"; the cache stays a fast path, never a single
+    /// point of failure.
+    fn proxy_body(&self, stream: &mut TcpStream, start: u64, end: u64) -> Result<()> {
+        if start > end {
+            return Ok(());
+        }
+        let expected = end - start + 1;
+        let mut response = self
+            .client
+            .get(&self.url)
+            .headers(self.headers.clone())
+            .header(RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .context("proxy media range")?;
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            bail!("proxy media range status {}", response.status());
+        }
+        let mut buffer = vec![0u8; READ_CHUNK];
+        let mut sent = 0u64;
+        while sent < expected {
+            let want = ((expected - sent) as usize).min(buffer.len());
+            let read = response.read(&mut buffer[..want])?;
+            if read == 0 {
+                break;
+            }
+            stream.write_all(&buffer[..read])?;
+            sent += read as u64;
+        }
+        if sent < expected {
+            bail!("proxy media range short: {sent}/{expected}");
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------- loopback server
@@ -702,7 +775,14 @@ fn serve(mut stream: TcpStream) -> Result<()> {
     let mut offset = start;
     let mut buffer = vec![0u8; READ_CHUNK];
     while offset <= end {
-        media.wait_ready(offset)?;
+        if let Err(error) = media.wait_ready(offset) {
+            log::line(&format!(
+                "media cache proxy fallback id={} offset={offset} end={end} err={error:#}",
+                media.id
+            ));
+            media.proxy_body(&mut stream, offset, end)?;
+            return Ok(());
+        }
         // Never read past the chunk just waited for: the sparse file has a
         // hole for every chunk still downloading, and returning those zeros
         // corrupts the bitstream (the H.264 parser then reports "missing

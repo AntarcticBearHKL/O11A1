@@ -80,8 +80,9 @@
 - **视频比例锁定为源比例**：缩放时按原比例等比缩放，不拉伸、不裁切。
 - **插帧挡位**：播放器设置页的插帧行展开 关闭 / 自动 / 60 / 90 / 120 内联菜单（自动 = 播放器窗口所在显示器的刷新率），高于该屏刷新率的固定挡位会被拒绝；窗口拖到另一块屏后一秒内重算挡位与自动目标（120↔60 实测生效）；键盘 I 同样在可用挡位间循环。工具条不再提供插帧入口。底层 `interp_hz` 仍为 0（自动）/ 60 / 90 / 120，pacer 按目标生成 tick；源帧到达时上屏，中间 tick 用按播放位置计算的权重混合。 每次选择立即写回全局 `settings.json`，并通过 `settings.changed` 同步主设置页与播放器侧栏；画质增强走同一条路径，换视频、换窗口或重启应用都继续沿用。
 - **多屏刷新率**：插帧挡位、自动挡和弹幕节拍都跟随播放器窗口所在显示器：`MonitorFromWindow` 取 HMONITOR，`GetMonitorInfoW` 取设备名，再对该设备调用 `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`，结果缓存 2 秒；1 秒一次的 `tick_monitor_refresh` 在跨屏或改刷新率后重算，固定挡位高于新屏时退回自动。旧实现用 `EnumDisplaySettingsW(NULL)`，在双屏驱动上会失败并固定回 60Hz，所以 120Hz 屏也只显示到 60 挡位；现在 60Hz 屏只给 60，120Hz 屏给 60 / 90 / 120。
-- **4K 解码**：设置里的「原始分辨率解码」现在真正生效。关闭时最高 1080P（`scale_cuda` 在 GPU 上缩放，管道只传 3.1MB/帧）；开启时按片源最高 4K 解码。8K 仍降到 4K。4K60 实测（RTX 4060 Ti + i7-8700）：插帧 + CAS 输出 103–121fps，关闭插帧稳定 60fps，解码 + `hwdownload` 回读约 60–65fps 已是本机上限。
+- **4K 解码**：设置里的「原始分辨率解码」现在真正生效。关闭时最高 1080P（`scale_cuda` 在 GPU 上缩放，管道只传 3.1MB/帧）；开启时按片源最高 4K 解码。8K 仍降到 4K。4K60 实测（RTX 4060 Ti + i7-8700）：插帧 + CAS 输出 93–121fps，关闭插帧稳定 60fps。解码帧环从固定 6 帧改成按帧率的 250ms 抖动缓冲（60fps 15 帧、30fps 8 帧），4K 冷缓存不再因为一次 100ms 抖动连丢 5 帧。10-bit HEVC/AV1 走 `scale_cuda=w:h:format=nv12` 在 GPU 转 8-bit NV12，4K60 10-bit 实测 60fps，不再报「GPU 硬解失败」。
 - **并行磁盘缓存 / 预加载**：Bilibili DASH 视频/音频在播放前写入 `<root>/cache/media` 的稀疏文件，由 `prefetch_connections` 个 Range 线程按 512KB 分块并行下载；`.state` 记录已完成块，退出或崩溃后从断点继续，`.ok` 标记完整文件直接复用。ffmpeg 通过 127.0.0.1 的只读代理读缓存，读到未完成块会等待，播放可从第 0 块立即开始。当前视频的缓存优先；它的视频/音频完成后，队列中后续视频按顺序逐个完整预取。直播、无 Range 或小于 512KB 的资源回退原 URL。
+- **0.8.1 4K 缓存抗抖**：Range 下载改成 8 个 HTTP/1.1 连接（每连接独立，避免 HTTP/2 多路复用被 CDN 重置），worker 线程降到 BELOW_NORMAL，解码 ffmpeg 提到 ABOVE_NORMAL、管道读线程 ABOVE_NORMAL；单块失败重试 8 次并指数退避，仍失败时 loopback 代理直接回源该区间，不再判死整个视频；代理读块从 64KB 提到 256KB。4K60 冷缓存首播 45 秒 `dropped=0`，缓存完成前也保持 60fps。
 - **A/V 同步**：音频设备时钟是唯一主时钟（有音频时 `position_now` 始终读设备位置，不再依赖 `audio_master` 开关）；视频按音频位置取帧，晚到帧直接丢弃。
   视频解码跟不上实时（4K / 硬解降速）时，画面时间戳会持续落后音频，旧实现会把每个解码出来的帧依次播放，形成“视频慢放、声音正常”的永久漂移；
   现在画面落后超过 250ms 且持续 900ms，就把视频单独 seek 到音频位置并丢掉无法实时解码的区间（音频只为这次短 seek 暂停，落地后一起恢复），2 秒内不会重复 seek。
@@ -106,7 +107,7 @@
 - **视频只走 GPU 硬解**：`h264_cuvid` / `hevc_cuvid` / `av1_cuvid` / `vp9_cuvid`，无软解回退；首次解析时用内嵌 256×144 样片真实探测每个编码，不支持的流从 `video_tracks`、画质菜单和切换目标中删除。NV12 以 R8 + R8G8 双平面上传，`nv12_main` 在 GPU 转 BGRA，插帧 `blend_main` 与 CAS/Anime4K 都直接吃 GPU 纹理（旧的 CPU `NV12→BGRA`、CPU 混合、staging 上传全部删除）。
 - **分P / 自动下一P**：B 站 DASH 视频轨常比 playurl 元数据时长短 0.5–2 秒，旧的 `position + 800ms >= duration` 判定会让画面停在最后一帧、音频时钟冻结，自动下一P永远不触发；现在队列关闭后只要最后一帧已接近元数据时长就按结束处理（循环 / 下一分P / 结束卡），拖到真实结尾之后的 seek 也立即走同一结束逻辑。分P解析加了 25 秒超时，视频层/解码器打开失败显示错误卡而不是一直卡在加载。
 - **缓存代理分块边界**：loopback 代理只等待读起点所在分块，却可能一次返回 64KB 跨进尚未下载的分块，稀疏文件的空洞（全 0）会让 H.264 解码器报 `missing picture in access unit` 并退出；现在每次读取都夹在当前分块边界内，未下载部分一律等待。
-- 4K60 实测（RTX 4060 Ti，真实 B 站 4K 缓存流 + 音频）：插帧 + CAS 输出 103–121fps、帧队列 6、丢弃 0；关闭插帧稳定 60fps、丢弃 0；`pos_ms` 与音频时钟逐秒一致。解码 + `hwdownload` 回读约 60–65fps 是本机上限。
+- 4K60 实测（RTX 4060 Ti，真实 B 站 4K 缓存流 + 音频）：0.8.1 冷缓存首播 45 秒 `dropped=0`、帧队列 15、`pos_ms` 与音频时钟逐秒一致；关闭插帧稳定 60fps，插帧 + Anime4K 93–121fps。4K60 10-bit HEVC 本地源稳定 60fps；8MB/s 限速 + 180ms 抖动的 4K60 Range 源 `dropped=0`。
 - 原生视频 popup：owned WS_POPUP、无激活、单击 / 双击事件转发、精确物理像素矩形、全屏 / 迷你 / DPI 同步。
 - 原生弹幕：滚动 / 顶部 / 底部、轨道避让、透明度 / 字号 / 速度 / 区域、屏蔽关键词 / 正则 / 用户、AI 云屏蔽、历史日期、右键 / 长按命中转发。 弹幕设置面板改为标题下 7 行统一 40px 行距：首行是标准设置行：左侧「弹幕」标签，右侧 54×28 空心胶囊开关（整行可点，只变边框颜色、开/关文字保持主色，无背景填充，关灰开蓝）；开关右缘与下方数值右缘对齐，行宽与下方几行一致；随后透明度、字号、速度、区域、屏蔽、分布密度，分布密度也使用同一空心开关；行标签、数值与按钮文字统一按同一行盒垂直居中；没有发送输入框、发送按钮或右上角关闭 X（Esc / 工具条弹幕键关闭）。
 - 下载子进程 Job object：引擎崩溃时强杀 ffmpeg 子进程。
@@ -117,7 +118,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.8.0.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.8.1.exe`（约 206 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
@@ -128,6 +129,7 @@
 - **0.7.7 设置行**：播放器「设置」tab 删除「速度」行，设置列表从 8 行变为 7 行；插帧 / 画质增强 / 置顶 / 仅音频依次上移。工具栏速度面板、键盘调速和已有的倍速功能保留。
 - **0.7.8 音量胶囊**：滚轮音量提示一度改成 56×280 的主题纸面胶囊（浅色暖纸 / 深色墨面，1px 发丝边 + 14px 轨道 + 蓝色填充），浅色主题不再使用深色细条；整体更高更宽，900ms 后自动消失。
 - **0.8.0 音量条**：去掉 0.7.8 的胶囊底板、纸面和描边，只保留进度条本身；轨道从 5×132 放大到 14×260，圆角、蓝色填充，空轨道颜色仍随当前主题（浅色 14% 黑 / 深色 rgb(58,58,68)），900ms 后消失。
+- **0.8.1 4K 丝滑**：帧环 250ms 抖动缓冲、10-bit HEVC/AV1 GPU 转 NV12、缓存 8×HTTP/1.1 + 失败回源 + 后台优先级；真实 B 站 4K60 冷缓存首播丢弃 0。
 - **0.7.9 缩放跟随**：缩放时不再只更新视频，DComp 根视觉下的弹幕层和 UI 层也按“当前 client / 手势起点 client”实时缩放；加载卡、工具条、HUD 和弹幕都随窗口边缘一起动，松手后重置为 1:1 并一次性重排。视频仍使用独立的 Fit 变换。
 
 ## 已知差异 / 后续
@@ -144,10 +146,10 @@
 | --- | --- |
 | Renderer | `npm run build:renderer` 通过 |
 | Rust | `cargo build --release`（vendored）通过 |
-| Rust 测试 | `native_player` 82 个测试通过（含 GPU 帧池 NV12→BGRA / 混合 / 真实 4K dump 转换、到期帧顺序、缓存分块边界、A/V 追赶判定、窗口缩放命中） |
+| Rust 测试 | `native_player` 82 个测试通过（0.8.1 全量回归）（含 GPU 帧池 NV12→BGRA / 混合 / 真实 4K dump 转换、到期帧顺序、缓存分块边界、A/V 追赶判定、窗口缩放命中） |
 | Rust 测试 | `o11a1-core` 251 个测试（7 ignored）通过 |
 | GPU 硬解 | 探测：本机 RTX 4060 Ti 对 `h264_cuvid` / `hevc_cuvid` / `av1_cuvid` 全部 supported=1；B 站 4K 流 `decoder=h264_cuvid`，直播 FLV `codec=h264 decoder=h264_cuvid` |
-| 4K 播放 | 真实 B 站 4K60 缓存流 + 音频：插帧 + CAS 103–121fps、`dropped=0`、`pos_ms == audio_ms`；关闭插帧稳定 60fps、`dropped=0`；1080P30 插帧 + CAS 120.1fps |
+| 4K 播放 | 真实 B 站 4K60 冷缓存首播 45 秒：`dropped=0`、帧队列 15、`pos_ms == audio_ms`；4K60 10-bit HEVC 本地源 60fps；8MB/s 限速 + 180ms 抖动源 `dropped=0`；插帧 + Anime4K 93–121fps |
 | A/V 追赶 | `O11A1_QA_DECODE_DELAY_MS=50` 把 30fps 源限制到 20fps：`pos_ms == audio_ms`，`av_gap` 峰值约 0.5–0.6s，每约 2s 一次视频单独 seek，落地后画面与音频差 10–40ms；正常 1080P30（插帧开 / 关）`av_gap` 0–52ms、无追赶；900ms/帧时先暂停音频，帧回来后 1.5s 内跳帧追上 |
 | 窗口缩放 | 主窗口 CDP 实测：右下角 grip 36×36、`cursor=nwse-resize`，按住拖动 +90/+64 后窗口从 1280×800 变为 1370×864；原生播放器 `WM_NCHITTEST` 在右下角 5 / 10 / 16 / 22px 均返回 `HTBOTTOMRIGHT(17)`，28px 为 `HTCLIENT` |
 | 窗口交互 | 原生播放器右下角拖动 1211×681 → 1311×745；拖动期间 `fps presented=30`、`av_gap=0`、`queue=6`、`dropped=0`、`ui_fps`/`dm_fps=0`（冻结帧按窗口比例缩放），松手后恢复；移动窗口 `interaction begin` / `settle` 正常，阴影不重传 |
