@@ -2571,6 +2571,55 @@ impl Engine {
         }
     }
 
+    /// Scroll offset that puts `index` in the middle of a list viewport.
+    /// `header_h` is the section slot above the first row; the result clamps
+    /// at both ends so the first/last rows never over-scroll the list.
+    fn centered_row_scroll(
+        index: usize,
+        row_h: f32,
+        header_h: f32,
+        viewport: f32,
+        max: f32,
+    ) -> f32 {
+        let target = header_h + index as f32 * row_h + row_h * 0.5 - viewport * 0.5;
+        target.clamp(0.0, max.max(0.0))
+    }
+
+    /// Put the current 分P row in the middle of the 选集 viewport. The target
+    /// clamps at both ends, so the first/last rows sit at the top/bottom when
+    /// there is not a full half-screen of content above or below.
+    fn center_sidebar_episode(&mut self) {
+        if !self.sidebar_open || self.sidebar_tab != SidebarTab::Episodes {
+            return;
+        }
+        let pages = self
+            .pages
+            .len()
+            .max(self.info.as_ref().map(|info| info.pages.len()).unwrap_or(0));
+        if pages == 0 {
+            return;
+        }
+        let current = if self.current_page < pages {
+            self.current_page
+        } else {
+            self.info
+                .as_ref()
+                .map(|info| info.current_page)
+                .unwrap_or(0)
+                .min(pages.saturating_sub(1))
+        };
+        let layout = self.overlay.layout;
+        let s = layout.scale;
+        let row_h = 52.0 * s;
+        let viewport = layout.sidebar_content.height().max(1.0);
+        let max = self.sidebar_max_scroll();
+        // The section header occupies one row slot above the list.
+        let target = Self::centered_row_scroll(current, row_h, row_h, viewport, max);
+        self.sidebar_scroll = target;
+        self.sidebar_scroll_target = target;
+        self.ui_dirty = true;
+    }
+
     fn animate_sidebar_scroll(&mut self) {
         if !self.sidebar_open {
             return;
@@ -4004,6 +4053,9 @@ impl Engine {
                 });
                 self.info_scroll_height = -1.0;
                 self.ui_dirty = true;
+                if self.sidebar_open && self.sidebar_tab == SidebarTab::Episodes {
+                    self.center_sidebar_episode();
+                }
                 log::line(&format!(
                     "detail info loaded pages={} current={}",
                     self.pages.len(),
@@ -7105,6 +7157,9 @@ impl Engine {
             .set_chrome_state(self.sidebar_open, self.fullscreen);
 
         if open {
+            if tab == SidebarTab::Episodes {
+                self.center_sidebar_episode();
+            }
             // Cover the right lane before the picture transform changes. The
             // supersized UI surface already holds the finished sidebar, which
             // sits outside the current window until `grow_width` exposes it.
@@ -7175,6 +7230,9 @@ impl Engine {
     fn select_sidebar_tab(&mut self, tab: SidebarTab) {
         if self.sidebar_open && self.sidebar_tab == tab {
             self.note_activity();
+            if tab == SidebarTab::Episodes {
+                self.center_sidebar_episode();
+            }
             self.ui_dirty = true;
             return;
         }
@@ -7363,6 +7421,9 @@ impl Engine {
         // not after playurl answers. The old picture/audio stop here, so the
         // spinner is honest about what is happening.
         self.current_page = index;
+        if self.sidebar_open && self.sidebar_tab == SidebarTab::Episodes {
+            self.center_sidebar_episode();
+        }
         self.next_page_prefetch = None;
         self.page_loading = Some(index);
         self.drop_loop_prefetch();
@@ -7476,6 +7537,9 @@ impl Engine {
         let restore_page = self.switch_from_page.take().unwrap_or(self.current_page);
         let resume = self.switch_resume_ms;
         self.current_page = restore_page;
+        if self.sidebar_open && self.sidebar_tab == SidebarTab::Episodes {
+            self.center_sidebar_episode();
+        }
         self.requested_play = true;
         self.had_first_frame = false;
         self.cur = None;
@@ -7533,6 +7597,9 @@ impl Engine {
         };
         if let Some(index) = self.switch_target.take() {
             self.current_page = index;
+            if self.sidebar_open && self.sidebar_tab == SidebarTab::Episodes {
+                self.center_sidebar_episode();
+            }
         }
         self.switch_from_page = None;
         self.reset_danmaku_for_source();
@@ -10394,6 +10461,18 @@ fn parse_qa(_duration_ms: u64) -> Vec<QaAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn episode_centering_clamps_at_both_ends() {
+        // Ten 52px rows, a 52px section header, a 500px viewport.
+        // max = 52 + 10*52 - 500 = 72.
+        assert_eq!(Engine::centered_row_scroll(0, 52.0, 52.0, 500.0, 72.0), 0.0);
+        let middle = Engine::centered_row_scroll(4, 52.0, 52.0, 500.0, 72.0);
+        assert!((middle - 36.0).abs() < 0.001, "middle={middle}");
+        assert_eq!(Engine::centered_row_scroll(9, 52.0, 52.0, 500.0, 72.0), 72.0);
+        // When every row already fits, the list stays at the top.
+        assert_eq!(Engine::centered_row_scroll(5, 52.0, 52.0, 900.0, 0.0), 0.0);
+    }
 
     #[test]
     fn transient_or_small_picture_lag_is_not_a_catch_up() {
