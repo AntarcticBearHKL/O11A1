@@ -1,6 +1,6 @@
 ﻿# O11A1 实现状态
 
-更新：2026-11-20
+更新：2026-11-21
 
 > 安装状态：旧 `bilibili-slint` 原生版已卸载，旧播放缓存与开始菜单快捷方式一并移除；源代码保留。
 > 桌面 `O11A1.lnk` 指向 Electron 版 `release\win-unpacked\O11A1.exe`。
