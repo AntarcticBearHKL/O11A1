@@ -335,6 +335,7 @@
 - [x] 4K 缓存抗抖：8 个 HTTP/1.1 Range 连接、单块 8 次退避重试、失败区间由 loopback 代理直接回源，不再判死整个视频；代理读块 256KB `[R]`
 - [x] 首页封面预热不再写 `src = ''`：只解绑 `onload` / `onerror`，消除无限图片错误循环；首页 renderer 空闲占用 100% → 0% `[E/R]`
 - [x] 完整缓存直读本地文件时不再给 ffmpeg 加 `-reconnect` / `-headers`（按 `proc::is_local` 判断），修掉 `Option reconnect not found` 的「GPU 硬解失败」回归 `[R]`
+- [x] 精准定位面板列对齐：A/B 按钮外沿与帧标尺同宽，清空与「1 帧」单位框同列同宽；单位框无下拉三角，文字水平垂直居中 `[R]`
 - [x] 原生 overlay 自适应刷新：chrome 隐藏 10Hz，菜单 / 侧栏 / OSD / 加载 / 错误 / 拖拽 / 悬停 60–120Hz；完整缓存直接读本地文件，省掉 loopback HTTP 拷贝 `[R]`
 - [x] 4K60 CPU 实测（i7-8700 + 4060 Ti，无插帧/增强）：60fps、`dropped=0`；播放器约 66% 单核 + ffmpeg 约 115% 单核，整机约 1.8 核 `[R]`
 - [x] 并行磁盘预加载：DASH 视频/音频以 512KB 分块、多个 Range 线程写入 `cache/media` 稀疏文件；`.state` 断点续传、`.ok` 完成标记；ffmpeg 通过 loopback 代理读取，当前视频优先，随后队列中后续视频逐个完整预取；直播、无 Range 和小文件回退原 URL `[R]`

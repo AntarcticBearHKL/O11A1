@@ -848,11 +848,15 @@ impl Layout {
         let ab_top = precision.top + 88.0 * s;
         let ab_h = 32.0 * s;
         let ab_gap = 8.0 * s;
-        // A / B share the row; 清空 owns the tail as a clear pale-red action.
-        // A wider minimum keeps the two-character label legible and visible at
-        // every toolbar width.
-        let clear_w = (content_w * 0.13).clamp(72.0 * s, content_w * 0.30);
-        let ab_w = ((content_w - clear_w - ab_gap * 2.0).max(40.0)) * 0.5;
+        let step_w = 92.0 * s;
+        // The A/B row mirrors the band below it column for column: A's left
+        // edge is the ruler's left edge, B's right edge is the ruler's right
+        // edge, and 清空 occupies exactly the 1帧 selector's column. The old
+        // 13%-of-row width made 清空 longer than the unit field and left B
+        // ending at a different x than the ruler.
+        let clear_w = step_w;
+        let wheel_w = (content_w - clear_w - 12.0 * s).max(2.0 * 40.0 * s + ab_gap);
+        let ab_w = ((wheel_w - ab_gap) * 0.5).max(40.0 * s);
         let precision_a = Rect {
             left: content_left,
             top: ab_top,
@@ -873,7 +877,6 @@ impl Layout {
         };
         let wheel_top = precision.top + 130.0 * s;
         let wheel_h = 38.0 * s;
-        let step_w = 92.0 * s;
         // The frame-step select is the same height as the ruler, so the two
         // controls share one clean horizontal band.
         let precision_step = Rect {
@@ -1351,6 +1354,8 @@ pub struct Overlay {
     hint_format: IDWriteTextFormat,
     precision_clock_format: IDWriteTextFormat,
     precision_frame_format: IDWriteTextFormat,
+    /// Centred 12.5px face for the frame-step value.
+    precision_step_format: IDWriteTextFormat,
     tab_format: IDWriteTextFormat,
     tab_active_format: IDWriteTextFormat,
     /// Comment list typography: a larger body than the old 12.5px rows, with
@@ -1524,6 +1529,9 @@ impl Overlay {
                 text_format(&dwrite, 16.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let precision_frame_format =
                 text_format(&dwrite, 13.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            let precision_step_format =
+                text_format(&dwrite, 12.5 * s, DWRITE_FONT_WEIGHT_NORMAL)?;
+            precision_step_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             let hint_format = text_format(&dwrite, 11.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?;
             hint_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             let tab_format = text_format(&dwrite, 12.5 * s, DWRITE_FONT_WEIGHT_NORMAL)?;
@@ -1645,6 +1653,7 @@ impl Overlay {
                 (&info_body_format, 13.5 * s, 400),
                 (&precision_clock_format, 16.0 * s, 600),
                 (&precision_frame_format, 13.0 * s, 600),
+                (&precision_step_format, 12.5 * s, 400),
                 (&hint_format, 11.0 * s, 400),
                 (&tab_format, 12.5 * s, 400),
                 // The active tab is semibold, but it must stay on the same GDI
@@ -1708,6 +1717,7 @@ impl Overlay {
                 hint_format,
                 precision_clock_format,
                 precision_frame_format,
+                precision_step_format,
                 tab_format,
                 tab_active_format,
                 comment_author_format,
@@ -5199,41 +5209,13 @@ impl Overlay {
             if open { 1.2 * s } else { 1.0 * s },
             None,
         );
-        self.text(
-            &format!("{} 帧", model.frame_step),
-            field.left + 12.0 * s,
-            field.top + (field.height() - 17.0 * s) * 0.5,
-            field.width() - 34.0 * s,
-            &self.comment_body_format,
+        let label = format!("{} 帧", model.frame_step);
+        self.text_box(
+            &label,
+            field,
+            &self.precision_step_format,
             if open { &self.accent_blue } else { &self.text },
-        );
-        let chevron_cx = field.right - 16.0 * s;
-        let chevron_cy = field.top + field.height() * 0.5;
-        let chevron = if open {
-            [(-3.0, 2.0), (0.0, -1.0), (3.0, 2.0)]
-        } else {
-            [(-3.0, -1.0), (0.0, 2.0), (3.0, -1.0)]
-        };
-        let chevron_brush = if open {
-            &self.accent_blue
-        } else {
-            &self.text_dim
-        };
-        self.line(
-            chevron_cx + chevron[0].0 * s,
-            chevron_cy + chevron[0].1 * s,
-            chevron_cx + chevron[1].0 * s,
-            chevron_cy + chevron[1].1 * s,
-            1.4 * s,
-            chevron_brush,
-        );
-        self.line(
-            chevron_cx + chevron[1].0 * s,
-            chevron_cy + chevron[1].1 * s,
-            chevron_cx + chevron[2].0 * s,
-            chevron_cy + chevron[2].1 * s,
-            1.4 * s,
-            chevron_brush,
+            1,
         );
         if open {
             let menu = layout.precision_step_menu;
@@ -8104,6 +8086,16 @@ mod tests {
             assert!(
                 layout.precision_clear.right <= layout.precision.right,
                 "clear chip leaves the panel at {width}"
+            );
+            assert!(
+                (layout.precision_clear.left - layout.precision_step.left).abs() < 0.01
+                    && (layout.precision_clear.right - layout.precision_step.right).abs() < 0.01,
+                "clear chip must share the unit field column at {width}"
+            );
+            assert!(
+                (layout.precision_a.left - layout.precision_wheel.left).abs() < 0.01
+                    && (layout.precision_b.right - layout.precision_wheel.right).abs() < 0.01,
+                "A/B row must span the ruler at {width}"
             );
         }
     }
