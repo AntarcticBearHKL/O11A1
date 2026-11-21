@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -89,6 +89,10 @@ const BUFFER_RESUME_FRAMES: usize = 8;
 /// No new picture for this long with a nearly empty ring means the reader is
 /// waiting on the network, not that the GPU hit a one-frame hitch.
 const BUFFER_LOW_MS: u64 = 400;
+/// Start warming the next part's cache when this much of the current part is
+/// left. Ten seconds covers the playurl resolve plus the first range requests,
+/// so the auto "next part" switch lands on a local opening chunk.
+const NEXT_PAGE_PREFETCH_MS: u64 = 10_000;
 /// While buffer-paused, wait until this much contiguous video is on disk.
 /// Resuming as soon as the ring refills makes a link that is slower than the
 /// bitrate pause and resume every few hundred milliseconds; a real lead turns
@@ -647,6 +651,10 @@ struct Engine {
     /// The queue prefetcher runs once per player window; it waits for the
     /// active entry's own cache and then fills the following entries.
     playlist_prefetch_started: bool,
+    /// Page index whose media is already being warmed for the auto "next
+    /// part" transition. Prevents starting a second resolver/worker pool for
+    /// the same page while the current video is in its last ten seconds.
+    next_page_prefetch: Option<usize>,
     danmaku_popup: bool,
     /// 发送弹幕 input and its in-flight post.
     dm_input: String,
@@ -677,6 +685,9 @@ struct Engine {
     avatars: std::collections::HashMap<String, ImageData>,
     switch_rx: Option<Receiver<Result<MediaSource, String>>>,
     switch_target: Option<usize>,
+    /// A fully resolved next-part source whose cache workers are already
+    /// running. `switch_page` consumes it instead of resolving playurl again.
+    next_page_source: Arc<Mutex<Option<(usize, MediaSource)>>>,
     /// When the pending 分P resolve started, so a hung playurl cannot leave
     /// the window on the loading card forever.
     switch_started: Option<Instant>,
@@ -798,6 +809,22 @@ fn picture_lag_requires_catch_up(
 fn buffer_is_low(queue_len: usize, no_picture_ms: u64) -> bool {
     (queue_len == 0 && no_picture_ms >= 200)
         || (queue_len <= BUFFER_LOW_FRAMES && no_picture_ms >= BUFFER_LOW_MS)
+}
+
+/// The auto "next part" transition gets a head start when the current part is
+/// in its last ten seconds. Single/V loop modes and the final part do not.
+fn next_page_prefetch_due(
+    loop_mode: u8,
+    position_ms: u64,
+    duration_ms: u64,
+    has_next: bool,
+    already_prefetching: bool,
+) -> bool {
+    loop_mode == o11a1::settings::LOOP_NEXT_PART
+        && has_next
+        && !already_prefetching
+        && duration_ms > 0
+        && position_ms.saturating_add(NEXT_PAGE_PREFETCH_MS) >= duration_ms
 }
 
 struct MiniSaved {
@@ -1262,6 +1289,7 @@ impl Engine {
             info_scroll_height: -1.0,
             info_scroll_width: 0.0,
             playlist_prefetch_started: false,
+            next_page_prefetch: None,
             danmaku_popup: false,
             dm_input: String::new(),
             dm_input_focus: false,
@@ -1295,6 +1323,7 @@ impl Engine {
             avatars: std::collections::HashMap::new(),
             switch_rx: None,
             switch_target: None,
+            next_page_source: Arc::new(Mutex::new(None)),
             switch_started: None,
             switch_from_page: None,
             switch_resume_ms: 0,
@@ -1467,8 +1496,86 @@ impl Engine {
     /// Fill the disk cache for the entries after the current one. The active
     /// entry's cache is drained first, so queue prefetch never competes with
     /// the picture the user is watching.
-    fn start_playlist_prefetch(&mut self) {
+    /// Warm the next part's video/audio cache while the current part is still
+    /// in its last ten seconds. The auto "next part" transition then opens on
+    /// a cache that already holds the next page's opening chunk instead of
+    /// starting the resolver and first range request on the end card.
+    fn maybe_prefetch_next_page(&mut self, position: u64) {
+        if self.is_live || self.switch_rx.is_some() {
+            return;
+        }
+        let next_index = self.current_page + 1;
+        let has_next = self.pages.get(next_index).is_some();
+        if !next_page_prefetch_due(
+            self.loop_mode,
+            position,
+            self.duration_ms,
+            has_next,
+            self.next_page_prefetch == Some(next_index),
+        ) {
+            return;
+        }
+        let Some(page) = self.pages.get(next_index) else {
+            return;
+        };
+        if self.next_page_prefetch == Some(next_index) {
+            return;
+        }
+        let Some(bvid) = self
+            .source
+            .bvid
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+        let cid = page.cid;
+        let title = page.title.clone();
+        let quality = self.source.qn;
+        let codecid = self.state.quality_codecid.unwrap_or(0);
+        let audio_index = self.source.audio_index;
+        self.next_page_prefetch = Some(next_index);
         log::line(&format!(
+            "next page prefetch start from_page={} to_page={} bvid={bvid} cid={cid}",
+            self.current_page + 1,
+            next_index + 1
+        ));
+        let source_slot = self.next_page_source.clone();
+        let spawned = std::thread::Builder::new()
+            .name("next-page-prefetch".into())
+            .spawn(move || {
+                let config = PlayerConfig {
+                    bvid: Some(bvid.clone()),
+                    cid: Some(cid),
+                    quality_qn: Some(quality),
+                    quality_codecid: Some(codecid),
+                    audio_index: Some(audio_index),
+                    title,
+                    ..Default::default()
+                };
+                match crate::source::resolve(&config) {
+                    Ok(resolved) => {
+                        if let Ok(mut slot) = source_slot.lock() {
+                            *slot = Some((next_index, resolved.source.clone()));
+                        }
+                        let ok = crate::mediacache::warm_source(&resolved.source);
+                        log::line(&format!(
+                            "next page prefetch bvid={bvid} cid={cid} ok={}",
+                            u8::from(ok)
+                        ));
+                    }
+                    Err(error) => log::line(&format!(
+                        "next page prefetch resolve failed bvid={bvid} cid={cid} err={error:#}"
+                    )),
+                }
+            });
+        if let Err(error) = spawned {
+            self.next_page_prefetch = None;
+            log::line(&format!("next page prefetch spawn failed: {error:#}"));
+        }
+    }
+
+    fn start_playlist_prefetch(&mut self) {        log::line(&format!(
             "playlist prefetch check started={} live={} bvid={:?}",
             u8::from(self.playlist_prefetch_started),
             u8::from(self.is_live),
@@ -5065,6 +5172,7 @@ impl Engine {
         let position = self.position_now();
         self.position_ms = position;
         self.shared.position_ms.store(position, Ordering::SeqCst);
+        self.maybe_prefetch_next_page(position);
         self.log_drift_if_needed();
 
         let (queue_closed_now, queue_len_now) = self
@@ -7016,6 +7124,7 @@ impl Engine {
         // not after playurl answers. The old picture/audio stop here, so the
         // spinner is honest about what is happening.
         self.current_page = index;
+        self.next_page_prefetch = None;
         self.page_loading = Some(index);
         self.drop_loop_prefetch();
         self.reset_ab_cache();
@@ -7053,10 +7162,37 @@ impl Engine {
         self.switch_rx = Some(rx);
         self.switch_target = Some(index);
         self.switch_started = Some(Instant::now());
+        // The ten-second prefetcher already resolved this page's playurl and
+        // started its cache workers. Consume that source instead of paying the
+        // resolve latency again on the end card.
+        let prefetched = self.next_page_source.lock().ok().and_then(|mut slot| {
+            if slot.as_ref().map(|(page, _)| *page) == Some(index) {
+                slot.take().map(|(_, source)| source)
+            } else {
+                None
+            }
+        });
+        let session = self.session.clone();
         let danmaku_tx = self.danmaku_tx.clone();
         let _ = std::thread::Builder::new()
             .name("player-source-switch".into())
             .spawn(move || {
+                if let Some(source) = prefetched {
+                    let duration_ms = source.duration_ms;
+                    let Some(cid) = source.cid else {
+                        let _ = tx.send(Err("新分P没有 cid".into()));
+                        return;
+                    };
+                    log::line(&format!("next page source reused cid={cid}"));
+                    let _ = tx.send(Ok(source));
+                    if let Some(session) = session {
+                        let items = crate::danmaku::fetch_with_session(
+                            session, cid, duration_ms,
+                        );
+                        let _ = danmaku_tx.send(items);
+                    }
+                    return;
+                }
                 let config = PlayerConfig {
                     bvid: Some(bvid),
                     cid: Some(cid),
@@ -7345,6 +7481,10 @@ impl Engine {
         // Stopping here (instead of only at the caller) makes both the initial
         // open and an in-place replacement deterministic.
         self.stop_sessions();
+        self.next_page_prefetch = None;
+        if let Ok(mut slot) = self.next_page_source.lock() {
+            *slot = None;
+        }
         self.reload_danmaku_settings();
         self.reset_ab_cache();
         let crate::DeferredOpen {
@@ -10047,6 +10187,60 @@ mod tests {
         // Reversing direction responds on the first notch instead of eating
         // the leftover of the previous direction.
         assert_eq!(wheel_volume_step(&mut accum, &mut direction, -120), -5);
+    }
+
+    #[test]
+    fn next_page_prefetch_starts_in_the_last_ten_seconds() {
+        let duration = 399_000;
+        assert!(next_page_prefetch_due(
+            o11a1::settings::LOOP_NEXT_PART,
+            duration - 10_000,
+            duration,
+            true,
+            false
+        ));
+        assert!(!next_page_prefetch_due(
+            o11a1::settings::LOOP_NEXT_PART,
+            duration - 10_001,
+            duration,
+            true,
+            false
+        ));
+        assert!(next_page_prefetch_due(
+            o11a1::settings::LOOP_NEXT_PART,
+            duration - 500,
+            duration,
+            true,
+            false
+        ));
+        assert!(!next_page_prefetch_due(
+            o11a1::settings::LOOP_NEXT_PART,
+            duration - 500,
+            duration,
+            false,
+            false
+        ));
+        assert!(!next_page_prefetch_due(
+            o11a1::settings::LOOP_NEXT_PART,
+            duration - 500,
+            duration,
+            true,
+            true
+        ));
+        assert!(!next_page_prefetch_due(
+            o11a1::settings::LOOP_ONE,
+            duration - 500,
+            duration,
+            true,
+            false
+        ));
+        assert!(!next_page_prefetch_due(
+            o11a1::settings::LOOP_NEXT_PART,
+            0,
+            0,
+            true,
+            false
+        ));
     }
 
     #[test]

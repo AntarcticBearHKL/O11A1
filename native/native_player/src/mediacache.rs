@@ -391,6 +391,29 @@ pub fn wait_for_key(key: &str) {
     }
 }
 
+/// Start the cache workers for both representations and return immediately.
+/// Used by the next-part prefetcher ten seconds before the current part ends:
+/// the opening chunks are then already on disk when the page switch happens.
+pub fn warm_source(source: &crate::source::MediaSource) -> bool {
+    let mut ok = true;
+    if let Some(key) = crate::source::media_cache_key(source, false) {
+        ok &= prepare_workers(
+            &source.video_url,
+            &source.headers,
+            &key,
+            0,
+            Some(8),
+        )
+        .is_some();
+    }
+    if let Some(url) = source.audio_url.as_deref() {
+        if let Some(key) = crate::source::media_cache_key(source, true) {
+            ok &= prepare_workers(url, &source.headers, &key, 0, Some(4)).is_some();
+        }
+    }
+    ok
+}
+
 /// Download both representations of a resolved source completely. The
 /// playlist prefetcher calls this one entry at a time so cache disk usage and
 /// bandwidth are predictable.
@@ -416,6 +439,16 @@ fn prepare(
     headers: &[(String, String)],
     key: &str,
     start_offset: u64,
+) -> Option<Arc<CachedMedia>> {
+    prepare_workers(url, headers, key, start_offset, None)
+}
+
+fn prepare_workers(
+    url: &str,
+    headers: &[(String, String)],
+    key: &str,
+    start_offset: u64,
+    workers_override: Option<usize>,
 ) -> Option<Arc<CachedMedia>> {
     let id = media_id(key);
     if let Ok(map) = registry().lock() {
@@ -580,10 +613,14 @@ fn prepare(
         map.insert(id.clone(), media.clone());
     }
 
-    let workers = o11a1::settings::load()
+    let configured = o11a1::settings::load()
         .prefetch_connections
         .clamp(1, MAX_WORKERS as u32) as usize;
-    let workers = workers.min(chunks).max(1);
+    let workers = workers_override
+        .unwrap_or(configured)
+        .clamp(1, MAX_WORKERS)
+        .min(chunks)
+        .max(1);
     log::line(&format!(
         "media cache start id={id} bytes={total} chunks={chunks} workers={workers} resumed={resumed_chunks}"
     ));
