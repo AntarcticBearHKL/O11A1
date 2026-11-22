@@ -5533,14 +5533,10 @@ impl Overlay {
         };
         // No inner halo band: the old 7px glow showed as a pale strip between
         // the frame and the picture, which read as a corner gap. The window
-        // shadow supplies the soft outer edge instead.
-        let frame_brush = if model.status.contains("暂停") {
-            &self.aim_line
-        } else {
-            &self.accent_blue
-        };
+        // shadow supplies the soft outer edge instead. Paused and finished both
+        // use the red accent; the frame is drawn only for those states.
         self.d2d
-            .DrawRoundedRectangle(&frame, frame_brush, stroke, None);
+            .DrawRoundedRectangle(&frame, &self.aim_line, stroke, None);
         let hair_inset = inset + 4.5 * s;
         let hair_radius = (window_radius - hair_inset).max(0.0);
         let inner = D2D1_ROUNDED_RECT {
