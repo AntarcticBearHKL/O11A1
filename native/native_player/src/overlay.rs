@@ -5487,8 +5487,9 @@ impl Overlay {
     /// The player window is clipped by a GDI region with a 16 logical-pixel
     /// corner (`window::apply_player_region`). Every arc here is concentric
     /// with that region: a rounded rect inset by `d` gets radius `16*s - d`,
-    /// so the blue stroke's outer edge lands on the window edge instead of
-    /// leaving a widening wedge at each corner.
+    /// so the stroke's outer edge lands on the window edge instead of leaving
+    /// a widening wedge at each corner. Paused uses the red accent; the ended
+    /// state keeps the blue frame.
     unsafe fn draw_pause_frame(&self, layout: &Layout, model: &UiModel) {
         let s = layout.scale;
         let width = layout.width;
@@ -5517,8 +5518,13 @@ impl Overlay {
         // No inner halo band: the old 7px glow showed as a pale strip between
         // the frame and the picture, which read as a corner gap. The window
         // shadow supplies the soft outer edge instead.
+        let frame_brush = if model.status.contains("暂停") {
+            &self.aim_line
+        } else {
+            &self.accent_blue
+        };
         self.d2d
-            .DrawRoundedRectangle(&frame, &self.accent_blue, stroke, None);
+            .DrawRoundedRectangle(&frame, frame_brush, stroke, None);
         let hair_inset = inset + 4.5 * s;
         let hair_radius = (window_radius - hair_inset).max(0.0);
         let inner = D2D1_ROUNDED_RECT {
