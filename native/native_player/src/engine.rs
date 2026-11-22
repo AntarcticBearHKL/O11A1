@@ -604,6 +604,10 @@ struct Engine {
     wheel_volume_dir: f32,
     /// Keep the right-edge volume bar on screen for a moment after a notch.
     volume_wheel_until: Option<Instant>,
+    /// Eased 0..1 volume for the wheel OSD. The integer `volume` still jumps
+    /// by whole steps; only the drawn fill travels between them.
+    volume_display: f32,
+    volume_anim_at: Instant,
     /// Horizontal drag on the frame ruler: (start_x, start_ms). The preview
     /// follows the total displacement and the real seek happens once on release.
     tuner_drag: Option<(f32, u64)>,
@@ -1248,6 +1252,8 @@ impl Engine {
             pending_live_resize: None,
             volume,
             muted,
+            volume_display: volume as f32 / 100.0,
+            volume_anim_at: Instant::now(),
             loop_mode: stored_settings.loop_mode,
             speed,
             interp: InterpMode::Off,
@@ -3117,8 +3123,28 @@ impl Engine {
     /// main loop runs continuously while video plays, so the capsule leaves on
     /// time even if the mouse never moves again.
     fn tick_volume_wheel(&mut self) {
+        let now = Instant::now();
+        let target = if self.muted {
+            0.0
+        } else {
+            self.volume.min(100) as f32 / 100.0
+        };
+        let dt = now
+            .duration_since(self.volume_anim_at)
+            .as_secs_f32()
+            .clamp(0.001, 0.1);
+        self.volume_anim_at = now;
+        let diff = target - self.volume_display;
+        if diff.abs() > 0.0005 {
+            // Exponential ease; ~95% of a step is covered in about 190 ms.
+            self.volume_display += diff * (1.0 - (-dt * 16.0).exp());
+            self.ui_dirty = true;
+        } else if self.volume_display != target {
+            self.volume_display = target;
+            self.ui_dirty = true;
+        }
         if let Some(until) = self.volume_wheel_until {
-            if Instant::now() >= until {
+            if now >= until {
                 self.volume_wheel_until = None;
                 self.ui_dirty = true;
             }
@@ -9469,6 +9495,7 @@ impl Engine {
             position_ms: self.drag_preview.unwrap_or(self.position_ms),
             duration_ms: self.duration_ms,
             volume: self.volume,
+            volume_osd: self.volume_display,
             muted: self.muted,
             volume_wheel: self
                 .volume_wheel_until

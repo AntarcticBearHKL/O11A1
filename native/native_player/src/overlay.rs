@@ -1167,6 +1167,8 @@ pub struct UiModel {
     pub position_ms: u64,
     pub duration_ms: u64,
     pub volume: u8,
+    /// Eased 0..1 level drawn by the scroll OSD.
+    pub volume_osd: f32,
     pub muted: bool,
     /// A wheel notch just changed the volume: show the right-edge level bar
     /// for a moment.
@@ -2335,21 +2337,18 @@ impl Overlay {
         let s = layout.scale;
         let width = 360.0 * s;
         let height = 126.0 * s;
-        let right = if model.fullscreen {
-            layout.stage.right - 12.0 * s
-        } else {
-            layout.stage.right - 8.0 * s
-        };
-        let top = if model.fullscreen {
-            12.0 * s
-        } else {
-            layout.top_close.bottom + 6.0 * s
-        };
+        // Keep the right-edge volume strip clear: the HUD ends just left of it.
+        let right = layout.stage.right - 56.0 * s;
+        // Bottom-right corner, above the floating toolbar so the controls stay
+        // clear even on a narrow window.
+        let bottom = (layout.panel.top - 10.0 * s)
+            .max(layout.stage.top + height + 8.0 * s);
+        let top = bottom - height;
         let rect = Rect {
             left: right - width,
             top,
             right,
-            bottom: top + height,
+            bottom,
         };
         let rounded = D2D1_ROUNDED_RECT {
             rect: to_d2d(rect),
@@ -5892,7 +5891,7 @@ impl Overlay {
         }
         let s = layout.scale;
         let stage = layout.stage;
-        let track_w = 26.0 * s;
+        let track_w = 16.0 * s;
         let track_h = (260.0 * s).min((stage.height() - 210.0 * s).max(120.0 * s));
         let right = stage.right - 24.0 * s;
         let centered_top = stage.top + (stage.height() - track_h) * 0.5;
@@ -5923,7 +5922,7 @@ impl Overlay {
         let fraction = if model.muted {
             0.0
         } else {
-            model.volume.min(100) as f32 / 100.0
+            model.volume_osd.clamp(0.0, 1.0)
         };
         if fraction > 0.002 {
             let fill_h = (bar.height() * fraction).max(track_w);
