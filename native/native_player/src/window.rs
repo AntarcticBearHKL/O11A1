@@ -29,8 +29,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
-    TRACKMOUSEEVENT, VK_LBUTTON, VK_SHIFT,
+    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus,
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_LBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -45,9 +45,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
     SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WNDCLASSW, WS_EX_LAYERED,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
 };
@@ -568,7 +568,11 @@ unsafe fn update_drag(hwnd: HWND, events: Option<&WindowEvents>, force: bool) ->
             // then fills the window edge to edge and the paper letterbox
             // disappears. The non-client border is measured at drag start so
             // the outer rectangle can be derived from the client target.
-            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            // `GetAsyncKeyState`, not `GetKeyState`: the player is a background
+            // process and may not own keyboard focus during a mouse-captured
+            // drag, so the thread-local key state can be stale. The async state
+            // reads the physical Shift key regardless of focus.
+            let shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
             if shift {
                 let border_w = state.border.0;
                 let border_h = state.border.1;
@@ -880,10 +884,24 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if wparam.0 as u32 == VK_SHIFT.0 as u32 {
+                // Shift changes the resize rule; re-evaluate the drag rectangle
+                // now so the aspect snap is visible before the next mouse move.
+                unsafe { update_drag(hwnd, events, true) };
+                return LRESULT(0);
+            }
             if let Some(events) = events {
                 events.push(InputEvent::Key(wparam.0 as u32));
             }
             LRESULT(0)
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            if wparam.0 as u32 == VK_SHIFT.0 as u32 {
+                // Releasing Shift returns the same drag to free resizing.
+                unsafe { update_drag(hwnd, events, true) };
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_CHAR => {
             if let Some(events) = events {
