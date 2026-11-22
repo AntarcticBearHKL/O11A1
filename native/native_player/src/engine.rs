@@ -9460,6 +9460,7 @@ impl Engine {
             }
             _ => None,
         };
+        let (screen_width, screen_height) = window::monitor_size(self.hwnd);
         let model = UiModel {
             title: self.source.title.clone(),
             playing: self.playing,
@@ -9491,6 +9492,9 @@ impl Engine {
             total_bytes: self.cache_total,
             status: self.status.clone(),
             source_size: (self.source.width, self.source.height),
+            source_resolution: (self.source.source_width, self.source.source_height),
+            decode_resolution: (self.source.width, self.source.height),
+            screen_resolution: (screen_width, screen_height),
             qn_label: self.source.qn_label.clone(),
             codec: self.source.codec.clone(),
             drag_preview: self.drag_preview,

@@ -1200,6 +1200,12 @@ pub struct UiModel {
     pub total_bytes: u64,
     pub status: String,
     pub source_size: (u32, u32),
+    /// Original stream dimensions reported by the selected track.
+    pub source_resolution: (u32, u32),
+    /// Dimensions the decoder actually produces (source unless capped).
+    pub decode_resolution: (u32, u32),
+    /// Current monitor's physical resolution.
+    pub screen_resolution: (u32, u32),
     pub qn_label: String,
     pub codec: String,
     pub drag_preview: Option<u64>,
@@ -2327,8 +2333,8 @@ impl Overlay {
 
     unsafe fn draw_fps_hud(&self, model: &UiModel, layout: &Layout) {
         let s = layout.scale;
-        let width = 210.0 * s;
-        let height = 108.0 * s;
+        let width = 360.0 * s;
+        let height = 126.0 * s;
         let right = if model.fullscreen {
             layout.stage.right - 12.0 * s
         } else {
@@ -2425,25 +2431,36 @@ impl Overlay {
         let decoded = (model.queue_len as f64 + 1.0) / fps;
         let buffered = model.net_lead_s.max(decoded);
         let next_preload = match model.next_preload_s {
-            Some(seconds) => format!("下一P预加载 {}", duration_text(seconds)),
-            None => "下一P预加载 —".to_string(),
+            Some(seconds) => duration_text(seconds),
+            None => "—".to_string(),
         };
+        let resolution = format!(
+            "源{}×{}/解{}×{}/屏{}×{}",
+            model.source_resolution.0,
+            model.source_resolution.1,
+            model.decode_resolution.0,
+            model.decode_resolution.1,
+            model.screen_resolution.0,
+            model.screen_resolution.1
+        );
         let lines = [
-            format!("画面 FPS {:.1} · {:.1} ms", model.fps, ms),
-            format!("弹幕 FPS {:.1}", model.danmaku_fps),
-            network,
-            format!("缓冲 {}", duration_text(buffered)),
-            next_preload,
-            format!("UI FPS {:.1}", model.ui_fps),
+            format!("画面帧率  {:.1} · {:.1} ms", model.fps, ms),
+            format!("弹幕帧率  {:.1}", model.danmaku_fps),
+            format!("界面帧率  {:.1}", model.ui_fps),
+            format!("分辨率    {resolution}"),
+            format!("网络      {network}"),
+            format!("缓冲长度  {}", duration_text(buffered)),
+            format!("下集预载  {next_preload}"),
         ];
         for text in lines {
-            let slot = Rect {
-                left: rect.left,
-                top: line_top,
-                right: rect.right,
-                bottom: line_top + line_h,
-            };
-            self.text_centered(&text, slot, &self.hud_format, &self.sidebar_text_dim);
+            self.text(
+                &text,
+                rect.left + 10.0 * s,
+                line_top,
+                rect.width() - 20.0 * s,
+                &self.hud_format,
+                &self.sidebar_text_dim,
+            );
             line_top += line_h;
         }
     }
