@@ -5887,7 +5887,7 @@ impl Overlay {
         }
         let s = layout.scale;
         let stage = layout.stage;
-        let track_w = 16.0 * s;
+        let track_w = 12.0 * s;
         let track_h = (260.0 * s).min((stage.height() - 210.0 * s).max(120.0 * s));
         let right = stage.right - 24.0 * s;
         let centered_top = stage.top + (stage.height() - track_h) * 0.5;
