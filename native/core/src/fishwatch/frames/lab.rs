@@ -295,10 +295,19 @@ pub async fn download_movie(
     })
 }
 
-/// Automatic interval for one clip: at most six frames per request, but never
-/// faster than one frame every two seconds.
-pub fn clip_interval(duration_s: u64) -> u64 {
-    ((duration_s.max(1) as f64 / 5.0).ceil() as u64).clamp(2, 60)
+/// The requested interval in seconds. The agent may ask for 1, 5, 10, 20, 30
+/// or 60; other values are clamped into that range.
+pub fn clip_interval(requested_s: u64) -> u64 {
+    requested_s.clamp(1, 60)
+}
+
+/// Number of frames for a clip. A 60s clip at 1s yields 60 sample points
+/// (0..59), not 61, so a 6×5 sheet packs it exactly.
+pub fn clip_frame_count(duration_s: u64, interval_s: u64) -> usize {
+    duration_s
+        .max(1)
+        .div_ceil(interval_s.max(1))
+        .max(1) as usize
 }
 
 /// Cut `[start_s, end_s)` from an already downloaded movie and compose it into
@@ -310,13 +319,13 @@ pub fn build_range_sheets(
     work: &Path,
     start_s: u64,
     end_s: u64,
+    interval_s: u64,
     cancel: &AtomicBool,
 ) -> Result<Vec<BuiltSheet>> {
-    let start_s = start_s;
     let end_s = end_s.max(start_s.saturating_add(1));
     let duration = end_s.saturating_sub(start_s);
-    let interval = clip_interval(duration);
-    let expected = ((duration / interval) + 1).min(MAX_FRAMES as u64) as usize;
+    let interval = clip_interval(interval_s);
+    let expected = clip_frame_count(duration, interval);
     if expected == 0 {
         bail!("切片时长太短，无法抽帧");
     }
@@ -350,12 +359,13 @@ pub fn build_range_sheets_url(
     work: &Path,
     start_s: u64,
     end_s: u64,
+    interval_s: u64,
     cancel: &AtomicBool,
 ) -> Result<Vec<BuiltSheet>> {
     let end_s = end_s.max(start_s.saturating_add(1));
     let duration = end_s.saturating_sub(start_s);
-    let interval = clip_interval(duration);
-    let expected = ((duration / interval) + 1).min(MAX_FRAMES as u64) as usize;
+    let interval = clip_interval(interval_s);
+    let expected = clip_frame_count(duration, interval);
     if expected == 0 {
         bail!("切片时长太短，无法抽帧");
     }
@@ -773,22 +783,39 @@ fn layout_for(width: u32, height: u32) -> Layout {
     }
 }
 
-/// The agent's clip sheets are read by a human as well as the model, so a
-/// landscape clip uses 3×2 smaller tiles instead of the 2×3 watch-step sheet:
-/// the result is a wide strip that fits the transcript without huge bars.
+/// The agent's clip sheets pack up to 30 frames (6×5) into one 2048px-wide
+/// image. Benchmarks against deepseek-flash show this keeps ~93% text
+/// similarity; 48 tiles drops to ~88% and larger canvases do not increase the
+/// model's fixed image-token budget.
 fn clip_layout_for(width: u32, height: u32) -> Layout {
     let aspect = width.max(1) as f32 / height.max(1) as f32;
     if aspect >= 1.2 {
         Layout {
-            columns: 3,
-            rows: 2,
-            cell_w: 640,
-            cell_h: 360,
+            columns: 6,
+            rows: 5,
+            cell_w: 328,
+            cell_h: 184,
             landscape: true,
             square: false,
         }
+    } else if aspect <= 0.83 {
+        Layout {
+            columns: 6,
+            rows: 5,
+            cell_w: 186,
+            cell_h: 330,
+            landscape: false,
+            square: false,
+        }
     } else {
-        layout_for(width, height)
+        Layout {
+            columns: 6,
+            rows: 5,
+            cell_w: 300,
+            cell_h: 300,
+            landscape: false,
+            square: true,
+        }
     }
 }
 
@@ -902,12 +929,13 @@ fn compose_sheets(
             let ox = (layout.cell_w - fitted.width()) / 2;
             let oy = (layout.cell_h - fitted.height()) / 2;
             imageops::overlay(&mut cell, &fitted, ox as i64, oy as i64);
-            draw_label(&mut cell, 12, 12, &mmss(frame.at_s), 4);
+            let label_scale = if layout.cell_w < 400 { 3 } else { 4 };
+            draw_label(&mut cell, 10, 10, &mmss(frame.at_s), label_scale);
             imageops::overlay(&mut canvas, &cell, x as i64, y as i64);
             times.push(frame.at_s);
         }
         let path = work.join(format!("sheet-{:02}.jpg", sheet_index + 1));
-        save_jpeg(&canvas, &path, 88)?;
+        save_jpeg(&canvas, &path, 80)?;
         let bytes = std::fs::metadata(&path)?.len();
         image_bytes += bytes;
         let from_s = times.first().copied().unwrap_or(0);
@@ -1451,6 +1479,18 @@ mod tests {
         assert_eq!(auto_interval(240), 8);
         assert_eq!(auto_interval(600), 20);
         assert_eq!(auto_interval(1_800), 60);
+    }
+
+    #[test]
+    fn clip_planning_packs_thirty_frames_into_2048px() {
+        assert_eq!(clip_frame_count(60, 1), 60);
+        assert_eq!(clip_frame_count(60, 5), 12);
+        assert_eq!(clip_frame_count(5, 5), 1);
+        let layout = clip_layout_for(1920, 1080);
+        assert_eq!((layout.columns, layout.rows), (6, 5));
+        let sheet_width =
+            layout.columns * layout.cell_w + (layout.columns - 1) * SHEET_GAP + SHEET_PADDING * 2;
+        assert!(sheet_width <= 2048, "sheet width {sheet_width}");
     }
 
     #[test]

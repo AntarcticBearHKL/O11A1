@@ -91,6 +91,11 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.33 养鱼 1 秒抽帧与 30 格拼图**：
+  - `watch_clip` 新增 `interval_s`，最低 1 秒，Agent 可自己选 1/5/10/20/30/60 秒；默认先用 1 秒看 30–60 秒。
+  - 画面拼图改成 6×5、每张最多 30 帧、长边 2042px、JPEG 质量 80、`detail: high`。120 秒切片按 1 秒抽帧会自动分成 4 张，不再丢帧。
+  - 用 5 张真实中文画面测过：30 格平均文字相似度 0.94、100% 可读；36 格降到 0.90，48 格降到 0.88；`detail: low` 只剩 0.06，已禁用。2048px 以上 DeepSeek 的图片 token 预算基本不变，4096px 不会更清楚。
+  - 1 秒实测：60 秒切片 = 60 帧 → 2 张 2042×984 拼图，字幕 21 句、弹幕 119 条同时返回。
 - **0.9.32 养鱼自主看片 Agent**：
   - 「开始 agent」后连续运行：Agent 自己调用 `list_videos` 取候选，按标题挑一个，看完自动进入下一个，直到暂停或停止。
   - 新增四个工具：候选列表、视频与评论、分段切片、点评打分。`open_video` 读取完整信息和最多 100 条评论，并缓存官方字幕；`watch_clip` 返回指定时间段的字幕、弹幕和 3×2 画面拼图；`rate_video` 可在任意时刻结束并写入结论。
@@ -254,7 +259,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.32.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.9.33.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。

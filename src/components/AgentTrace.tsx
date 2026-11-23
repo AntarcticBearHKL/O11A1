@@ -139,6 +139,10 @@ function ToolPreview({ step }: { step: FishAgentStep }) {
     const danmaku = listOf(data.danmaku);
     return (
       <div className="agent-tool-preview">
+        <div className="agent-preview-head">
+          <span>每 {data.interval_s ?? 1} 秒一帧 · {data.frame_count ?? 0} 帧</span>
+          <span>{data.sheet_count ?? step.images?.length ?? 0} 张拼图</span>
+        </div>
         {step.images?.length ? (
           <div className="agent-shots">
             {step.images.map((image) => (

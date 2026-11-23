@@ -2382,7 +2382,7 @@ impl FishEngine {
                                 if let Ok(data) = self.agent_image_data_url(&image.key) {
                                     parts.push(serde_json::json!({
                                         "type": "image_url",
-                                        "image_url": { "url": data, "detail": "low" }
+                                        "image_url": { "url": data, "detail": "high" }
                                     }));
                                 }
                             }
@@ -2669,6 +2669,13 @@ impl FishEngine {
             bail!("start_s 超出视频时长 {}", mmss(opened_duration_s));
         }
         let end_s = end_s.min(opened_duration_s.max(start_s + 1));
+        let interval_s = args
+            .get("interval_s")
+            .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|f| f.max(1.0) as u64)))
+            .unwrap_or(1);
+        if ![1, 5, 10, 20, 30, 60].contains(&interval_s) {
+            bail!("interval_s 只能是 1 / 5 / 10 / 20 / 30 / 60 秒");
+        }
 
         let clip_dir = state
             .work_dir
@@ -2687,6 +2694,7 @@ impl FishEngine {
                 &clip_dir,
                 start_s,
                 end_s,
+                interval_s,
                 &self.cancel_current,
             ) {
                 Ok(sheets) => {
@@ -2739,6 +2747,7 @@ impl FishEngine {
                 &clip_dir,
                 start_s,
                 end_s,
+                interval_s,
                 &opened_cues,
                 &self.cancel_current,
             ))?);
@@ -2794,6 +2803,9 @@ impl FishEngine {
             "danmaku": danmaku_json,
             "frame_count": clip.frame_count,
             "image_count": images.len(),
+            "interval_s": interval_s,
+            "frames_per_sheet": 30,
+            "sheet_count": images.len(),
             "note": if images.is_empty() { "没有画面" } else { "拼接画面随后附上" },
         });
         state.clips.push(AgentClipRecord {
@@ -2822,9 +2834,10 @@ impl FishEngine {
                 .unwrap_or_default(),
         });
         let summary = format!(
-            "{}–{} · 字幕 {} 句 · 弹幕 {} 条（{} 帧 / {} 张）",
+            "{}–{} · 每 {}s · 字幕 {} 句 · 弹幕 {} 条（{} 帧 / {} 张）",
             mmss(clip.start_s),
             mmss(clip.end_s),
+            interval_s,
             clip.subtitles.len(),
             clip.danmaku_total,
             clip.frame_count,

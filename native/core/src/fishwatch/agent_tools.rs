@@ -43,7 +43,7 @@ pub fn tool_catalog() -> Vec<AgentToolSpec> {
         AgentToolSpec {
             name: "watch_clip",
             label: "分段切片",
-            description: "下载并截取一段画面拼图，同时返回该段字幕与弹幕。",
+            description: "按 1/5/10/20/30/60 秒抽帧，打包成 6×5 拼图，同时返回该段字幕与弹幕。",
             timeout_s: 600,
         },
         AgentToolSpec {
@@ -114,7 +114,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "watch_clip",
-                "description": "看指定视频的一段：返回这一段的所有字幕、弹幕和最多 6 帧画面拼图，图片会随后附上。一次最多 120 秒。",
+                "description": "看指定视频的一段：按 interval_s 抽帧并打包成 6×5 联系表（每张最多 30 帧，自动分页），同时返回该段的全部字幕和弹幕，图片随后附上。一次最多 120 秒。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -131,6 +131,11 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "integer",
                             "minimum": 1,
                             "description": "切片结束时间，秒；与 start_s 相差 5-120 秒。"
+                        },
+                        "interval_s": {
+                            "type": "integer",
+                            "enum": [1, 5, 10, 20, 30, 60],
+                            "description": "抽帧间隔，默认 1 秒。1 秒最细；只想看节奏/长片段时用 5/10/20/30/60 秒，工具自动决定分几张拼图。"
                         },
                         "focus": {
                             "type": "string",
@@ -196,7 +201,7 @@ pub const SYSTEM_PROMPT: &str = "你是 O11A1「养鱼」栏目里的看片 agen
 工作流程：\n\
 1. 先调用 list_videos，按标题、UP 主、时长和播放量挑一个最有意思的。不要随机挑，说明你为什么选它。\n\
 2. 调用 open_video 读取视频信息、完整简介和评论。看标题与内容是否一致、评论区在争什么；如果一眼就是标题党、广告或完全不感兴趣，可以直接 rate_video 低分结束。\n\
-3. 决定继续看时，调用 watch_clip 分段看。一次 30-90 秒最合适；工具会返回这一段的字幕、弹幕和最多 6 帧画面拼图，拼图会作为图片附在下一条消息。先看开头，再根据兴趣看中段/高潮/结尾，最多看 4 段。\n\
+3. 决定继续看时，调用 watch_clip 分段看。默认先用 interval_s=1 看 30-60 秒；只有确认是纯口播、动作慢或只需要看节奏时，才放宽到 5/10/20/30/60 秒。一次 30-90 秒最合适。工具会把这一段的字幕、弹幕和按间隔抽出的画面打包成 6×5 联系表（每张最多 30 帧，自动分页），图片随后附上。先看开头，再根据兴趣看中段/高潮/结尾，最多看 4 段。\n\
 4. 任何时候觉得够了，调用 rate_video。把分数、看/不看、一句话结论、依据、标签和一句原话写清楚。\n\n\
 规则：\n\
 - 只依据工具返回的材料判断，不编造剧情、数据或评论。\n\
@@ -461,10 +466,19 @@ pub async fn build_clip(
     work: &Path,
     start_s: u64,
     end_s: u64,
+    interval_s: u64,
     cues: &[Segment],
     cancel: &AtomicBool,
 ) -> Result<ClipData> {
-    let sheets = lab::build_range_sheets(config, movie, work, start_s, end_s, cancel)?;
+    let sheets = lab::build_range_sheets(
+        config,
+        movie,
+        work,
+        start_s,
+        end_s,
+        interval_s,
+        cancel,
+    )?;
     clip_from_sheets(session, cid, start_s, end_s, cues, sheets).await
 }
 
