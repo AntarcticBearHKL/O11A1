@@ -1714,7 +1714,11 @@ impl Overlay {
                 {
                     None
                 } else {
-                    gdi_text::GdiText::new(player_font_family())
+                    gdi_text::GdiText::new(
+                        player_font_family_gdi(400),
+                        player_font_family_gdi(500),
+                        player_font_family_gdi(700),
+                    )
                 },
             );
 
@@ -7611,12 +7615,29 @@ impl Overlay {
     }
 }
 
-/// Resolve the bundled rounded UI face privately. Chill Round Gothic (a
-/// rounded Source Han Sans SC) covers the common simplified set and the rare
-/// glyphs; YaHei is the system fallback when the files cannot be loaded.
+/// DirectWrite exposes the three bundled files as one family with Regular /
+/// Medium / Bold styles, so it always asks for `Chill Round Gothic` and lets
+/// the requested weight select the face.
 pub(crate) fn player_font_family() -> PCWSTR {
     if chill_loaded() {
         w!("Chill Round Gothic")
+    } else {
+        w!("Microsoft YaHei UI")
+    }
+}
+
+/// GDI instead exposes the bundled weights as separate families. Ask for the
+/// exact file so 600/700px text is the real Medium/Bold face, not synthetic
+/// bold drawn from Regular.
+pub(crate) fn player_font_family_gdi(weight: u16) -> PCWSTR {
+    if chill_loaded() {
+        if weight >= 600 {
+            w!("Chill Round Gothic Bold")
+        } else if weight >= 500 {
+            w!("Chill Round Gothic Medium")
+        } else {
+            w!("Chill Round Gothic")
+        }
     } else {
         w!("Microsoft YaHei UI")
     }
@@ -7758,7 +7779,8 @@ fn text_format(
     size: f32,
     weight: DWRITE_FONT_WEIGHT,
 ) -> Result<IDWriteTextFormat> {
-    // One rounded family everywhere, including small chrome text.
+    // One rounded family everywhere; DirectWrite selects its Medium/Bold
+    // styles from the requested weight.
     let family = player_font_family();
     unsafe {
         let format = dwrite.CreateTextFormat(
@@ -8307,5 +8329,38 @@ mod tests {
         assert!(layout.info_actions[0].top > layout.info_id.bottom);
         assert!(layout.info_actions[2].right <= layout.sidebar_content.right + 0.01);
         assert!(layout.info_description.top > layout.info_actions[0].bottom);
+    }
+}
+
+#[cfg(test)]
+mod font_probe_tests {
+    use super::*;
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::DirectWrite::IDWriteFontCollection;
+
+    #[test]
+    fn dwrite_sees_bundled_family_names() {
+        unsafe {
+            let _ = chill_loaded();
+            let dwrite: IDWriteFactory =
+                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("dwrite");
+            let mut collection: Option<IDWriteFontCollection> = None;
+            let _ = dwrite.GetSystemFontCollection(&mut collection, false);
+            let collection = collection.expect("collection");
+            for name in [
+                "Chill Round Gothic",
+                "Chill Round Gothic Medium",
+                "Chill Round Gothic Bold",
+            ] {
+                let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut index = 0u32;
+                let mut exists = BOOL(0);
+                let _ = collection.FindFamilyName(PCWSTR(wide.as_ptr()), &mut index, &mut exists);
+                println!("{name}: exists={} index={index}", exists.as_bool());
+                if name == "Chill Round Gothic" {
+                    assert!(exists.as_bool(), "DirectWrite cannot see the bundled family");
+                }
+            }
+        }
     }
 }

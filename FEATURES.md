@@ -405,6 +405,7 @@
 - [x] 0.9.31 滚轮音量条宽度再缩到 12px `[R]`
 - [x] 0.9.32 养鱼 Agent 改为工具循环：自选视频、视频+评论、分段画面/字幕/弹幕、任意时刻评分；连续看片与全过程可视化 `[E/R]`
 - [x] 0.9.33 养鱼 1 秒抽帧，Agent 可选 1/5/10/20/30/60 秒；6×5×30 帧拼图、2048px、JPEG 80、detail high；基准见 `VISION_BENCHMARK.md` `[R]`
+- [x] 0.9.34 圆体字重修正：原生播放器 400/500/600/700 分别用 Regular/Medium/Bold，Electron 全局 `--font-ui` 兜底侧栏/工具栏 `[E/R]`
 - [x] 关闭视频恢复主界面：关闭原生/Electron 播放器后 restore + show + focus 主窗口，覆盖最小化和托盘隐藏 `[E]`
 - [x] 零拷贝解码（进程内 D3D11VA）：libavformat/libavcodec 直接解码到播放器 D3D11 纹理，NV12/P010 着色器转换后进入插帧/增强/DComp；不支持的片源自动回退 ffmpeg 管道；4K60 H.264/HEVC/AV1 实测 60fps `[R]`
 - [x] 视频帧不经过 Electron，零拷贝上屏 `[R]`

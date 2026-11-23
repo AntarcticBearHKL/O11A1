@@ -77,19 +77,25 @@ pub struct GdiText {
     cap_w: i32,
     cap_h: i32,
     stride: usize,
-    family: Vec<u16>,
+    /// Regular / Medium / Bold families. The bundled face exposes its weights
+    /// as separate GDI families (`Chill Round Gothic`, `… Medium`, `… Bold`),
+    /// so asking the regular family for 600px text only yields synthetic bold.
+    families: [Vec<u16>; 3],
     fonts: HashMap<(u16, u16), FontEntry>,
     masks: HashMap<u64, Mask>,
 }
 
 impl GdiText {
-    pub unsafe fn new(family: PCWSTR) -> Option<Self> {
+    pub unsafe fn new(regular: PCWSTR, medium: PCWSTR, bold: PCWSTR) -> Option<Self> {
         let dc = CreateCompatibleDC(None);
         if dc.0.is_null() {
             return None;
         }
-        let mut wide: Vec<u16> = family.as_wide().to_vec();
-        wide.push(0);
+        let wide = |family: PCWSTR| {
+            let mut values: Vec<u16> = family.as_wide().to_vec();
+            values.push(0);
+            values
+        };
         let mut text = Self {
             dc,
             dib: Default::default(),
@@ -97,7 +103,7 @@ impl GdiText {
             cap_w: 0,
             cap_h: 0,
             stride: 0,
-            family: wide,
+            families: [wide(regular), wide(medium), wide(bold)],
             fonts: HashMap::new(),
             masks: HashMap::new(),
         };
@@ -107,6 +113,16 @@ impl GdiText {
             return None;
         }
         Some(text)
+    }
+
+    fn family_for(&self, weight: u16) -> &[u16] {
+        if weight >= 600 {
+            &self.families[2]
+        } else if weight >= 500 {
+            &self.families[1]
+        } else {
+            &self.families[0]
+        }
     }
 
     unsafe fn release_dib(&mut self) {
@@ -154,7 +170,7 @@ impl GdiText {
     unsafe fn font(&mut self, size: f32, weight: u16) -> Option<&FontEntry> {
         let key = (size.round().max(1.0) as u16, weight);
         if !self.fonts.contains_key(&key) {
-            let family = PCWSTR(self.family.as_ptr());
+            let family = PCWSTR(self.family_for(key.1).as_ptr());
             let font = CreateFontW(
                 -(key.0 as i32),
                 0,

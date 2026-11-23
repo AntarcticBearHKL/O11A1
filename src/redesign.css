@@ -4665,3 +4665,16 @@ html, body, #root {
     font-size: 12.5px;
   }
 }
+
+/* One UI face everywhere. Some panels (player-adjacent sidebars, toolbars)
+   were inheriting the Chromium default after their own font reset; this keeps
+   every label on the bundled rounded face. Code / JSON / debug text stays
+   monospace so it remains readable. */
+.app, .app * { font-family: var(--font-ui) !important; }
+.app code, .app pre, .app kbd, .app samp,
+.app .agent-json, .app .agent-json *,
+.app .tool-preview, .app .tool-preview *,
+.app .agent-thinking-full, .app .agent-thinking-full *,
+.app .agent-code, .app .agent-code * {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace !important;
+}
