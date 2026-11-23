@@ -19,11 +19,22 @@ use super::steps::{StepId, StepProgress};
 /// Stable id of the DeepSeek judgement row. Tool rows use a [`StepId`] string.
 pub const THINK_STEP_ID: &str = "deepseek";
 
+/// One contact-sheet image produced by a tool. The bytes stay on disk; the
+/// transcript only carries this descriptor and loads the image on demand.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct AgentImageView {
+    pub key: String,
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+}
+
 /// One row of the agent transcript.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AgentStepView {
     pub id: String,
-    /// `tool` or `thinking`.
+    /// `tool`, `thinking` or `note`.
     pub kind: String,
     pub title: String,
     /// The small line beside the title (`完成`, the model name, …).
@@ -38,6 +49,12 @@ pub struct AgentStepView {
     /// Tool result (pretty JSON): the material the step actually produced, or
     /// the raw DeepSeek response for the thinking row. Empty while running.
     pub output: String,
+    /// Function name (`list_videos`, `open_video`, `watch_clip`, `rate_video`).
+    pub tool: String,
+    /// Assistant text / reasoning for a thinking row (full, unlike `detail`).
+    pub thinking: String,
+    /// Contact sheets the tool produced.
+    pub images: Vec<AgentImageView>,
     pub ms: u64,
     pub bytes: u64,
     pub tokens: u64,
@@ -91,36 +108,66 @@ pub struct AgentView {
 }
 
 impl AgentView {
-    /// Open the transcript for one video. The prompt card (cover / title / UP)
-    /// is painted from these fields before the first step arrives.
-    #[allow(clippy::too_many_arguments)]
-    pub fn begin(
-        bvid: &str,
-        title: &str,
-        up_name: &str,
-        cover: &str,
-        duration_s: u64,
-        instruction: &str,
-        model: &str,
-    ) -> Self {
+    /// Open an empty transcript for a continuous run. The video card fills in
+    /// once the agent picks a candidate and calls `open_video`.
+    pub fn begin(instruction: &str, model: &str) -> Self {
         let at = unix_now();
         AgentView {
-            bvid: bvid.to_string(),
-            title: title.to_string(),
-            up_name: up_name.to_string(),
-            cover: cover.to_string(),
-            duration_s,
             instruction: instruction.to_string(),
             model: model.to_string(),
             state: "running".to_string(),
             started_at: at,
             updated_at: at,
-            note: "开始看片…".to_string(),
+            note: "正在挑选候选视频…".to_string(),
             ..AgentView::default()
         }
     }
 
-    /// Merge one watch-step event into the tool cards.
+    /// Fill in the video card after `open_video` returns.
+    pub fn set_video(
+        &mut self,
+        bvid: &str,
+        title: &str,
+        up_name: &str,
+        cover: &str,
+        duration_s: u64,
+    ) {
+        self.bvid = bvid.to_string();
+        self.title = title.to_string();
+        self.up_name = up_name.to_string();
+        self.cover = cover.to_string();
+        self.duration_s = duration_s;
+        self.updated_at = unix_now();
+    }
+
+    /// Append one chronological event. Tool rows have a stable id supplied by
+    /// the caller so a running row can be replaced when the tool returns.
+    pub fn push_step(&mut self, step: AgentStepView) {
+        if !step.detail.trim().is_empty() {
+            self.note = step.detail.clone();
+        }
+        self.steps.push(step);
+        self.updated_at = unix_now();
+    }
+
+    /// Replace an existing row by id, keeping its position in the thread.
+    pub fn update_step(&mut self, step: AgentStepView) {
+        if !step.detail.trim().is_empty() {
+            self.note = step.detail.clone();
+        }
+        match self.steps.iter().position(|row| row.id == step.id) {
+            Some(index) => self.steps[index] = step,
+            None => self.steps.push(step),
+        }
+        self.updated_at = unix_now();
+    }
+
+    /// A unique, readable id for the next transcript row.
+    pub fn next_step_id(&self, prefix: &str) -> String {
+        format!("{prefix}-{}", self.steps.len() + 1)
+    }
+
+    /// Merge one watch-step event into the tool cards (legacy tool tester).
     pub fn apply_step(&mut self, event: &StepProgress) {
         let label = match event.state {
             "ok" => "完成",
@@ -137,9 +184,11 @@ impl AgentView {
             detail: event.detail.clone(),
             arguments: event.arguments.clone(),
             output: event.output.clone(),
+            tool: event.step.as_str().to_string(),
             ms: event.ms,
             bytes: event.bytes,
             tokens: event.tokens,
+            ..AgentStepView::default()
         };
         match self.steps.iter().position(|row| row.id == step.id) {
             Some(index) => self.steps[index] = step,
@@ -301,10 +350,15 @@ mod tests {
         }
     }
 
+    fn agent_for_test(model: &str) -> AgentView {
+        let mut agent = AgentView::begin("指令", model);
+        agent.set_video("BV1", "标题", "UP", "", 90);
+        agent
+    }
+
     #[test]
     fn steps_keep_the_watch_plan_order() {
-        let mut agent =
-            AgentView::begin("BV1", "标题", "UP", "cover", 90, "指令", "deepseek-flash");
+        let mut agent = agent_for_test("deepseek-flash");
         agent.apply_step(&progress(StepId::Comments, "ok", "30 条"));
         agent.apply_step(&progress(StepId::Meta, "ok", "12 万播放"));
         agent.begin_thinking("deepseek-flash", "system", "user", "{\"model\":\"x\"}");
@@ -319,7 +373,7 @@ mod tests {
 
     #[test]
     fn thinking_and_reply_carry_usage() {
-        let mut agent = AgentView::begin("BV1", "标题", "UP", "", 90, "", "deepseek-chat");
+        let mut agent = agent_for_test("deepseek-chat");
         agent.begin_thinking("deepseek-chat", "system", "user", "{\"model\":\"x\"}");
         agent.finish_thinking(1_500, 1_234, 56, 180, "{\"score\":8}");
         agent.finish_reply(AgentReplyView {
@@ -351,7 +405,7 @@ mod tests {
 
     #[test]
     fn thinking_keeps_the_exact_prompts_and_raw_bodies() {
-        let mut agent = AgentView::begin("BV1", "标题", "UP", "", 90, "", "deepseek-flash");
+        let mut agent = agent_for_test("deepseek-flash");
         agent.begin_thinking(
             "deepseek-flash",
             "系统提示",
@@ -378,7 +432,7 @@ mod tests {
 
     #[test]
     fn a_failed_run_closes_the_running_row() {
-        let mut agent = AgentView::begin("BV1", "标题", "UP", "", 90, "", "deepseek-chat");
+        let mut agent = agent_for_test("deepseek-chat");
         agent.apply_step(&progress(StepId::Meta, "ok", "打开"));
         agent.apply_step(&progress(StepId::Subtitle, "running", "拉取字幕"));
         agent.finish("error", "DeepSeek 返回 HTTP 401");
@@ -392,7 +446,7 @@ mod tests {
 
     #[test]
     fn a_done_run_keeps_its_reply_note() {
-        let mut agent = AgentView::begin("BV1", "标题", "UP", "", 90, "", "deepseek-chat");
+        let mut agent = agent_for_test("deepseek-chat");
         agent.finish_reply(AgentReplyView {
             score: 2.0,
             verdict: "划走".to_string(),

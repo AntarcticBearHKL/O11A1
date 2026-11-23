@@ -524,6 +524,39 @@ impl Session {
         all.sort_by_key(|item| item.progress_ms);
         all
     }
+
+    /// Fetch only the 6-minute danmaku segments covering `[start_s, end_s]`,
+    /// then keep the lines that actually fall inside the requested window.
+    /// Best-effort: a failed segment is logged and skipped.
+    pub async fn danmaku_range(
+        &self,
+        cid: u64,
+        start_s: u64,
+        end_s: u64,
+    ) -> Vec<crate::danmaku::Danmaku> {
+        if cid == 0 || end_s <= start_s {
+            return Vec::new();
+        }
+        let first = (start_s / 360 + 1).max(1) as u32;
+        let last = ((end_s.saturating_sub(1)) / 360 + 1).max(1) as u32;
+        let mut all: Vec<crate::danmaku::Danmaku> = Vec::new();
+        for index in first..=last {
+            match self.danmaku_segment(&self.client, cid, index).await {
+                Ok(list) => all.extend(list),
+                Err(err) => {
+                    crate::debug_log(&format!(
+                        "danmaku range seg={index} start={start_s} failed: {err:#}"
+                    ));
+                }
+            }
+        }
+        all.retain(|item| {
+            let at = item.progress_ms as u64 / 1_000;
+            at >= start_s && at <= end_s
+        });
+        all.sort_by_key(|item| item.progress_ms);
+        all
+    }
 }
 
 impl Session {

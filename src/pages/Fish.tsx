@@ -1,20 +1,12 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { call, formatCount } from '../api';
 import { AgentTrace } from '../components/AgentTrace';
 import { TestLab } from '../components/TestLab';
 import { useApp } from '../context';
-import { recommendFromFolder } from '../favRecommend';
-import type { FavFolder, FeedVideo, FishAgent, FishState, FishToolSpec } from '../types';
+import type { FavFolder, FishAgent, FishAgentTool, FishState, FishToolSpec } from '../types';
 import { ErrorBox, PageHead, Spinner, Tabs, Toggle } from '../components/Common';
 
 const TABS = ['看片', '试验台', '设置'];
-
-/// Keep at most this many rows waiting/running; the auto-filler adds one when
-/// the queue drops below it.
-const AUTOFILL_LOW_WATER = 2;
-/// After an empty source / failed pick, wait this long before trying again so
-/// a dead feed does not hammer Bilibili every poll.
-const AUTOFILL_RETRY_MS = 8_000;
 
 /// 语音识别固定使用 tiny 模型：设置里只提供下载，其余参数保持默认值。
 const ASR_MODEL = 'tiny';
@@ -25,7 +17,7 @@ function fishStateLabel(value: any): string {
   if (typeof value !== 'string') return value?.Error || 'Idle';
   switch (value) {
     case 'Running': return '运行中';
-    case 'Waiting': return '等待投喂';
+    case 'Waiting': return '等待候选';
     case 'Paused': return '已暂停';
     case 'NeedsKey': return '需要 API Key';
     case 'Idle': return '空闲';
@@ -44,11 +36,9 @@ export default function Fish() {
   const [key, setKey] = useState('');
   const [instruction, setInstruction] = useState(settings.fish_instruction || '');
   const [tools, setTools] = useState<FishToolSpec[]>([]);
+  const [agentTools, setAgentTools] = useState<FishAgentTool[]>([]);
   const [folders, setFolders] = useState<FavFolder[]>([]);
   const [foldersLoading, setFoldersLoading] = useState(false);
-  const autofillBusy = useRef(false);
-  const autofillRetryAt = useRef(0);
-  const autofillWarned = useRef('');
 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -89,14 +79,21 @@ export default function Fish() {
     return () => clearInterval(timer);
   }, [tab, models?.running, refreshModels]);
 
-  // The Agent and 试验台 tabs share one static catalog; fetch it the first time
-  // either is opened (the engine also uses it to enumerate the watch steps).
+  // 工具台 uses the old fixed watch-step catalog; the Agent header uses the
+  // four continuous-agent tools.
   useEffect(() => {
-    if ((tab !== 0 && tab !== 1) || tools.length) return;
+    if (tab !== 1 || tools.length) return;
     call<FishToolSpec[]>('fish.tools')
       .then((list) => setTools(Array.isArray(list) ? list : []))
       .catch((reason) => toast(reason.message, true));
   }, [tab, tools.length, toast]);
+
+  useEffect(() => {
+    if (tab !== 0 || agentTools.length) return;
+    call<FishAgentTool[]>('fish.agent.tools')
+      .then((list) => setAgentTools(Array.isArray(list) ? list : []))
+      .catch((reason) => toast(reason.message, true));
+  }, [tab, agentTools.length, toast]);
 
   const snapshot = state?.snapshot;
   const snapshotState = snapshot?.state;
@@ -127,13 +124,6 @@ export default function Fish() {
     loadFolders();
   }, [tab, autofillSource, folders.length, loadFolders]);
 
-  // A source / folder change is an explicit "try again now"; clear the
-  // back-off that an empty previous source installed.
-  useEffect(() => {
-    autofillRetryAt.current = 0;
-    autofillWarned.current = '';
-  }, [settings.fish_autofill_source, settings.fish_autofill_folder]);
-
   const action = async (method: string, params: Record<string, any> = {}) => {
     try {
       await call(method, params);
@@ -162,77 +152,6 @@ export default function Fish() {
     }
   };
 
-  const pickAutofill = useCallback(async (): Promise<FeedVideo | null> => {
-    if (autofillSource === 'favorites') {
-      if (!autofillFolder) throw new Error('请先选择一个收藏夹');
-      const pool = await recommendFromFolder(autofillFolder, 12);
-      if (!pool.length) return null;
-      const candidates = pool.slice();
-      for (let index = candidates.length - 1; index > 0; index -= 1) {
-        const swap = Math.floor(Math.random() * (index + 1));
-        [candidates[index], candidates[swap]] = [candidates[swap], candidates[index]];
-      }
-      for (const item of candidates) {
-        if (!item?.bvid) continue;
-        const check = await call<{ watched: boolean; queued: boolean }>('fish.watched.check', { bvid: item.bvid });
-        if (!check?.watched && !check?.queued) return item;
-      }
-      return null;
-    }
-    return call<FeedVideo | null>('fish.feed.next');
-  }, [autofillSource, autofillFolder]);
-
-  const fillQueue = useCallback(async () => {
-    if (autofillBusy.current) return;
-    if (Date.now() < autofillRetryAt.current) return;
-    autofillBusy.current = true;
-    try {
-      const item = await pickAutofill();
-      if (!item) {
-        autofillRetryAt.current = Date.now() + AUTOFILL_RETRY_MS;
-        if (autofillWarned.current !== 'empty') {
-          autofillWarned.current = 'empty';
-          toast('自动填充没有找到未看过的视频，稍后重试', true);
-        }
-        return;
-      }
-      const result = await call<{ queued: boolean; bvid: string }>('fish.enqueue.item', { item });
-      if (result?.queued) {
-        autofillWarned.current = '';
-        autofillRetryAt.current = 0;
-        await load(true);
-      } else {
-        autofillRetryAt.current = Date.now() + AUTOFILL_RETRY_MS;
-      }
-    } catch (reason: any) {
-      autofillRetryAt.current = Date.now() + AUTOFILL_RETRY_MS;
-      const message = reason?.message || String(reason);
-      if (autofillWarned.current !== message) {
-        autofillWarned.current = message;
-        toast(`自动填充失败：${message}`, true);
-      }
-    } finally {
-      autofillBusy.current = false;
-    }
-  }, [pickAutofill, load, toast]);
-
-  useEffect(() => {
-    if (!settings.fish_autofill) return;
-    if (snapshotState !== 'Running' && snapshotState !== 'Waiting') return;
-    if ((snapshot?.queued ?? 0) >= AUTOFILL_LOW_WATER) return;
-    const kick = () => {
-      if ((snapshot?.queued ?? 0) < AUTOFILL_LOW_WATER) void fillQueue();
-    };
-    const first = window.setTimeout(kick, 300);
-    // The queue count may stay at 0 while a source is empty or offline. Keep
-    // retrying on a timer; `fillQueue` owns the longer 8 s back-off.
-    const timer = window.setInterval(kick, 2_000);
-    return () => {
-      window.clearTimeout(first);
-      window.clearInterval(timer);
-    };
-  }, [settings.fish_autofill, snapshotState, snapshot?.queued, fillQueue]);
-
   const agent = (snapshot?.agent || null) as FishAgent | null;
   const toolSeed = agent?.bvid || snapshot?.current?.[0] || state?.verdicts?.[0]?.bvid || '';
   const asrTiny = (models?.items || []).find((item: any) => item.model?.name === ASR_MODEL);
@@ -257,6 +176,13 @@ export default function Fish() {
   };
 
   const isLive = snapshotState === 'Running' || snapshotState === 'Waiting';
+  const lastAgentStep = (name: string) => {
+    const rows = agent?.steps || [];
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      if (rows[index].tool === name) return rows[index];
+    }
+    return null;
+  };
 
   return (
     <>
@@ -275,7 +201,7 @@ export default function Fish() {
                     {fishStateLabel(snapshot.state)}
                   </span>
                   <span className="fish-meta">
-                    队列 {snapshot.queued} · 完成 {snapshot.done} · 错误 {snapshot.errors} · tokens {formatCount(snapshot.tokens_in + snapshot.tokens_out)}
+                    候选 {snapshot.queued} · 完成 {snapshot.done} · 错误 {snapshot.errors} · tokens {formatCount(snapshot.tokens_in + snapshot.tokens_out)}
                   </span>
                   <div className="fish-toolbar">
                     <button className="btn sm primary" onClick={startAgent}>开始 agent</button>
@@ -285,21 +211,17 @@ export default function Fish() {
                 </div>
                 {snapshot.current ? <div className="fish-current">正在看：{snapshot.current[1] || snapshot.current[0]}</div> : null}
                 <div className="fish-toolbar fish-toolbar-secondary">
-                  <button className="btn sm" onClick={() => action('fish.enqueue')}>投喂首页推荐</button>
+                  <button className="btn sm" onClick={() => action('fish.enqueue')}>补充候选</button>
                   <button className="btn sm" onClick={() => action('fish.retry')}>重试错误</button>
-                  <button className="btn sm danger" onClick={() => { if (window.confirm('清空推荐流？历史结论会保留。')) action('fish.clear'); }}>清空推荐流</button>
+                  <button className="btn sm danger" onClick={() => { if (window.confirm('清空候选队列？历史结论会保留。')) action('fish.clear'); }}>清空候选</button>
                 </div>
                 <div className="fish-autofill">
-                  <span className="fish-autofill-label">自动填充</span>
-                  <Toggle
-                    on={settings.fish_autofill}
-                    onChange={(value) => saveFish({ fish_autofill: value })}
-                  />
+                  <span className="fish-autofill-label">候选来源</span>
                   <select
                     className="select"
                     value={autofillSource}
                     onChange={(event) => saveFish({ fish_autofill_source: event.target.value })}
-                    aria-label="自动填充来源"
+                    aria-label="候选来源"
                   >
                     <option value="home">首页视频流</option>
                     <option value="favorites">收藏夹推荐流</option>
@@ -309,7 +231,7 @@ export default function Fish() {
                       className="select"
                       value={settings.fish_autofill_folder || 0}
                       onChange={(event) => saveFish({ fish_autofill_folder: Number(event.target.value) })}
-                      aria-label="自动填充收藏夹"
+                      aria-label="候选收藏夹"
                     >
                       <option value={0}>{foldersLoading ? '正在读取收藏夹…' : '选择收藏夹'}</option>
                       {folders.map((folder) => (
@@ -320,35 +242,65 @@ export default function Fish() {
                     </select>
                   ) : null}
                   <span className="fish-autofill-note">
-                    随机挑一条数据库里没有的视频投喂；队列低于 {AUTOFILL_LOW_WATER} 条时补充。
+                    Agent 每轮自己从候选列表里按标题挑一个；看完一个自动进入下一个，直到你点暂停或停止。
                     {autofillSource === 'favorites' && !autofillFolder ? ' 需要先选择一个收藏夹。' : ''}
                   </span>
-                  {isLive && settings.fish_autofill ? <span className="fish-autofill-state">运行中</span> : null}
+                  {isLive ? <span className="fish-autofill-state">连续看片中</span> : null}
                 </div>
               </section>
 
               <section className="fish-section fish-agent-head">
                 <div className="fish-agent-line">
                   <div className="agent-tool-strip">
-                    <span className="agent-tool-strip-label">固定步骤</span>
-                    {tools.map((tool) => {
-                      const step = agent?.steps.find((row) => row.id === tool.id);
+                    <span className="agent-tool-strip-label">Agent 工具</span>
+                    {agentTools.map((tool) => {
+                      const step = lastAgentStep(tool.name);
                       const tone = step ? step.state : 'idle';
+                      const meta = step
+                        ? step.state === 'running'
+                          ? '运行中'
+                          : step.state === 'failed'
+                            ? '失败'
+                            : '已调用'
+                        : '未参与';
                       return (
-                        <span className={`agent-tool-chip ${tone}`} key={tool.id} title={`${tool.description} · 上限 ${tool.timeout_s}s`}>
+                        <span className={`agent-tool-chip ${tone}`} key={tool.name} title={tool.description}>
                           <i />
                           {tool.label}
-                          <em>{step ? step.meta || step.state : '未参与'}</em>
+                          <em>{meta}</em>
                         </span>
                       );
                     })}
-                    {!tools.length ? <span className="agent-tool-strip-empty">正在读取工具清单…</span> : null}
+                    {!agentTools.length ? <span className="agent-tool-strip-empty">正在读取工具清单…</span> : null}
                   </div>
                   <button className="btn sm ghost" onClick={() => setTab(1)}>试验台</button>
                 </div>
               </section>
 
               <AgentTrace key={`full-${agent?.bvid || 'empty'}`} agent={agent} full />
+
+              {state.verdicts?.[0] && state.verdicts[0].bvid !== agent?.bvid ? (
+                <section className="fish-section fish-recent">
+                  <div className="fish-section-title">最近结论</div>
+                  <div className="fish-recent-row">
+                    <span className="fish-recent-score">{Math.round(Number(state.verdicts[0].score) || 0)}</span>
+                    <div className="fish-recent-copy">
+                      <div className="fish-recent-head">
+                        <b>{state.verdicts[0].verdict || '也许'}</b>
+                        <span>{state.verdicts[0].title || state.verdicts[0].bvid}</span>
+                      </div>
+                      <div className="fish-recent-line">{state.verdicts[0].one_line}</div>
+                      {Array.isArray(state.verdicts[0].reasons) && state.verdicts[0].reasons.length ? (
+                        <div className="fish-recent-reasons">
+                          {state.verdicts[0].reasons.slice(0, 3).map((reason: string, index: number) => (
+                            <span key={`${index}-${reason}`}>{reason}</span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </section>
+              ) : null}
             </div>
           ) : null}
 

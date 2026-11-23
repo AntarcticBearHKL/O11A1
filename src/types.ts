@@ -420,8 +420,8 @@ export interface DownloadTask {
 }
 
 /// One row of the 养鱼 Agent transcript (`snapshot.agent.steps`). Tool rows use
-/// a watch-step id (`meta` / `subtitle` / `outline` / `comments` / `asr` /
-/// `frames`); the DeepSeek request is the `thinking` row with id `deepseek`.
+/// a tool name (`list_videos` / `open_video` / `watch_clip` / `rate_video`);
+/// the DeepSeek request is the `thinking` row.
 export interface FishAgentStep {
   id: string;
   kind: string;
@@ -429,15 +429,28 @@ export interface FishAgentStep {
   meta: string;
   state: string;
   detail: string;
-  /// Tool-call arguments (pretty JSON): the watch-step request, or the raw
-  /// DeepSeek request body for the thinking row.
+  /// Tool-call arguments (pretty JSON), or the raw DeepSeek request body.
   arguments: string;
-  /// Tool result (pretty JSON): the material produced, or the raw DeepSeek
-  /// response for the thinking row.
+  /// Tool result (pretty JSON), or the raw DeepSeek response.
   output: string;
+  /// Function name for tool rows (`list_videos`, `open_video`, ...).
+  tool: string;
+  /// Full assistant text / reasoning for a thinking row.
+  thinking: string;
+  /// Contact sheets the tool produced; images load on demand by key.
+  images: FishAgentImage[];
   ms: number;
   bytes: number;
   tokens: number;
+}
+
+/// One contact sheet referenced by an Agent tool row.
+export interface FishAgentImage {
+  key: string;
+  label: string;
+  width: number;
+  height: number;
+  bytes: number;
 }
 
 /// The verdict card the Agent panel paints after the DeepSeek call.
@@ -481,7 +494,15 @@ export interface FishAgent {
   cost_tokens: number;
 }
 
-/// One tool exposed to the 养鱼 agent (`fish.tools`).
+/// One tool exposed to the continuous 养鱼 agent (`fish.agent.tools`).
+export interface FishAgentTool {
+  name: string;
+  label: string;
+  description: string;
+  timeout_s: number;
+}
+
+/// One tool exposed to the 养鱼 工具台 (`fish.tools`).
 export interface FishToolSpec {
   id: string;
   label: string;

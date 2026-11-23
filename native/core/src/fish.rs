@@ -43,6 +43,7 @@
 // `snapshot`/`stats`/`verdicts` are called from the app.
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -53,8 +54,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bilibili::Session;
-use crate::fishwatch::agent::{AgentReplyView, AgentView};
-use crate::fishwatch::evidence::Evidence;
+use crate::fishwatch::agent::{AgentImageView, AgentReplyView, AgentStepView, AgentView};
+use crate::fishwatch::agent_tools::{self, Candidate, OpenedVideo};
+use crate::fishwatch::evidence::{Evidence, StepRecord};
+use crate::fishwatch::frames::lab::{self, MovieSource};
 use crate::fishwatch::steps::StepId;
 use crate::fishwatch::transcript::ConclusionGate;
 use crate::fishwatch::{
@@ -506,6 +509,9 @@ struct EngineConfig {
     /// Keep the worker alive when the queue empties; the page's auto-filler
     /// feeds it the next random unwatched video.
     autofill: bool,
+    /// `home` | `favorites` for the agent's `list_videos` tool.
+    source: String,
+    folder_id: i64,
     endpoint: String,
     /// 看片力度 + ASR/视觉参数，passed to `fishwatch` unchanged.
     watch: WatchConfig,
@@ -523,6 +529,12 @@ impl EngineConfig {
             budget_videos: settings::normalise_fish_budget(settings.fish_budget_videos),
             interval_ms: settings::normalise_fish_interval(settings.fish_interval_ms),
             autofill: settings.fish_autofill,
+            source: if settings.fish_autofill_source == "favorites" {
+                "favorites".to_string()
+            } else {
+                "home".to_string()
+            },
+            folder_id: settings.fish_autofill_folder,
             endpoint: endpoint.clone(),
             watch: watch_config_from_settings(settings, &key, &model, &endpoint),
         }
@@ -858,6 +870,65 @@ struct Asked {
     response: String,
 }
 
+/// One assistant turn from the tool-calling endpoint.
+struct AgentAsk {
+    content: String,
+    reasoning: String,
+    tool_calls: Vec<AgentToolCall>,
+    tokens_in: u64,
+    tokens_out: u64,
+    /// Pretty raw response for the transcript.
+    response: String,
+}
+
+#[derive(Clone, Debug)]
+struct AgentToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// One watched segment, kept for the verdict's evidence.
+struct AgentClipRecord {
+    start_s: u64,
+    end_s: u64,
+    subtitles: usize,
+    danmaku: usize,
+    frames: usize,
+    sheets: usize,
+    subtitle_text: String,
+    danmaku_sample: String,
+}
+
+/// Mutable state of one agent video. Reset for every rate_video.
+struct AgentRunState {
+    opened: Option<OpenedVideo>,
+    movie: Option<MovieSource>,
+    work_dir: PathBuf,
+    clip_count: usize,
+    clips: Vec<AgentClipRecord>,
+    network_bytes: u64,
+    system_prompt: String,
+    user_prompt: String,
+    total_in: u64,
+    total_out: u64,
+    rate: Option<ParsedVerdict>,
+    no_candidates: bool,
+}
+
+/// What one tool call produced for the transcript and the model.
+struct AgentToolOutcome {
+    /// JSON/text handed back in the `tool` message.
+    content: String,
+    /// Pretty JSON shown in the expanded transcript row.
+    output: String,
+    summary: String,
+    images: Vec<AgentImageView>,
+    bytes: u64,
+    /// Set by rate_video.
+    rate: Option<ParsedVerdict>,
+}
+
 /// The 养鱼 engine. Build it once via [`FishEngine::open`] and share the `Arc`.
 pub struct FishEngine {
     db: Mutex<Connection>,
@@ -869,6 +940,14 @@ pub struct FishEngine {
     progress: Mutex<Option<FishProgressView>>,
     /// The same run as the Agent chat transcript (tool / thinking / reply).
     agent: Mutex<Option<AgentView>>,
+    /// Contact sheets referenced by the current transcript. Files stay on disk
+    /// and the UI loads them by key, so the one-second snapshot poll never
+    /// carries megabytes of base64.
+    agent_images: Mutex<HashMap<String, PathBuf>>,
+    agent_image_seq: AtomicU64,
+    /// Work directory of the transcript currently on screen. Kept until the
+    /// next video starts so its contact sheets stay loadable.
+    agent_work_dir: Mutex<Option<PathBuf>>,
     /// Last time `progress` was pushed to the snapshot hook (throttle).
     last_progress_publish: Mutex<Option<Instant>>,
     signals: Mutex<Option<Signals>>,
@@ -954,6 +1033,9 @@ impl FishEngine {
             current: Mutex::new(None),
             progress: Mutex::new(None),
             agent: Mutex::new(None),
+            agent_images: Mutex::new(HashMap::new()),
+            agent_image_seq: AtomicU64::new(1),
+            agent_work_dir: Mutex::new(None),
             last_progress_publish: Mutex::new(None),
             signals: Mutex::new(None),
             hook: Mutex::new(None),
@@ -979,6 +1061,57 @@ impl FishEngine {
     /// Where this engine stores its data.
     pub fn db_path(&self) -> &Path {
         &self.path
+    }
+
+    /// Read one contact sheet back to the renderer. The transcript keeps only
+    /// the key; images never ride the snapshot poll.
+    pub fn agent_image_data_url(&self, key: &str) -> Result<String> {
+        let path = self
+            .agent_images
+            .lock()
+            .map_err(|_| anyhow!("图片索引锁被污染"))?
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow!("图片已过期"))?;
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("读取拼图失败：{}", path.display()))?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            bail!("拼图过大，拒绝发送");
+        }
+        Ok(format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
+    }
+
+    fn clear_agent_images(&self) {
+        if let Ok(mut map) = self.agent_images.lock() {
+            map.clear();
+        }
+    }
+
+    fn register_agent_image(
+        &self,
+        path: PathBuf,
+        label: &str,
+        width: u32,
+        height: u32,
+        bytes: u64,
+    ) -> AgentImageView {
+        let key = format!(
+            "img-{}",
+            self.agent_image_seq.fetch_add(1, Ordering::SeqCst)
+        );
+        if let Ok(mut map) = self.agent_images.lock() {
+            map.insert(key.clone(), path);
+        }
+        AgentImageView {
+            key,
+            label: label.to_string(),
+            width,
+            height,
+            bytes,
+        }
     }
 
     /// Optional push-style update for the UI (called after every state change).
@@ -1517,7 +1650,17 @@ impl FishEngine {
     // -- worker ------------------------------------------------------------
 
     fn worker_loop(&self, generation: u64) {
-        let mut looked: u32 = 0;
+        #[cfg(test)]
+        {
+            let stub = matches!(
+                self.signals.lock().ok().and_then(|slot| slot.clone()),
+                Some(Signals::Stub)
+            );
+            if stub {
+                self.legacy_worker_loop(generation);
+                return;
+            }
+        }
         loop {
             if self.stop_requested.load(Ordering::SeqCst)
                 || generation != self.generation.load(Ordering::SeqCst)
@@ -1541,37 +1684,111 @@ impl FishEngine {
                 self.set_state_if_current(generation, FishState::NeedsKey);
                 return;
             }
+            self.set_state_if_current(generation, FishState::Running);
+            let started = Instant::now();
+            crate::player::tag_here("fish:agent");
+            crate::player::note_fish_step(true);
+            let outcome = self.run_agent_session(&config, generation, started);
+            crate::player::note_fish_step(false);
+            let stale = generation != self.generation.load(Ordering::SeqCst)
+                || self.stop_requested.load(Ordering::SeqCst);
+            let current = self.current.lock().ok().and_then(|guard| guard.clone());
+            match outcome {
+                Ok(Some(view)) => {
+                    if stale {
+                        return;
+                    }
+                    crate::debug_log(&format!(
+                        "fish agent done bvid={} verdict={} score={:.1} ms={} tokens={}+{}",
+                        view.bvid,
+                        view.verdict,
+                        view.score,
+                        started.elapsed().as_millis(),
+                        view.tokens_in,
+                        view.tokens_out
+                    ));
+                    self.set_current(None);
+                    self.finish_progress(
+                        "done",
+                        format!(
+                            "完成 · {} · {:.1} 分 · 覆盖 {}%",
+                            view.verdict,
+                            view.score,
+                            (view.evidence.coverage * 100.0).round() as u32
+                        ),
+                    );
+                    self.publish();
+                }
+                Ok(None) => {
+                    // No candidate came back (offline feed / empty folder).
+                    // Stay alive like the old auto-fill Waiting state.
+                    self.set_current(None);
+                    self.set_state_if_current(generation, FishState::Waiting);
+                    self.finish_progress("cancelled", "候选列表为空，等待补充");
+                    self.publish();
+                }
+                Err(_) if stale || self.cancel_current.load(Ordering::SeqCst) => {
+                    if let Some((bvid, _)) = current.as_ref() {
+                        self.requeue_bvid(bvid);
+                    }
+                    self.set_current(None);
+                    self.finish_progress("cancelled", "已取消；当前视频已放回候选");
+                    self.publish();
+                    if stale {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    if let Some((bvid, _)) = current.as_ref() {
+                        self.fail_queue_bvid(bvid, &message);
+                    }
+                    self.set_current(None);
+                    self.finish_progress("error", message);
+                    self.publish();
+                }
+            }
+            if self.sleep_interval(config.interval_ms) {
+                return;
+            }
+        }
+    }
+
+    /// The legacy queue worker, kept only for the deterministic mock-server
+    /// tests (`Signals::Stub`). Production always runs the continuous agent.
+    #[cfg(test)]
+    fn legacy_worker_loop(&self, generation: u64) {
+        let mut looked: u32 = 0;
+        loop {
+            if self.stop_requested.load(Ordering::SeqCst)
+                || generation != self.generation.load(Ordering::SeqCst)
+            {
+                self.set_current(None);
+                return;
+            }
+            if self.paused.load(Ordering::SeqCst) {
+                self.set_state_if_current(generation, FishState::Paused);
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            let Ok(config) = self.config() else {
+                return;
+            };
+            if config.key.trim().is_empty() {
+                self.set_state_if_current(generation, FishState::NeedsKey);
+                return;
+            }
             if !config.autofill && looked >= config.budget_videos.max(1) {
-                crate::debug_log(&format!("fish run budget={} reached", looked));
                 self.set_state_if_current(generation, FishState::Idle);
                 return;
             }
             let Some(job) = self.pop_next() else {
-                if config.autofill {
-                    // A continuous run has no budget and no exit on an empty
-                    // queue: the page's auto-filler adds the next unwatched
-                    // video while the worker waits here.
-                    let already_waiting = self
-                        .state
-                        .lock()
-                        .map(|guard| *guard == FishState::Waiting)
-                        .unwrap_or(false);
-                    if !already_waiting {
-                        self.set_state_if_current(generation, FishState::Waiting);
-                    }
-                    if self.sleep_interval(500) {
-                        return;
-                    }
-                    continue;
-                }
                 self.set_state_if_current(generation, FishState::Idle);
                 return;
             };
             self.set_current(Some((job.bvid.clone(), job.title.clone())));
             self.set_state_if_current(generation, FishState::Running);
             let started = Instant::now();
-            // The stall trace reports `fish=`/`last=fish:step` while a step is
-            // in flight, so a UI gap can be blamed on this worker (or cleared).
             crate::player::tag_here("fish:step");
             crate::player::note_fish_step(true);
             let outcome = self.process(&job, &config, started, generation);
@@ -1613,8 +1830,6 @@ impl FishEngine {
                     }
                 }
                 Err(_) if stale || self.cancel_current.load(Ordering::SeqCst) => {
-                    // The current row goes back to the queue; no error verdict
-                    // and no attempt count for a user-requested stop.
                     let _ = self.requeue(&job);
                     self.set_current(None);
                     self.finish_progress("cancelled", "已取消；视频已放回队列");
@@ -1633,12 +1848,6 @@ impl FishEngine {
                         )));
                         return;
                     }
-                    crate::debug_log(&format!(
-                        "fish error bvid={} attempts={} ms={} err={err:#}",
-                        job.bvid,
-                        job.attempts + 1,
-                        started.elapsed().as_millis()
-                    ));
                     self.publish();
                 }
             }
@@ -1677,6 +1886,28 @@ impl FishEngine {
         )?;
         crate::debug_log(&format!("fish requeue bvid={}", job.bvid));
         Ok(())
+    }
+
+    fn requeue_bvid(&self, bvid: &str) {
+        if let Ok(db) = self.lock_db() {
+            let _ = db.execute(
+                "UPDATE queue SET state = 'pending', updated_at = ?2 \
+                 WHERE bvid = ?1 AND state = 'running'",
+                params![bvid, now()],
+            );
+        }
+        crate::debug_log(&format!("fish agent requeue bvid={bvid}"));
+    }
+
+    fn fail_queue_bvid(&self, bvid: &str, message: &str) {
+        if let Ok(db) = self.lock_db() {
+            let _ = db.execute(
+                "UPDATE queue SET state = 'error', attempts = attempts + 1, \
+                 last_error = ?2, updated_at = ?3 WHERE bvid = ?1 AND state = 'running'",
+                params![bvid, clip(message, 800), now()],
+            );
+        }
+        crate::debug_log(&format!("fish agent queue error bvid={bvid}"));
     }
 
     /// Claim the highest-priority pending row (and mark it `running`).
@@ -1867,6 +2098,1125 @@ impl FishEngine {
         Ok(view)
     }
 
+    // -- continuous agent --------------------------------------------------
+
+    fn begin_agent_waiting(&self, config: &EngineConfig) {
+        let agent = AgentView::begin(&config.instruction, &config.model);
+        if let Ok(mut slot) = self.agent.lock() {
+            *slot = Some(agent);
+        }
+        self.publish();
+    }
+
+    fn agent_with<F>(&self, f: F)
+    where
+        F: FnOnce(&mut AgentView),
+    {
+        if let Ok(mut slot) = self.agent.lock() {
+            if let Some(agent) = slot.as_mut() {
+                f(agent);
+            }
+        }
+        self.publish();
+    }
+
+    fn agent_next_id(&self, prefix: &str) -> String {
+        self.agent
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|agent| agent.next_step_id(prefix)))
+            .unwrap_or_else(|| format!("{prefix}-1"))
+    }
+
+    fn agent_push(&self, step: AgentStepView) {
+        self.agent_with(|agent| agent.push_step(step));
+    }
+
+    fn agent_update(&self, step: AgentStepView) {
+        self.agent_with(|agent| agent.update_step(step));
+    }
+
+    fn agent_set_video(&self, opened: &OpenedVideo) {
+        self.agent_with(|agent| {
+            agent.set_video(
+                &opened.bvid,
+                &opened.title,
+                &opened.up_name,
+                &opened.cover,
+                opened.duration_s,
+            );
+        });
+    }
+
+    fn agent_add_usage(&self, tokens_in: u64, tokens_out: u64) {
+        self.agent_with(|agent| {
+            agent.tokens_in = agent.tokens_in.saturating_add(tokens_in);
+            agent.tokens_out = agent.tokens_out.saturating_add(tokens_out);
+            agent.cost_tokens = agent
+                .cost_tokens
+                .saturating_add(tokens_in)
+                .saturating_add(tokens_out);
+        });
+    }
+
+    /// The whole continuous loop for one video. `Ok(None)` means the candidate
+    /// source was empty; the caller puts the worker into `Waiting` and retries.
+    fn run_agent_session(
+        &self,
+        config: &EngineConfig,
+        generation: u64,
+        started: Instant,
+    ) -> Result<Option<VerdictView>> {
+        let Some(Signals::Live(session)) = self.signals.lock().ok().and_then(|slot| slot.clone())
+        else {
+            return Err(anyhow!("养鱼引擎没有可用的 Bilibili 会话"));
+        };
+        if let Some(previous) = self.agent_work_dir.lock().ok().and_then(|mut slot| slot.take()) {
+            let _ = std::fs::remove_dir_all(previous);
+        }
+        self.clear_agent_images();
+        self.set_current(None);
+        self.clear_progress();
+        self.begin_agent_waiting(config);
+        self.begin_progress("", "");
+        self.progress_note("正在挑选候选视频…");
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let work_dir = std::env::temp_dir()
+            .join("o11a1-fish-agent")
+            .join(format!("run-{stamp}"));
+        std::fs::create_dir_all(&work_dir)
+            .with_context(|| format!("创建 Agent 工作目录失败：{}", work_dir.display()))?;
+        if let Ok(mut slot) = self.agent_work_dir.lock() {
+            *slot = Some(work_dir.clone());
+        }
+
+        let (system, user) = agent_initial_prompt(config);
+        let mut state = AgentRunState {
+            opened: None,
+            movie: None,
+            work_dir: work_dir.clone(),
+            clip_count: 0,
+            clips: Vec::new(),
+            network_bytes: 0,
+            system_prompt: system.clone(),
+            user_prompt: user.clone(),
+            total_in: 0,
+            total_out: 0,
+            rate: None,
+            no_candidates: false,
+        };
+        self.agent_with(|agent| {
+            agent.system_prompt = system.clone();
+            agent.user_prompt = user.clone();
+        });
+
+        let mut messages: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "role": "system", "content": system }),
+            serde_json::json!({ "role": "user", "content": user }),
+        ];
+        let tools = agent_tools::tool_definitions();
+        let max_turns = 10usize;
+
+        for turn in 0..max_turns {
+            if self.stale_or_cancelled(generation) {
+                return Err(anyhow!("已取消"));
+            }
+            let request = agent_request(
+                config,
+                &messages_for_display(&messages),
+                &tools,
+            );
+            let request_json = clip(&pretty_json(&request), 24_000);
+            let think_id = self.agent_next_id("think");
+            self.agent_push(AgentStepView {
+                id: think_id.clone(),
+                kind: "thinking".to_string(),
+                title: "思考".to_string(),
+                meta: config.model.clone(),
+                state: "running".to_string(),
+                detail: format!("第 {} 轮 · 等待 DeepSeek…", turn + 1),
+                arguments: request_json,
+                tool: "deepseek".to_string(),
+                ..AgentStepView::default()
+            });
+            self.progress_note(format!("Agent 第 {} 轮思考…", turn + 1));
+
+            let ask_started = Instant::now();
+            let asked = runtime().block_on(async {
+                let ask = self.ask_agent(config, &messages, &tools);
+                let cancel = wait_cancel(self.cancel_current.clone());
+                tokio::pin!(ask);
+                tokio::pin!(cancel);
+                match futures::future::select(ask, cancel).await {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right((_, _)) => Err(anyhow!("已取消")),
+                }
+            })?;
+            if self.stale_or_cancelled(generation) {
+                return Err(anyhow!("已取消"));
+            }
+            let ask_ms = ask_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            state.total_in = state.total_in.saturating_add(asked.tokens_in);
+            state.total_out = state.total_out.saturating_add(asked.tokens_out);
+            self.agent_add_usage(asked.tokens_in, asked.tokens_out);
+
+            let thought = if !asked.reasoning.trim().is_empty() {
+                asked.reasoning.clone()
+            } else {
+                asked.content.clone()
+            };
+            let call_names = asked
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let preview = if !thought.trim().is_empty() {
+                clip(&collapse_ws(&thought), 180)
+            } else if !call_names.is_empty() {
+                format!("决定调用：{call_names}")
+            } else {
+                "没有文字，也没有工具调用".to_string()
+            };
+            self.agent_update(AgentStepView {
+                id: think_id,
+                kind: "thinking".to_string(),
+                title: "思考".to_string(),
+                meta: config.model.clone(),
+                state: "ok".to_string(),
+                detail: preview,
+                arguments: clip(&pretty_json(&request), 24_000),
+                output: asked.response.clone(),
+                tool: "deepseek".to_string(),
+                thinking: clip(&thought, 12_000),
+                ms: ask_ms,
+                tokens: asked.tokens_in.saturating_add(asked.tokens_out),
+                ..AgentStepView::default()
+            });
+
+            let mut assistant = serde_json::json!({
+                "role": "assistant",
+                "content": asked.content,
+            });
+            if !asked.tool_calls.is_empty() {
+                assistant["tool_calls"] = serde_json::Value::Array(
+                    asked
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments,
+                                }
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            messages.push(assistant);
+
+            if asked.tool_calls.is_empty() {
+                if state.rate.is_some() {
+                    break;
+                }
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": "请调用 rate_video 给出这个视频的最终评分和结论。只有调用工具才算结束，不要用普通文本回答。"
+                }));
+                continue;
+            }
+
+            for call in &asked.tool_calls {
+                if self.stale_or_cancelled(generation) {
+                        return Err(anyhow!("已取消"));
+                }
+                let tool_step_id = self.agent_next_id("tool");
+                let label = agent_tools::tool_label(&call.name);
+                let args_pretty = clip(
+                    &pretty_json(
+                        &serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": call.arguments })),
+                    ),
+                    12_000,
+                );
+                self.agent_push(AgentStepView {
+                    id: tool_step_id.clone(),
+                    kind: "tool".to_string(),
+                    title: label.to_string(),
+                    meta: call.name.clone(),
+                    state: "running".to_string(),
+                    detail: format!("调用 {}", call.name),
+                    arguments: args_pretty.clone(),
+                    tool: call.name.clone(),
+                    ..AgentStepView::default()
+                });
+                let tool_started = Instant::now();
+                let outcome =
+                    self.execute_agent_tool(config, &session, &mut state, call, &tool_step_id);
+                let tool_ms = tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                match outcome {
+                    Ok(out) => {
+                        state.network_bytes = state.network_bytes.saturating_add(out.bytes);
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": clip(&out.content, 20_000),
+                        }));
+                        if !out.images.is_empty() {
+                            let mut parts = vec![serde_json::json!({
+                                "type": "text",
+                                "text": format!(
+                                    "{} 的画面拼图（{} 张，按时间顺序，左上角是时间戳）。请结合这一段的字幕和弹幕判断。",
+                                    label,
+                                    out.images.len()
+                                ),
+                            })];
+                            for image in &out.images {
+                                if let Ok(data) = self.agent_image_data_url(&image.key) {
+                                    parts.push(serde_json::json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": data, "detail": "low" }
+                                    }));
+                                }
+                            }
+                            messages.push(serde_json::json!({ "role": "user", "content": parts }));
+                        }
+                        self.agent_update(AgentStepView {
+                            id: tool_step_id,
+                            kind: "tool".to_string(),
+                            title: label.to_string(),
+                            meta: call.name.clone(),
+                            state: "ok".to_string(),
+                            detail: out.summary.clone(),
+                            arguments: args_pretty,
+                            output: clip(&out.output, 20_000),
+                            tool: call.name.clone(),
+                            images: out.images.clone(),
+                            ms: tool_ms,
+                            bytes: out.bytes,
+                            ..AgentStepView::default()
+                        });
+                        if let Some(rate) = out.rate {
+                            state.rate = Some(rate);
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        let error_json = pretty_json(&serde_json::json!({ "error": message }));
+                        self.agent_update(AgentStepView {
+                            id: tool_step_id,
+                            kind: "tool".to_string(),
+                            title: label.to_string(),
+                            meta: call.name.clone(),
+                            state: "failed".to_string(),
+                            detail: clip(&message, 240),
+                            arguments: args_pretty,
+                            output: clip(&error_json, 8_000),
+                            tool: call.name.clone(),
+                            ms: tool_ms,
+                            ..AgentStepView::default()
+                        });
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": error_json,
+                        }));
+                    }
+                }
+                if state.rate.is_some() {
+                    break;
+                }
+            }
+            if state.rate.is_some() {
+                break;
+            }
+        }
+
+        if state.opened.is_none() && state.no_candidates && state.rate.is_none() {
+            self.agent_with(|agent| {
+                agent.finish("cancelled", "候选列表为空，等待补充");
+            });
+            return Ok(None);
+        }
+
+        if state.rate.is_none() {
+            self.agent_with(|agent| {
+                agent.finish(
+                    "error",
+                    &format!("Agent 在 {max_turns} 轮内没有调用 rate_video"),
+                );
+            });
+            return Err(anyhow!("Agent 没有在 {max_turns} 轮内给出结论"));
+        }
+
+        let verdict = self.save_agent_verdict(config, &mut state, started)?;
+        Ok(Some(verdict))
+    }
+
+    fn execute_agent_tool(
+        &self,
+        config: &EngineConfig,
+        session: &Arc<Session>,
+        state: &mut AgentRunState,
+        call: &AgentToolCall,
+        _step_id: &str,
+    ) -> Result<AgentToolOutcome> {
+        let args = parse_tool_arguments(&call.arguments)?;
+        match call.name.as_str() {
+            "list_videos" => self.tool_list_videos(config, session, state, &args),
+            "open_video" => self.tool_open_video(session, state, &args),
+            "watch_clip" => self.tool_watch_clip(config, session, state, &args),
+            "rate_video" => self.tool_rate_video(state, &args),
+            other => Err(anyhow!("未知工具：{other}")),
+        }
+    }
+
+    fn tool_list_videos(
+        &self,
+        config: &EngineConfig,
+        session: &Arc<Session>,
+        state: &mut AgentRunState,
+        args: &serde_json::Value,
+    ) -> Result<AgentToolOutcome> {
+        let limit = args
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(10)
+            .clamp(4, 20) as usize;
+        let source = match args.get("source").and_then(|value| value.as_str()) {
+            Some("home") => "home".to_string(),
+            Some("favorites") => "favorites".to_string(),
+            _ => config.source.clone(),
+        };
+        let mut list = self.queue_candidates(limit)?;
+        let mut label = if source == "favorites" {
+            "收藏夹".to_string()
+        } else {
+            "首页推荐".to_string()
+        };
+        let mut note = String::new();
+        if list.len() < limit.min(6) {
+            match runtime().block_on(agent_tools::fetch_candidates(
+                session,
+                &source,
+                config.folder_id,
+                limit * 2,
+            )) {
+                Ok(fresh) => {
+                    label = fresh.label;
+                    if let Err(err) = self.enqueue_candidates(&fresh.videos) {
+                        note = format!("候选写入失败：{err:#}");
+                    }
+                }
+                Err(err) => {
+                    note = format!("读取候选失败：{err:#}");
+                }
+            }
+            list = self.queue_candidates(limit)?;
+        }
+        state.no_candidates = list.is_empty();
+        let videos: Vec<serde_json::Value> = list
+            .iter()
+            .map(|video| {
+                serde_json::json!({
+                    "bvid": video.bvid,
+                    "title": clip(&video.title, 120),
+                    "up_name": video.up_name,
+                    "duration": mmss(video.duration_s),
+                    "duration_s": video.duration_s,
+                    "view": video.view,
+                })
+            })
+            .collect();
+        let output = serde_json::json!({
+            "source": source,
+            "label": label,
+            "count": videos.len(),
+            "videos": videos,
+            "note": if note.is_empty() {
+                "按标题挑一个，然后调用 open_video。".to_string()
+            } else {
+                note
+            },
+        });
+        Ok(AgentToolOutcome {
+            content: pretty_json(&output),
+            output: pretty_json(&output),
+            summary: if list.is_empty() {
+                "没有拿到候选视频".to_string()
+            } else {
+                format!("{} 条候选 · {}", list.len(), label)
+            },
+            images: Vec::new(),
+            bytes: 0,
+            rate: None,
+        })
+    }
+
+    fn tool_open_video(
+        &self,
+        session: &Arc<Session>,
+        state: &mut AgentRunState,
+        args: &serde_json::Value,
+    ) -> Result<AgentToolOutcome> {
+        let bvid = args
+            .get("bvid")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if bvid.is_empty() {
+            bail!("open_video 需要 bvid");
+        }
+        if let Some(opened) = &state.opened {
+            if opened.bvid == bvid {
+                let output = open_video_json(opened);
+                return Ok(AgentToolOutcome {
+                    content: pretty_json(&output),
+                    output: pretty_json(&output),
+                    summary: format!("{} · 已经打开", opened.title),
+                    images: Vec::new(),
+                    bytes: 0,
+                    rate: None,
+                });
+            }
+            bail!(
+                "本轮已经打开了 {}（{}），请先 rate_video 再换视频",
+                opened.title,
+                opened.bvid
+            );
+        }
+        self.progress_note(format!("打开视频 {bvid} · 读取评论与字幕…"));
+        let opened = runtime().block_on(agent_tools::open_video(
+            session,
+            &self.conclusion_gate,
+            &bvid,
+            100,
+        ))?;
+        self.agent_set_video(&opened);
+        self.set_current(Some((opened.bvid.clone(), opened.title.clone())));
+        self.mark_queue_running(&opened.bvid);
+        let opened_bytes = opened.bytes;
+        let output = open_video_json(&opened);
+        let summary = format!(
+            "{} · {} · 评论 {} 条 · 字幕 {} 句",
+            clip(&opened.title, 40),
+            mmss(opened.duration_s),
+            opened.comments.len(),
+            opened.cues.len()
+        );
+        state.opened = Some(opened);
+        Ok(AgentToolOutcome {
+            content: pretty_json(&output),
+            output: pretty_json(&output),
+            summary,
+            images: Vec::new(),
+            bytes: opened_bytes,
+            rate: None,
+        })
+    }
+
+    fn tool_watch_clip(
+        &self,
+        config: &EngineConfig,
+        session: &Arc<Session>,
+        state: &mut AgentRunState,
+        args: &serde_json::Value,
+    ) -> Result<AgentToolOutcome> {
+        let (opened_bvid, opened_cid, opened_duration_s, opened_cues) = match state.opened.as_ref() {
+            Some(opened) => (
+                opened.bvid.clone(),
+                opened.cid,
+                opened.duration_s,
+                opened.cues.clone(),
+            ),
+            None => bail!("先调用 open_video 选择视频，再调用 watch_clip"),
+        };
+        let bvid = args
+            .get("bvid")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !bvid.is_empty() && bvid != opened_bvid {
+            bail!("watch_clip 只能看当前打开的 {opened_bvid}，不能看 {bvid}");
+        }
+        if state.clip_count >= 4 {
+            bail!("这个视频已经看了 4 段，请调用 rate_video 下结论");
+        }        let start_s = args
+            .get("start_s")
+            .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|f| f.max(0.0) as u64)))
+            .unwrap_or(0);
+        let mut end_s = args
+            .get("end_s")
+            .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|f| f.max(0.0) as u64)))
+            .unwrap_or(start_s.saturating_add(45));
+        if end_s <= start_s {
+            end_s = start_s.saturating_add(45);
+        }
+        let span = end_s.saturating_sub(start_s);
+        if !(5..=120).contains(&span) {
+            bail!("一次只能看 5-120 秒（现在请求了 {span} 秒）");
+        }
+        if start_s >= opened_duration_s.max(1) {
+            bail!("start_s 超出视频时长 {}", mmss(opened_duration_s));
+        }
+        let end_s = end_s.min(opened_duration_s.max(start_s + 1));
+
+        let clip_dir = state
+            .work_dir
+            .join(format!("clip-{:02}", state.clip_count + 1));
+        let watch = config.watch_config(true);
+        let mut clip: Option<agent_tools::ClipData> = None;
+        self.progress_note(format!(
+            "截取 {}–{} · 读取远端切片…",
+            mmss(start_s),
+            mmss(end_s)
+        ));
+        match runtime().block_on(lab::remote_source(session, &opened_bvid, opened_cid)) {
+            Ok(source) => match lab::build_range_sheets_url(
+                &watch,
+                &source,
+                &clip_dir,
+                start_s,
+                end_s,
+                &self.cancel_current,
+            ) {
+                Ok(sheets) => {
+                    self.progress_note("读取这一段字幕与弹幕…");
+                    match runtime().block_on(agent_tools::clip_from_sheets(
+                        session,
+                        opened_cid,
+                        start_s,
+                        end_s,
+                        &opened_cues,
+                        sheets,
+                    )) {
+                        Ok(data) => clip = Some(data),
+                        Err(err) => crate::debug_log(&format!(
+                            "fish agent remote clip post bvid={opened_bvid} failed: {err:#}"
+                        )),
+                    }
+                }
+                Err(err) => crate::debug_log(&format!(
+                    "fish agent remote clip bvid={opened_bvid} start={start_s} failed: {err:#}"
+                )),
+            },
+            Err(err) => crate::debug_log(&format!(
+                "fish agent remote source bvid={opened_bvid} failed: {err:#}"
+            )),
+        }
+        if clip.is_none() {
+            // Fallback for a CDN/ffmpeg combination that refuses ranged reads:
+            // download the whole 720P movie once, then cut locally.
+            self.progress_note("远端切片失败，下载整片后重试…".to_string());
+            if state.movie.is_none() {
+                let movie_dir = state.work_dir.join("video");
+                let movie = runtime().block_on(lab::download_movie(
+                    &watch,
+                    session,
+                    &opened_bvid,
+                    opened_cid,
+                    &movie_dir,
+                    None,
+                    self.cancel_current.clone(),
+                ))?;
+                state.network_bytes = state.network_bytes.saturating_add(movie.bytes);
+                state.movie = Some(movie);
+            }
+            clip = Some(runtime().block_on(agent_tools::build_clip(
+                &watch,
+                session,
+                state.movie.as_ref().expect("movie cached"),
+                opened_cid,
+                &clip_dir,
+                start_s,
+                end_s,
+                &opened_cues,
+                &self.cancel_current,
+            ))?);
+        }
+        let clip = clip.expect("clip produced");
+        state.clip_count += 1;
+        let mut images = Vec::new();
+        for (index, sheet) in clip.sheets.iter().enumerate() {
+            let bytes = std::fs::metadata(&sheet.path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            images.push(self.register_agent_image(
+                sheet.path.clone(),
+                &format!(
+                    "{}–{} · 第 {} 张",
+                    mmss(sheet.from_s),
+                    mmss(sheet.to_s),
+                    index + 1
+                ),
+                sheet.width,
+                sheet.height,
+                bytes,
+            ));
+        }
+        let subtitle_json: Vec<serde_json::Value> = clip
+            .subtitles
+            .iter()
+            .map(|segment| {
+                serde_json::json!({
+                    "at": mmss(segment.start_s.max(0.0) as u64),
+                    "text": segment.text,
+                })
+            })
+            .collect();
+        let danmaku_json: Vec<serde_json::Value> = clip
+            .danmaku
+            .iter()
+            .map(|line| {
+                serde_json::json!({
+                    "at_s": (line.at_s * 10.0).round() / 10.0,
+                    "text": line.text,
+                })
+            })
+            .collect();
+        let output = serde_json::json!({
+            "bvid": opened_bvid,
+            "start_s": clip.start_s,
+            "end_s": clip.end_s,
+            "focus": args.get("focus").and_then(|value| value.as_str()).unwrap_or(""),
+            "subtitle_source": if clip.subtitles.is_empty() { "none" } else { "official" },
+            "subtitles": subtitle_json,
+            "danmaku_total": clip.danmaku_total,
+            "danmaku": danmaku_json,
+            "frame_count": clip.frame_count,
+            "image_count": images.len(),
+            "note": if images.is_empty() { "没有画面" } else { "拼接画面随后附上" },
+        });
+        state.clips.push(AgentClipRecord {
+            start_s: clip.start_s,
+            end_s: clip.end_s,
+            subtitles: clip.subtitles.len(),
+            danmaku: clip.danmaku_total,
+            frames: clip.frame_count,
+            sheets: clip.sheets.len(),
+            subtitle_text: clip
+                .subtitles
+                .iter()
+                .map(|segment| {
+                    format!(
+                        "[{}] {}",
+                        mmss(segment.start_s.max(0.0) as u64),
+                        segment.text.trim()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            danmaku_sample: clip
+                .danmaku
+                .first()
+                .map(|line| line.text.clone())
+                .unwrap_or_default(),
+        });
+        let summary = format!(
+            "{}–{} · 字幕 {} 句 · 弹幕 {} 条（{} 帧 / {} 张）",
+            mmss(clip.start_s),
+            mmss(clip.end_s),
+            clip.subtitles.len(),
+            clip.danmaku_total,
+            clip.frame_count,
+            images.len()
+        );
+        Ok(AgentToolOutcome {
+            content: pretty_json(&output),
+            output: pretty_json(&output),
+            summary,
+            images,
+            bytes: clip.bytes,
+            rate: None,
+        })
+    }
+
+    fn tool_rate_video(
+        &self,
+        state: &mut AgentRunState,
+        args: &serde_json::Value,
+    ) -> Result<AgentToolOutcome> {
+        let opened_bvid = match state.opened.as_ref() {
+            Some(opened) => opened.bvid.clone(),
+            None => bail!("还没有打开视频，不能打分"),
+        };
+        let bvid = args
+            .get("bvid")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !bvid.is_empty() && bvid != opened_bvid {
+            bail!("rate_video 的 bvid 不是当前视频 {opened_bvid}");
+        }
+        if args.get("score").is_none() || args.get("verdict").is_none() {
+            bail!("rate_video 需要 score 和 verdict");
+        }
+        let mut rate = parse_verdict(&args.to_string());
+        if rate.verdict == "也许" && args.get("verdict").and_then(|v| v.as_str()) != Some("也许") {
+            bail!("verdict 只能是 看 / 不看 / 也许");
+        }
+        if rate.one_line.trim().is_empty() {
+            rate.one_line = "Agent 没有写一句话结论".to_string();
+        }
+        let output = serde_json::json!({
+            "accepted": true,
+            "bvid": opened_bvid,
+            "score": rate.score,
+            "verdict": rate.verdict,
+            "one_line": rate.one_line,
+            "note": "评分已接受，系统将保存并进入下一个视频。",
+        });
+        let summary = format!("{} · {:.1} 分 · {}", rate.verdict, rate.score, rate.one_line);
+        state.rate = Some(rate.clone());
+        Ok(AgentToolOutcome {
+            content: pretty_json(&output),
+            output: pretty_json(&output),
+            summary,
+            images: Vec::new(),
+            bytes: 0,
+            rate: Some(rate),
+        })
+    }
+
+    fn queue_candidates(&self, limit: usize) -> Result<Vec<Candidate>> {
+        let db = self.lock_db()?;
+        let mut statement = db.prepare(
+            "SELECT q.bvid, COALESCE(v.title, ''), COALESCE(v.up_name, ''), \
+             COALESCE(v.duration_s, 0), COALESCE(v.view_count, 0) \
+             FROM queue q LEFT JOIN videos v ON v.bvid = q.bvid \
+             WHERE q.state = 'pending' \
+             AND NOT EXISTS (SELECT 1 FROM verdicts d WHERE d.bvid = q.bvid AND d.error IS NULL) \
+             AND NOT EXISTS (SELECT 1 FROM watched w WHERE w.bvid = q.bvid) \
+             ORDER BY q.priority DESC, q.updated_at ASC, q.rowid ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit.clamp(1, 40) as i64], |row| {
+            Ok(Candidate {
+                bvid: row.get(0)?,
+                title: row.get(1)?,
+                up_name: row.get(2)?,
+                duration_s: row.get::<_, i64>(3)?.max(0) as u64,
+                view: row.get::<_, i64>(4)?.max(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let candidate = row?;
+            if !candidate.bvid.trim().is_empty() && !candidate.title.trim().is_empty() {
+                out.push(candidate);
+            }
+        }
+        Ok(out)
+    }
+
+    fn enqueue_candidates(&self, videos: &[Candidate]) -> Result<()> {
+        let items: Vec<FeedItem> = videos
+            .iter()
+            .filter(|video| !video.bvid.trim().is_empty())
+            .map(|video| FeedItem {
+                bvid: video.bvid.clone(),
+                cid: 0,
+                aid: 0,
+                title: video.title.clone(),
+                pic: String::new(),
+                owner: video.up_name.clone(),
+                owner_mid: 0,
+                view: video.view,
+                duration: video.duration_s,
+                pub_ts: 0,
+            })
+            .collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let added = self.enqueue_inner(&items, false)?;
+        crate::debug_log(&format!("fish agent candidates added={added}"));
+        Ok(())
+    }
+
+    fn mark_queue_running(&self, bvid: &str) {
+        if let Ok(db) = self.lock_db() {
+            let _ = db.execute(
+                "UPDATE queue SET state = 'running', updated_at = ?2 \
+                 WHERE bvid = ?1 AND state = 'pending'",
+                params![bvid, now()],
+            );
+        }
+    }
+
+    fn save_agent_verdict(
+        &self,
+        config: &EngineConfig,
+        state: &mut AgentRunState,
+        started: Instant,
+    ) -> Result<VerdictView> {
+        let opened = state
+            .opened
+            .as_ref()
+            .ok_or_else(|| anyhow!("没有打开视频"))?;
+        let rate = state
+            .rate
+            .as_ref()
+            .ok_or_else(|| anyhow!("没有拿到评分"))?;
+        let total_tokens = state.total_in.saturating_add(state.total_out);
+        let agent_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let coverage_s = merged_seconds(&state.clips);
+        let coverage = if opened.duration_s > 0 {
+            (coverage_s as f64 / opened.duration_s as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let coverage_note = format!(
+            "Agent 分 {} 段看了 {} / {}",
+            state.clips.len(),
+            mmss(coverage_s),
+            mmss(opened.duration_s)
+        );
+        let mut materials = Materials {
+            bvid: opened.bvid.clone(),
+            cid: opened.cid,
+            aid: opened.aid,
+            title: opened.title.clone(),
+            up_mid: opened.up_mid,
+            up_name: opened.up_name.clone(),
+            duration_s: opened.duration_s,
+            view: opened.view,
+            pub_ts: opened.pub_ts,
+            cover: opened.cover.clone(),
+            tname: opened.tname.clone(),
+            desc: opened.desc.clone(),
+            transcript_source: "none".to_string(),
+            comments: opened
+                .comments
+                .iter()
+                .map(|comment| StoredComment {
+                    like: comment.like,
+                    text: comment.text.clone(),
+                })
+                .collect(),
+            coverage_note: coverage_note.clone(),
+            ..Materials::default()
+        };
+        let mut subtitle_lines = Vec::new();
+        let mut danmaku_total = 0usize;
+        for (index, clip) in state.clips.iter().enumerate() {
+            if !clip.subtitle_text.trim().is_empty() {
+                subtitle_lines.push(format!(
+                    "## 第 {} 段 {}–{}\n{}",
+                    index + 1,
+                    mmss(clip.start_s),
+                    mmss(clip.end_s),
+                    clip.subtitle_text
+                ));
+            }
+            danmaku_total += clip.danmaku;
+            if clip.danmaku > 0 {
+                let minute = (clip.start_s / 60) as u32;
+                materials.danmaku.push(Peak {
+                    minute,
+                    count: clip.danmaku.min(u32::MAX as usize) as u32,
+                    sample: clip.danmaku_sample.clone(),
+                });
+            }
+        }
+        if !subtitle_lines.is_empty() {
+            materials.transcript = subtitle_lines.join("\n\n");
+            materials.transcript_source = "official".to_string();
+        }
+        let frames: usize = state.clips.iter().map(|clip| clip.frames).sum();
+        let sheets: usize = state.clips.iter().map(|clip| clip.sheets).sum();
+        materials.frame_observations = format!(
+            "Agent 看了 {} 段拼接画面：{} 帧 / {} 张拼图（每张带时间戳）。",
+            state.clips.len(),
+            frames,
+            sheets
+        );
+        let subtitles: usize = state.clips.iter().map(|clip| clip.subtitles).sum();
+
+        let steps = vec![
+            StepRecord {
+                id: "meta".to_string(),
+                label: "元数据".to_string(),
+                state: "ok".to_string(),
+                detail: format!(
+                    "{} · {} · {} 播放",
+                    clip(&opened.title, 40),
+                    mmss(opened.duration_s),
+                    opened.view
+                ),
+                ..StepRecord::default()
+            },
+            StepRecord {
+                id: "comments".to_string(),
+                label: "评论".to_string(),
+                state: "ok".to_string(),
+                detail: format!(
+                    "{} 条 · 弹幕 {} 条",
+                    opened.comments.len(),
+                    danmaku_total
+                ),
+                ..StepRecord::default()
+            },
+            StepRecord {
+                id: "subtitle".to_string(),
+                label: "字幕".to_string(),
+                state: if subtitles > 0 { "ok" } else { "skipped" }.to_string(),
+                reason: if subtitles > 0 {
+                    String::new()
+                } else {
+                    "这个视频没有字幕".to_string()
+                },
+                detail: format!("{} 句", subtitles),
+                ..StepRecord::default()
+            },
+            StepRecord {
+                id: "frames".to_string(),
+                label: "拼接画面".to_string(),
+                state: "ok".to_string(),
+                detail: format!("{} 帧 / {} 张", frames, sheets),
+                ..StepRecord::default()
+            },
+            StepRecord {
+                id: "verdict".to_string(),
+                label: "Agent 判定".to_string(),
+                state: "ok".to_string(),
+                ms: agent_ms,
+                tokens: total_tokens,
+                detail: format!("{} tok", total_tokens),
+                ..StepRecord::default()
+            },
+        ];
+        let evidence = Evidence {
+            channels: "meta,comments,subtitle,frames".to_string(),
+            coverage,
+            coverage_note,
+            cost_ms: agent_ms,
+            cost_bytes: state.network_bytes,
+            cost_tokens: total_tokens,
+            steps,
+        };
+        let view = VerdictView {
+            bvid: materials.bvid.clone(),
+            title: materials.title.clone(),
+            up_name: materials.up_name.clone(),
+            cover: materials.cover.clone(),
+            score: rate.score,
+            verdict: rate.verdict.clone(),
+            one_line: rate.one_line.clone(),
+            reasons: rate.reasons.clone(),
+            tags: rate.tags.clone(),
+            quote: rate.quote.clone(),
+            at: now(),
+            tokens_in: state.total_in,
+            tokens_out: state.total_out,
+            evidence: evidence.clone(),
+        };
+        let job = Job {
+            bvid: materials.bvid.clone(),
+            title: materials.title.clone(),
+            attempts: 0,
+        };
+        let hash = prompt_hash(&config.model, &state.system_prompt, &state.user_prompt);
+        self.store_success(
+            &job,
+            &materials,
+            &view,
+            &config.model,
+            &hash,
+            &evidence,
+            started.elapsed(),
+        )?;
+        self.agent_finish_reply(AgentReplyView {
+            score: view.score,
+            verdict: view.verdict.clone(),
+            one_line: view.one_line.clone(),
+            reasons: view.reasons.clone(),
+            tags: view.tags.clone(),
+            quote: view.quote.clone(),
+            ms: agent_ms,
+            tokens_in: state.total_in,
+            tokens_out: state.total_out,
+        });
+        crate::debug_log(&format!(
+            "fish agent saved bvid={} score={:.1} verdict={} clips={} coverage={:.2} tokens={total_tokens}",
+            view.bvid,
+            view.score,
+            view.verdict,
+            state.clips.len(),
+            coverage
+        ));
+        Ok(view)
+    }
+
+    async fn ask_agent(
+        &self,
+        config: &EngineConfig,
+        messages: &[serde_json::Value],
+        tools: &serde_json::Value,
+    ) -> Result<AgentAsk> {
+        let body = agent_request(config, messages, tools);
+        let response = self
+            .http
+            .post(&config.endpoint)
+            .bearer_auth(config.key.trim())
+            .json(&body)
+            .send()
+            .await
+            .context("请求 DeepSeek 失败")?;
+        let status = response.status();
+        let text = response.text().await.context("读取 DeepSeek 响应失败")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "DeepSeek 返回 HTTP {}：{}",
+                status.as_u16(),
+                clip(&text, 300)
+            ));
+        }
+        let parsed: ChatResp =
+            serde_json::from_str(&text).map_err(|err| anyhow!("DeepSeek 响应解析失败：{err}"))?;
+        let usage = parsed.usage.unwrap_or_default();
+        let message = parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.message)
+            .ok_or_else(|| anyhow!("DeepSeek 没有返回 message"))?;
+        let tool_calls = message
+            .tool_calls
+            .into_iter()
+            .map(|call| AgentToolCall {
+                id: call.id,
+                name: call.function.name,
+                arguments: call.function.arguments,
+            })
+            .collect::<Vec<_>>();
+        let content = message.content.unwrap_or_default();
+        if content.trim().is_empty() && tool_calls.is_empty() {
+            return Err(anyhow!("DeepSeek 返回了空内容"));
+        }
+        let response = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .unwrap_or_else(|| clip(&text, 24_000));
+        Ok(AgentAsk {
+            content,
+            reasoning: message.reasoning_content,
+            tool_calls,
+            tokens_in: usage.prompt_tokens,
+            tokens_out: usage.completion_tokens,
+            response,
+        })
+    }
+
     // -- signals -----------------------------------------------------------
 
     /// The feed metadata row as the watch plan's starting point. The live
@@ -1933,7 +3283,7 @@ impl FishEngine {
             .into_iter()
             .next()
             .and_then(|choice| choice.message)
-            .map(|message| message.content)
+            .and_then(|message| message.content)
             .unwrap_or_default();
         if content.trim().is_empty() {
             return Err(anyhow!("DeepSeek 返回了空内容"));
@@ -2117,14 +3467,13 @@ impl FishEngine {
     /// cover / UP / instruction the prompt card paints, which the checklist
     /// does not need.
     fn begin_agent(&self, base: &Materials, config: &EngineConfig) {
-        let agent = AgentView::begin(
+        let mut agent = AgentView::begin(&config.instruction, &config.model);
+        agent.set_video(
             &base.bvid,
             &base.title,
             &base.up_name,
             &base.cover,
             base.duration_s,
-            &config.instruction,
-            &config.model,
         );
         if let Ok(mut slot) = self.agent.lock() {
             *slot = Some(agent);
@@ -2744,6 +4093,195 @@ fn stub_materials(materials: &mut Materials) {
     materials.conclusion_code = 0;
 }
 
+/// The exact first `(system, user)` pair of a continuous agent run.
+fn agent_initial_prompt(config: &EngineConfig) -> (String, String) {
+    let instruction = settings::normalise_fish_instruction(&config.instruction);
+    let source = if config.source == "favorites" {
+        "收藏夹推荐流"
+    } else {
+        "首页视频流"
+    };
+    let mut system = agent_tools::SYSTEM_PROMPT.to_string();
+    system.push_str("\n\n## 鱼主人的指令\n");
+    system.push_str(&instruction);
+    let user = format!(
+        "开始一轮看片。候选来源是「{source}」。\n\
+         先调用 list_videos 拿候选，按标题挑一个，再调用 open_video 读视频信息和评论。\n\
+         觉得值得看就分段 watch_clip，觉得没意思就随时 rate_video 结束。"
+    );
+    (system, user)
+}
+
+fn agent_request(
+    config: &EngineConfig,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": config.model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "temperature": 0.4,
+        "max_tokens": 3_000,
+        "stream": false,
+    })
+}
+
+/// The transcript must not store megabytes of base64 contact sheets. Keep the
+/// exact message structure and replace each data URL with a size marker.
+fn messages_for_display(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut copy = messages.to_vec();
+    for message in &mut copy {
+        redact_image_data(message);
+    }
+    copy
+}
+
+fn redact_image_data(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) if text.starts_with("data:image/") => {
+            let prefix = text.split(',').next().unwrap_or("data:image/jpeg;base64");
+            *text = format!("{prefix},<omitted {} chars>", text.len());
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_image_data(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_image_data(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    if let Ok(value) = serde_json::from_str(raw) {
+        return Ok(value);
+    }
+    // DeepSeek can hit the output token ceiling in the middle of a long
+    // `quote`/`reasons` string. Close the open string and containers so the
+    // fields that did arrive are still usable; a retry is optional.
+    let repaired = repair_truncated_json(raw);
+    serde_json::from_str(&repaired).map_err(|err| anyhow!("工具参数不是 JSON：{err}"))
+}
+
+/// Best-effort repair for a JSON object cut off by the token limit. It only
+/// closes what is open; it never invents field values.
+fn repair_truncated_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut braces: Vec<char> = Vec::new();
+    for ch in raw.chars() {
+        out.push(ch);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => braces.push(ch),
+            '}' | ']' => {
+                braces.pop();
+            }
+            _ => {}
+        }
+    }
+    if escaped {
+        out.push('\\');
+        out.push('"');
+    } else if in_string {
+        out.push('"');
+    }
+    // Trim a dangling key or comma (`"reasons":` / `...,`) so the closers can
+    // still make a valid object.
+    let trimmed = out.trim_end();
+    if trimmed.ends_with(':') || trimmed.ends_with(',') {
+        out = trimmed.trim_end_matches([':', ',']).trim_end().to_string();
+    }
+    for open in braces.into_iter().rev() {
+        out.push(if open == '{' { '}' } else { ']' });
+    }
+    out
+}
+
+fn open_video_json(opened: &OpenedVideo) -> serde_json::Value {
+    let comments: Vec<serde_json::Value> = opened
+        .comments
+        .iter()
+        .map(|comment| {
+            serde_json::json!({
+                "user": comment.user,
+                "like": comment.like,
+                "replies": comment.replies,
+                "text": comment.text,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "bvid": opened.bvid,
+        "cid": opened.cid,
+        "title": opened.title,
+        "up_name": opened.up_name,
+        "duration": mmss(opened.duration_s),
+        "duration_s": opened.duration_s,
+        "view": opened.view,
+        "pub_ts": opened.pub_ts,
+        "tname": opened.tname,
+        "desc": clip(&opened.desc, 1_200),
+        "comments_total": opened.comments_total,
+        "comment_count": comments.len(),
+        "comments": comments,
+        "subtitle_source": if opened.cues.is_empty() { "none" } else { "official" },
+        "subtitle_cues": opened.cues.len(),
+        "cues": opened.cues.iter().take(12).map(|cue| {
+            serde_json::json!({
+                "at": mmss(cue.start_s.max(0.0) as u64),
+                "text": clip(&cue.text, 160),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+/// Merge watched clip intervals so overlapping/nearby ranges do not inflate the
+/// coverage number.
+fn merged_seconds(clips: &[AgentClipRecord]) -> u64 {
+    if clips.is_empty() {
+        return 0;
+    }
+    let mut ranges: Vec<(u64, u64)> = clips
+        .iter()
+        .filter(|clip| clip.end_s > clip.start_s)
+        .map(|clip| (clip.start_s, clip.end_s))
+        .collect();
+    ranges.sort_by_key(|range| range.0);
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged.iter().map(|(start, end)| end - start).sum()
+}
+
+fn pretty_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Prompt
 // ---------------------------------------------------------------------------
@@ -3342,7 +4880,27 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessage {
     #[serde(default)]
-    content: String,
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: String,
+    #[serde(default)]
+    tool_calls: Vec<ChatToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ChatToolCall {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    function: ChatFunction,
+}
+
+#[derive(Deserialize, Default)]
+struct ChatFunction {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    arguments: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -4427,6 +5985,8 @@ mod tests {
                 budget_videos: 10,
                 interval_ms: 20,
                 autofill: false,
+                source: "home".to_string(),
+                folder_id: 0,
                 endpoint: server.endpoint(),
                 watch: WatchConfig::default(),
             },
@@ -4543,6 +6103,8 @@ mod tests {
                 budget_videos: 5,
                 interval_ms: 10,
                 autofill: false,
+                source: "home".to_string(),
+                folder_id: 0,
                 endpoint: server.endpoint(),
                 watch: WatchConfig::default(),
             },
@@ -4653,6 +6215,8 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 10,
                 autofill: false,
+                source: "home".to_string(),
+                folder_id: 0,
                 endpoint: format!("http://127.0.0.1:{port}/chat/completions"),
                 watch: WatchConfig::default(),
             },
@@ -4781,6 +6345,8 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 500,
                 autofill: false,
+                source: "home".to_string(),
+                folder_id: 0,
                 endpoint: DEEPSEEK_URL.to_string(),
                 watch,
             },
@@ -4877,6 +6443,8 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 1_500,
                 autofill: false,
+                source: "home".to_string(),
+                folder_id: 0,
                 endpoint: DEEPSEEK_URL.to_string(),
                 watch: WatchConfig::default(),
             },
@@ -4895,5 +6463,30 @@ mod tests {
         assert!(!verdicts.is_empty(), "live run produced no verdict");
         drop(engine);
         cleanup(&path);
+    }
+
+    #[test]
+    fn truncated_rate_arguments_are_repaired() {
+        let raw = r#"{"score":8,"verdict":"看","one_line":"值得看","reasons":["讲得清楚","有实测"#;
+        let value = parse_tool_arguments(raw).expect("repaired json");
+        assert_eq!(value.get("score").and_then(|v| v.as_u64()), Some(8));
+        assert_eq!(value.get("verdict").and_then(|v| v.as_str()), Some("看"));
+        assert_eq!(
+            value
+                .get("reasons")
+                .and_then(|v| v.as_array())
+                .map(|rows| rows.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn truncated_quote_is_closed() {
+        let raw = r#"{"score":7,"verdict":"看","one_line":"不错","quote":"这里讲得很好"#;
+        let value = parse_tool_arguments(raw).expect("repaired json");
+        assert_eq!(
+            value.get("quote").and_then(|v| v.as_str()),
+            Some("这里讲得很好")
+        );
     }
 }

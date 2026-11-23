@@ -1,8 +1,195 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { call, formatCount, formatDuration } from '../api';
 import { CoverImage } from './CoverImage';
 import { JsonView } from './JsonView';
-import { formatCount, formatDuration } from '../api';
-import type { FishAgent, FishAgentReply, FishAgentStep } from '../types';
+import type { FishAgent, FishAgentImage, FishAgentReply, FishAgentStep } from '../types';
+
+/// Load one contact sheet only when its row is on screen. The snapshot carries
+/// a key, not megabytes of base64, so a one-second poll stays small.
+function AgentShot({ image }: { image: FishAgentImage }) {
+  const [src, setSrc] = useState('');
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    setFailed(false);
+    setSrc('');
+    call<{ data_url: string }>('fish.agent.image', { key: image.key })
+      .then((result) => {
+        if (alive) setSrc(result?.data_url || '');
+      })
+      .catch(() => {
+        if (alive) setFailed(true);
+      });
+    return () => { alive = false; };
+  }, [image.key]);
+  return (
+    <figure className="agent-shot">
+      {src ? (
+        <a href={src} target="_blank" rel="noreferrer" title="点开看大图">
+          <img src={src} alt={image.label} loading="lazy" />
+        </a>
+      ) : (
+        <div className="agent-shot-placeholder">
+          {failed ? '画面已过期' : '正在读取拼接画面…'}
+        </div>
+      )}
+      <figcaption>{image.label}</figcaption>
+    </figure>
+  );
+}
+
+function parseOutput(step: FishAgentStep): any {
+  if (!step.output) return null;
+  try {
+    return JSON.parse(step.output);
+  } catch {
+    return null;
+  }
+}
+
+function listOf(value: any): any[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function textOf(value: any, max = 220): string {
+  const text = String(value ?? '').trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/// What a tool actually saw, painted inline instead of hiding it behind a JSON
+/// blob. This is the part the owner reads to audit the agent.
+function ToolPreview({ step }: { step: FishAgentStep }) {
+  const data = parseOutput(step);
+  if (!data) return null;
+
+  if (step.tool === 'list_videos') {
+    const videos = listOf(data.videos).slice(0, 10);
+    if (!videos.length) {
+      return <div className="agent-tool-preview agent-tool-empty">{textOf(data.note || '候选列表为空')}</div>;
+    }
+    return (
+      <div className="agent-tool-preview">
+        <div className="agent-preview-head">
+          <span>候选 · {data.label || data.source || '视频列表'}</span>
+          <span>{data.count ?? videos.length} 条</span>
+        </div>
+        <div className="agent-candidates">
+          {videos.map((video: any, index: number) => (
+            <div className="agent-candidate" key={video.bvid || index}>
+              <span className="agent-candidate-index">{index + 1}</span>
+              <div className="agent-candidate-copy">
+                <div className="agent-candidate-title">{video.title}</div>
+                <div className="agent-candidate-meta">
+                  {[video.up_name, video.duration, video.view ? `${formatCount(video.view)} 播放` : '']
+                    .filter(Boolean)
+                    .join(' · ')}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (step.tool === 'open_video') {
+    const comments = listOf(data.comments).slice(0, 8);
+    return (
+      <div className="agent-tool-preview">
+        <div className="agent-video-facts">
+          <div className="agent-video-fact-main">
+            <span className="agent-video-fact-title">{data.title || step.detail}</span>
+            <span className="agent-video-fact-sub">
+              {[
+                data.up_name,
+                data.duration,
+                data.view ? `${formatCount(data.view)} 播放` : '',
+                data.tname,
+              ].filter(Boolean).join(' · ')}
+            </span>
+          </div>
+          <span className="agent-chip">
+            评论 {data.comments_total ?? comments.length} 条
+          </span>
+          <span className="agent-chip">
+            字幕 {data.subtitle_cues ?? 0} 句
+          </span>
+        </div>
+        {data.desc ? <div className="agent-desc">{textOf(data.desc, 360)}</div> : null}
+        {comments.length ? (
+          <div className="agent-comments">
+            <div className="agent-evidence-label">评论 · 按点赞</div>
+            {comments.map((comment: any, index: number) => (
+              <div className="agent-comment" key={`${comment.user}-${index}`}>
+                <span className="agent-comment-like">{formatCount(comment.like || 0)}</span>
+                <div className="agent-comment-copy">
+                  <div className="agent-comment-user">{comment.user || '匿名'}</div>
+                  <div className="agent-comment-text">{textOf(comment.text, 180)}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (step.tool === 'watch_clip') {
+    const subtitles = listOf(data.subtitles);
+    const danmaku = listOf(data.danmaku);
+    return (
+      <div className="agent-tool-preview">
+        {step.images?.length ? (
+          <div className="agent-shots">
+            {step.images.map((image) => (
+              <AgentShot image={image} key={image.key} />
+            ))}
+          </div>
+        ) : null}
+        <div className="agent-evidence-grid">
+          <div className="agent-evidence-block">
+            <div className="agent-evidence-label">
+              字幕 · {subtitles.length} 句
+              {data.subtitle_source === 'none' ? '（没有字幕）' : ''}
+            </div>
+            {subtitles.length ? (
+              <div className="agent-subtitle-list">
+                {subtitles.slice(0, 12).map((line: any, index: number) => (
+                  <div className="agent-subtitle-line" key={`s-${index}`}>
+                    <span>{line.at || ''}</span>
+                    <p>{textOf(line.text, 140)}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="agent-tool-empty">这一段没有字幕，只能看画面和评论。</div>
+            )}
+          </div>
+          <div className="agent-evidence-block">
+            <div className="agent-evidence-label">
+              弹幕 · {data.danmaku_total ?? danmaku.length} 条
+            </div>
+            {danmaku.length ? (
+              <div className="agent-danmaku-list">
+                {danmaku.slice(0, 24).map((line: any, index: number) => (
+                  <span className="agent-danmaku" key={`d-${index}`} title={line.text}>
+                    <em>{line.at_s != null ? `${Math.round(Number(line.at_s))}s` : ''}</em>
+                    {textOf(line.text, 60)}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <div className="agent-tool-empty">这一段没有弹幕。</div>
+            )}
+          </div>
+        </div>
+        {data.focus ? <div className="agent-focus">关注：{data.focus}</div> : null}
+      </div>
+    );
+  }
+
+  return null;
+}
 
 /// One tool / thinking row inside the process group. Expanding it prints the
 /// exact request arguments and the result the tool produced, not just a
@@ -24,7 +211,7 @@ function AgentStepRow({
         <span className={`agent-dot ${step.kind} ${step.state}`} />
         <span className="agent-title">{step.title}</span>
         <span className={`agent-badge ${state.tone}`}>{state.label}</span>
-        <span className="agent-meta">{thinking ? step.meta : step.id}</span>
+        <span className="agent-meta">{thinking ? step.meta : step.tool || step.id}</span>
         <span className="agent-preview">{step.detail}</span>
         <span className="agent-tail">
           {step.ms ? <span className="agent-timing">{formatMs(step.ms)}</span> : null}
@@ -33,8 +220,21 @@ function AgentStepRow({
         </span>
         <Chevron open={open} />
       </button>
+
+      {thinking && !open ? (
+        <div className="agent-thinking-preview">{textOf(step.thinking || step.detail, 240)}</div>
+      ) : null}
+
+      {!thinking ? <ToolPreview step={step} /> : null}
+
       {open ? (
-        <div className="agent-card-body agent-tool-body">
+        <div className={`agent-card-body ${thinking ? 'agent-thinking-body' : 'agent-tool-body'}`}>
+          {thinking ? (
+            <div className="agent-io">
+              <div className="agent-io-label">模型原文 · reasoning / content</div>
+              <pre className="agent-thinking-full">{step.thinking || step.detail || '（没有文字）'}</pre>
+            </div>
+          ) : null}
           <div className="agent-io">
             <div className="agent-io-label">{thinking ? '请求体 · request' : '调用参数'}</div>
             <JsonView text={step.arguments} empty="(没有记录参数)" />
@@ -195,8 +395,8 @@ function formatBytes(bytes: number): string {
 export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; full?: boolean }) {
   const [processOpen, setProcessOpen] = useState(true);
   const [expanded, setExpanded] = useState<string[]>([]);
-  const [systemOpen, setSystemOpen] = useState(true);
-  const [userOpen, setUserOpen] = useState(true);
+  const [systemOpen, setSystemOpen] = useState(false);
+  const [userOpen, setUserOpen] = useState(false);
   const threadRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
@@ -206,7 +406,9 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
   const skipped = steps.filter((step) => step.state === 'skipped').length;
   // A cheap signature that changes when a row's state/detail moves, so the
   // tail keeps following even when several updates land in the same second.
-  const signature = steps.map((step) => `${step.id}:${step.state}:${step.detail}:${step.ms}`).join('|');
+  const signature = steps
+    .map((step) => `${step.id}:${step.state}:${step.detail}:${step.ms}:${step.images?.length || 0}`)
+    .join('|');
 
   useEffect(() => {
     if (!stick.current) return;
@@ -218,6 +420,9 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
     setExpanded((current) => current.includes(id) ? current.filter((row) => row !== id) : [...current, id]);
   };
 
+  const waiting = !agent || agent.state === 'running' || agent.state === 'waiting';
+  const title = agent?.title || (agent ? '正在挑选视频…' : '');
+
   return (
     <div className={`agent-chat ${full ? 'full' : ''}`}>
       <div className="agent-head">
@@ -226,7 +431,7 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
           <div>
             <div className="agent-head-title">Agent</div>
             <div className="agent-head-sub">
-              {agent ? `DeepSeek 看片 · ${state?.label || agent.state}` : 'DeepSeek 看片 · 等待投喂'}
+              {agent ? `DeepSeek 自主看片 · ${state?.label || agent.state}` : 'DeepSeek 自主看片 · 等待开始'}
             </div>
           </div>
         </div>
@@ -251,24 +456,28 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
         {!agent ? (
           <div className="agent-empty">
             <div className="agent-empty-title">还没有开始看片</div>
-            <div className="agent-empty-hint">点「开始 agent」，自动填充器会持续投喂未看过的视频，这里实时显示完整提示词、工具调用和 DeepSeek 判定。</div>
+            <div className="agent-empty-hint">点「开始 agent」，它会自己拿候选、按标题挑视频、读评论、分段看画面/字幕/弹幕，再给出看或不看的结论；做完一个会自动进入下一个。</div>
           </div>
         ) : (
           <>
             <div className="agent-card prompt">
               <div className="agent-card-head static">
                 <span className="agent-dot prompt" />
-                <span className="agent-title">投喂</span>
+                <span className="agent-title">{agent.bvid ? '投喂' : '挑选中'}</span>
                 <span className="agent-meta">你</span>
                 <span className="agent-tail">
-                  <span className="agent-timing">{formatDuration(agent.duration_s)}</span>
+                  {agent.duration_s ? <span className="agent-timing">{formatDuration(agent.duration_s)}</span> : null}
                 </span>
               </div>
               <div className="agent-prompt-body">
-                <CoverImage src={agent.cover} alt="" eager className="agent-cover" />
+                {agent.cover ? <CoverImage src={agent.cover} alt="" eager className="agent-cover" /> : (
+                  <div className="agent-cover agent-cover-empty">AI</div>
+                )}
                 <div className="agent-prompt-copy">
-                  <div className="agent-video-title">{agent.title || agent.bvid}</div>
-                  <div className="agent-video-sub">{[agent.up_name, agent.bvid].filter(Boolean).join(' · ')}</div>
+                  <div className="agent-video-title">{title || '正在挑选视频…'}</div>
+                  <div className="agent-video-sub">
+                    {[agent.up_name, agent.bvid].filter(Boolean).join(' · ') || agent.note || '正在读取候选列表'}
+                  </div>
                   {agent.instruction ? <div className="agent-instruction">“{agent.instruction}”</div> : null}
                 </div>
               </div>
@@ -278,15 +487,15 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
               <>
                 <PromptDoc
                   title="系统提示词"
-                  meta="system"
+                  meta="system · 工具与规则"
                   tone="system"
                   text={agent.system_prompt}
                   open={systemOpen}
                   onToggle={() => setSystemOpen((open) => !open)}
                 />
                 <PromptDoc
-                  title="用户提示词"
-                  meta="user · 材料 + 指令"
+                  title="起始消息"
+                  meta="user · 看片任务"
                   tone="user"
                   text={agent.user_prompt}
                   open={userOpen}
@@ -328,7 +537,7 @@ export function AgentTrace({ agent, full = false }: { agent: FishAgent | null; f
 
             {agent.reply ? (
               <AgentReplyCard reply={agent.reply} model={agent.model} />
-            ) : agent.state === 'running' || agent.state === 'waiting' ? (
+            ) : waiting ? (
               <div className="agent-waiting">
                 <span className="agent-dot thinking running" />
                 <span className="agent-waiting-text">{agent.note || '正在思考…'}</span>

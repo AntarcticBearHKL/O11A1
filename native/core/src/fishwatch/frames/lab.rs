@@ -129,6 +129,19 @@ pub struct BuiltLab {
     pub sheets: Vec<BuiltSheet>,
 }
 
+/// One downloaded 720P movie kept for the lifetime of an agent video, so each
+/// clip request can cut from the local file instead of downloading the whole
+/// video again.
+#[derive(Clone, Debug)]
+pub struct MovieSource {
+    pub path: PathBuf,
+    pub dir: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+    pub source: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TileObservation {
     #[serde(default)]
@@ -247,6 +260,189 @@ pub async fn build(
     build_with_meta(config, session, meta, interval_s, progress, cancel).await
 }
 
+/// Download the 720P movie once and keep it for range cuts. The caller owns
+/// `dir` and must remove it when the video is finished.
+pub async fn download_movie(
+    config: &WatchConfig,
+    session: &Session,
+    bvid: &str,
+    cid: u64,
+    dir: &Path,
+    progress: Option<ProgressFn<'_>>,
+    cancel: Arc<AtomicBool>,
+) -> Result<MovieSource> {
+    if !config.online {
+        bail!("未登录");
+    }
+    if !ffmpeg_available(&config.ffmpeg) {
+        bail!("ffmpeg 不在 PATH");
+    }
+    if cid == 0 {
+        bail!("缺少 cid");
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("创建视频缓存目录失败：{}", dir.display()))?;
+    let movie = dir.join("movie.mp4");
+    let (bytes, track) =
+        download_source(session, bvid, cid, &movie, progress, &cancel).await?;
+    Ok(MovieSource {
+        path: movie,
+        dir: dir.to_path_buf(),
+        width: track.0,
+        height: track.1,
+        bytes,
+        source: format!("720P · {}×{}", track.0, track.1),
+    })
+}
+
+/// Automatic interval for one clip: at most six frames per request, but never
+/// faster than one frame every two seconds.
+pub fn clip_interval(duration_s: u64) -> u64 {
+    ((duration_s.max(1) as f64 / 5.0).ceil() as u64).clamp(2, 60)
+}
+
+/// Cut `[start_s, end_s)` from an already downloaded movie and compose it into
+/// contact sheets. The caller registers the sheet paths with the engine so the
+/// transcript can show exactly what the model saw.
+pub fn build_range_sheets(
+    config: &WatchConfig,
+    movie: &MovieSource,
+    work: &Path,
+    start_s: u64,
+    end_s: u64,
+    cancel: &AtomicBool,
+) -> Result<Vec<BuiltSheet>> {
+    let start_s = start_s;
+    let end_s = end_s.max(start_s.saturating_add(1));
+    let duration = end_s.saturating_sub(start_s);
+    let interval = clip_interval(duration);
+    let expected = ((duration / interval) + 1).min(MAX_FRAMES as u64) as usize;
+    if expected == 0 {
+        bail!("切片时长太短，无法抽帧");
+    }
+    std::fs::create_dir_all(work)
+        .with_context(|| format!("创建切片目录失败：{}", work.display()))?;
+    let layout = clip_layout_for(movie.width.max(1), movie.height.max(1));
+    let frames = extract(
+        config,
+        &movie.path,
+        work,
+        interval,
+        expected,
+        layout,
+        start_s,
+        duration,
+        cancel,
+    )?;
+    if frames.is_empty() {
+        bail!("这个时间段没有抽出画面");
+    }
+    let (sheets, _) = compose_sheets(&frames, work, layout, None, cancel)?;
+    Ok(sheets)
+}
+
+/// Cut a range directly from the signed CDN URL. This is the fast path for the
+/// agent: only the requested seconds are pulled, so a 30-minute video does not
+/// have to download before the first clip.
+pub fn build_range_sheets_url(
+    config: &WatchConfig,
+    source: &RemoteSource,
+    work: &Path,
+    start_s: u64,
+    end_s: u64,
+    cancel: &AtomicBool,
+) -> Result<Vec<BuiltSheet>> {
+    let end_s = end_s.max(start_s.saturating_add(1));
+    let duration = end_s.saturating_sub(start_s);
+    let interval = clip_interval(duration);
+    let expected = ((duration / interval) + 1).min(MAX_FRAMES as u64) as usize;
+    if expected == 0 {
+        bail!("切片时长太短，无法抽帧");
+    }
+    std::fs::create_dir_all(work)
+        .with_context(|| format!("创建切片目录失败：{}", work.display()))?;
+    let layout = clip_layout_for(source.width.max(1), source.height.max(1));
+    let frames = extract_remote(
+        config,
+        source,
+        work,
+        interval,
+        expected,
+        layout,
+        start_s,
+        duration,
+        cancel,
+    )?;
+    if frames.is_empty() {
+        bail!("这个时间段没有抽出画面");
+    }
+    let (sheets, _) = compose_sheets(&frames, work, layout, None, cancel)?;
+    Ok(sheets)
+}
+
+fn extract_remote(
+    config: &WatchConfig,
+    source: &RemoteSource,
+    work: &Path,
+    interval_s: u64,
+    expected: usize,
+    layout: Layout,
+    start_s: u64,
+    duration_s: u64,
+    cancel: &AtomicBool,
+) -> Result<Vec<ExtractedFrame>> {
+    let scale = if layout.landscape {
+        format!("scale={}:-2", layout.cell_w)
+    } else if layout.square {
+        format!("scale={}:-2", layout.cell_w)
+    } else {
+        format!("scale=-2:{}", layout.cell_h)
+    };
+    let filter = format!("fps=1/{interval_s},{scale}");
+    let pattern = work.join("f-%03d.jpg");
+    let mut command = proc::command(&config.ffmpeg);
+    command.args(["-v", "error", "-y"]);
+    command.arg("-headers").arg(&source.headers);
+    if start_s > 0 {
+        command.arg("-ss").arg(start_s.to_string());
+    }
+    command.arg("-i").arg(&source.url);
+    command.arg("-t").arg(duration_s.max(1).to_string());
+    let status = command
+        .args([
+            "-vf",
+            &filter,
+            "-frames:v",
+            &expected.max(1).to_string(),
+            "-q:v",
+            "3",
+        ])
+        .arg(&pattern)
+        .status()
+        .with_context(|| format!("启动 ffmpeg 失败：{}", config.ffmpeg))?;
+    if !status.success() {
+        bail!("远程切片 ffmpeg 退出码 {:?}", status.code());
+    }
+    let mut frames = Vec::new();
+    for index in 1..=expected {
+        if cancelled(cancel) {
+            bail!("已取消");
+        }
+        let path = work.join(format!("f-{index:03}.jpg"));
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() < 500 {
+            continue;
+        }
+        frames.push(ExtractedFrame {
+            path,
+            at_s: start_s + (index as u64 - 1) * interval_s,
+        });
+    }
+    Ok(frames)
+}
+
 pub async fn build_with_meta(
     config: &WatchConfig,
     session: &Session,
@@ -343,7 +539,17 @@ async fn build_inner(
         0,
         expected,
     );
-    let frames = extract(config, &movie, dir, interval_s, expected, layout, cancel)?;
+    let frames = extract(
+        config,
+        &movie,
+        dir,
+        interval_s,
+        expected,
+        layout,
+        0,
+        meta.duration_s,
+        cancel,
+    )?;
     let _ = std::fs::remove_file(&movie);
     if frames.is_empty() {
         bail!("没有抽出任何画面");
@@ -397,6 +603,22 @@ async fn download_source(
     cancel: &AtomicBool,
 ) -> Result<(u64, (u32, u32, i64))> {
     let info = session.playurl(bvid, cid).await?;
+    let track = pick_video_track(&info)?;
+    let feature = (track.width, track.height, track.id);
+    let referer = format!("https://www.bilibili.com/video/{bvid}");
+    let mut last = None;
+    for url in track.urls.iter().chain(std::iter::once(&track.url)) {
+        match stream_to_file(session, url, &referer, path, progress, cancel).await {
+            Ok(bytes) if bytes > 10_000 => return Ok((bytes, feature)),
+            Ok(bytes) => last = Some(anyhow!("视频流只有 {bytes} 字节")),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("没有可用的视频 CDN")))
+}
+
+/// Pick the 720P-class track used by the frame lab and the agent.
+fn pick_video_track(info: &crate::bilibili::PlayInfo) -> Result<&crate::bilibili::VideoTrack> {
     if info.video_tracks.is_empty() {
         bail!("没有可下载的视频流");
     }
@@ -414,18 +636,45 @@ async fn download_source(
             .cmp(&short_side(a))
             .then_with(|| a.bandwidth.cmp(&b.bandwidth))
     });
-    let track = candidates[0];
-    let feature = (track.width, track.height, track.id);
-    let referer = format!("https://www.bilibili.com/video/{bvid}");
-    let mut last = None;
-    for url in track.urls.iter().chain(std::iter::once(&track.url)) {
-        match stream_to_file(session, url, &referer, path, progress, cancel).await {
-            Ok(bytes) if bytes > 10_000 => return Ok((bytes, feature)),
-            Ok(bytes) => last = Some(anyhow!("视频流只有 {bytes} 字节")),
-            Err(err) => last = Some(err),
-        }
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("没有可用的视频流"))
+}
+
+/// One remote video source, used to cut a clip without downloading the whole
+/// movie. `headers` is the CRLF block ffmpeg expects in `-headers`.
+#[derive(Clone, Debug)]
+pub struct RemoteSource {
+    pub url: String,
+    pub headers: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Resolve a playable 720P URL and the session headers for ffmpeg.
+pub async fn remote_source(
+    session: &Session,
+    bvid: &str,
+    cid: u64,
+) -> Result<RemoteSource> {
+    let info = session.playurl(bvid, cid).await?;
+    let track = pick_video_track(&info)?;
+    let url = track
+        .urls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| track.url.clone());
+    if url.trim().is_empty() {
+        bail!("没有可用的视频 CDN");
     }
-    Err(last.unwrap_or_else(|| anyhow!("没有可用的视频 CDN")))
+    let referer = format!("https://www.bilibili.com/video/{bvid}");
+    Ok(RemoteSource {
+        url,
+        headers: session.ffmpeg_headers(&referer),
+        width: track.width,
+        height: track.height,
+    })
 }
 
 async fn stream_to_file(
@@ -524,6 +773,25 @@ fn layout_for(width: u32, height: u32) -> Layout {
     }
 }
 
+/// The agent's clip sheets are read by a human as well as the model, so a
+/// landscape clip uses 3×2 smaller tiles instead of the 2×3 watch-step sheet:
+/// the result is a wide strip that fits the transcript without huge bars.
+fn clip_layout_for(width: u32, height: u32) -> Layout {
+    let aspect = width.max(1) as f32 / height.max(1) as f32;
+    if aspect >= 1.2 {
+        Layout {
+            columns: 3,
+            rows: 2,
+            cell_w: 640,
+            cell_h: 360,
+            landscape: true,
+            square: false,
+        }
+    } else {
+        layout_for(width, height)
+    }
+}
+
 struct ExtractedFrame {
     path: PathBuf,
     at_s: u64,
@@ -536,6 +804,8 @@ fn extract(
     interval_s: u64,
     expected: usize,
     layout: Layout,
+    start_s: u64,
+    duration_s: u64,
     cancel: &AtomicBool,
 ) -> Result<Vec<ExtractedFrame>> {
     let scale = if layout.landscape {
@@ -547,9 +817,14 @@ fn extract(
     };
     let filter = format!("fps=1/{interval_s},{scale}");
     let pattern = work.join("f-%03d.jpg");
-    let status = proc::command(&config.ffmpeg)
-        .args(["-v", "error", "-y", "-i"])
-        .arg(movie)
+    let mut command = proc::command(&config.ffmpeg);
+    command.args(["-v", "error", "-y"]);
+    if start_s > 0 {
+        command.arg("-ss").arg(start_s.to_string());
+    }
+    command.arg("-i").arg(movie);
+    command.arg("-t").arg(duration_s.max(1).to_string());
+    let status = command
         .args([
             "-vf",
             &filter,
@@ -578,7 +853,7 @@ fn extract(
         }
         frames.push(ExtractedFrame {
             path,
-            at_s: (index as u64 - 1) * interval_s,
+            at_s: start_s + (index as u64 - 1) * interval_s,
         });
     }
     Ok(frames)

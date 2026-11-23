@@ -871,6 +871,19 @@ impl Session {
         let header = self.jar.cookies(&api_url)?;
         header.to_str().ok().map(|text| text.to_string())
     }
+
+    /// Header block for an ffmpeg remote input. ffmpeg's `-headers` option
+    /// wants one CRLF-separated string; the CDN accepts the same session
+    /// cookies as the in-app player.
+    pub fn ffmpeg_headers(&self, referer: &str) -> String {
+        let mut out = format!("Referer: {referer}\r\nUser-Agent: {UA}\r\n");
+        if let Some(cookie) = self.api_cookie_header() {
+            out.push_str("Cookie: ");
+            out.push_str(&cookie);
+            out.push_str("\r\n");
+        }
+        out
+    }
 }
 
 fn build_client(jar: Arc<Jar>) -> Result<reqwest::Client> {

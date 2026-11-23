@@ -13,6 +13,7 @@
 // `main.rs`; a few helpers exist for the next phase before their call site.
 
 pub mod agent;
+pub mod agent_tools;
 pub mod asr;
 pub mod comments;
 // The tool surface lives beside the steps it describes: the UI catalog can

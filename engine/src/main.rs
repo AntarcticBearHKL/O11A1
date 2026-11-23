@@ -1375,6 +1375,13 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             }))
         }
         "fish.tools" => Ok(json!(o11a1::fishwatch::tool_catalog())),
+        "fish.agent.tools" => Ok(json!(o11a1::fishwatch::agent_tools::tool_catalog())),
+        "fish.agent.image" => {
+            let engine = fish_engine(app).await?;
+            let key = text(&params, "key");
+            let data_url = engine.agent_image_data_url(&key).map_err(e)?;
+            Ok(json!({ "key": key, "data_url": data_url }))
+        }
         "fish.feed.next" => {
             let session = app.session().await?;
             let items = session.homepage_feed_from(0, &|_, _| {}).await.map_err(e)?;
