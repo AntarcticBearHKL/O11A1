@@ -91,6 +91,11 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.35 养鱼单步调试**：
+  - 养鱼页新增「单步调试」开关。开启后点击「开始 agent」先跑一轮，之后每一轮 DeepSeek 调用 + 它发起的工具调用结束后自动停住，等你点「下一步」才继续。
+  - 停在审批点时显示「等待审批」，Agent 面板同步显示「单步调试 · 等待下一步」；「下一步」只在审批点可点，「继续运行」会关闭单步并恢复连续看片。
+  - 暂停后点「开始 agent」会恢复停在审批点的同一轮对话，不丢当前视频的上下文；停止或暂停立即会取消等待。
+  - Agent 快照新增 `agent_debug` / `agent_waiting`，并补了门闩单元测试：未审批时线程必须停住，批准一次只放行一轮。
 - **0.9.34 全应用字体回归圆体**：
   - 原生播放器把 600/700 字重直接请求 `Chill Round Gothic` 的 Regular 家族，GDI 只能用合成粗体或回退；现在 400 用 Regular、500 用 Medium、600/700 用 Bold，视频侧边栏、评论/选集/性能工具条和精准面板都回到真正的圆体。
   - DirectWrite 仍按一个家族 + 字重选择 Medium/Bold；新增回归测试确认系统字体集合里能看到 `Chill Round Gothic`。
@@ -263,7 +268,7 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.34.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- 产物：`release/O11A1 Setup 0.9.35.exe`（约 218 MB，含 FFmpeg 与 Chill Round Gothic 三个字重）。
 - `release/win-unpacked/O11A1.exe`：免安装版；桌面快捷方式继续指向这里。
 - `release/win-unpacked/O11A1.exe` 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。

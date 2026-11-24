@@ -1382,6 +1382,25 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             let data_url = engine.agent_image_data_url(&key).map_err(e)?;
             Ok(json!({ "key": key, "data_url": data_url }))
         }
+        "fish.agent.debug" => {
+            let enabled = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let engine = fish_engine(app).await?;
+            engine.set_agent_debug(enabled);
+            Ok(json!({ "enabled": enabled, "snapshot": engine.snapshot() }))
+        }
+        "fish.agent.step" => {
+            let engine = fish_engine(app).await?;
+            let approved = engine.approve_agent_step();
+            Ok(json!({ "approved": approved, "snapshot": engine.snapshot() }))
+        }
+        "fish.agent.continue" => {
+            let engine = fish_engine(app).await?;
+            engine.set_agent_debug(false);
+            Ok(json!({ "snapshot": engine.snapshot() }))
+        }
         "fish.feed.next" => {
             let session = app.session().await?;
             let items = session.homepage_feed_from(0, &|_, _| {}).await.map_err(e)?;

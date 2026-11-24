@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bilibili::Session;
@@ -310,6 +310,10 @@ pub struct FishSnapshot {
     /// and the reply card. Kept beside `progress` because the Agent panel uses
     /// the richer shape while older surfaces keep the checklist.
     pub agent: Option<AgentView>,
+    /// True when the worker is in single-step mode.
+    pub agent_debug: bool,
+    /// True while the worker is stopped at a single-step approval gate.
+    pub agent_waiting: bool,
     /// True while a `fish-worker` thread exists.
     pub worker_alive: bool,
     /// The newest successful verdict.
@@ -804,6 +808,15 @@ struct Job {
     attempts: i64,
 }
 
+/// Single-step debug gate. The worker parks here at the top of every model
+/// turn; the UI releases one permit per click. A permit left over from Start
+/// lets the first turn run immediately.
+#[derive(Debug, Default)]
+struct StepGate {
+    waiting: bool,
+    permit: bool,
+}
+
 /// The text material of one video, gathered once and then used for the prompt,
 /// the `signals` row and the verdict.
 #[derive(Clone, Debug, Default)]
@@ -970,6 +983,10 @@ pub struct FishEngine {
     restart: AtomicBool,
     /// True while a worker thread exists (guards `start` against a second one).
     worker: AtomicBool,
+    /// Single-step debug mode for the agent loop.
+    debug_steps: AtomicBool,
+    step_gate: Mutex<StepGate>,
+    step_cv: Condvar,
     /// Whether [`FishEngine::set_instruction`] writes `settings.json`. Tests
     /// must never touch the user's file.
     persist: AtomicBool,
@@ -1048,6 +1065,9 @@ impl FishEngine {
             worker_generation: AtomicU64::new(0),
             restart: AtomicBool::new(false),
             worker: AtomicBool::new(false),
+            debug_steps: AtomicBool::new(false),
+            step_gate: Mutex::new(StepGate::default()),
+            step_cv: Condvar::new(),
             persist: AtomicBool::new(true),
             self_ref: Mutex::new(Weak::new()),
             http,
@@ -1148,11 +1168,18 @@ impl FishEngine {
         let current = self.current.lock().ok().and_then(|guard| guard.clone());
         let progress = self.progress.lock().ok().and_then(|guard| guard.clone());
         let agent = self.agent.lock().ok().and_then(|guard| guard.clone());
+        let agent_waiting = self
+            .step_gate
+            .lock()
+            .map(|gate| gate.waiting)
+            .unwrap_or(false);
         let mut snapshot = FishSnapshot {
             state,
             current,
             progress,
             agent,
+            agent_debug: self.debug_steps.load(Ordering::SeqCst),
+            agent_waiting,
             worker_alive: self.worker.load(Ordering::SeqCst),
             ..FishSnapshot::default()
         };
@@ -1523,6 +1550,119 @@ impl FishEngine {
 
     // -- control -----------------------------------------------------------
 
+    /// Turn single-step debugging on/off. Turning it off releases a parked
+    /// worker and lets it continue; turning it on takes effect at the next
+    /// model turn boundary.
+    pub fn set_agent_debug(&self, enabled: bool) {
+        let was = self.debug_steps.swap(enabled, Ordering::SeqCst);
+        let was_waiting = self
+            .step_gate
+            .lock()
+            .map(|mut gate| {
+                if enabled {
+                    gate.permit = false;
+                    gate.waiting
+                } else {
+                    let waiting = gate.waiting;
+                    gate.permit = true;
+                    gate.waiting = false;
+                    waiting
+                }
+            })
+            .unwrap_or(false);
+        if !enabled {
+            if was_waiting && self.worker_alive() && self.paused.load(Ordering::SeqCst) {
+                self.paused.store(false, Ordering::SeqCst);
+                self.set_state(FishState::Running);
+            }
+            self.step_cv.notify_all();
+        }
+        crate::debug_log(&format!(
+            "fish agent debug={} was={was}",
+            u8::from(enabled)
+        ));
+        self.publish();
+    }
+
+    /// Release exactly one model turn. The worker consumes the permit at its
+    /// next gate, runs one turn (DeepSeek request + any tool calls), then parks
+    /// again if debug mode is still on.
+    pub fn approve_agent_step(&self) -> bool {
+        if !self.debug_steps.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Ok(mut gate) = self.step_gate.lock() else {
+            return false;
+        };
+        gate.permit = true;
+        gate.waiting = false;
+        drop(gate);
+        self.step_cv.notify_all();
+        self.publish();
+        true
+    }
+
+    fn clear_step_waiting(&self) {
+        if let Ok(mut gate) = self.step_gate.lock() {
+            gate.waiting = false;
+            gate.permit = false;
+        }
+        self.step_cv.notify_all();
+    }
+
+    /// Park the worker before one model turn when debug mode is on. Returns
+    /// false when the worker was stopped/paused while waiting.
+    fn wait_for_agent_step(&self, generation: u64) -> bool {
+        if !self.debug_steps.load(Ordering::SeqCst) {
+            return true;
+        }
+        let Ok(mut gate) = self.step_gate.lock() else {
+            return false;
+        };
+        if gate.permit {
+            gate.permit = false;
+            gate.waiting = false;
+            drop(gate);
+            return true;
+        }
+        gate.waiting = true;
+        drop(gate);
+        self.agent_with(|agent| agent.set_note("单步调试 · 等待下一步"));
+        self.progress_note("单步调试 · 等待下一步");
+        self.publish();
+        let Ok(mut gate) = self.step_gate.lock() else {
+            return false;
+        };
+        loop {
+            if self.stop_requested.load(Ordering::SeqCst)
+                || self.cancel_current.load(Ordering::SeqCst)
+                || generation != self.generation.load(Ordering::SeqCst)
+            {
+                gate.waiting = false;
+                drop(gate);
+                self.publish();
+                return false;
+            }
+            if gate.permit {
+                gate.permit = false;
+                gate.waiting = false;
+                drop(gate);
+                self.publish();
+                return true;
+            }
+            match self
+                .step_cv
+                .wait_timeout(gate, Duration::from_millis(100))
+            {
+                Ok((next, _)) => gate = next,
+                Err(poisoned) => {
+                    let (next, _) = poisoned.into_inner();
+                    gate = next;
+                }
+            }
+        }
+    }
+
     /// Start (or resume) the worker with a logged-in Bilibili session.
     ///
     /// Every call bumps the worker generation. A worker from an older
@@ -1531,6 +1671,27 @@ impl FishEngine {
     /// generation to a fresh thread. This is what makes `stop` → `start` safe.
     pub fn start(&self, session: Arc<Session>) {
         self.refresh_from_settings();
+        // A debug run parked at the approval gate keeps its whole session
+        // (messages, chosen video, clips).  Start resumes that exact run with
+        // one turn instead of spawning a fresh worker and losing the context.
+        let parked = self.worker_alive()
+            && self.debug_steps.load(Ordering::SeqCst)
+            && self.paused.load(Ordering::SeqCst)
+            && self
+                .step_gate
+                .lock()
+                .map(|gate| gate.waiting)
+                .unwrap_or(false);
+        if parked {
+            if let Ok(mut slot) = self.signals.lock() {
+                *slot = Some(Signals::Live(session));
+            }
+            self.cancel_current.store(false, Ordering::SeqCst);
+            self.paused.store(false, Ordering::SeqCst);
+            self.set_state(FishState::Running);
+            self.approve_agent_step();
+            return;
+        }
         // A redundant 开始 while the worker is already running only replaces
         // the session: bumping the generation here would abort the video in
         // flight. Paused/stopped workers take the generation-safe path below.
@@ -1544,6 +1705,14 @@ impl FishEngine {
             self.cancel_current.store(false, Ordering::SeqCst);
             self.paused.store(false, Ordering::SeqCst);
             return;
+        }
+        // In single-step mode the first click of 开始 should run one turn, not
+        // sit at the gate before the user can see anything. `spawn_with` clears
+        // the paused flag below; do it before priming so approve_agent_step
+        // does not reject the permit.
+        self.paused.store(false, Ordering::SeqCst);
+        if self.debug_steps.load(Ordering::SeqCst) {
+            self.approve_agent_step();
         }
         self.spawn_with(Signals::Live(session));
     }
@@ -1561,6 +1730,7 @@ impl FishEngine {
     pub fn pause_now(&self) {
         self.cancel_current.store(true, Ordering::SeqCst);
         self.paused.store(true, Ordering::SeqCst);
+        self.clear_step_waiting();
         self.finish_progress("cancelled", "已暂停；正在取消当前步骤");
         self.set_state(FishState::Paused);
         self.publish();
@@ -1576,6 +1746,7 @@ impl FishEngine {
         self.paused.store(true, Ordering::SeqCst);
         self.cancel_current.store(true, Ordering::SeqCst);
         self.restart.store(false, Ordering::SeqCst);
+        self.clear_step_waiting();
         self.set_current(None);
         self.finish_progress("cancelled", "已停止；当前视频已放回队列");
         self.set_state(FishState::Idle);
@@ -2222,6 +2393,9 @@ impl FishEngine {
         let max_turns = 10usize;
 
         for turn in 0..max_turns {
+            if !self.wait_for_agent_step(generation) {
+                return Err(anyhow!("已取消"));
+            }
             if self.stale_or_cancelled(generation) {
                 return Err(anyhow!("已取消"));
             }
@@ -6479,8 +6653,31 @@ mod tests {
     }
 
     #[test]
-    fn truncated_rate_arguments_are_repaired() {
-        let raw = r#"{"score":8,"verdict":"看","one_line":"值得看","reasons":["讲得清楚","有实测"#;
+    fn debug_gate_waits_for_one_permit() {
+        let path = temp_db("debug-gate");
+        let engine = FishEngine::open_at(&path).expect("open");
+        engine.persist.store(false, Ordering::SeqCst);
+        engine.set_agent_debug(true);
+        let generation = engine.generation.load(Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        let worker = engine.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.wait_for_agent_step(generation));
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        let waiting = engine.snapshot();
+        assert!(waiting.agent_debug);
+        assert!(waiting.agent_waiting, "worker should park at the gate");
+        assert!(engine.approve_agent_step());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(true));
+        assert!(!engine.snapshot().agent_waiting);
+        engine.set_agent_debug(false);
+        drop(engine);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn truncated_rate_arguments_are_repaired() {        let raw = r#"{"score":8,"verdict":"看","one_line":"值得看","reasons":["讲得清楚","有实测"#;
         let value = parse_tool_arguments(raw).expect("repaired json");
         assert_eq!(value.get("score").and_then(|v| v.as_u64()), Some(8));
         assert_eq!(value.get("verdict").and_then(|v| v.as_str()), Some("看"));

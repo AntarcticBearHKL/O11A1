@@ -140,6 +140,29 @@ export default function Fish() {
     } catch (reason: any) { toast(reason.message, true); }
   };
 
+  const setAgentDebug = async (enabled: boolean) => {
+    try {
+      await call('fish.agent.debug', { enabled });
+      await load(true);
+      toast(enabled ? '已开启单步调试：每轮模型调用后停住' : '已关闭单步调试，继续连续运行');
+    } catch (reason: any) { toast(reason.message, true); }
+  };
+
+  const nextAgentStep = async () => {
+    try {
+      await call('fish.agent.step');
+      await load(true);
+    } catch (reason: any) { toast(reason.message, true); }
+  };
+
+  const continueAgent = async () => {
+    try {
+      await call('fish.agent.continue');
+      await load(true);
+      toast('已继续连续运行');
+    } catch (reason: any) { toast(reason.message, true); }
+  };
+
   const saveFish = async (patch: Record<string, any>) => {
     await saveSettings(patch as any);
     // The worker snapshots settings when it starts. Refresh it in place (a
@@ -176,6 +199,8 @@ export default function Fish() {
   };
 
   const isLive = snapshotState === 'Running' || snapshotState === 'Waiting';
+  const agentDebug = Boolean(snapshot?.agent_debug);
+  const agentWaiting = Boolean(snapshot?.agent_waiting);
   const lastAgentStep = (name: string) => {
     const rows = agent?.steps || [];
     for (let index = rows.length - 1; index >= 0; index -= 1) {
@@ -215,6 +240,22 @@ export default function Fish() {
                   <button className="btn sm" onClick={() => action('fish.retry')}>重试错误</button>
                   <button className="btn sm danger" onClick={() => { if (window.confirm('清空候选队列？历史结论会保留。')) action('fish.clear'); }}>清空候选</button>
                 </div>
+                <div className={`fish-debug ${agentDebug ? 'on' : ''}`}>
+                  <span className="fish-debug-label">单步调试</span>
+                  <Toggle on={agentDebug} onChange={setAgentDebug} />
+                  {agentDebug ? (
+                    <>
+                      <button className="btn sm primary" disabled={!agentWaiting || snapshotState === 'Paused'} onClick={nextAgentStep}>下一步</button>
+                      <button className="btn sm" onClick={continueAgent}>继续运行</button>
+                      <span className={`fish-debug-state ${agentWaiting ? 'waiting' : isLive ? 'running' : 'idle'}`}>
+                        {agentWaiting ? (snapshotState === 'Paused' ? '已暂停 · 等待恢复' : '等待审批') : isLive ? '运行中' : '先点开始'}
+                      </span>
+                      <span className="fish-debug-hint">每轮 DeepSeek 调用和工具执行结束后停住</span>
+                    </>
+                  ) : (
+                    <span className="fish-debug-hint">开启后，每轮调用结束会停住，点「下一步」才继续</span>
+                  )}
+                </div>
                 <div className="fish-autofill">
                   <span className="fish-autofill-label">候选来源</span>
                   <select
@@ -245,7 +286,7 @@ export default function Fish() {
                     Agent 每轮自己从候选列表里按标题挑一个；看完一个自动进入下一个，直到你点暂停或停止。
                     {autofillSource === 'favorites' && !autofillFolder ? ' 需要先选择一个收藏夹。' : ''}
                   </span>
-                  {isLive ? <span className="fish-autofill-state">连续看片中</span> : null}
+                  {isLive ? <span className="fish-autofill-state">{agentDebug ? '单步调试中' : '连续看片中'}</span> : null}
                 </div>
               </section>
 
