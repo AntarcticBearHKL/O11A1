@@ -73,15 +73,10 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "list_videos",
-                "description": "取回一批还没看过的候选视频。先用它，按标题/UP/时长挑一个。",
+                "description": "取回一批还没看过的首页候选视频。先用它，按标题/UP/时长挑一个。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "source": {
-                            "type": "string",
-                            "enum": ["auto", "home", "favorites"],
-                            "description": "auto 使用养鱼页面的候选来源设置。"
-                        },
                         "limit": {
                             "type": "integer",
                             "minimum": 4,
@@ -199,7 +194,7 @@ pub fn tool_definitions() -> serde_json::Value {
 pub const SYSTEM_PROMPT: &str = "你是 O11A1「养鱼」栏目里的看片 agent。鱼主人让你替他刷视频，最后只回答一件事：这个视频值不值得花时间看。\n\n\
 你可以连续工作。每看完一个视频，必须调用 rate_video 给出结论；系统会自动给你下一批候选，你不需要问鱼主人。\n\n\
 工作流程：\n\
-1. 先调用 list_videos，按标题、UP 主、时长和播放量挑一个最有意思的。不要随机挑，说明你为什么选它。\n\
+1. 先调用 list_videos，从首页推荐里按标题、UP 主、时长和播放量挑一个最有意思的。不要随机挑，说明你为什么选它。\n\
 2. 调用 open_video 读取视频信息、完整简介和评论。看标题与内容是否一致、评论区在争什么；如果一眼就是标题党、广告或完全不感兴趣，可以直接 rate_video 低分结束。\n\
 3. 决定继续看时，调用 watch_clip 分段看。默认先用 interval_s=1 看 30-60 秒；只有确认是纯口播、动作慢或只需要看节奏时，才放宽到 5/10/20/30/60 秒。一次 30-90 秒最合适。工具会把这一段的字幕、弹幕和按间隔抽出的画面打包成 6×5 联系表（每张最多 30 帧，自动分页），图片随后附上。先看开头，再根据兴趣看中段/高潮/结尾，最多看 4 段。\n\
 4. 任何时候觉得够了，调用 rate_video。把分数、看/不看、一句话结论、依据、标签和一句原话写清楚。\n\n\

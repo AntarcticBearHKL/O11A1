@@ -1393,6 +1393,10 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         }
         "fish.agent.step" => {
             let engine = fish_engine(app).await?;
+            engine.set_agent_debug(true);
+            // The page has no separate 开始 button: the first click starts the
+            // worker and runs one turn, later clicks release the gate.
+            engine.start(app.session().await?);
             let approved = engine.approve_agent_step();
             Ok(json!({ "approved": approved, "snapshot": engine.snapshot() }))
         }

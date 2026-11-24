@@ -513,9 +513,6 @@ struct EngineConfig {
     /// Keep the worker alive when the queue empties; the page's auto-filler
     /// feeds it the next random unwatched video.
     autofill: bool,
-    /// `home` | `favorites` for the agent's `list_videos` tool.
-    source: String,
-    folder_id: i64,
     endpoint: String,
     /// 看片力度 + ASR/视觉参数，passed to `fishwatch` unchanged.
     watch: WatchConfig,
@@ -533,12 +530,6 @@ impl EngineConfig {
             budget_videos: settings::normalise_fish_budget(settings.fish_budget_videos),
             interval_ms: settings::normalise_fish_interval(settings.fish_interval_ms),
             autofill: settings.fish_autofill,
-            source: if settings.fish_autofill_source == "favorites" {
-                "favorites".to_string()
-            } else {
-                "home".to_string()
-            },
-            folder_id: settings.fish_autofill_folder,
             endpoint: endpoint.clone(),
             watch: watch_config_from_settings(settings, &key, &model, &endpoint),
         }
@@ -2438,10 +2429,13 @@ impl FishEngine {
             state.total_out = state.total_out.saturating_add(asked.tokens_out);
             self.agent_add_usage(asked.tokens_in, asked.tokens_out);
 
-            let thought = if !asked.reasoning.trim().is_empty() {
-                asked.reasoning.clone()
-            } else {
-                asked.content.clone()
+            // Keep both the reasoning and the visible reply when the model
+            // writes both; the transcript renders this as one readable turn.
+            let thought = match (asked.reasoning.trim(), asked.content.trim()) {
+                ("", "") => String::new(),
+                (reasoning, "") => reasoning.to_string(),
+                ("", content) => content.to_string(),
+                (reasoning, content) => format!("{reasoning}\n\n{content}"),
             };
             let call_names = asked
                 .tool_calls
@@ -2654,7 +2648,7 @@ impl FishEngine {
 
     fn tool_list_videos(
         &self,
-        config: &EngineConfig,
+        _config: &EngineConfig,
         session: &Arc<Session>,
         state: &mut AgentRunState,
         args: &serde_json::Value,
@@ -2664,36 +2658,32 @@ impl FishEngine {
             .and_then(|value| value.as_u64())
             .unwrap_or(10)
             .clamp(4, 20) as usize;
-        let source = match args.get("source").and_then(|value| value.as_str()) {
-            Some("home") => "home".to_string(),
-            Some("favorites") => "favorites".to_string(),
-            _ => config.source.clone(),
-        };
-        let mut list = self.queue_candidates(limit)?;
-        let mut label = if source == "favorites" {
-            "收藏夹".to_string()
-        } else {
-            "首页推荐".to_string()
-        };
+        let mut label = "首页推荐".to_string();
         let mut note = String::new();
-        if list.len() < limit.min(6) {
-            match runtime().block_on(agent_tools::fetch_candidates(
-                session,
-                &source,
-                config.folder_id,
-                limit * 2,
-            )) {
-                Ok(fresh) => {
-                    label = fresh.label;
-                    if let Err(err) = self.enqueue_candidates(&fresh.videos) {
-                        note = format!("候选写入失败：{err:#}");
-                    }
-                }
-                Err(err) => {
-                    note = format!("读取候选失败：{err:#}");
+        // The page is home-only now. Read a fresh homepage batch instead of
+        // trusting old queue rows from the removed favorites source.
+        let mut list: Vec<Candidate> = Vec::new();
+        match runtime().block_on(agent_tools::fetch_candidates(
+            session,
+            "home",
+            0,
+            limit * 2,
+        )) {
+            Ok(fresh) => {
+                label = fresh.label;
+                list = fresh
+                    .videos
+                    .into_iter()
+                    .filter(|video| !self.is_watched(&video.bvid).unwrap_or(false))
+                    .take(limit)
+                    .collect();
+                if let Err(err) = self.enqueue_candidates(&list) {
+                    note = format!("候选写入失败：{err:#}");
                 }
             }
-            list = self.queue_candidates(limit)?;
+            Err(err) => {
+                note = format!("读取首页推荐失败：{err:#}");
+            }
         }
         state.no_candidates = list.is_empty();
         let videos: Vec<serde_json::Value> = list
@@ -2710,7 +2700,7 @@ impl FishEngine {
             })
             .collect();
         let output = serde_json::json!({
-            "source": source,
+            "source": "home",
             "label": label,
             "count": videos.len(),
             "videos": videos,
@@ -3073,36 +3063,6 @@ impl FishEngine {
             bytes: 0,
             rate: Some(rate),
         })
-    }
-
-    fn queue_candidates(&self, limit: usize) -> Result<Vec<Candidate>> {
-        let db = self.lock_db()?;
-        let mut statement = db.prepare(
-            "SELECT q.bvid, COALESCE(v.title, ''), COALESCE(v.up_name, ''), \
-             COALESCE(v.duration_s, 0), COALESCE(v.view_count, 0) \
-             FROM queue q LEFT JOIN videos v ON v.bvid = q.bvid \
-             WHERE q.state = 'pending' \
-             AND NOT EXISTS (SELECT 1 FROM verdicts d WHERE d.bvid = q.bvid AND d.error IS NULL) \
-             AND NOT EXISTS (SELECT 1 FROM watched w WHERE w.bvid = q.bvid) \
-             ORDER BY q.priority DESC, q.updated_at ASC, q.rowid ASC LIMIT ?1",
-        )?;
-        let rows = statement.query_map(params![limit.clamp(1, 40) as i64], |row| {
-            Ok(Candidate {
-                bvid: row.get(0)?,
-                title: row.get(1)?,
-                up_name: row.get(2)?,
-                duration_s: row.get::<_, i64>(3)?.max(0) as u64,
-                view: row.get::<_, i64>(4)?.max(0) as u64,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let candidate = row?;
-            if !candidate.bvid.trim().is_empty() && !candidate.title.trim().is_empty() {
-                out.push(candidate);
-            }
-        }
-        Ok(out)
     }
 
     fn enqueue_candidates(&self, videos: &[Candidate]) -> Result<()> {
@@ -4283,19 +4243,14 @@ fn stub_materials(materials: &mut Materials) {
 /// The exact first `(system, user)` pair of a continuous agent run.
 fn agent_initial_prompt(config: &EngineConfig) -> (String, String) {
     let instruction = settings::normalise_fish_instruction(&config.instruction);
-    let source = if config.source == "favorites" {
-        "收藏夹推荐流"
-    } else {
-        "首页视频流"
-    };
     let mut system = agent_tools::SYSTEM_PROMPT.to_string();
     system.push_str("\n\n## 鱼主人的指令\n");
     system.push_str(&instruction);
-    let user = format!(
-        "开始一轮看片。候选来源是「{source}」。\n\
+    let user =
+        "开始一轮看片。候选来源是「首页视频流」。\n\
          先调用 list_videos 拿候选，按标题挑一个，再调用 open_video 读视频信息和评论。\n\
          觉得值得看就分段 watch_clip，觉得没意思就随时 rate_video 结束。"
-    );
+            .to_string();
     (system, user)
 }
 
@@ -6172,8 +6127,6 @@ mod tests {
                 budget_videos: 10,
                 interval_ms: 20,
                 autofill: false,
-                source: "home".to_string(),
-                folder_id: 0,
                 endpoint: server.endpoint(),
                 watch: WatchConfig::default(),
             },
@@ -6290,8 +6243,6 @@ mod tests {
                 budget_videos: 5,
                 interval_ms: 10,
                 autofill: false,
-                source: "home".to_string(),
-                folder_id: 0,
                 endpoint: server.endpoint(),
                 watch: WatchConfig::default(),
             },
@@ -6402,8 +6353,6 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 10,
                 autofill: false,
-                source: "home".to_string(),
-                folder_id: 0,
                 endpoint: format!("http://127.0.0.1:{port}/chat/completions"),
                 watch: WatchConfig::default(),
             },
@@ -6532,8 +6481,6 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 500,
                 autofill: false,
-                source: "home".to_string(),
-                folder_id: 0,
                 endpoint: DEEPSEEK_URL.to_string(),
                 watch,
             },
@@ -6630,8 +6577,6 @@ mod tests {
                 budget_videos: 1,
                 interval_ms: 1_500,
                 autofill: false,
-                source: "home".to_string(),
-                folder_id: 0,
                 endpoint: DEEPSEEK_URL.to_string(),
                 watch: WatchConfig::default(),
             },
