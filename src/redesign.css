@@ -3548,6 +3548,11 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .fish-debug-state { display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border-radius: 999px; background: var(--surface-2); font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em; color: var(--text-faint); white-space: nowrap; }
 .fish-debug-state.waiting { background: var(--accent-soft); color: var(--accent); }
 .fish-debug-state.running { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); }
+.fish-debug-state.done { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); }
+.fish-debug-state.error { background: color-mix(in srgb, var(--danger) 13%, transparent); color: var(--danger); }
+.fish-error-strip { display: flex; align-items: flex-start; gap: 10px; margin-top: 9px; padding: 8px 11px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 6%, transparent); font-size: 12px; line-height: 1.65; color: var(--text-dim); }
+.fish-error-strip b { flex: none; color: var(--danger); font-weight: 700; }
+.fish-error-strip span { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; user-select: text; cursor: text; }
 .fish-debug.on .fish-debug-label { color: var(--accent); }
 .agent-thinking-body { position: relative; margin: 0 16px 10px 33px; padding: 2px 0 2px 13px; border-left: 2px solid var(--line); }
 .agent-thinking-body.clamped { max-height: 8.1em; overflow: hidden; }
@@ -3591,6 +3596,14 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .agent-fact > span { flex: none; min-width: 48px; color: var(--text-faint); }
 .agent-fact > b { min-width: 0; font-weight: 400; color: var(--text-dim); word-break: break-word; }
 .agent-tool-error { padding: 7px 10px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 7%, transparent); font-size: 12.5px; line-height: 1.65; color: var(--text-dim); }
+.agent-error-card { margin: 4px 2px 8px; padding: 10px 12px 11px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 6%, transparent); text-align: left; }
+.agent-error-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.agent-error-head b { color: var(--danger); font-weight: 700; letter-spacing: 0.02em; }
+.agent-error-head .agent-timing { margin-left: auto; }
+.agent-error-badge { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; border-radius: 999px; background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); font-size: 9.5px; font-weight: 700; }
+.agent-error-text { margin-top: 6px; font-size: 13px; line-height: 1.7; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; user-select: text; cursor: text; }
+.agent-step.failed .agent-thinking-body { border-left-color: var(--danger); }
+.agent-step.failed .agent-thinking-body .agent-rich { color: var(--danger); user-select: text; cursor: text; }
 .agent-step-extra { padding: 0 14px 10px 33px; }
 .agent-args { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 2px; }
 .agent-args-label { margin-right: 2px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; color: var(--text-faint); }

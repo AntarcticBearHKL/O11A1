@@ -1880,14 +1880,25 @@ impl FishEngine {
                         ),
                     );
                     self.publish();
+                    // Single-step: stop here and keep the finished transcript
+                    // on screen until 下一步 is clicked again.
+                    if self.debug_steps.load(Ordering::SeqCst) {
+                        self.set_state_if_current(generation, FishState::Idle);
+                        self.publish();
+                        return;
+                    }
                 }
                 Ok(None) => {
                     // No candidate came back (offline feed / empty folder).
-                    // Stay alive like the old auto-fill Waiting state.
                     self.set_current(None);
                     self.set_state_if_current(generation, FishState::Waiting);
                     self.finish_progress("cancelled", "候选列表为空，等待补充");
                     self.publish();
+                    if self.debug_steps.load(Ordering::SeqCst) {
+                        self.set_state_if_current(generation, FishState::Idle);
+                        self.publish();
+                        return;
+                    }
                 }
                 Err(_) if stale || self.cancel_current.load(Ordering::SeqCst) => {
                     if let Some((bvid, _)) = current.as_ref() {
@@ -1895,6 +1906,9 @@ impl FishEngine {
                     }
                     self.set_current(None);
                     self.finish_progress("cancelled", "已取消；当前视频已放回候选");
+                    self.agent_with(|agent| {
+                        agent.finish("cancelled", "已取消；当前视频已放回候选");
+                    });
                     self.publish();
                     if stale {
                         return;
@@ -1906,8 +1920,13 @@ impl FishEngine {
                         self.fail_queue_bvid(bvid, &message);
                     }
                     self.set_current(None);
-                    self.finish_progress("error", message);
+                    self.finish_progress("error", message.clone());
+                    // Keep the failed turn and its error on screen. The next
+                    // 下一步 starts a fresh attempt; nothing clears it first.
+                    self.agent_fail(&message);
+                    self.set_state_if_current(generation, FishState::Error(message));
                     self.publish();
+                    return;
                 }
             }
             if self.sleep_interval(config.interval_ms) {
@@ -2307,6 +2326,41 @@ impl FishEngine {
                 &opened.cover,
                 opened.duration_s,
             );
+        });
+    }
+
+    /// Keep a terminal failure visible in the transcript. The page is a
+    /// single-step debug surface: an error must stay readable until the owner
+    /// deliberately starts the next attempt, never be wiped by an automatic
+    /// retry.
+    fn agent_fail(&self, message: &str) {
+        let note = if message.trim().is_empty() {
+            "未知错误".to_string()
+        } else {
+            message.to_string()
+        };
+        self.agent_with(|agent| {
+            agent.finish("error", &note);
+            // `finish` already turns the running turn/tool row into a failed
+            // row carrying this message. Only add a standalone error card when
+            // there was no row that could show it (e.g. a setup failure).
+            if agent
+                .steps
+                .iter()
+                .any(|step| step.state == "failed" && step.detail == note)
+            {
+                return;
+            }
+            let id = format!("error-{}", agent.steps.len() + 1);
+            agent.push_step(AgentStepView {
+                id,
+                kind: "error".to_string(),
+                title: "运行出错".to_string(),
+                state: "failed".to_string(),
+                detail: note.clone(),
+                thinking: note,
+                ..AgentStepView::default()
+            });
         });
     }
 

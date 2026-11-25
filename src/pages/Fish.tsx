@@ -116,8 +116,28 @@ export default function Fish() {
     } catch (reason: any) { toast(reason.message, true); }
   };
 
-  const isLive = snapshotState === 'Running' || snapshotState === 'Waiting';
+  const stateName = typeof snapshotState === 'string'
+    ? snapshotState
+    : snapshotState && typeof snapshotState === 'object'
+      ? Object.keys(snapshotState)[0] || ''
+      : '';
+  const stateError = snapshotState && typeof snapshotState === 'object'
+    ? String((snapshotState as any).Error || '')
+    : '';
+  const workerAlive = Boolean(snapshot?.worker_alive);
+  const isLive = workerAlive && (stateName === 'Running' || stateName === 'Waiting');
   const agentWaiting = Boolean(snapshot?.agent_waiting);
+  const agentState = agent?.state || '';
+  const errorText = stateError || (agentState === 'error' ? agent?.note || '' : '');
+  const stepLabel = agentWaiting
+    ? '等待下一步'
+    : isLive
+      ? '运行中'
+      : errorText
+        ? '出错 · 点下一步重试'
+        : agentState === 'done' || agentState === 'cancelled'
+          ? '本轮结束 · 点下一步继续'
+          : '点击「下一步」开始';
 
   return (
     <>
@@ -138,12 +158,26 @@ export default function Fish() {
                   >
                     下一步
                   </button>
-                  <span className={`fish-debug-state ${agentWaiting ? 'waiting' : isLive ? 'running' : 'idle'}`}>
-                    {agentWaiting ? '等待下一步' : isLive ? '运行中' : '点击「下一步」开始'}
+                  <span className={`fish-debug-state ${agentWaiting ? 'waiting' : isLive ? 'running' : errorText ? 'error' : agentState === 'done' ? 'done' : 'idle'}`}>
+                    {stepLabel}
                   </span>
                   {isLive ? <button className="btn sm danger" onClick={() => action('fish.stop')}>停止</button> : null}
+                  {errorText ? (
+                    <button
+                      className="btn sm"
+                      onClick={() => navigator.clipboard.writeText(errorText).then(() => toast('错误已复制')).catch(() => toast('复制失败', true))}
+                    >
+                      复制错误
+                    </button>
+                  ) : null}
                   <span className="fish-step-hint">每轮 DeepSeek 调用和工具执行结束后停住</span>
                 </div>
+                {errorText ? (
+                  <div className="fish-error-strip" role="alert">
+                    <b>运行出错</b>
+                    <span>{errorText}</span>
+                  </div>
+                ) : null}
               </section>
 
               <AgentTrace key={`full-${agent?.bvid || 'empty'}`} agent={agent} full parked={agentWaiting} />

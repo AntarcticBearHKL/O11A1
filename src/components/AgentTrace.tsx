@@ -449,6 +449,23 @@ function AgentStepRow({
   const thought = String(step.thinking || (thinking ? step.detail : '') || '').trim();
   const longThought = thought.length > 420 || thought.split('\n').length > 5;
   const collapsible = thinking ? longThought : true;
+
+  if (step.kind === 'error') {
+    return (
+      <div className="agent-card agent-step error failed" data-step-index={index}>
+        <div className="agent-error-card">
+          <div className="agent-error-head">
+            <span className="agent-dot failed" />
+            <b>{step.title || '运行出错'}</b>
+            <span className="agent-error-badge">失败</span>
+            {step.ms ? <span className="agent-timing">{formatMs(step.ms)}</span> : null}
+          </div>
+          <div className="agent-error-text">{step.thinking || step.detail || '未知错误'}</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`agent-card agent-step ${step.kind} ${step.state} ${open ? 'open' : ''}`} data-step-index={index}>
       <button
@@ -460,7 +477,11 @@ function AgentStepRow({
         <span className={`agent-dot ${step.kind} ${step.state}`} />
         <span className="agent-title">{step.title}</span>
         <span className={`agent-badge ${state.tone}`}>{state.label}</span>
-        <span className="agent-meta">{thinking ? step.meta : step.tool || step.id}</span>
+        {thinking
+          ? step.meta && step.meta !== state.label
+            ? <span className="agent-meta">{step.meta}</span>
+            : null
+          : <span className="agent-meta">{step.tool || step.id}</span>}
         {!thinking ? <span className="agent-preview">{step.detail}</span> : null}
         <span className="agent-tail">
           {step.ms ? <span className="agent-timing">{formatMs(step.ms)}</span> : null}
