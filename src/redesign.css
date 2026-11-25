@@ -3854,22 +3854,28 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   box-shadow: none;
 }
 .bottom-item.active:hover { background: transparent; }
-.bottom-item.refresh {
+.bottom-item.fish {
   background: var(--accent);
   color: var(--accent-ink);
   border-radius: 999px;
   box-shadow: 0 8px 18px -10px var(--accent);
 }
-/* Odd number of hidden entries: the refresh button spans two slots so the
+/* Odd number of hidden entries: the blue Agent cap spans two slots so the
    vinyl still sits on the exact centre line. The extra 3px covers the gap
    that a second, separate slot would have contributed. */
-.bottom-item.refresh.wide {
+.bottom-item.fish.wide {
   width: calc(var(--dock-slot) * 2 + 3px);
 }
-.bottom-item.refresh:hover {
+.bottom-item.fish:hover {
   background: color-mix(in srgb, var(--accent) 86%, #fff);
   color: var(--accent-ink);
   transform: translateY(-2px);
+}
+.bottom-item.fish.active,
+.bottom-item.fish.active:hover {
+  background: var(--accent);
+  color: var(--accent-ink);
+  box-shadow: 0 0 0 3px var(--accent-soft), 0 8px 18px -10px var(--accent);
 }
 .bottom-item.active .bottom-icon { animation: bottomIconPop 0.36s var(--spring); }
 @keyframes bottomIconPop {
@@ -3878,8 +3884,6 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   100% { transform: scale(1); }
 }
 .bottom-icon { display: grid; place-items: center; }
-.bottom-item.refreshing .bottom-icon { animation: dockSpin 0.62s var(--ease); }
-@keyframes dockSpin { to { transform: rotate(360deg); } }
 
 /* Hover labels float clear of the dock on the same frosted panel recipe as the
    dock itself: the theme's card tint, hairline and ink text, so dark and light
@@ -4220,48 +4224,6 @@ img, a {
   -webkit-app-region: no-drag;
 }
 
-/* ------------------------------------------------ hold-to-refresh ring */
-
-/* Bare hold-to-refresh progress: a thin track and an accent arc that fills
-   from 12 o'clock while it stays wrapped around the pointer. No glyph, label,
-   card, border, glass or shadow. */
-.hold-refresh {
-  position: fixed;
-  z-index: 900;
-  width: 44px;
-  height: 44px;
-  pointer-events: none;
-  transform: translate(-50%, -50%);
-  will-change: transform, opacity, left, top;
-  animation: holdRefreshIn 0.14s var(--ease) both;
-}
-.hold-refresh-ring {
-  display: block;
-  width: 44px;
-  height: 44px;
-  transform: rotate(-90deg);
-  overflow: visible;
-}
-.hold-refresh-track {
-  fill: none;
-  stroke: color-mix(in srgb, var(--text) 14%, transparent);
-  stroke-width: 3;
-}
-.hold-refresh-fill {
-  fill: none;
-  stroke: var(--accent);
-  stroke-width: 3.8;
-  stroke-linecap: round;
-}
-.hold-refresh.fired { animation: holdRefreshOut 0.18s var(--ease) forwards; }
-@keyframes holdRefreshIn {
-  from { opacity: 0; transform: translate(-50%, -50%) scale(0.84); }
-  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-}
-@keyframes holdRefreshOut {
-  from { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-  to { opacity: 0; transform: translate(-50%, -50%) scale(1.1); }
-}
 @keyframes rd-dock-center {
   from { opacity: 0; transform: translate(-50%, 12px) scale(0.96); }
   to { opacity: 1; transform: translate(-50%, 0) scale(1); }
@@ -4320,8 +4282,8 @@ html, body, #root {
 }
 
 
-/* Custom cursor-follow drag replaces native app regions: native drag areas
-   swallow right-click, which would kill the long-press refresh wheel. */
+/* Custom cursor-follow drag replaces native app regions so right-click stays
+   available for the card action instead of starting a native window drag. */
 .app, .login-gate, .drag, .login-drag {
   -webkit-app-region: no-drag;
 }

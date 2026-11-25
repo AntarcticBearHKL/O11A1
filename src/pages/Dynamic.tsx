@@ -6,7 +6,7 @@ import { useApp } from '../context';
 import type { DynamicItem, DynamicPage } from '../types';
 import { Empty, ErrorBox, PageHead, SkeletonGrid, Tabs } from '../components/Common';
 import { IconFull, IconHeart } from '../components/Icons';
-import { flushCardRightClick, scheduleCardRightClick } from '../rightClickGuard';
+import { scheduleCardRightClick } from '../rightClickGuard';
 
 const TAB_LABELS = ['全部', '视频', '图文'];
 const TAB_TYPES = ['all', 'video', 'all'];
@@ -131,9 +131,6 @@ export default function Dynamic() {
                     owner: item.author_name,
                   }, true).catch((reason) => toast(reason.message, true)),
                 );
-              }}
-              onMouseUp={(event) => {
-                if (event.button === 2) flushCardRightClick();
               }}
               style={{ cursor: 'pointer' }}
             >

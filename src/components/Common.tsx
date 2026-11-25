@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { call, formatCount, formatDuration } from '../api';
 import { CoverImage } from './CoverImage';
 import { useApp } from '../context';
-import { flushCardRightClick, scheduleCardRightClick } from '../rightClickGuard';
+import { scheduleCardRightClick } from '../rightClickGuard';
 import type { FeedVideo, VideoCard } from '../types';
 
 export function Spinner({ label }: { label?: string }) {
@@ -389,9 +389,6 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
         setTip(null);
         stopPreview();
         scheduleCardRightClick(() => onPlay(item, true));
-      }}
-      onMouseUp={(event) => {
-        if (event.button === 2) flushCardRightClick();
       }}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) return;

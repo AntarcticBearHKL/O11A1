@@ -6,7 +6,7 @@ import { useToast } from './hooks';
 import type { Account, Settings } from './types';
 import {
   IconActivity, IconBell, IconClock, IconClose, IconCompass, IconDownload, IconFish, IconGear,
-  IconHome, IconMax, IconMin, IconRadio, IconRefresh, IconSearch, IconStar, IconTv, IconUser,
+  IconHome, IconMax, IconMin, IconRadio, IconSearch, IconStar, IconTv, IconUser,
 } from './components/Icons';
 import Home from './pages/Home';
 import Search from './pages/Search';
@@ -26,12 +26,6 @@ import { launchPlayer } from './player';
 import { CoverImage } from './components/CoverImage';
 import { WindowResizeGrip } from './components/WindowResizeGrip';
 import { clearPreloadedData } from './preload';
-import {
-  beginRightClickGesture,
-  flushCardRightClick,
-  markHoldRefreshFired,
-  markRightClickMoved,
-} from './rightClickGuard';
 
 type HotSearchItem = { keyword: string; show_name: string };
 
@@ -94,8 +88,6 @@ export default function App({ initial }: { initial?: AppInitial }) {
   const searchHotCache = useRef<HotSearchItem[]>([]);
   const [accountOpen, setAccountOpen] = useState(false);
   const [playlistOpen, setPlaylistOpen] = useState(false);
-  const [holdPoint, setHoldPoint] = useState<{ id: number; x: number; y: number } | null>(null);
-  const [dockRefresh, setDockRefresh] = useState(false);
   const appRef = useRef<HTMLDivElement>(null);
   const [playlistScroll, setPlaylistScroll] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -106,12 +98,6 @@ export default function App({ initial }: { initial?: AppInitial }) {
   const vinylRef = useRef<HTMLButtonElement>(null);
   const bottomBarRef = useRef<HTMLDivElement>(null);
   const [bottomPill, setBottomPill] = useState({ left: 0, top: 8, size: 42, ready: false });
-  const holdRef = useRef<{ start: number; x: number; y: number; raf: number; timer: any; fired: boolean } | null>(null);
-  const holdBoxRef = useRef<HTMLDivElement>(null);
-  const holdFillRef = useRef<SVGCircleElement>(null);
-  const HOLD_RING_LENGTH = 2 * Math.PI * 18;
-  const HOLD_MS = 400;
-  const holdIdRef = useRef(0);
   const { toast, show } = useToast();
 
   // Windowed mode keeps the 22px transparent rim for the paper shadow. The
@@ -253,8 +239,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
   useEffect(() => {
     const onDown = (event: MouseEvent) => {
       // While the search dock is open it owns the right button: a right press
-      // anywhere closes it immediately and must not start the hold-refresh
-      // gesture behind it.
+      // anywhere closes it immediately.
       if (event.button === 2 && searchOpen) {
         event.preventDefault();
         event.stopPropagation();
@@ -448,27 +433,12 @@ export default function App({ initial }: { initial?: AppInitial }) {
     await launchPlayer({ ...options, reportHistory: true }, newWindow);
   }, []);
 
-  const triggerRefresh = useCallback(() => {
-    // Refresh always returns to the top of the active page first, then asks
-    // every page to reload its data. The home feed consumes one pre-fetched
-    // batch on the same tick.
-    const page = document.querySelector<HTMLElement>('.page');
-    page?.scrollTo({ top: 0, behavior: 'smooth' });
-    window.dispatchEvent(new CustomEvent('o11a1:refresh'));
-  }, []);
-
   const dockGo = useCallback((key: string) => {
     setSearchOpen(false);
     setPlaylistOpen(false);
     setAccountOpen(false);
     navigate(key);
   }, [navigate]);
-
-  const dockRefreshNow = useCallback(() => {
-    setDockRefresh(true);
-    triggerRefresh();
-    window.setTimeout(() => setDockRefresh(false), 650);
-  }, [triggerRefresh]);
 
   // Ctrl+V on the shell opens a Bilibili share directly. Inputs keep their
   // normal paste behavior (search box, settings fields); a share text can use a
@@ -499,123 +469,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
   // scrolls; the glass samples the moving content every frame instead of
   // switching to an opaque surface.
 
-  // Shell gesture: hold the right mouse button for 400 ms anywhere on the
-  // page, including video cards and their hover controls, to refresh the
-  // current page. Only text-editing targets keep their native right button.
-  // Moving more than 16 px cancels. The indicator is a bare progress ring
-  // centered on the pointer; its fill is written straight to the DOM each
-  // frame, so holding never re-renders the page behind it.
-  useEffect(() => {
-    const clear = () => {
-      const current = holdRef.current;
-      if (!current) return;
-      cancelAnimationFrame(current.raf);
-      clearTimeout(current.timer);
-      holdRef.current = null;
-      setHoldPoint(null);
-    };
 
-    const start = (event: MouseEvent) => {
-      if (event.button !== 2) return;
-      // Every right press starts a fresh gesture. A previous long press must
-      // not leave the next short right click unable to open a card.
-      beginRightClickGesture();
-      // 养鱼 (大肥鱼) owns its own interaction surface; a long right press must
-      // not reload the page while inspecting frames or chatting with the agent.
-      // 设置页也禁用长按刷新：那里全是开关、滑杆和下拉，误触刷新会打断配置。
-      if (route.name === 'fish' || route.name === 'settings') return;
-      // Video cards, links and buttons all start the hold-refresh gesture:
-      // right-click has no other meaning in this shell. Text editing is the
-      // one exception, where the native right-click menu is still useful.
-      if ((event.target as HTMLElement)?.closest(
-        'input, textarea, select, [contenteditable="true"]',
-      )) return;
-      clear();
-      holdIdRef.current += 1;
-      holdBoxRef.current?.classList.remove('fired');
-      if (holdFillRef.current) {
-        holdFillRef.current.style.strokeDashoffset = String(HOLD_RING_LENGTH);
-      }
-      const current = {
-        start: performance.now(),
-        x: event.clientX,
-        y: event.clientY,
-        raf: 0,
-        timer: 0,
-        fired: false,
-      };
-      holdRef.current = current;
-      setHoldPoint({ id: holdIdRef.current, x: current.x, y: current.y });
-
-      const tick = (now: number) => {
-        const active = holdRef.current;
-        if (!active) return;
-        const progress = Math.min(1, (now - active.start) / HOLD_MS);
-        if (holdFillRef.current) {
-          holdFillRef.current.style.strokeDashoffset = String(HOLD_RING_LENGTH * (1 - progress));
-        }
-        if (progress >= 1) {
-          if (!active.fired) {
-            active.fired = true;
-            markHoldRefreshFired();
-            holdBoxRef.current?.classList.add('fired');
-            triggerRefresh();
-            active.timer = setTimeout(() => {
-              if (holdRef.current === active) clear();
-            }, 200);
-          }
-          return;
-        }
-        active.raf = requestAnimationFrame(tick);
-      };
-      current.raf = requestAnimationFrame(tick);
-    };
-
-    const move = (event: MouseEvent) => {
-      const current = holdRef.current;
-      if (!current || current.fired) return;
-      if (Math.hypot(event.clientX - current.x, event.clientY - current.y) > 16) {
-        markRightClickMoved();
-        clear();
-        return;
-      }
-      // Keep the ring wrapped around the pointer without re-rendering the
-      // page: write the position straight to the fixed element.
-      const box = holdBoxRef.current;
-      if (box) {
-        box.style.left = `${event.clientX}px`;
-        box.style.top = `${event.clientY}px`;
-      }
-    };
-    const release = (event: MouseEvent) => {
-      if (event.button !== 2) return;
-      if (holdRef.current && !holdRef.current.fired) clear();
-      // Resolve a contextmenu that Chromium delivered while the button was
-      // still down. The hold's timer has already cancelled it on a long press.
-      flushCardRightClick();
-    };
-    const leftDown = (event: MouseEvent) => {
-      if (event.button === 0) clear();
-    };
-    const noMenu = (event: MouseEvent) => event.preventDefault();
-    const blur = () => clear();
-
-    window.addEventListener('mousedown', start);
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', release);
-    window.addEventListener('mousedown', leftDown);
-    window.addEventListener('contextmenu', noMenu);
-    window.addEventListener('blur', blur);
-    return () => {
-      window.removeEventListener('mousedown', start);
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', release);
-      window.removeEventListener('mousedown', leftDown);
-      window.removeEventListener('contextmenu', noMenu);
-      window.removeEventListener('blur', blur);
-      clear();
-    };
-  }, [route.name, triggerRefresh]);
 
   const openSearchMorph = useCallback(() => {
     // Every open starts from an empty field, so hot searches are visible and
@@ -656,23 +510,26 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
   type DockItem = { key: string; label: string; icon: React.ComponentType<{ size?: number }>; hint?: string };
   const dock = useMemo(() => {
+    // Agent lives in the blue end-cap, not in the ordinary nav row.
     const items: DockItem[] = [...NAV, LIBRARY[0]].filter((item) => !(
-      (item.key === 'live' && settings?.hide_live_tab)
+      item.key === 'fish'
+      || (item.key === 'live' && settings?.hide_live_tab)
       || (item.key === 'pgc' && settings?.hide_pgc_tab)
-      || (item.key === 'fish' && settings?.hide_fish_tab)
     ));
-    // Keep the vinyl optically centred. Hidden entries always pull the next
-    // button over from the right, so the two nav groups stay contiguous; an
-    // even number of remaining entries leaves an odd slot count, which the
-    // refresh button absorbs by spanning two slots.
-    const wideRefresh = items.length % 2 === 0;
-    const slots = items.length + (wideRefresh ? 2 : 1);
+    // Keep the vinyl optically centred. The blue Agent cap replaces the old
+    // refresh button and spans one or two slots depending on how many ordinary
+    // icons actually remain after the two optional tabs are hidden.
+    const showFish = !settings?.hide_fish_tab;
+    const wideFish = showFish && items.length % 2 === 0;
+    const fishSlots = showFish ? (wideFish ? 2 : 1) : 0;
+    const slots = items.length + fishSlots;
     const leftCount = Math.floor(slots / 2);
     return {
       items,
       left: items.slice(0, leftCount),
       right: items.slice(leftCount),
-      wideRefresh,
+      wideFish,
+      showFish,
     };
   }, [settings?.hide_live_tab, settings?.hide_pgc_tab, settings?.hide_fish_tab]);
   const playlist = settings?.playlist || [];
@@ -709,7 +566,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
     const bar = bottomBarRef.current;
     if (!bar) return;
     const measure = () => {
-      const active = bar.querySelector<HTMLButtonElement>('.bottom-item.active');
+      const active = bar.querySelector<HTMLButtonElement>('.bottom-item.active:not(.fish)');
       if (!active) {
         setBottomPill((pill) => (pill.ready ? { ...pill, ready: false } : pill));
         return;
@@ -737,8 +594,8 @@ export default function App({ initial }: { initial?: AppInitial }) {
     };
   }, [route.name, dock]);
 
-  // Optical centering: several icon paths (TV antenna, fish tail, refresh
-  // arrow) do not put their ink at 12,12 inside the 24px viewBox. Shift each
+  // Optical centering: several icon paths (TV antenna, fish tail) do not put
+  // their ink at 12,12 inside the 24px viewBox. Shift each
   // SVG by the measured bbox delta so the visible strokes, not just the box,
   // sit in the exact centre of the round button.
   useLayoutEffect(() => {
@@ -780,6 +637,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
   }
 
   const activeNav = dock.items.some((item) => item.key === route.name) ? route.name : '';
+  const fishActive = dock.showFish && route.name === 'fish';
   const currentEntry = playlistCurrent != null ? playlist[playlistCurrent] : null;
   const searchTerm = searchDraft.trim();
   const searchPanelItems: Array<{ value: string; label: string; rank?: number }> = searchTerm
@@ -1124,43 +982,21 @@ export default function App({ initial }: { initial?: AppInitial }) {
                   </button>
                 );
               })}
-              <button
-                className={`bottom-item refresh ${dock.wideRefresh ? 'wide' : ''} ${dockRefresh ? 'refreshing' : ''}`}
-                data-tip="刷新"
-                aria-label="刷新"
-                onClick={dockRefreshNow}
-              >
-                <span className="bottom-icon"><IconRefresh size={18} /></span>
-              </button>
+              {dock.showFish ? (
+                <button
+                  className={`bottom-item fish ${dock.wideFish ? 'wide' : ''} ${fishActive ? 'active' : ''}`}
+                  data-tip="Agent"
+                  aria-label="Agent"
+                  onClick={() => dockGo('fish')}
+                >
+                  <span className="bottom-icon"><IconFish size={18} /></span>
+                </button>
+              ) : null}
             </nav>
           </div>
         </div>
 
         </div>
-
-        {holdPoint ? (
-          <div
-            key={holdPoint.id}
-            ref={holdBoxRef}
-            className="hold-refresh"
-            style={{ left: holdPoint.x, top: holdPoint.y }}
-            role="status"
-            aria-live="polite"
-          >
-            <svg className="hold-refresh-ring" viewBox="0 0 44 44" aria-hidden="true">
-              <circle className="hold-refresh-track" cx="22" cy="22" r="18" />
-              <circle
-                ref={holdFillRef}
-                className="hold-refresh-fill"
-                cx="22"
-                cy="22"
-                r="18"
-                strokeDasharray={HOLD_RING_LENGTH}
-                strokeDashoffset={HOLD_RING_LENGTH}
-              />
-            </svg>
-          </div>
-        ) : null}
 
         {toast ? <div className={`toast ${toast.error ? 'error' : ''}`}>{toast.text}</div> : null}
       </div>

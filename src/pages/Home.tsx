@@ -15,10 +15,17 @@ import { FEED_ROWS, feedBatchCount } from '../feedLayout';
 /// jump to a different place.
 
 const PAGE_SIZE = 30;
+/// Four grid rows per mounted block. Block sizes are rounded to whole columns,
+/// so an infinite feed never leaves a one-card orphan row at the bottom.
+const ROWS_PER_BLOCK = 4;
 /// Keep the current block, the one below it, and one block of scrollback.
 const WINDOW_BLOCKS = 3;
 const PREFETCH_PX = 900;
 const SCROLL_IDLE_MS = 140;
+
+/// `agent.html`-style remounts of Home should open a fresh stream. The first
+/// entry in a session still consumes the fast startup batch.
+let homeVisited = false;
 
 type FeedBlock = { id: number; items: FeedVideo[] };
 type FeedPage = { items: FeedVideo[]; next: number; has_more: boolean };
@@ -39,16 +46,29 @@ function dedupe(items: FeedVideo[], seen: Set<string>): FeedVideo[] {
   return out;
 }
 
-function splitIntoBlocks(items: FeedVideo[], firstId: number): { blocks: FeedBlock[]; nextId: number } {
+/// Split loaded cards into blocks of complete grid rows. The leftover shorter
+/// than one row stays in `pending` until another page can fill it, so a block
+/// boundary can never paint an incomplete row.
+function splitFullRows(
+  items: FeedVideo[],
+  columns: number,
+  firstId: number,
+): { blocks: FeedBlock[]; pending: FeedVideo[]; nextId: number } {
+  const width = Math.max(1, columns);
   const blocks: FeedBlock[] = [];
   let id = firstId;
-  for (let index = 0; index < items.length; index += PAGE_SIZE) {
-    const slice = items.slice(index, index + PAGE_SIZE);
-    if (!slice.length) continue;
-    blocks.push({ id, items: slice });
+  let index = 0;
+  const maxItems = width * ROWS_PER_BLOCK;
+  while (items.length - index >= width) {
+    const remaining = items.length - index;
+    const take = Math.min(maxItems, Math.floor(remaining / width) * width);
+    const rows = Math.floor(take / width);
+    if (rows < 1) break;
+    blocks.push({ id, items: items.slice(index, index + rows * width) });
     id += 1;
+    index += rows * width;
   }
-  return { blocks, nextId: id };
+  return { blocks, pending: items.slice(index), nextId: id };
 }
 
 function rememberCover(pic: string): void {
@@ -93,30 +113,37 @@ function focusCard(feed: HTMLElement, scroll: HTMLElement): HTMLElement | null {
 
 export default function Home() {
   const { launch, toast } = useApp();
-  const [preloaded] = useState(() => takePreloadedFeed());
+  const firstVisitRef = useRef<boolean | null>(null);
+  if (firstVisitRef.current === null) {
+    firstVisitRef.current = !homeVisited;
+    homeVisited = true;
+  }
+  const firstVisit = firstVisitRef.current;
   const [initial] = useState(() => {
     const seen = new Set<string>();
-    const clean = dedupe(preloaded ?? [], seen);
-    const split = splitIntoBlocks(clean, 0);
+    const clean = dedupe(firstVisit ? takePreloadedFeed() ?? [] : [], seen);
     return {
-      blocks: split.blocks,
-      nextId: split.nextId,
+      clean,
       cursor: clean.length ? Math.ceil(clean.length / PAGE_SIZE) + 1 : 1,
       seen,
     };
   });
-  const [blocks, setBlocks] = useState<FeedBlock[]>(initial.blocks);
-  const [loading, setLoading] = useState(() => initial.blocks.length === 0);
+  const [blocks, setBlocks] = useState<FeedBlock[]>(() => (
+    initial.clean.length ? [{ id: 0, items: initial.clean }] : []
+  ));
+  const [loading, setLoading] = useState(() => initial.clean.length === 0);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState('');
   const [moreError, setMoreError] = useState('');
   const feedRef = useRef<HTMLDivElement>(null);
 
-  const blocksRef = useRef<FeedBlock[]>(initial.blocks);
+  const blocksRef = useRef<FeedBlock[]>(blocks);
+  const pendingRef = useRef<FeedVideo[]>([]);
+  const columnsRef = useRef(0);
   const seen = useRef(initial.seen);
   const cursor = useRef(initial.cursor);
-  const nextBlockId = useRef(initial.nextId);
+  const nextBlockId = useRef(blocks.length ? 1 : 0);
   const hasMoreRef = useRef(true);
   const loadingRef = useRef(false);
   const generation = useRef(0);
@@ -127,6 +154,35 @@ export default function Home() {
 
   const applyCover = useCallback((items: FeedVideo[]) => {
     if (items[0]?.pic) rememberCover(items[0].pic);
+  }, []);
+
+  /// Move complete rows out of the pending queue and into mounted blocks.
+  /// A remainder shorter than one column stays pending; it is either filled
+  /// by the next page or dropped at the true end of the stream.
+  const fillBlocks = useCallback(() => {
+    const columns = Math.max(1, columnsRef.current || 4);
+    let created = 0;
+    while (pendingRef.current.length >= columns) {
+      const rows = Math.min(ROWS_PER_BLOCK, Math.floor(pendingRef.current.length / columns));
+      if (rows < 1) break;
+      const items = pendingRef.current.splice(0, rows * columns);
+      setBlocks((previous) => [...previous, { id: nextBlockId.current++, items }]);
+      prewarmFeedPreviews(items);
+      created += 1;
+      if (created >= 3) break;
+    }
+    return created;
+  }, []);
+
+  /// Re-split mounted cards after a column change so every block still ends
+  /// on a complete grid row.
+  const reflowBlocks = useCallback((columns: number) => {
+    const all = [...blocksRef.current.flatMap((block) => block.items), ...pendingRef.current];
+    const split = splitFullRows(all, columns, nextBlockId.current);
+    nextBlockId.current = split.nextId;
+    pendingRef.current = split.pending;
+    blocksRef.current = split.blocks;
+    setBlocks(split.blocks);
   }, []);
 
   const loadPage = useCallback(async (first = false) => {
@@ -157,15 +213,19 @@ export default function Home() {
           setHasMore(false);
         }
         if (clean.length) {
-          const block = { id: nextBlockId.current, items: clean };
-          nextBlockId.current += 1;
-          setBlocks((previous) => [...previous, block]);
+          pendingRef.current.push(...clean);
           if (first) applyCover(clean);
-          prewarmFeedPreviews(clean);
-          appended = true;
+          if (fillBlocks() > 0) {
+            appended = true;
+            break;
+          }
+        }
+        if (page?.has_more === false) {
+          // Keep any complete final rows; a shorter-than-one-row remainder is
+          // intentionally hidden so the feed never ends on a ragged row.
+          if (fillBlocks() > 0) appended = true;
           break;
         }
-        if (page?.has_more === false) break;
       }
       if (!appended && first) setError('推荐流为空，请稍后重试');
       if (!appended && !first) setMoreError('暂时没有更多新内容');
@@ -241,10 +301,11 @@ export default function Home() {
     loadingRef.current = false;
     const nextSeen = new Set<string>();
     const clean = dedupe(batch, nextSeen);
-    const split = splitIntoBlocks(clean, 0);
+    const split = splitFullRows(clean, Math.max(1, columnsRef.current || 4), 0);
     seen.current = nextSeen;
     cursor.current = clean.length ? Math.ceil(clean.length / PAGE_SIZE) + 1 : 1;
     nextBlockId.current = split.nextId;
+    pendingRef.current = split.pending;
     hasMoreRef.current = true;
     setHasMore(true);
     setBlocks(split.blocks);
@@ -281,9 +342,14 @@ export default function Home() {
       });
   }, [resetStream]);
 
+  const startedRef = useRef(false);
   useEffect(() => {
-    if (!blocks.length && !loadingRef.current) void loadPage(true);
-  }, [blocks.length, loadPage]);
+    if (startedRef.current) return;
+    startedRef.current = true;
+    if (blocksRef.current.length) return;
+    if (firstVisit) void loadPage(true);
+    else void refresh();
+  }, [firstVisit, loadPage, refresh]);
 
   // Keep enough blocks mounted to cover the viewport and one screen below it.
   useEffect(() => {
@@ -298,6 +364,26 @@ export default function Home() {
       void loadPage(false);
     }
   }, [blocks, loadPage]);
+
+  useLayoutEffect(() => {
+    const feed = feedRef.current;
+    const grid = feed?.querySelector<HTMLElement>('.video-grid');
+    if (!grid) return;
+    blocksRef.current = blocks;
+    const measure = () => {
+      const tracks = getComputedStyle(grid).gridTemplateColumns;
+      const count = tracks && tracks !== 'none'
+        ? tracks.split(/\s+/).filter(Boolean).length
+        : 0;
+      if (!count || count === columnsRef.current) return;
+      columnsRef.current = count;
+      reflowBlocks(count);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(grid);
+    return () => observer.disconnect();
+  }, [blocks.length, reflowBlocks]);
 
   useLayoutEffect(() => {
     blocksRef.current = blocks;
