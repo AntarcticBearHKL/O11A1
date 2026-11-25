@@ -305,6 +305,38 @@ pub struct Session {
     wbi: Mutex<Option<WbiKeys>>,
 }
 
+struct SharedSession {
+    mid: i64,
+    session: Arc<Session>,
+}
+
+static SHARED_SESSION: OnceLock<Mutex<Option<SharedSession>>> = OnceLock::new();
+
+fn shared_slot() -> &'static Mutex<Option<SharedSession>> {
+    SHARED_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the sidecar's login session to in-process users such as the native
+/// player. Re-creating a `Session` for every open repeated the cookie and
+/// fingerprint network round-trips on the first-frame critical path.
+pub fn set_shared_session(mid: i64, session: Arc<Session>) {
+    if let Ok(mut slot) = shared_slot().lock() {
+        *slot = Some(SharedSession { mid, session });
+    }
+}
+
+/// The published session for `mid` (`0` = logged out), if one exists.
+pub fn shared_session(mid: i64) -> Option<Arc<Session>> {
+    shared_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref()
+                .filter(|shared| shared.mid == mid)
+                .map(|shared| shared.session.clone())
+        })
+}
+
 #[derive(Clone)]
 struct WbiKeys {
     img_key: String,

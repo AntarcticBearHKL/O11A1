@@ -47,6 +47,13 @@ pub fn unload_player_fonts() {
     overlay::unload_player_fonts();
 }
 
+/// Probe the NVDEC decoders before the first video is opened. The first
+/// `source::resolve` otherwise runs up to four short ffmpeg jobs on its
+/// critical path just to learn which codecs this GPU accepts.
+pub fn prewarm_hwdecode() {
+    hwdecode::prewarm([7, 12, 13, 14]);
+}
+
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -152,7 +159,7 @@ pub(crate) fn resolve_deferred(
     let duration_ms = resolved.source.duration_ms;
     let bvid = resolved.source.bvid.clone();
     let cid = resolved.source.cid;
-    let session = resolved.session.map(Arc::new);
+    let session = resolved.session;
 
     if let (Some(session), Some(cid)) = (session.clone(), cid) {
         let sender = danmaku_tx.clone();

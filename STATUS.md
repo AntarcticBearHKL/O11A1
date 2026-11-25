@@ -3,7 +3,7 @@
 更新：2026-11-21
 
 > 安装状态：旧 `bilibili-slint` 原生版已卸载，旧播放缓存与开始菜单快捷方式一并移除；源代码保留。
-> 桌面 `O11A1.lnk` 指向 Electron 版 `release-0.9.44\win-unpacked\O11A1.exe`。
+> 桌面 `O11A1.lnk` 指向 Electron 版 `release-0.9.45\win-unpacked\O11A1.exe`。
 
 ## 已实现
 
@@ -91,6 +91,13 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.45 视频加载加速、加载阶段保持响应**：
+  - 解析视频时直接复用 sidecar 已建立的登录会话，不再每次重建 cookie/指纹（本机实测约省 1.3 秒）。
+  - 播放历史续播查询与 `playurl` 并行，远程历史最多等 800 ms，不再串行阻塞首帧。
+  - NVDEC 编码支持在 sidecar 启动后后台预热，首次打开不再现场跑 3 个 ffmpeg 探测（约省 0.6 秒）。
+  - 解码器打开、媒体缓存探测、音频会话全部移到后台线程；加载转圈持续动画，窗口在整个加载阶段都能拖动。
+  - 音频与视频并行打开，首帧到达时音轨通常已就绪，减少起播前的额外等待。
+  - `probesize` / `analyzeduration` 从 1 MB 降到 500 KB，B 站 DASH 首帧所需索引更早返回。
 - **0.9.44 粘贴分享加速**：
   - b23.tv / bili2233.cn 短链改为 HEAD + `redirect: manual`，只读 302 的 Location，不再把整个 B 站视频页下载完才返回。
   - 短链解析结果缓存 10 分钟；同一链接再次粘贴直接命中缓存。
@@ -307,8 +314,8 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.44.exe`（218,688,683 字节，SHA-256 `9d8ed6db10874518eba3f5a305b20f3d705fd5e762b9005497fb90cdaae75666`；含 FFmpeg 与 Chill Round Gothic 三个字重）。
-- `release-0.9.44/win-unpacked/O11A1.exe`：本次免安装版；桌面快捷方式已指向这里。
+- 产物：`release/O11A1 Setup 0.9.45.exe`（218,740,998 字节，SHA-256 `9e1376fee9285cfc8c183ac16162a9ed76640b97bd1a58bf41bed8a5f6ede0e0`；含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- `release-0.9.45/win-unpacked/O11A1.exe`：本次免安装版；桌面快捷方式已指向这里。
 - 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载；养鱼页只有「下一步」与逐轮思考/工具记录。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
 - **0.7.3 A/V 同步**：音频设备时钟成为唯一参考；画面持续落后时改为跳帧追赶，不再出现“视频慢放、声音正常”。详见上方 A/V 同步条目。

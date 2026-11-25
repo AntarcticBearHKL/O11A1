@@ -2,6 +2,7 @@
 //! plus the size, duration, frame rate and CDN headers the decoder needs.
 
 use std::process::Stdio;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -210,7 +211,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// same login/cookies instead of re-authenticating.
 pub struct ResolvedSource {
     pub source: MediaSource,
-    pub session: Option<o11a1::bilibili::Session>,
+    pub session: Option<std::sync::Arc<o11a1::bilibili::Session>>,
 }
 
 /// `BILI_PLAYER_URL` wins over everything (direct URL or local path). Otherwise
@@ -344,21 +345,61 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
     let bvid_owned = bvid.to_string();
     let account = o11a1::accounts::load();
     let logged_in = account.is_some();
-    let resolved: Result<(MediaSource, Option<o11a1::bilibili::Session>)> = runtime.block_on(async move {
+    let account_mid = account.as_ref().map(|account| account.mid).unwrap_or(0);
+    let resolve_started = Instant::now();
+    let resolved: Result<(MediaSource, Option<std::sync::Arc<o11a1::bilibili::Session>>)> = runtime.block_on(async move {
+        use std::sync::Arc;
         use o11a1::bilibili::Session;
-        let session = match &account {
-            Some(account) => Session::from_token(&o11a1::accounts::to_token(account)).await?,
-            None => Session::new().await?,
+        let session_started = Instant::now();
+        // The sidecar already built the login session for its own API calls.
+        // Reuse it instead of repeating cookie/fingerprint round-trips here.
+        let session = match o11a1::bilibili::shared_session(account_mid) {
+            Some(session) => session,
+            None => {
+                let built = match &account {
+                    Some(account) => Session::from_token(&o11a1::accounts::to_token(account)).await?,
+                    None => Session::new().await?,
+                };
+                let built = Arc::new(built);
+                o11a1::bilibili::set_shared_session(account_mid, built.clone());
+                built
+            }
         };
+        let session_ms = session_started.elapsed().as_millis();
+        let view_started = Instant::now();
         let detail = session
             .video_view(&bvid_owned)
             .await
             .with_context(|| format!("video_view {bvid_owned}"))?;
+        let view_ms = view_started.elapsed().as_millis();
         let cid = config.cid.unwrap_or(detail.cid as u64);
-        let info = session
-            .playurl(&bvid_owned, cid)
-            .await
-            .with_context(|| format!("playurl {bvid_owned} cid={cid}"))?;
+        // The resume lookup only needs `cid`; run it beside `playurl` instead
+        // of adding a third round-trip after it. A fresh video has no history
+        // row, so waiting the full timeout on the critical path was pure
+        // startup latency.
+        let history_duration_ms = detail.duration.saturating_mul(1000);
+        let resume_fut = async {
+            if config.start_ms == 0 && !config.is_live {
+                resume_position(
+                    &session,
+                    &bvid_owned,
+                    cid,
+                    history_duration_ms,
+                    logged_in,
+                )
+                .await
+            } else {
+                None
+            }
+        };
+        let play_started = Instant::now();
+        let (play_result, remote_resume_ms) =
+            tokio::join!(session.playurl(&bvid_owned, cid), resume_fut);
+        let play_ms = play_started.elapsed().as_millis();
+        let info = play_result.with_context(|| format!("playurl {bvid_owned} cid={cid}"))?;
+        log::line(&format!(
+            "source timing bvid={bvid_owned} session_ms={session_ms} video_view_ms={view_ms} playurl_resume_ms={play_ms} history_resume_ms={remote_resume_ms:?}"
+        ));
         // GPU-only: keep exactly the representations NVDEC accepted in this
         // process. The quality menu and the selection both read this list, so
         // an unsupported stream can neither be shown nor switched to.
@@ -449,11 +490,10 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
         if !(fps.is_finite() && fps > 1.0) {
             fps = 30.0;
         }
-        let resume_ms = if config.start_ms == 0 && !config.is_live {
-            resume_position(&session, &bvid_owned, cid, duration_ms, logged_in).await
-        } else {
-            None
-        };
+        // The duration is only final after `playurl`; re-check the hint with
+        // the real duration so a finished video is not resumed into its end.
+        let resume_ms =
+            remote_resume_ms.and_then(|position| crate::watch::usable_resume(position, duration_ms));
         let cap = decode_cap_for();
         let (width, height) = fit_capped(source_width, source_height, cap.0, cap.1);
         let video_tracks = video_track_infos(&tracks);
@@ -519,6 +559,10 @@ fn resolve_bilibili(bvid: &str, config: &PlayerConfig) -> Result<ResolvedSource>
         ))
     });
     let (source, session) = resolved?;
+    log::line(&format!(
+        "source resolve total bvid={bvid} elapsed_ms={}",
+        resolve_started.elapsed().as_millis()
+    ));
     Ok(ResolvedSource { source, session })
 }
 
@@ -541,11 +585,11 @@ async fn resume_position(
     if !logged_in {
         return None;
     }
-    // The history cursor is a small GET, but the window is already showing its
-    // loading card: a stalled request must not hold the first frame for more
-    // than a couple of seconds. No entry means start at zero, as before.
+    // The history cursor runs beside `playurl`, so a normal answer is free.
+    // If it is slower than this, start at zero instead of holding the first
+    // frame; the player can still resume from its own local progress file.
     let history = match tokio::time::timeout(
-        std::time::Duration::from_millis(2_000),
+        std::time::Duration::from_millis(800),
         session.history(0, 0, ""),
     )
     .await

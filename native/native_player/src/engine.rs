@@ -349,6 +349,55 @@ fn wheel_volume_step(accum: &mut f32, direction: &mut f32, delta: i32) -> i32 {
     step
 }
 
+/// Everything needed to open the audio side of a source without borrowing the
+/// engine from the session worker.
+struct AudioOpen {
+    url: String,
+    headers: Vec<(String, String)>,
+    remote: bool,
+    start_ms: u64,
+    speed: f64,
+    volume: u8,
+    muted: bool,
+    cache_key: Option<String>,
+}
+
+/// A decoder/audio pair built off the window thread. The loading card keeps
+/// animating and the window stays draggable while the media cache probes the
+/// CDN, FFmpeg opens the hardware decoder and the first picture is decoded.
+struct OpenedSessions {
+    generation: u64,
+    /// Original media URL used to reject a result that belongs to the source
+    /// this window has already replaced.
+    source_url: String,
+    decoder: VideoDecoder,
+    audio: AudioEngine,
+}
+
+struct SessionOpenFailure {
+    generation: u64,
+    source_url: String,
+    error: String,
+}
+
+/// A video-only stream (no DASH audio) still gets a session so commands stay
+/// uniform; ffmpeg ends immediately and the clock simply never becomes ready.
+/// It starts paused until the picture's first frame is ready; the seek/start
+/// state machine then resumes both together.
+fn spawn_audio_session(open: AudioOpen) -> AudioEngine {
+    let audio = AudioEngine::spawn(
+        open.url,
+        open.headers,
+        open.remote,
+        open.start_ms,
+        open.speed,
+        if open.muted { 0 } else { open.volume },
+        open.cache_key,
+    );
+    audio.send(AudioCommand::Pause);
+    audio
+}
+
 struct Engine {
     source: MediaSource,
     /// The open request, kept so a failed initial resolve can be retried.
@@ -368,6 +417,10 @@ struct Engine {
     failed_replace: Option<PlayerConfig>,
     source_rx: Receiver<std::result::Result<crate::DeferredOpen, String>>,
     source_tx: Sender<std::result::Result<crate::DeferredOpen, String>>,
+    /// Decoder/audio pair opening in the background. Keeping this off the
+    /// window thread is what lets the loading ring animate and the window drag
+    /// while FFmpeg probes the stream and starts the hardware decoder.
+    sessions_rx: Option<Receiver<std::result::Result<OpenedSessions, SessionOpenFailure>>>,
     requested_start_ms: u64,
     session: Option<Arc<o11a1::bilibili::Session>>,
     shared: Arc<SharedState>,
@@ -1182,6 +1235,7 @@ impl Engine {
             failed_replace: None,
             source_rx,
             source_tx,
+            sessions_rx: None,
             requested_start_ms,
             session,
             shared,
@@ -1543,31 +1597,29 @@ impl Engine {
         }
     }
 
-    fn spawn_audio_at(&mut self, start_ms: u64) {
-        let audio_url = self
-            .source
-            .audio_url
-            .clone()
-            .unwrap_or_else(|| self.source.video_url.clone());
-        // A video-only stream (no DASH audio) still gets a session so commands
-        // stay uniform; ffmpeg ends immediately and the clock simply never
-        // becomes ready.
-        let audio = AudioEngine::spawn(
-            audio_url,
-            self.source.headers.clone(),
-            self.source.remote,
+    fn audio_open(&self, start_ms: u64) -> AudioOpen {
+        AudioOpen {
+            url: self
+                .source
+                .audio_url
+                .clone()
+                .unwrap_or_else(|| self.source.video_url.clone()),
+            headers: self.source.headers.clone(),
+            remote: self.source.remote,
             start_ms,
-            self.speed as f64,
-            if self.muted { 0 } else { self.volume },
-            if self.is_live || self.source.audio_url.is_none() {
+            speed: self.speed as f64,
+            volume: self.volume,
+            muted: self.muted,
+            cache_key: if self.is_live || self.source.audio_url.is_none() {
                 None
             } else {
                 crate::source::media_cache_key(&self.source, true)
             },
-        );
-        // Starts paused until the picture's first frame is ready; the
-        // seek/start state machine resumes both together.
-        audio.send(AudioCommand::Pause);
+        }
+    }
+
+    fn spawn_audio_at(&mut self, start_ms: u64) {
+        let audio = spawn_audio_session(self.audio_open(start_ms));
         self.audio = Some(audio);
     }
 
@@ -1832,49 +1884,161 @@ impl Engine {
     fn open_sessions(&mut self, start_ms: u64, gate_open: bool) -> Result<()> {
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        // Pin both representations before the decoder/audio spawn starts its
-        // cache preparation, so the TTL janitor cannot delete a cache between
-        // prepare and the first read.
+        // Pin both representations before the worker starts cache preparation,
+        // so the TTL janitor cannot delete a cache between prepare and the
+        // first read.
         self.current_video_pin = crate::mediacache::pin_source(&self.source, false);
         self.current_audio_pin = crate::mediacache::pin_source(&self.source, true);
-        let decoder = match VideoDecoder::spawn(
-            &self.video_spec(),
-            start_ms,
-            generation,
-            gate_open,
-            &self.gpu,
-        )
-        .with_context(|| format!("open video decoder at {start_ms} ms"))
-        {
-            Ok(decoder) => decoder,
-            Err(error) => {
-                self.current_video_pin = None;
-                self.current_audio_pin = None;
-                return Err(error);
-            }
-        };
-        self.decoder = Some(decoder);
-
-        // Above 2× the sound is unintelligible and its reader becomes the
-        // bottleneck: at 10× the audio clock only reached ~4.7× and dragged
-        // the picture with it. Run these speeds video-only and let the wall
-        // clock drive the timeline.
+        let source_url = self.source.video_url.clone();
+        let spec = self.video_spec();
+        let audio_open = self.audio_open(start_ms);
+        let gpu = self.gpu.clone();
+        // Stop the old pair here, but never join it on the window thread: a
+        // reader blocked in a network read must not stall the drag loop.
+        if let Some(mut decoder) = self.decoder.take() {
+            let _ = std::thread::Builder::new()
+                .name("player-stop-video".into())
+                .spawn(move || decoder.stop());
+        }
         if let Some(mut audio) = self.audio.take() {
             let _ = std::thread::Builder::new()
                 .name("player-stop-audio".into())
                 .spawn(move || audio.stop());
         }
-        // The audio chain supports the whole 0.1×–10× range (atempo stages),
-        // and the wall-clock/atempo clock stays correct at every stop. Always
-        // open sound, so 3×/5×/10× fast-forward is not silent.
-        self.spawn_audio_at(start_ms);
+        let (tx, rx) = mpsc::channel();
+        self.sessions_rx = Some(rx);
         self.session_started = Instant::now();
         self.shared.position_ms.store(start_ms, Ordering::SeqCst);
         self.position_ms = start_ms;
+        log::line(&format!(
+            "sessions open start gen={generation} start_ms={start_ms} gate={}",
+            u8::from(gate_open)
+        ));
+        let spawned = std::thread::Builder::new()
+            .name("player-open-sessions".into())
+            .spawn(move || {
+                let started = Instant::now();
+                // Audio has its own cache probe and ffmpeg startup. Run it
+                // beside the video decoder open instead of adding it after.
+                let (audio_tx, audio_rx) = mpsc::channel();
+                let audio_thread = std::thread::Builder::new()
+                    .name("player-open-audio".into())
+                    .spawn(move || {
+                        let audio = spawn_audio_session(audio_open);
+                        let _ = audio_tx.send(audio);
+                    });
+                if let Err(error) = audio_thread {
+                    log::line(&format!("audio open thread failed: {error}"));
+                }
+                let decoder =
+                    VideoDecoder::spawn(&spec, start_ms, generation, gate_open, &gpu);
+                let audio = audio_rx.recv_timeout(Duration::from_secs(20)).ok();
+                let result = match (decoder, audio) {
+                    (Ok(decoder), Some(audio)) => {
+                        log::line(&format!(
+                            "sessions open ready gen={generation} elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        ));
+                        Ok(OpenedSessions {
+                            generation,
+                            source_url,
+                            decoder,
+                            audio,
+                        })
+                    }
+                    (Err(error), _) => Err(SessionOpenFailure {
+                        generation,
+                        source_url,
+                        error: format!("{error:#}"),
+                    }),
+                    (Ok(_), None) => Err(SessionOpenFailure {
+                        generation,
+                        source_url,
+                        error: "音频会话线程没有返回会话".to_string(),
+                    }),
+                };
+                if tx.send(result).is_err() {
+                    log::line(&format!(
+                        "sessions open dropped gen={generation} (window moved on)"
+                    ));
+                }
+            });
+        if let Err(error) = spawned {
+            self.sessions_rx = None;
+            self.current_video_pin = None;
+            self.current_audio_pin = None;
+            return Err(error).with_context(|| format!("spawn session worker at {start_ms} ms"));
+        }
         Ok(())
     }
 
+    /// Install a decoder/audio pair that finished opening on its worker. The
+    /// caller's playback state (`starting` / `seek_in_flight` / target) was set
+    /// when the open was requested, so this only swaps the handles in.
+    fn poll_pending_sessions(&mut self) {
+        let Some(rx) = self.sessions_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(open)) => {
+                if open.generation != self.generation || open.source_url != self.source.video_url {
+                    log::line(&format!(
+                        "sessions open discarded gen={} current={} source_matches={}",
+                        open.generation,
+                        self.generation,
+                        u8::from(open.source_url == self.source.video_url)
+                    ));
+                    // Dropping the decoder joins its reader and the audio pump
+                    // joins ffmpeg; a stale result must not do that on the
+                    // window thread during a seek or source switch.
+                    let _ = std::thread::Builder::new()
+                        .name("player-drop-sessions".into())
+                        .spawn(move || drop(open));
+                    return;
+                }
+                self.decoder = Some(open.decoder);
+                self.audio = Some(open.audio);
+                self.session_started = Instant::now();
+                self.ui_dirty = true;
+                log::line(&format!(
+                    "sessions installed gen={} position_ms={}",
+                    open.generation, self.position_ms
+                ));
+            }
+            Ok(Err(failure)) => {
+                if failure.generation != self.generation
+                    || failure.source_url != self.source.video_url
+                {
+                    log::line(&format!(
+                        "sessions open failure discarded gen={} error={}",
+                        failure.generation, failure.error
+                    ));
+                    return;
+                }
+                log::line(&format!(
+                    "sessions open failed gen={} error={}",
+                    failure.generation, failure.error
+                ));
+                self.loading = false;
+                self.page_loading = None;
+                self.report_error(format!("打开播放会话失败：{}", failure.error));
+            }
+            Err(TryRecvError::Empty) => {
+                self.sessions_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.loading = false;
+                self.page_loading = None;
+                self.report_error("打开播放会话失败：后台线程已退出");
+            }
+        }
+    }
+
     fn stop_sessions(&mut self) {
+        // A pending open belongs to the pair being torn down. Dropping its
+        // receiver makes the worker discard the decoder/audio when it finishes
+        // instead of installing them into the new source.
+        self.sessions_rx = None;
         // Closing/switching/quality change releases the current cache pins;
         // the janitor will remove them after the 15-minute TTL if nobody else
         // holds them.
@@ -4796,6 +4960,7 @@ impl Engine {
                     }
                 }
             }
+            self.poll_pending_sessions();
             loop {
                 match self.danmaku_rx.try_recv() {
                     Ok(items) => self.install_danmaku(items),
@@ -6831,7 +6996,10 @@ impl Engine {
         // the window must still be movable. Arm the drag before any overlay
         // branch can swallow the press; the toolbar and close button keep
         // their own hit targets.
-        if self.loading
+        // The splash stays up after the source is attached but before the first
+        // picture arrives (`loading` is already false then). Arm the drag for
+        // that whole window, not just the network-resolve phase.
+        if (self.loading || !self.had_first_frame)
             && !self.fullscreen
             && !self.external
             && !layout.panel.contains(px, py)
@@ -7587,7 +7755,7 @@ impl Engine {
                         let _ = tx.send(Ok(source));
                         if let Some(session) = resolved.session {
                             let items = crate::danmaku::fetch_with_session(
-                                std::sync::Arc::new(session),
+                                session,
                                 cid,
                                 duration_ms,
                             );
@@ -9476,6 +9644,7 @@ impl Engine {
             || self.settings_menu.is_some()
             || self.loading
             || self.starting
+            || !self.had_first_frame
             || self.stalled
             || self.error.is_some()
             || self.page_loading.is_some()

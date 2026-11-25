@@ -329,6 +329,14 @@ async fn main() -> Result<()> {
     // shell's taskbar group before the first window exists so one O11A1 button
     // holds both the main window and the player previews.
     native_player::join_shell_taskbar_group();
+    // The codec-support probes are process-wide and final. Run them beside
+    // startup so the first player open does not pay them on its loading card.
+    let _ = std::thread::Builder::new()
+        .name("hwdecode-prewarm".into())
+        .spawn(|| {
+            std::thread::sleep(Duration::from_millis(1_500));
+            native_player::prewarm_hwdecode();
+        });
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind control port")?;
@@ -339,6 +347,7 @@ async fn main() -> Result<()> {
 
     let saved = accounts::load();
     let boot_token = saved.as_ref().map(accounts::to_token);
+    let boot_mid = saved.as_ref().map(|account| account.mid).unwrap_or(0);
     let settings = settings::load();
     let (events, _) = broadcast::channel(256);
     let app = Arc::new(App {
@@ -368,7 +377,9 @@ async fn main() -> Result<()> {
             };
             match session {
                 Ok(session) => {
-                    *app.session.lock().await = Some(Arc::new(session));
+                    let session = Arc::new(session);
+                    *app.session.lock().await = Some(session.clone());
+                    o11a1::bilibili::set_shared_session(boot_mid, session);
                 }
                 Err(error) => {
                     *app.session_error.lock().await = Some(error);
@@ -660,14 +671,18 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             *app.session.lock().await = None;
             let app = app.clone();
             tokio::spawn(async move {
-                let token = accounts::load().as_ref().map(accounts::to_token);
+                let account = accounts::load();
+                let mid = account.as_ref().map(|account| account.mid).unwrap_or(0);
+                let token = account.as_ref().map(accounts::to_token);
                 let session = match token {
                     Some(token) => Session::from_token(&token).await.map_err(e),
                     None => Session::new().await.map_err(e),
                 };
                 match session {
                     Ok(session) => {
-                        *app.session.lock().await = Some(Arc::new(session));
+                        let session = Arc::new(session);
+                        *app.session.lock().await = Some(session.clone());
+                        o11a1::bilibili::set_shared_session(mid, session);
                         app.session_note.notify_waiters();
                     }
                     Err(error) => {
@@ -724,8 +739,9 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                 // tier table fetched before login shadow them.
                 o11a1::bilibili::clear_quality_tiers();
                 let token = accounts::to_token(&account);
-                let new_session = Session::from_token(&token).await.map_err(e)?;
-                *app.session.lock().await = Some(Arc::new(new_session));
+                let new_session = Arc::new(Session::from_token(&token).await.map_err(e)?);
+                *app.session.lock().await = Some(new_session.clone());
+                o11a1::bilibili::set_shared_session(account.mid, new_session);
                 *app.account.lock().await = Some(account.clone());
                 app.session_note.notify_waiters();
                 let public = public_account(account);
@@ -740,8 +756,9 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             accounts::clear();
             o11a1::bilibili::clear_quality_tiers();
             *app.account.lock().await = None;
-            let anonymous = Session::new().await.map_err(e)?;
-            *app.session.lock().await = Some(Arc::new(anonymous));
+            let anonymous = Arc::new(Session::new().await.map_err(e)?);
+            *app.session.lock().await = Some(anonymous.clone());
+            o11a1::bilibili::set_shared_session(0, anonymous);
             app.emit("account.changed", Value::Null);
             Ok(json!(null))
         }

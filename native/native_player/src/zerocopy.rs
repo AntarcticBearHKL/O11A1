@@ -290,8 +290,10 @@ impl NativeDecoder {
             set("reconnect_streamed", "1");
             set("reconnect_delay_max", "5");
             set("rw_timeout", "15000000");
-            set("probesize", "1000000");
-            set("analyzeduration", "1000000");
+            // Bilibili's DASH MP4 has its index at the start; a 1 MB probe
+            // mostly waited for cache chunks the first picture did not need.
+            set("probesize", "500000");
+            set("analyzeduration", "500000");
             // The cache is filled while playback runs. A range that arrives
             // while its neighbours are still on the wire can leave one bad
             // packet at the seam; the external ffmpeg path already uses this
@@ -900,16 +902,20 @@ impl ZeroCopySession {
         stop: Arc<AtomicBool>,
         gpu: &Gpu,
     ) -> Result<Self> {
+        let open_started = Instant::now();
         let mut decoder = NativeDecoder::open(url, headers, remote, live, start_ms, fps, &stop, gpu)
             .with_context(|| format!("open zero-copy decoder for {url}"))?;
+        let open_ms = open_started.elapsed().as_millis();
 
+        let decode_started = Instant::now();
         let device = gpu.device.clone();
         let (first, first_ts) = decode_one(&mut decoder, &stop, &device)
             .with_context(|| format!("decode first zero-copy frame at {start_ms} ms"))?
             .ok_or_else(|| anyhow!("zero-copy decoder reached EOF before its first picture"))?;
+        let first_ms = decode_started.elapsed().as_millis();
 
         log::line(&format!(
-            "zerocopy decoder gen={generation} start_ms={start_ms} size={}x{} source={}x{} p010={} live={}",
+            "zerocopy decoder gen={generation} start_ms={start_ms} size={}x{} source={}x{} p010={} live={} open_ms={open_ms} first_frame_ms={first_ms}",
             first.width,
             first.height,
             width,

@@ -44,6 +44,7 @@ use crate::interp::{self, Signature, SIG_COLS, SIG_LEN, SIG_ROWS};
 use crate::log;
 use crate::zerocopy::HWFrame;
 
+#[derive(Clone)]
 pub struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
