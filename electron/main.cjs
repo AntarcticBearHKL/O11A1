@@ -220,17 +220,6 @@ function entryByPlayerId(playerId) {
   return entry && entry.window && !entry.window.isDestroyed() ? entry : null;
 }
 
-/// Closing a video returns to the shell. The main window may have been
-/// minimized or hidden to the tray while watching; leaving it that way makes
-/// the app look like it vanished with the player. Bring it back after the
-/// player window is gone (but never during a real app quit).
-function restoreMainWindow() {
-  if (quitting || !mainWindow || mainWindow.isDestroyed()) return;
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
-}
-
 function entryForWindow(win) {
   if (!win) return null;
   return playerEntries().find((entry) => entry.window === win) || null;
@@ -481,7 +470,6 @@ async function advanceNativePlaylist(record, loopMode) {
     await engineCall('player.close', { playerId: record.playerId }).catch(() => {});
     nativePlayers.delete(record.playerId);
     if (quitting || !next || !next.bvid) {
-      restoreMainWindow();
       return;
     }
     await launchNativePlayer({
@@ -515,7 +503,6 @@ function handleEngineEvent(message) {
       }
       if (data.open === false) {
         nativePlayers.delete(native.playerId);
-        restoreMainWindow();
       } else if (data.ended) {
         if (!native.endedHandled) {
           native.endedHandled = true;
@@ -550,7 +537,6 @@ function handleEngineEvent(message) {
     } else if (data.id) {
       nativePlayers.delete(String(data.id));
     }
-    restoreMainWindow();
   } else if (message.event === 'account.changed') {
     broadcast('account:changed', message.data);
   } else if (message.event === 'settings.changed') {
@@ -1430,7 +1416,6 @@ ipcMain.handle('player:close', async (event) => {
   await engineCall('player.close', { playerId: entry.playerId }).catch(() => {});
   entry.opened = false;
   if (!entry.window.isDestroyed()) entry.window.close();
-  restoreMainWindow();
 });
 ipcMain.handle('player:detach', (event) => {
   entryForEvent(event)?.window.close();
