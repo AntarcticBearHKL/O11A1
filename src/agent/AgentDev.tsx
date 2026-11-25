@@ -42,7 +42,6 @@ export default function AgentDev() {
   const [state, setState] = useState<FishState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [connected, setConnected] = useState(Boolean((window as any).o11a1?.call));
   const themeApplied = useRef(false);
 
   const load = useCallback(async (quiet = false) => {
@@ -50,7 +49,6 @@ export default function AgentDev() {
       setState(demoRef.current);
       setLoading(false);
       setError('');
-      setConnected(true);
       applyTheme(null);
       return;
     }
@@ -58,7 +56,6 @@ export default function AgentDev() {
     try {
       setState(await call<FishState>('fish.state'));
       setError('');
-      setConnected(true);
       if (!themeApplied.current) {
         themeApplied.current = true;
         call<any>('settings.get')
@@ -67,7 +64,6 @@ export default function AgentDev() {
       }
     } catch (reason: any) {
       if (!quiet) setError(reason?.message || String(reason));
-      setConnected(false);
     } finally {
       if (!quiet) setLoading(false);
     }
@@ -104,57 +100,30 @@ export default function AgentDev() {
   return (
     <div className="app agent-dev-app">
       <div className="agent-dev-shell">
-        <header className="agent-dev-head">
-          <div className="agent-dev-copy">
-            <div className="agent-dev-eyebrow">独立调试 · Agent</div>
-            <div className="agent-dev-title">Agent</div>
-            <div className="agent-dev-sub">
-              同一个 AgentPanel / AgentTrace，Vite 热更新，不需要重编主体。加上 `?demo=1` 可用演示数据调 UI。
-              {' '}
-              <span className={`agent-dev-connection ${demoMode ? 'ok' : connected ? 'ok' : 'bad'}`}>
-                {demoMode ? '演示数据' : connected ? '引擎已连接' : '未连接引擎'}
-              </span>
-            </div>
-          </div>
-
-          <div className="agent-dev-actions no-drag">
-            <span className={`fish-state ${isLive ? 'on' : ''}`}>
-              <i />
-              {name || '空闲'}
-            </span>
-            <button className="btn sm" onClick={() => load()} disabled={loading}>
-              <IconRefresh size={13} />
-              刷新
+        <div className="agent-dev-actions no-drag">
+          <button className="btn sm" onClick={() => load()} disabled={loading}>
+            <IconRefresh size={13} />
+            刷新
+          </button>
+          <button
+            className="btn sm primary"
+            disabled={demoMode || (isLive && !agentWaiting)}
+            onClick={next}
+            title={demoMode ? '演示数据不连接引擎' : isLive && !agentWaiting ? '当前这一轮还在运行' : '执行下一次 DeepSeek 请求'}
+          >
+            下一步
+          </button>
+          <div className="window-controls">
+            <button className="icon-btn" title="最小化" onClick={() => (window as any).o11a1?.window?.minimize?.()}>
+              <IconMin />
             </button>
-            <button
-              className="btn sm primary"
-              disabled={demoMode || (isLive && !agentWaiting)}
-              onClick={next}
-              title={demoMode ? '演示数据不连接引擎' : isLive && !agentWaiting ? '当前这一轮还在运行' : '执行下一次 DeepSeek 请求'}
-            >
-              下一步
+            <button className="icon-btn" title="最大化" onClick={() => (window as any).o11a1?.window?.maximize?.()}>
+              <IconMax />
             </button>
-            <div className="window-controls">
-              <button className="icon-btn" title="最小化" onClick={() => (window as any).o11a1?.window?.minimize?.()}>
-                <IconMin />
-              </button>
-              <button className="icon-btn" title="最大化" onClick={() => (window as any).o11a1?.window?.maximize?.()}>
-                <IconMax />
-              </button>
-              <button className="icon-btn close" title="退出调试" onClick={() => (window as any).o11a1?.window?.quit?.()}>
-                <IconClose />
-              </button>
-            </div>
+            <button className="icon-btn close" title="退出调试" onClick={() => (window as any).o11a1?.window?.quit?.()}>
+              <IconClose />
+            </button>
           </div>
-        </header>
-
-        <div className="agent-dev-meta">
-          <span>状态 {name || '-'}</span>
-          <span>Worker {workerAlive ? '在线' : '离线'}</span>
-          <span>等待下一步 {agentWaiting ? '是' : '否'}</span>
-          <span>视频 {agent?.bvid || '-'}</span>
-          <span>模型 {agent?.model || '-'}</span>
-          <span>Tokens {Number(agent?.tokens_in || 0) + Number(agent?.tokens_out || 0)}</span>
         </div>
 
         <div className="agent-dev-body">
