@@ -62,8 +62,22 @@ New-Item -ItemType Directory -Force (Join-Path $runtime 'assets\fonts') | Out-Nu
 $fonts = Join-Path $root 'public\fonts'
 $fontTarget = Join-Path $runtime 'assets\fonts'
 # Clear stale faces so an older bundled family can never ship alongside the
-# current one.
-if (Test-Path $fontTarget) { Remove-Item (Join-Path $fontTarget '*') -Force }
-Copy-Item (Join-Path $fonts '*.ttf') $fontTarget -Force
-Copy-Item (Join-Path $fonts '*.txt') $fontTarget -Force
+# current one. The native player may still hold a font file open after a
+# crash/restart; skip a locked identical file instead of failing the build.
+if (Test-Path $fontTarget) {
+  Get-ChildItem $fontTarget -File | ForEach-Object {
+    try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch { }
+  }
+}
+foreach ($font in Get-ChildItem $fonts -File) {
+  $dest = Join-Path $fontTarget $font.Name
+  if ((Test-Path $dest) -and ((Get-FileHash $dest -Algorithm SHA256).Hash -eq (Get-FileHash $font.FullName -Algorithm SHA256).Hash)) {
+    continue
+  }
+  try {
+    Copy-Item $font.FullName $dest -Force -ErrorAction Stop
+  } catch {
+    Write-Warning "font copy skipped: $($font.Name) is locked"
+  }
+}
 Write-Output "engine -> $(Join-Path $runtime 'o11a1-engine.exe')"

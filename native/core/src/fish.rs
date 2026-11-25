@@ -2868,25 +2868,25 @@ impl FishEngine {
         }
         if state.clip_count >= 4 {
             bail!("这个视频已经看了 4 段，请调用 rate_video 下结论");
-        }        let start_s = args
+        }
+        let mut start_s = args
             .get("start_s")
             .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|f| f.max(0.0) as u64)))
             .unwrap_or(0);
-        let mut end_s = args
+        let requested_end_s = args
             .get("end_s")
             .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|f| f.max(0.0) as u64)))
-            .unwrap_or(start_s.saturating_add(45));
-        if end_s <= start_s {
-            end_s = start_s.saturating_add(45);
-        }
-        let span = end_s.saturating_sub(start_s);
-        if !(5..=120).contains(&span) {
-            bail!("一次只能看 5-120 秒（现在请求了 {span} 秒）");
-        }
-        if start_s >= opened_duration_s.max(1) {
+            .unwrap_or_else(|| start_s.saturating_add(45));
+        let requested_span = requested_end_s.saturating_sub(start_s);
+        let duration_s = opened_duration_s.max(1);
+        if start_s >= duration_s {
             bail!("start_s 超出视频时长 {}", mmss(opened_duration_s));
         }
-        let end_s = end_s.min(opened_duration_s.max(start_s + 1));
+        let (start_s, end_s, trim_note) =
+            clamp_clip_range(start_s, requested_end_s, duration_s);
+        if end_s <= start_s {
+            bail!("这段视频没有可看的画面");
+        }
         let interval_s = args
             .get("interval_s")
             .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|f| f.max(1.0) as u64)))
@@ -3010,10 +3010,18 @@ impl FishEngine {
                 })
             })
             .collect();
+        let image_note = if images.is_empty() { "没有画面" } else { "拼接画面随后附上" };
+        let note = if trim_note.is_empty() {
+            image_note.to_string()
+        } else {
+            format!("{trim_note}；{image_note}")
+        };
         let output = serde_json::json!({
             "bvid": opened_bvid,
             "start_s": clip.start_s,
             "end_s": clip.end_s,
+            "requested_span_s": requested_span,
+            "clamped": !trim_note.is_empty(),
             "focus": args.get("focus").and_then(|value| value.as_str()).unwrap_or(""),
             "subtitle_source": if clip.subtitles.is_empty() { "none" } else { "official" },
             "subtitles": subtitle_json,
@@ -3024,7 +3032,7 @@ impl FishEngine {
             "interval_s": interval_s,
             "frames_per_sheet": 30,
             "sheet_count": images.len(),
-            "note": if images.is_empty() { "没有画面" } else { "拼接画面随后附上" },
+            "note": note,
         });
         state.clips.push(AgentClipRecord {
             start_s: clip.start_s,
@@ -3051,7 +3059,7 @@ impl FishEngine {
                 .map(|line| line.text.clone())
                 .unwrap_or_default(),
         });
-        let summary = format!(
+        let mut summary = format!(
             "{}–{} · 每 {}s · 字幕 {} 句 · 弹幕 {} 条（{} 帧 / {} 张）",
             mmss(clip.start_s),
             mmss(clip.end_s),
@@ -3061,6 +3069,10 @@ impl FishEngine {
             clip.frame_count,
             images.len()
         );
+        if !trim_note.is_empty() {
+            summary.push_str(" · ");
+            summary.push_str(&trim_note);
+        }
         Ok(AgentToolOutcome {
             content: pretty_json(&output),
             output: pretty_json(&output),
@@ -4843,6 +4855,50 @@ fn collapse_ws(text: &str) -> String {
 }
 
 /// `754` → `12:34`, `3725` → `1:02:05`.
+/// Keep a `watch_clip` request inside the 5–120 s window and the video. A
+/// model that asks for 130 s gets a 120 s clip plus a note, not a failed tool
+/// row; a request near the end is moved back so it still gets five seconds.
+fn clamp_clip_range(
+    mut start_s: u64,
+    requested_end_s: u64,
+    duration_s: u64,
+) -> (u64, u64, String) {
+    let duration_s = duration_s.max(1);
+    let requested_span = requested_end_s.saturating_sub(start_s);
+    let mut end_s = requested_end_s
+        .max(start_s.saturating_add(1))
+        .min(duration_s);
+    let mut note = String::new();
+    if requested_span > 120 {
+        end_s = end_s.min(start_s.saturating_add(120));
+        note = format!(
+            "请求 {requested_span} 秒，单次上限 120 秒，已截到 {} 秒",
+            end_s.saturating_sub(start_s)
+        );
+    } else if requested_end_s > duration_s {
+        note = format!("视频只到 {}，已截到片尾", mmss(duration_s));
+    }
+    let mut span = end_s.saturating_sub(start_s);
+    if span < 5 {
+        if duration_s >= start_s.saturating_add(5) {
+            end_s = start_s.saturating_add(5);
+            span = end_s.saturating_sub(start_s);
+            if note.is_empty() {
+                note = format!(
+                    "请求 {requested_span} 秒，单次至少 5 秒，已调整为 {span} 秒"
+                );
+            }
+        } else {
+            start_s = duration_s.saturating_sub(5);
+            end_s = duration_s;
+            if note.is_empty() {
+                note = format!("视频只有 {} 秒，已截到片尾", mmss(duration_s));
+            }
+        }
+    }
+    (start_s, end_s, note)
+}
+
 fn mmss(seconds: u64) -> String {
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;
@@ -6697,5 +6753,24 @@ mod tests {
             value.get("quote").and_then(|v| v.as_str()),
             Some("这里讲得很好")
         );
+    }
+
+    #[test]
+    fn clip_range_clamps_long_and_short_requests() {
+        let (start, end, note) = clamp_clip_range(0, 130, 600);
+        assert_eq!((start, end), (0, 120));
+        assert!(note.contains("130"));
+
+        let (start, end, _) = clamp_clip_range(500, 700, 600);
+        assert_eq!((start, end), (500, 600));
+
+        let (start, end, _) = clamp_clip_range(598, 700, 600);
+        assert_eq!((start, end), (595, 600));
+
+        let (start, end, _) = clamp_clip_range(0, 3, 600);
+        assert_eq!((start, end), (0, 5));
+
+        let (start, end, _) = clamp_clip_range(0, 3, 3);
+        assert_eq!((start, end), (0, 3));
     }
 }
