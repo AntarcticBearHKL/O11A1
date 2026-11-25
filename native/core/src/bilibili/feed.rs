@@ -302,7 +302,11 @@ impl Session {
                     format.quality,
                     format.new_description,
                     format.display_desc,
-                    format.codecs.join("|")
+                    format
+                        .codecs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .join("|")
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -382,6 +386,50 @@ impl Session {
                 .join(",")
         ));
         Ok(info)
+    }
+
+    /// A low-quality progressive MP4 for the feed's hover preview. The preview
+    /// is muted, never reports history and never writes local watch progress;
+    /// it only needs a URL an HTML5 video can stream without MSE.
+    pub async fn preview_url(&self, bvid: &str, cid: u64) -> Result<PreviewStream> {
+        let bvid = bvid.trim();
+        if bvid.is_empty() || cid == 0 {
+            bail!("预览需要 bvid 和 cid");
+        }
+        let params = preview_params(bvid, cid);
+        let (mut status, mut body) = match self.playurl_request(&params, false).await {
+            Ok(result) => result,
+            Err(err) => {
+                crate::debug_log(&format!("preview playurl wbi failed bvid={bvid} err={err:#}"));
+                self.playurl_plain_request(&params).await?
+            }
+        };
+        if body.code != 0 {
+            let (plain_status, plain_body) = self.playurl_plain_request(&params).await?;
+            if plain_body.code == 0 {
+                status = plain_status;
+                body = plain_body;
+            }
+        }
+        if body.code != 0 {
+            bail!("获取预览地址失败：code={}, HTTP {status}", body.code);
+        }
+        let data = body
+            .data
+            .ok_or_else(|| anyhow!("获取预览地址失败：响应缺少 data"))?;
+        let url = data
+            .durl
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|part| part.url.trim())
+            .find(|url| !url.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("这条视频没有渐进式预览流"))?;
+        Ok(PreviewStream {
+            url,
+            duration_ms: data.timelength,
+        })
     }
 }
 
@@ -1228,6 +1276,24 @@ pub fn quality_fnval() -> i64 {
         .unwrap_or(FNVAL_ALL)
 }
 
+/// The old progressive-MP4 response (`fnval=1`) at 360P, used only by the
+/// feed's hover preview. It deliberately does not ask for DASH: an HTML5
+/// video cannot attach to Bilibili's signed DASH segments.
+fn preview_params(bvid: &str, cid: u64) -> Vec<(String, String)> {
+    vec![
+        ("bvid".into(), bvid.to_string()),
+        ("cid".into(), cid.to_string()),
+        ("qn".into(), "16".into()),
+        ("fnval".into(), "1".into()),
+        ("fnver".into(), "0".into()),
+        ("fourk".into(), "0".into()),
+        ("platform".into(), "pc".into()),
+        ("otype".into(), "json".into()),
+        ("high_quality".into(), "1".into()),
+        ("web_location".into(), "1315873".into()),
+    ]
+}
+
 fn playurl_params(bvid: &str, cid: u64) -> Vec<(String, String)> {
     vec![
         ("bvid".into(), bvid.to_string()),
@@ -1674,7 +1740,7 @@ fn build_play_info(data: PlayUrlData) -> Option<PlayInfo> {
         duration = data.timelength / 1000;
     }
     if video_tracks.is_empty() {
-        if let Some(first) = data.durl.first() {
+        if let Some(first) = data.durl.as_deref().and_then(|parts| parts.first()) {
             if !first.url.is_empty() {
                 video_tracks.push(VideoTrack {
                     id: 0,
@@ -2962,6 +3028,13 @@ struct FeedStat {
     view: u64,
 }
 
+/// A progressive MP4 used by the home feed's hover preview.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PreviewStream {
+    pub url: String,
+    pub duration_ms: u64,
+}
+
 /// Resolved media streams for one video.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PlayInfo {
@@ -3285,8 +3358,10 @@ struct PlayUrlResp {
 struct PlayUrlData {
     #[serde(default)]
     dash: Option<Dash>,
+    /// `null` for DASH-only responses; older `fnval=1` answers carry the MP4
+    /// parts here. The feed preview is the only caller that needs them.
     #[serde(default)]
-    durl: Vec<Durl>,
+    durl: Option<Vec<Durl>>,
     #[serde(default)]
     timelength: u64,
     /// Every tier the video advertises (`120` 4K, `116` 1080P60, …), in the
@@ -3312,8 +3387,9 @@ struct SupportFormat {
     new_description: String,
     #[serde(default)]
     display_desc: String,
+    /// `null` in the progressive-MP4 response (`fnval=1`).
     #[serde(default)]
-    codecs: Vec<String>,
+    codecs: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]

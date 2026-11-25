@@ -8,7 +8,7 @@ for (const output of [process.stdout, process.stderr]) {
   if (output && typeof output.on === 'function') output.on('error', () => {});
 }
 
-const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, shell, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, Tray, Menu, nativeImage, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -940,6 +940,16 @@ app.whenReady().then(() => {
   app.setAppUserModelId('com.o11a1.electron');
   cleanInstalledUpdates();
   copyRuntimeAssets();
+  // The feed's hover preview plays a signed Bilibili MP4 in an HTML5 video.
+  // A file:// page cannot set a Referer, and the CDN rejects the request
+  // without the Bilibili one; add it here, media hosts only.
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    { urls: ['*://*.bilivideo.com/*', '*://*.akamaized.net/*'] },
+    (details, callback) => {
+      details.requestHeaders.Referer = 'https://www.bilibili.com/';
+      callback({ requestHeaders: details.requestHeaders });
+    },
+  );
   startEngine();
   createWindow();
   createTray();

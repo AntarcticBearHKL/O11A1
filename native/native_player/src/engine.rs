@@ -1860,7 +1860,9 @@ impl Engine {
         // the picture with it. Run these speeds video-only and let the wall
         // clock drive the timeline.
         if let Some(mut audio) = self.audio.take() {
-            audio.stop();
+            let _ = std::thread::Builder::new()
+                .name("player-stop-audio".into())
+                .spawn(move || audio.stop());
         }
         // The audio chain supports the whole 0.1×–10× range (atempo stages),
         // and the wall-clock/atempo clock stays correct at every stop. Always
@@ -1882,11 +1884,18 @@ impl Engine {
         self.stall_pause = None;
         self.video_lag_since = None;
         self.video_resync = None;
+        // Joining the old decoder/audio can stall on a network read or a
+        // closed pipe. Do it off the player thread: the window must stay
+        // draggable in the instant between source resolve and first frame.
         if let Some(mut decoder) = self.decoder.take() {
-            decoder.stop();
+            let _ = std::thread::Builder::new()
+                .name("player-stop-video".into())
+                .spawn(move || decoder.stop());
         }
         if let Some(mut audio) = self.audio.take() {
-            audio.stop();
+            let _ = std::thread::Builder::new()
+                .name("player-stop-audio".into())
+                .spawn(move || audio.stop());
         }
     }
 
@@ -6818,6 +6827,19 @@ impl Engine {
         let layout = self.overlay.layout;
         let px = x as f32;
         let py = y as f32;
+        // While the splash is up there is no picture to scrub or toggle, but
+        // the window must still be movable. Arm the drag before any overlay
+        // branch can swallow the press; the toolbar and close button keep
+        // their own hit targets.
+        if self.loading
+            && !self.fullscreen
+            && !self.external
+            && !layout.panel.contains(px, py)
+            && !(self.sidebar_open && layout.sidebar.contains(px, py))
+            && !(self.chrome_shown && layout.top_close.contains(px, py))
+        {
+            self.window_drag_arm = Some((x, y));
+        }
         if self.precision_open {
             if self.handle_precision_click(px, py) {
                 return;
@@ -7775,6 +7797,10 @@ impl Engine {
         self.playing = false;
         self.requested_play = true;
         self.ended = false;
+        // A replacement is usually triggered from the main window. Focus the
+        // player before the loading card appears so the first press is a
+        // drag, not an activation click.
+        window::focus_player(self.hwnd);
         self.seek_in_flight = false;
         self.stalled = false;
         self.stall_audio_paused = false;

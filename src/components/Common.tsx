@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { formatCount, formatDuration } from '../api';
+import { call, formatCount, formatDuration } from '../api';
 import { CoverImage } from './CoverImage';
 import { useApp } from '../context';
 import { flushCardRightClick, scheduleCardRightClick } from '../rightClickGuard';
@@ -211,6 +211,30 @@ function CardTooltip({ tip, item, onClose }: {
   );
 }
 
+/// Signed preview URLs live for minutes; keep a small process-wide cache so
+/// moving the pointer across a row does not request the same video twice.
+const previewCache = new Map<string, { url: string; at: number }>();
+const PREVIEW_TTL_MS = 5 * 60_000;
+const PREVIEW_CACHE_MAX = 48;
+
+function cachedPreview(key: string): string {
+  const hit = previewCache.get(key);
+  if (!hit) return '';
+  if (Date.now() - hit.at > PREVIEW_TTL_MS) {
+    previewCache.delete(key);
+    return '';
+  }
+  return hit.url;
+}
+
+function rememberPreview(key: string, url: string): void {
+  if (previewCache.size >= PREVIEW_CACHE_MAX) {
+    const oldest = previewCache.keys().next().value;
+    if (oldest) previewCache.delete(oldest);
+  }
+  previewCache.set(key, { url, at: Date.now() });
+}
+
 function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigate }: {
   item: any;
   index: number;
@@ -225,6 +249,78 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
     setTip({ kind, anchor: event.currentTarget.getBoundingClientRect() });
   };
   const hideTip = () => setTip(null);
+
+  // Hover preview: a muted, low-quality MP4 plays over the cover after a
+  // short delay. It is only a look-ahead, never history or local progress.
+  const [preview, setPreview] = useState<{ url: string; key: string } | null>(null);
+  const [previewOn, setPreviewOn] = useState(false);
+  const previewTimer = useRef<any>(null);
+  const previewToken = useRef(0);
+  const previewStart = useRef(0);
+  const previewVideo = useRef<HTMLVideoElement | null>(null);
+
+  const stopPreview = useCallback(() => {
+    previewToken.current += 1;
+    clearTimeout(previewTimer.current);
+    previewTimer.current = null;
+    setPreview(null);
+    setPreviewOn(false);
+    const video = previewVideo.current;
+    if (video) {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    }
+  }, []);
+
+  const beginPreview = useCallback(() => {
+    const bvid = String(item?.bvid || '').trim();
+    const cid = Number(item?.cid || 0);
+    if (!bvid || !cid) return;
+    const key = `${bvid}:${cid}`;
+    const cached = cachedPreview(key);
+    if (cached) {
+      setPreview({ url: cached, key });
+      return;
+    }
+    const token = ++previewToken.current;
+    clearTimeout(previewTimer.current);
+    previewTimer.current = setTimeout(async () => {
+      try {
+        const data = await call<{ url: string }>('video.preview', { bvid, cid });
+        if (token !== previewToken.current || !data?.url) return;
+        rememberPreview(key, data.url);
+        setPreview({ url: data.url, key });
+      } catch {
+        /* The cover remains; a missing preview is not an error. */
+      }
+    }, 280);
+  }, [item?.bvid, item?.cid]);
+
+  useEffect(() => () => stopPreview(), [stopPreview]);
+
+  useEffect(() => {
+    if (!preview) return;
+    const onScroll = () => stopPreview();
+    window.addEventListener('scroll', onScroll, true);
+    return () => window.removeEventListener('scroll', onScroll, true);
+  }, [preview, stopPreview]);
+
+  const onPreviewMeta = (event: React.SyntheticEvent<HTMLVideoElement>) => {
+    const video = event.currentTarget;
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const start = duration > 20 ? Math.min(duration * 0.18, duration - 10, 45) : 1;
+    previewStart.current = Math.max(0, start);
+    try { video.currentTime = previewStart.current; } catch { /* metadata race */ }
+    video.play().catch(() => {});
+  };
+
+  const onPreviewTime = (event: React.SyntheticEvent<HTMLVideoElement>) => {
+    const video = event.currentTarget;
+    if (previewStart.current > 0 && video.currentTime > previewStart.current + 8) {
+      video.currentTime = previewStart.current;
+    }
+  };
 
   const author = item.owner || item.author || item.uname || '';
   const authorMid = Number(item.owner_mid || item.author_mid || item.mid || item.up_mid || 0) || 0;
@@ -247,8 +343,12 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
       style={{ animationDelay: `${Math.min(index, 14) * 32}ms` }}
       role="button"
       tabIndex={0}
+      onMouseEnter={beginPreview}
+      onMouseLeave={stopPreview}
+      onPointerDown={stopPreview}
       onClick={() => {
         setTip(null);
+        stopPreview();
         onPlay(item);
       }}
       onContextMenu={(event) => {
@@ -257,6 +357,7 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
         // ring fires; a held menu delivered before mouseup waits for release.
         event.preventDefault();
         setTip(null);
+        stopPreview();
         scheduleCardRightClick(() => onPlay(item, true));
       }}
       onMouseUp={(event) => {
@@ -272,6 +373,24 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
     >
       <div className="cover">
         <CoverImage src={item.pic || item.cover} alt="" eager={index < 24} />
+        {preview ? (
+          <video
+            ref={previewVideo}
+            className={`card-preview ${previewOn ? 'on' : ''}`}
+            src={preview.url}
+            muted
+            playsInline
+            preload="auto"
+            onLoadedMetadata={onPreviewMeta}
+            onPlaying={() => setPreviewOn(true)}
+            onTimeUpdate={onPreviewTime}
+            onError={() => {
+              previewCache.delete(preview.key);
+              setPreview(null);
+              setPreviewOn(false);
+            }}
+          />
+        ) : null}
         {badge ? <div className="cover-badge">{badge}</div> : null}
         {progress > 0 ? <div className="video-progress"><span style={{ width: `${Math.min(100, progress * 100)}%` }} /></div> : null}
         {renderAction ? <div className="card-action" onClick={(event) => event.stopPropagation()}>{renderAction(item)}</div> : null}

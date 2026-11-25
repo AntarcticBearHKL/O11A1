@@ -908,6 +908,13 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                 .await
                 .map_err(e)?)
         }
+        "video.preview" => {
+            let session = app.session().await?;
+            rv(session
+                .preview_url(&text(&params, "bvid"), unum(&params, "cid"))
+                .await
+                .map_err(e)?)
+        }
         "video.heartbeat" => {
             let session = app.session().await?;
             let code = session

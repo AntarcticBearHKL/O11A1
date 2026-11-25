@@ -3,7 +3,7 @@
 更新：2026-11-21
 
 > 安装状态：旧 `bilibili-slint` 原生版已卸载，旧播放缓存与开始菜单快捷方式一并移除；源代码保留。
-> 桌面 `O11A1.lnk` 指向 Electron 版 `release-0.9.39\win-unpacked\O11A1.exe`。
+> 桌面 `O11A1.lnk` 指向 Electron 版 `release-0.9.40\win-unpacked\O11A1.exe`。
 
 ## 已实现
 
@@ -91,6 +91,11 @@
 - **0.9.0 零拷贝全链路**：视频解码从外部 `ffmpeg.exe` 管道改为进程内 libavformat + libavcodec + D3D11VA。解码纹理就是播放器自己的 `ID3D11Device` 上的 NV12/P010 数组切片，直接由 `nv12_hw_main` / `p010_hw_main` 转成 BGRA，再进入原有的插帧、画质增强和 DComp 上屏；不再有 `hwdownload`、stdout rawvideo、`UpdateSubresource`。本地 4K60 H.264 / HEVC 10-bit / AV1 8-bit / AV1 10-bit 实测 60fps、`dropped=0`，4K60 + 120Hz 插帧稳定 120fps；播放器进程约 15–22% 单核。seek、暂停 seek、A/B 循环、画质增强、直播/不支持片源的自动 ffmpeg 回退都走同一条引擎路径。
 - **0.8.6 恢复 4K 解码**：撤销 0.8.5 按显示器高度限制。开启「原始分辨率解码」时 4K 源仍按 3840×2160 解码和渲染，再在窗口 / DComp 缩放；不再降成 1080P。
 - **0.9.1 高倍速声音**：取消 2× 以上关闭音频的旧限制。0.1×–10× 全部使用 `atempo` 链（单级 0.5–2.0 串联），音频设备时钟继续作为媒体时钟；3× / 5× / 10× 实测 `starved_ms=0`、`pos_ms=audio_ms`，10× 时视频解码跟不上会按既有 A/V 追赶逻辑跳帧，但声音持续。
+- **0.9.40 视频流悬停预览 + 加载拖动**：
+  - 首页/收藏/搜索等视频卡片悬停约 0.3s 后，封面淡入静音 360P 预览，播放约 8s 循环；移开、滚动或点击立即停止。
+  - 预览只解析 `x/player/playurl` 的渐进 MP4 地址，不发送历史心跳，也不写本地 `watch_progress.json`。
+  - Electron 只为 `*.bilivideo.com` / `*.akamaized.net` 媒体请求补 B 站 Referer，CSP 增加 `media-src`。
+  - 播放器加载阶段（视频可播放之前）也能拖动窗口：loading 时在工具栏/侧栏/关闭按钮之外提前 arm 窗口拖动。
 - **0.9.39 Agent 页改名与页头合并**：
   - 「看片」tab 改名为 Agent，底栏鱼类入口的提示同步改成 Agent，页内标题也是 Agent。
   - 删掉第二行整行状态/开始/暂停/停止/提示，只在第一行 tabs 的右端保留一个「下一步」；运行中禁用，停住或出错后可点。
@@ -287,8 +292,8 @@
 
 - `scripts/build-engine.ps1`：自包含 Rust engine 构建（`native/core` + `native/native_player`）。
 - `scripts/package.ps1`：复制字体 / FFmpeg、构建 renderer、electron-builder NSIS。
-- 产物：`release/O11A1 Setup 0.9.39.exe`（218,677,687 字节，SHA-256 `e3d1d6bbd6df7b1b85a27f244707eda2a5211194d046333007a1be61a028c6a4`；含 FFmpeg 与 Chill Round Gothic 三个字重）。
-- `release-0.9.39/win-unpacked/O11A1.exe`：本次免安装版；桌面快捷方式已指向这里。
+- 产物：`release/O11A1 Setup 0.9.40.exe`（218,684,293 字节，SHA-256 `b4189efddccc7d957a002aad7c1dad1d74d7372aaa4f785eaebffa18595e0755`；含 FFmpeg 与 Chill Round Gothic 三个字重）。
+- `release-0.9.40/win-unpacked/O11A1.exe`：本次免安装版；桌面快捷方式已指向这里。
 - 已实测：首页、账号、播放器、视频 + 弹幕、下载、养鱼 tiny 模型下载；养鱼页只有「下一步」与逐轮思考/工具记录。
 - **0.7.2 回退**：移除 0.7.0 / 0.7.1 的 RIFE 插帧、7 个 ONNX 模型、DirectML 运行库以及设置页 / 播放器侧栏的「插帧算法」行；插帧恢复为原来的 GPU 线性混合，安装包回到约 206 MB。
 - **0.7.3 A/V 同步**：音频设备时钟成为唯一参考；画面持续落后时改为跳帧追赶，不再出现“视频慢放、声音正常”。详见上方 A/V 同步条目。

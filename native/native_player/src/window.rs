@@ -1403,6 +1403,13 @@ fn update_shadow(owner: HWND) {
 /// duration of the call lets the player take keyboard focus immediately rather
 /// than waiting for the user to click the picture. Without this, Space goes to
 /// the Electron window that launched the player.
+/// Bring the player window to the foreground. Used on initial show and on a
+/// card replacement: an inactive player swallows the first press as an
+/// activation click, which made the loading card feel undraggable.
+pub fn focus_player(hwnd: HWND) {
+    force_foreground(hwnd);
+}
+
 fn force_foreground(hwnd: HWND) {
     unsafe {
         let foreground = GetForegroundWindow();
