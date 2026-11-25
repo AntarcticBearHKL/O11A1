@@ -199,6 +199,41 @@ function FactList({ data }: { data: any }) {
   );
 }
 
+/// One menu row inside the Agent transcript. Every evidence block, prompt and
+/// tool detail uses this same chevron/header so the page reads as a stack of
+/// foldable sections instead of one long wall of text.
+function AgentFold({
+  title,
+  meta,
+  defaultOpen = false,
+  className = '',
+  children,
+}: {
+  title: React.ReactNode;
+  meta?: React.ReactNode;
+  defaultOpen?: boolean;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className={`agent-fold ${open ? 'open' : ''}${className ? ` ${className}` : ''}`}>
+      <button
+        className="agent-fold-head"
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="agent-fold-dot" />
+        <span className="agent-fold-title">{title}</span>
+        {meta ? <span className="agent-fold-meta">{meta}</span> : null}
+        <Chevron open={open} />
+      </button>
+      {open ? <div className="agent-fold-body">{children}</div> : null}
+    </section>
+  );
+}
+
 /// A parsed answer to rate_video. The arguments carry the model's written
 /// judgement (score, verdict, reasons, tags and quote); the result only says it
 /// was accepted, so read both and paint the model's side.
@@ -263,34 +298,34 @@ function ToolPreview({ step, expanded }: { step: FishAgentStep; expanded: boolea
 
   if (step.tool === 'list_videos') {
     const all = listOf(data.videos);
-    const videos = all.slice(0, expanded ? 30 : 4);
+    const videos = all.slice(0, 30);
     if (!videos.length) {
       return <div className="agent-tool-preview"><div className="agent-tool-empty">{textOf(data.note || '候选列表为空')}</div></div>;
     }
     return (
       <div className="agent-tool-preview">
-        <div className="agent-preview-head">
-          <span>候选 · {data.label || data.source || '视频列表'}</span>
-          <span>{data.count ?? all.length} 条</span>
-        </div>
-        <div className="agent-candidates">
-          {videos.map((video: any, index: number) => (
-            <div className="agent-candidate" key={video.bvid || index}>
-              <span className="agent-candidate-index">{index + 1}</span>
-              <div className="agent-candidate-copy">
-                <div className="agent-candidate-title">{video.title}</div>
-                <div className="agent-candidate-meta">
-                  {[video.up_name, video.duration, video.view ? `${formatCount(video.view)} 播放` : '']
-                    .filter(Boolean)
-                    .join(' · ')}
+        <AgentFold
+          title={`候选 · ${data.label || data.source || '视频列表'}`}
+          meta={`${data.count ?? all.length} 条`}
+          defaultOpen
+          className="agent-evidence-fold"
+        >
+          <div className="agent-candidates">
+            {videos.map((video: any, index: number) => (
+              <div className="agent-candidate" key={video.bvid || index}>
+                <span className="agent-candidate-index">{index + 1}</span>
+                <div className="agent-candidate-copy">
+                  <div className="agent-candidate-title">{video.title}</div>
+                  <div className="agent-candidate-meta">
+                    {[video.up_name, video.duration, video.view ? `${formatCount(video.view)} 播放` : '']
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
-        </div>
-        {!expanded && all.length > videos.length ? (
-          <div className="agent-expand-hint">展开查看其余 {all.length - videos.length} 条</div>
-        ) : null}
+            ))}
+          </div>
+        </AgentFold>
       </div>
     );
   }
@@ -300,42 +335,46 @@ function ToolPreview({ step, expanded }: { step: FishAgentStep; expanded: boolea
     const comments = allComments.slice(0, expanded ? 60 : 3);
     return (
       <div className="agent-tool-preview">
-        <div className="agent-video-facts">
-          <div className="agent-video-fact-main">
-            <span className="agent-video-fact-title">{data.title || step.detail}</span>
-            <span className="agent-video-fact-sub">
-              {[
-                data.up_name,
-                data.duration,
-                data.view ? `${formatCount(data.view)} 播放` : '',
-                data.tname,
-              ].filter(Boolean).join(' · ')}
+        <AgentFold title="视频信息" meta={step.detail || undefined} defaultOpen className="agent-evidence-fold">
+          <div className="agent-video-facts">
+            <div className="agent-video-fact-main">
+              <span className="agent-video-fact-title">{data.title || step.detail}</span>
+              <span className="agent-video-fact-sub">
+                {[
+                  data.up_name,
+                  data.duration,
+                  data.view ? `${formatCount(data.view)} 播放` : '',
+                  data.tname,
+                ].filter(Boolean).join(' · ')}
+              </span>
+            </div>
+            <span className="agent-chip">
+              评论 {data.comments_total ?? allComments.length} 条
+            </span>
+            <span className="agent-chip">
+              字幕 {data.subtitle_cues ?? 0} 句
             </span>
           </div>
-          <span className="agent-chip">
-            评论 {data.comments_total ?? allComments.length} 条
-          </span>
-          <span className="agent-chip">
-            字幕 {data.subtitle_cues ?? 0} 句
-          </span>
-        </div>
-        {data.desc ? <div className="agent-desc">{textOf(data.desc, expanded ? 1600 : 360)}</div> : null}
+          {data.desc ? <div className="agent-desc">{textOf(data.desc, 1600)}</div> : null}
+        </AgentFold>
         {comments.length ? (
-          <div className="agent-comments">
-            <div className="agent-evidence-label">评论 · 按点赞</div>
-            {comments.map((comment: any, index: number) => (
-              <div className="agent-comment" key={`${comment.user}-${index}`}>
-                <span className="agent-comment-like">{formatCount(comment.like || 0)}</span>
-                <div className="agent-comment-copy">
-                  <div className="agent-comment-user">{comment.user || '匿名'}</div>
-                  <div className="agent-comment-text">{textOf(comment.text, expanded ? 500 : 160)}</div>
+          <AgentFold
+            title="评论 · 按点赞"
+            meta={`${data.comments_total ?? allComments.length} 条`}
+            className="agent-evidence-fold"
+          >
+            <div className="agent-comments">
+              {comments.map((comment: any, index: number) => (
+                <div className="agent-comment" key={`${comment.user}-${index}`}>
+                  <span className="agent-comment-like">{formatCount(comment.like || 0)}</span>
+                  <div className="agent-comment-copy">
+                    <div className="agent-comment-user">{comment.user || '匿名'}</div>
+                    <div className="agent-comment-text">{textOf(comment.text, 500)}</div>
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
-        ) : null}
-        {!expanded && allComments.length > comments.length ? (
-          <div className="agent-expand-hint">展开查看其余 {allComments.length - comments.length} 条评论</div>
+              ))}
+            </div>
+          </AgentFold>
         ) : null}
       </div>
     );
@@ -346,54 +385,58 @@ function ToolPreview({ step, expanded }: { step: FishAgentStep; expanded: boolea
     const danmaku = listOf(data.danmaku);
     return (
       <div className="agent-tool-preview">
-        <div className="agent-preview-head">
-          <span>每 {data.interval_s ?? 1} 秒一帧 · {data.frame_count ?? 0} 帧</span>
-          <span>{data.sheet_count ?? step.images?.length ?? 0} 张拼图</span>
-        </div>
         {step.images?.length ? (
-          <div className="agent-shots">
-            {step.images.map((image) => (
-              <AgentShot image={image} key={image.key} />
-            ))}
-          </div>
+          <AgentFold
+            title="画面拼图"
+            meta={`每 ${data.interval_s ?? 1} 秒一帧 · ${data.frame_count ?? 0} 帧 · ${step.images.length} 张`}
+            defaultOpen
+            className="agent-evidence-fold"
+          >
+            <div className="agent-shots">
+              {step.images.map((image) => (
+                <AgentShot image={image} key={image.key} />
+              ))}
+            </div>
+          </AgentFold>
         ) : null}
-        <div className="agent-evidence-grid">
-          <div className="agent-evidence-block">
-            <div className="agent-evidence-label">
-              字幕 · {subtitles.length} 句
-              {data.subtitle_source === 'none' ? '（没有字幕）' : ''}
+        <AgentFold
+          title="字幕"
+          meta={`${subtitles.length} 句${data.subtitle_source === 'none' ? ' · 没有字幕' : ''}`}
+          defaultOpen={subtitles.length === 0}
+          className="agent-evidence-fold"
+        >
+          {subtitles.length ? (
+            <div className="agent-subtitle-list">
+              {subtitles.slice(0, 40).map((line: any, index: number) => (
+                <div className="agent-subtitle-line" key={`s-${index}`}>
+                  <span>{line.at || ''}</span>
+                  <p>{textOf(line.text, 300)}</p>
+                </div>
+              ))}
             </div>
-            {subtitles.length ? (
-              <div className="agent-subtitle-list">
-                {subtitles.slice(0, expanded ? 40 : 8).map((line: any, index: number) => (
-                  <div className="agent-subtitle-line" key={`s-${index}`}>
-                    <span>{line.at || ''}</span>
-                    <p>{textOf(line.text, expanded ? 300 : 160)}</p>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="agent-tool-empty">这一段没有字幕，只能看画面和评论。</div>
-            )}
-          </div>
-          <div className="agent-evidence-block">
-            <div className="agent-evidence-label">
-              弹幕 · {data.danmaku_total ?? danmaku.length} 条
+          ) : (
+            <div className="agent-tool-empty">这一段没有字幕，只能看画面和评论。</div>
+          )}
+        </AgentFold>
+        <AgentFold
+          title="弹幕"
+          meta={`${data.danmaku_total ?? danmaku.length} 条`}
+          defaultOpen={danmaku.length === 0}
+          className="agent-evidence-fold"
+        >
+          {danmaku.length ? (
+            <div className="agent-danmaku-list">
+              {danmaku.slice(0, 60).map((line: any, index: number) => (
+                <span className="agent-danmaku" key={`d-${index}`} title={line.text}>
+                  <em>{line.at_s != null ? `${Math.round(Number(line.at_s))}s` : ''}</em>
+                  {textOf(line.text, 80)}
+                </span>
+              ))}
             </div>
-            {danmaku.length ? (
-              <div className="agent-danmaku-list">
-                {danmaku.slice(0, expanded ? 60 : 16).map((line: any, index: number) => (
-                  <span className="agent-danmaku" key={`d-${index}`} title={line.text}>
-                    <em>{line.at_s != null ? `${Math.round(Number(line.at_s))}s` : ''}</em>
-                    {textOf(line.text, 80)}
-                  </span>
-                ))}
-              </div>
-            ) : (
-              <div className="agent-tool-empty">这一段没有弹幕。</div>
-            )}
-          </div>
-        </div>
+          ) : (
+            <div className="agent-tool-empty">这一段没有弹幕。</div>
+          )}
+        </AgentFold>
         {data.focus ? <div className="agent-focus">关注：{data.focus}</div> : null}
       </div>
     );
@@ -419,49 +462,59 @@ function AgentArgs({ step }: { step: FishAgentStep }) {
     .filter(([key]) => key !== 'bvid');
   if (!entries.length) return null;
   return (
-    <div className="agent-args">
-      <span className="agent-args-label">调用参数</span>
-      {entries.map(([key, value]) => (
-        <span className="agent-arg" key={key}>
-          <em>{ARG_LABELS[key] || key}</em>
-          <b>{formatValue(value)}</b>
-        </span>
-      ))}
-    </div>
+    <AgentFold title="调用参数" meta={`${entries.length} 项`} className="agent-evidence-fold">
+      <div className="agent-args">
+        {entries.map(([key, value]) => (
+          <span className="agent-arg" key={key}>
+            <em>{ARG_LABELS[key] || key}</em>
+            <b>{formatValue(value)}</b>
+          </span>
+        ))}
+      </div>
+    </AgentFold>
   );
 }
 
 /// One thinking or tool row. Thinking is painted as prose; a tool shows its
 /// parsed result. Raw request/response JSON is never rendered.
-function AgentStepRow({
-  step,
-  index,
-  open,
-  onToggle,
-}: {
-  step: FishAgentStep;
-  index: number;
-  open: boolean;
-  onToggle: () => void;
-}) {
+function AgentStepRow({ step, index }: { step: FishAgentStep; index: number }) {
   const state = STATE_LABEL[step.state] || STATE_LABEL.running;
   const thinking = step.kind === 'thinking';
+  const error = step.kind === 'error';
   const thought = String(step.thinking || (thinking ? step.detail : '') || '').trim();
-  const longThought = thought.length > 420 || thought.split('\n').length > 5;
-  const collapsible = thinking ? longThought : true;
+  const errorText = step.thinking || step.detail || '未知错误';
+  // Errors and the live turn open themselves; completed history starts folded
+  // so the page reads as a menu.
+  const autoOpen = error || step.state === 'running' || step.state === 'failed' || step.state === 'error';
+  const [open, setOpen] = useState(autoOpen);
 
-  if (step.kind === 'error') {
+  useEffect(() => {
+    if (autoOpen) setOpen(true);
+  }, [autoOpen]);
+
+  if (error) {
     return (
-      <div className="agent-card agent-step error failed" data-step-index={index}>
-        <div className="agent-error-card">
-          <div className="agent-error-head">
-            <span className="agent-dot failed" />
-            <b>{step.title || '运行出错'}</b>
-            <span className="agent-error-badge">失败</span>
+      <div className={`agent-card agent-step agent-error failed ${open ? 'open' : ''}`} data-step-index={index}>
+        <button
+          className="agent-card-head"
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={open}
+        >
+          <span className="agent-dot failed" />
+          <span className="agent-title">{step.title || '运行出错'}</span>
+          <span className="agent-badge failed">失败</span>
+          {!open ? <span className="agent-preview">{textOf(errorText, 180)}</span> : null}
+          <span className="agent-tail">
             {step.ms ? <span className="agent-timing">{formatMs(step.ms)}</span> : null}
+            <Chevron open={open} />
+          </span>
+        </button>
+        {open ? (
+          <div className="agent-error-card">
+            <div className="agent-error-text">{errorText}</div>
           </div>
-          <div className="agent-error-text">{step.thinking || step.detail || '未知错误'}</div>
-        </div>
+        ) : null}
       </div>
     );
   }
@@ -469,9 +522,9 @@ function AgentStepRow({
   return (
     <div className={`agent-card agent-step ${step.kind} ${step.state} ${open ? 'open' : ''}`} data-step-index={index}>
       <button
-        className={`agent-card-head ${collapsible ? '' : 'static'}`}
+        className="agent-card-head"
         type="button"
-        onClick={onToggle}
+        onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
       >
         <span className={`agent-dot ${step.kind} ${step.state}`} />
@@ -482,50 +535,52 @@ function AgentStepRow({
             ? <span className="agent-meta">{step.meta}</span>
             : null
           : <span className="agent-meta">{step.tool || step.id}</span>}
-        {!thinking ? <span className="agent-preview">{step.detail}</span> : null}
+        {!open ? (
+          <span className="agent-preview">
+            {thinking ? textOf(thought || '（这一轮没有文字）', 180) : step.detail}
+          </span>
+        ) : null}
         <span className="agent-tail">
           {step.ms ? <span className="agent-timing">{formatMs(step.ms)}</span> : null}
           {step.bytes ? <span className="agent-usage">{formatBytes(step.bytes)}</span> : null}
           {step.tokens ? <span className="agent-usage">{formatCount(step.tokens)} tok</span> : null}
         </span>
-        {collapsible ? <Chevron open={open} /> : null}
+        <Chevron open={open} />
       </button>
 
-      {thinking ? (
-        <div className={`agent-thinking-body ${longThought && !open ? 'clamped' : ''}`}>
-          <RichText text={thought || '（这一轮没有文字）'} />
-          {longThought ? (
-            <button className="agent-more" type="button" onClick={onToggle}>
-              {open ? '收起' : '展开完整思考'}
-            </button>
-          ) : null}
-        </div>
-      ) : (
-        <>
-          <ToolPreview step={step} expanded={open} />
-          {open && step.tool !== 'rate_video' ? (
-            <div className="agent-step-extra">
-              <AgentArgs step={step} />
-            </div>
-          ) : null}
-        </>
-      )}
+      {open ? (
+        thinking ? (
+          <div className="agent-thinking-body">
+            <RichText text={thought || '（这一轮没有文字）'} />
+          </div>
+        ) : (
+          <>
+            <ToolPreview step={step} expanded />
+            {step.tool !== 'rate_video' ? (
+              <div className="agent-step-extra">
+                <AgentArgs step={step} />
+              </div>
+            ) : null}
+          </>
+        )
+      ) : null}
     </div>
   );
 }
 
-/// The exact prompt text, open by default. The owner wants every system
-/// instruction visible verbatim, not a preview or a folded card.
+/// The exact prompt text, open by default so the full instructions stay
+/// visible, but the same foldable menu row as every other Agent section.
 function PromptBlock({ title, text }: { title: string; text: string }) {
   if (!text.trim()) return null;
   return (
-    <details className="agent-prompt" open>
-      <summary>
-        <span className="agent-prompt-title">{title}</span>
-        <span className="agent-prompt-meta">{text.length} 字符</span>
-      </summary>
+    <AgentFold
+      title={title}
+      meta={`${text.length} 字符`}
+      defaultOpen
+      className="agent-prompt-fold"
+    >
       <div className="agent-prompt-text">{text}</div>
-    </details>
+    </AgentFold>
   );
 }
 
@@ -576,7 +631,6 @@ export function AgentTrace({
   full?: boolean;
   parked?: boolean;
 }) {
-  const [expanded, setExpanded] = useState<string[]>([]);
   const threadRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const seen = useRef(0);
@@ -616,10 +670,6 @@ export function AgentTrace({
     node.scrollTop = node.scrollHeight;
   }, [agent?.updated_at, steps.length, agent?.state, signature, parked]);
 
-  const toggleStep = (id: string) => {
-    setExpanded((current) => current.includes(id) ? current.filter((row) => row !== id) : [...current, id]);
-  };
-
   return (
     <div className={`agent-chat ${full ? 'full' : ''}`}>
       {agent?.system_prompt || agent?.user_prompt ? (
@@ -638,13 +688,7 @@ export function AgentTrace({
         }}
       >
         {steps.map((step, index) => (
-          <AgentStepRow
-            key={step.id}
-            step={step}
-            index={index}
-            open={expanded.includes(step.id)}
-            onToggle={() => toggleStep(step.id)}
-          />
+          <AgentStepRow key={step.id} step={step} index={index} />
         ))}
         {waiting ? (
           <div className="agent-waiting">

@@ -4,6 +4,7 @@ import { AgentPanel } from './AgentPanel';
 import { ErrorBox, Spinner } from '../components/Common';
 import { IconClose, IconMax, IconMin, IconRefresh } from '../components/Icons';
 import { useToast } from '../hooks';
+import { createDemoState } from './demo';
 import type { FishAgent, FishState } from '../types';
 
 function applyTheme(settings: any) {
@@ -35,6 +36,9 @@ function stateError(value: any): string {
 /// the app.
 export default function AgentDev() {
   const { toast, show } = useToast();
+  const demoMode = new URLSearchParams(window.location.search).has('demo');
+  const demoRef = useRef<FishState | null>(null);
+  if (demoMode && !demoRef.current) demoRef.current = createDemoState();
   const [state, setState] = useState<FishState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -42,6 +46,14 @@ export default function AgentDev() {
   const themeApplied = useRef(false);
 
   const load = useCallback(async (quiet = false) => {
+    if (demoMode) {
+      setState(demoRef.current);
+      setLoading(false);
+      setError('');
+      setConnected(true);
+      applyTheme(null);
+      return;
+    }
     if (!quiet) setLoading(true);
     try {
       setState(await call<FishState>('fish.state'));
@@ -97,10 +109,10 @@ export default function AgentDev() {
             <div className="agent-dev-eyebrow">独立调试 · Agent</div>
             <div className="agent-dev-title">Agent</div>
             <div className="agent-dev-sub">
-              同一个 AgentPanel / AgentTrace，Vite 热更新，不需要重编主体。
+              同一个 AgentPanel / AgentTrace，Vite 热更新，不需要重编主体。加上 `?demo=1` 可用演示数据调 UI。
               {' '}
-              <span className={`agent-dev-connection ${connected ? 'ok' : 'bad'}`}>
-                {connected ? '引擎已连接' : '未连接引擎'}
+              <span className={`agent-dev-connection ${demoMode ? 'ok' : connected ? 'ok' : 'bad'}`}>
+                {demoMode ? '演示数据' : connected ? '引擎已连接' : '未连接引擎'}
               </span>
             </div>
           </div>
@@ -116,9 +128,9 @@ export default function AgentDev() {
             </button>
             <button
               className="btn sm primary"
-              disabled={isLive && !agentWaiting}
+              disabled={demoMode || (isLive && !agentWaiting)}
               onClick={next}
-              title={isLive && !agentWaiting ? '当前这一轮还在运行' : '执行下一次 DeepSeek 请求'}
+              title={demoMode ? '演示数据不连接引擎' : isLive && !agentWaiting ? '当前这一轮还在运行' : '执行下一次 DeepSeek 请求'}
             >
               下一步
             </button>

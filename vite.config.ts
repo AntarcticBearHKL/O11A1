@@ -7,6 +7,14 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        // Standalone Agent playground; harmless in the packaged renderer and
+        // available for `file://.../dist/agent.html?demo=1` UI debugging.
+        agent: 'agent.html',
+      },
+    },
   },
   server: {
     port: 5173,

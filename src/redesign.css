@@ -3438,10 +3438,12 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .agent-state.failed { background: color-mix(in srgb, var(--danger) 13%, transparent); color: var(--danger); }
 .agent-state.skipped { background: var(--surface-3); color: var(--text-faint); }
 
-.agent-thread { display: flex; flex-direction: column; gap: 6px; padding: 2px 2px 16px; max-height: clamp(240px, calc(100vh - 520px), 560px); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
+.agent-thread { display: flex; flex-direction: column; gap: 0; padding: 2px 2px 16px; max-height: clamp(240px, calc(100vh - 520px), 560px); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
 .agent-thread::-webkit-scrollbar { display: none; }
 
 .agent-card { border-radius: 0; background: transparent; transition: background 0.18s var(--ease); }
+.agent-card.agent-step { border-bottom: 1px solid var(--line); }
+.agent-card.agent-step:last-child { border-bottom: 0; }
 .agent-card.reply { padding-top: 4px; border-top: 1px solid var(--line); }
 .agent-card-head { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 42px; padding: 0 12px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; border-radius: 12px; }
 .agent-card-head.static { cursor: default; }
@@ -3596,6 +3598,22 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .agent-rich code { padding: 0.1em 0.35em; border-radius: 5px; background: var(--surface-2); font-size: 0.88em; color: var(--text); }
 .agent-rich-code { margin: 0.45em 0 0.65em; padding: 9px 12px; overflow: auto; border-radius: 9px; background: var(--surface-2); font-size: 11.5px; line-height: 1.65; color: var(--text-dim); white-space: pre-wrap; }
 .agent-prompts { display: flex; flex-direction: column; margin: 0 0 12px; border-top: 1px solid var(--line); }
+.agent-fold { border-bottom: 1px solid var(--line); }
+.agent-fold:last-child { border-bottom: 0; }
+.agent-fold-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 0 12px; border: 0; border-radius: 10px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.agent-fold-head:hover .agent-fold-title { color: var(--accent); }
+.agent-fold-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--text-faint); }
+.agent-fold-title { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; font-weight: 700; letter-spacing: 0.03em; color: var(--text-dim); }
+.agent-fold-meta { flex: none; font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.agent-fold-body { padding: 0 12px 12px 26px; }
+.agent-prompt-fold .agent-fold-head { min-height: 40px; }
+.agent-prompt-fold .agent-fold-body { padding: 0; }
+.agent-evidence-fold { border-bottom: 1px solid var(--line); }
+.agent-evidence-fold:last-child { border-bottom: 0; }
+.agent-evidence-fold .agent-fold-head { min-height: 32px; padding: 0 2px; }
+.agent-evidence-fold .agent-fold-body { padding: 4px 0 10px; }
+.agent-evidence-fold .agent-fold-title { font-size: 10.5px; }
+.agent-evidence-fold .agent-fold-meta { font-size: 10px; }
 .agent-prompt { border-bottom: 1px solid var(--line); }
 .agent-prompt summary { display: flex; align-items: center; gap: 9px; min-height: 40px; padding: 0 12px; list-style: none; cursor: pointer; }
 .agent-prompt summary::-webkit-details-marker { display: none; }
@@ -3606,7 +3624,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .agent-prompt-text { padding: 0 16px 13px 33px; font-size: 12.5px; line-height: 1.75; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; user-select: text; cursor: text; }
 .agent-more { margin-top: 5px; padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 11.5px; font-weight: 600; cursor: pointer; }
 .agent-more:hover { text-decoration: underline; }
-.agent-tool-preview { display: flex; flex-direction: column; gap: 10px; padding: 0 14px 10px 33px; }
+.agent-tool-preview { display: flex; flex-direction: column; gap: 0; padding: 0 14px 10px 33px; }
 .agent-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em; color: var(--text-faint); }
 .agent-candidates { display: flex; flex-direction: column; }
 .agent-candidate { display: flex; gap: 8px; padding: 7px 2px; border-top: 1px solid var(--line); }
@@ -3633,6 +3651,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .agent-fact > b { min-width: 0; font-weight: 400; color: var(--text-dim); word-break: break-word; }
 .agent-tool-error { padding: 7px 10px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 7%, transparent); font-size: 12.5px; line-height: 1.65; color: var(--text-dim); }
 .agent-error-card { margin: 4px 2px 8px; padding: 10px 12px 11px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 6%, transparent); text-align: left; }
+.agent-step.agent-error .agent-error-card { margin: 0 14px 10px 33px; }
 .agent-error-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .agent-error-head b { color: var(--danger); font-weight: 700; letter-spacing: 0.02em; }
 .agent-error-head .agent-timing { margin-left: auto; }
