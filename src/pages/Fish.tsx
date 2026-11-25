@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { call } from '../api';
-import { AgentTrace } from '../components/AgentTrace';
+import { AgentPanel } from '../agent/AgentPanel';
 import { TestLab } from '../components/TestLab';
 import { useApp } from '../context';
 import type { FishAgent, FishState, FishToolSpec } from '../types';
@@ -138,22 +138,12 @@ export default function Fish() {
       {loading && !state ? <Spinner label="读取 Agent…" /> : error ? <ErrorBox error={error} onRetry={() => load()} /> : state ? (
         <>
           {tab === 0 ? (
-            <div className="agent-page">
-              {errorText ? (
-                <div className="fish-error-strip" role="alert">
-                  <b>运行出错</b>
-                  <span>{errorText}</span>
-                  <button
-                    className="btn sm"
-                    onClick={() => navigator.clipboard.writeText(errorText).then(() => toast('错误已复制')).catch(() => toast('复制失败', true))}
-                  >
-                    复制错误
-                  </button>
-                </div>
-              ) : null}
-
-              <AgentTrace key={`full-${agent?.bvid || 'empty'}`} agent={agent} full parked={agentWaiting} />
-            </div>
+            <AgentPanel
+              agent={agent}
+              errorText={errorText}
+              parked={agentWaiting}
+              onCopyError={() => navigator.clipboard.writeText(errorText).then(() => toast('错误已复制')).catch(() => toast('复制失败', true))}
+            />
           ) : null}
 
           {tab === 1 ? <TestLab tools={tools} seedBvid={toolSeed} /> : null}

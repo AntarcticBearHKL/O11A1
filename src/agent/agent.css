@@ -1,0 +1,139 @@
+/* Standalone Agent debugging window. This file is only imported by
+   src/agent/main.tsx, so none of it ships in the normal renderer bundle. */
+
+.agent-dev-app {
+  -webkit-app-region: no-drag;
+  color: var(--text);
+}
+
+.agent-dev-shell {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 24px 26px 0;
+}
+
+.agent-dev-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  flex: none;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.agent-dev-copy { flex: 1; min-width: 0; }
+
+.agent-dev-eyebrow {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.agent-dev-title {
+  margin-top: 3px;
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: 0.01em;
+}
+
+.agent-dev-sub {
+  max-width: 720px;
+  margin-top: 4px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.agent-dev-connection {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.agent-dev-connection.ok {
+  background: color-mix(in srgb, var(--success) 13%, transparent);
+  color: var(--success);
+}
+
+.agent-dev-connection.bad {
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
+  color: var(--danger);
+}
+
+.agent-dev-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: none;
+}
+
+.agent-dev-actions .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.agent-dev-actions .window-controls { margin-left: 9px; }
+
+.agent-dev-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  flex: none;
+  padding: 10px 2px 0;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-dev-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 4px 28px;
+  overscroll-behavior: contain;
+}
+
+.agent-dev-body .agent-thread {
+  max-height: none;
+  min-height: 0;
+}
+
+.agent-dev-empty {
+  padding: 48px 20px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.agent-dev-empty code {
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+}
+
+@media (max-width: 760px) {
+  .agent-dev-shell { padding: 18px 16px 0; }
+  .agent-dev-head { flex-direction: column; }
+  .agent-dev-actions { width: 100%; justify-content: flex-start; }
+  .agent-dev-actions .window-controls { margin-left: auto; }
+}

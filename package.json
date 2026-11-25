@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "start": "electron .",
     "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && cross-env O11A1_DEV_URL=http://127.0.0.1:5173 electron .\"",
+    "agent:dev": "concurrently -k \"vite --host 127.0.0.1 --port 4173 --strictPort\" \"wait-on http://127.0.0.1:4173/agent.html && cross-env O11A1_DEV_URL=http://127.0.0.1:4173/agent.html electron .\"",
     "package": "electron-builder --win --x64"
   },
   "dependencies": {

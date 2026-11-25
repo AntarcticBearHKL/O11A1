@@ -64,6 +64,14 @@ npm start
 
 开发时可以用 `npm run dev`（Vite + Electron）。
 
+只调 Agent 页面时用：
+
+```powershell
+npm run agent:dev
+```
+
+它会让 Vite 只加载 `agent.html`，Electron 仍然带 preload 和真实 engine，所以 `fish.state` / `fish.agent.step` 都是真实数据；改 `src/agent/AgentPanel.tsx`、`src/components/AgentTrace.tsx` 会热更新，不需要重编 renderer 或重新打包。主界面的 Agent tab 也复用同一个 `AgentPanel`。
+
 ## 打包
 
 ```powershell
