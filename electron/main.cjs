@@ -1228,33 +1228,74 @@ function directShareTarget(text) {
   return aid > 0 ? { aid, part, startMs } : null;
 }
 
-async function fetchShare(url, timeoutMs = 12000) {
+async function fetchShare(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, {
       redirect: 'follow',
+      ...options,
       signal: controller.signal,
-      headers: { 'User-Agent': SHARE_UA, Referer: 'https://www.bilibili.com/' },
+      headers: {
+        'User-Agent': SHARE_UA,
+        Referer: 'https://www.bilibili.com/',
+        ...(options.headers || {}),
+      },
     });
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function resolveShortShare(host, path, query) {
+const shortShareCache = new Map();
+const SHORT_CACHE_TTL = 10 * 60_000;
+
+async function resolveShortShare(host, path, query, depth = 0) {
   const part = shareQueryNumber(query, 'p') || 1;
   const startMs = shareTimeMs(query);
   if (/^BV[0-9A-Za-z]{10}$/i.test(path)) return { bvid: path, part, startMs };
   if (/^av\d+$/i.test(path)) return { aid: Number(path.replace(/^av/i, '')), part, startMs };
-  const response = await fetchShare(`https://${host}/${path}${query || ''}`);
+  const url = `https://${host}/${path}${query || ''}`;
+  const cached = shortShareCache.get(url);
+  if (cached && Date.now() - cached.at < SHORT_CACHE_TTL) return cached.target;
+  const remember = (target) => {
+    if (target) shortShareCache.set(url, { target, at: Date.now() });
+    return target;
+  };
+  // A b23 link is normally a 302. Read just that Location instead of
+  // downloading the whole Bilibili video page, which is the slow part.
+  try {
+    const head = await fetchShare(url, { method: 'HEAD', redirect: 'manual' }, 8000);
+    const location = head.headers.get('location');
+    if (location) {
+      const absolute = new URL(location, url).toString();
+      const direct = directShareTarget(absolute);
+      if (direct) return remember(direct);
+      const queryBv = absolute.match(SHARE_BVID_QUERY_RE);
+      if (queryBv) {
+        return remember({
+          bvid: queryBv[1],
+          part: shareQueryNumber(absolute, 'p') || 1,
+          startMs: shareTimeMs(absolute),
+        });
+      }
+      const next = absolute.match(SHARE_SHORT_RE);
+      if (next && depth < 3 && (next[1] !== host || next[2] !== path)) {
+        const nested = await resolveShortShare(next[1], next[2], next[3] || '', depth + 1);
+        if (nested) return remember(nested);
+      }
+    }
+  } catch {
+    /* fall back to a normal GET below */
+  }
+  const response = await fetchShare(url);
   const finalUrl = String(response.url || '');
   const direct = directShareTarget(finalUrl);
-  if (direct) return direct;
+  if (direct) return remember(direct);
   // A few short links answer with an HTML jump page instead of a 302.
   const html = await response.text();
   const inline = html.match(/https?:\/\/[^"'<>\\\s]*bilibili\.com\/video\/(?:BV[0-9A-Za-z]{10}|av\d+)[^"'<>\\\s]*/i);
-  return inline ? directShareTarget(inline[0]) : null;
+  return remember(inline ? directShareTarget(inline[0]) : null);
 }
 
 async function resolveShareTarget(text) {

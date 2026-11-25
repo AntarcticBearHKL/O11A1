@@ -485,6 +485,7 @@ export default function App({ initial }: { initial?: AppInitial }) {
         || (/(?:bilibili|B站|哔哩)/i.test(text) && /\bav\d+\b/i.test(text));
       if (!hasVideo) return;
       event.preventDefault();
+      show('正在打开分享视频…');
       window.o11a1.share?.open(text).then((result: any) => {
         if (result?.ok) show('已打开分享视频');
         else show(result?.error || '没有识别到视频', true);
