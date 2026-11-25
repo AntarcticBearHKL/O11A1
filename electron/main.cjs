@@ -491,6 +491,9 @@ async function advanceNativePlaylist(record, loopMode) {
       title: next.title || '',
       cover: next.cover || '',
       startMs: 0,
+      // Playlist auto-advance is stream playback, not an explicit open:
+      // never write it to the account's Bilibili history.
+      reportHistory: false,
     });
   } catch (error) {
     console.error('native playlist advance failed', error);

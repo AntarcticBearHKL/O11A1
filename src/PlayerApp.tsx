@@ -536,16 +536,16 @@ export default function PlayerApp() {
     show('截图已保存到 screenshots 目录');
   };
 
-  const playPlaylistIndex = async (index: number) => {
+  const playPlaylistIndex = async (index: number, reportHistory = true) => {
     const playlist = settings?.playlist || [];
     const item = playlist[index];
     if (!item) return;
     await saveSettings({ playlist_current: index });
-    await openPlayer({ bvid: item.bvid, cid: item.cid || null, aid: item.aid, title: item.title, cover: item.cover, startMs: 0, url: null, audioUrl: null, epId: null });
+    await openPlayer({ bvid: item.bvid, cid: item.cid || null, aid: item.aid, title: item.title, cover: item.cover, startMs: 0, url: null, audioUrl: null, epId: null, reportHistory });
     setShowPlaylist(false);
   };
 
-  const nextPlaylist = () => {
+  const nextPlaylist = (reportHistory = true) => {
     const playlist = settings?.playlist || [];
     if (!playlist.length) return;
     const current = settings?.playlist_current ?? -1;
@@ -559,7 +559,7 @@ export default function PlayerApp() {
       : settings?.playlist_random && pool.length
         ? pool[Math.floor(Math.random() * pool.length)]
         : (current + 1) % playlist.length;
-    playPlaylistIndex(next);
+    playPlaylistIndex(next, reportHistory);
   };
 
   const prevPlaylist = () => {
@@ -579,7 +579,8 @@ export default function PlayerApp() {
         seek(0);
         command('play');
       } else if (loopMode === 2) {
-        nextPlaylist();
+        // Stream auto-advance: play the next row without reporting history.
+        nextPlaylist(false);
       }
     } else if (!settings?.playlist_autoplay && settings?.playlist_current != null) {
       const current = playlist[settings.playlist_current];
@@ -589,7 +590,7 @@ export default function PlayerApp() {
     } else if (options?.parts?.length > 1 && Number(options.partIndex || 0) < options.parts.length - 1) {
       const next = Number(options.partIndex || 0) + 1;
       const part = options.parts[next];
-      openPlayer({ ...options, cid: part.cid, partIndex: next, startMs: 0 });
+      openPlayer({ ...options, cid: part.cid, partIndex: next, startMs: 0, reportHistory: false });
     }
   }, [state.ended]);
 
@@ -727,6 +728,7 @@ export default function PlayerApp() {
       episodes: [],
       parts: entry.parts || [],
       partIndex: entry.partIndex || 0,
+      reportHistory: true,
     };
     await enqueuePlaylist(next).catch(() => {});
     await openPlayer(next, true);
@@ -741,6 +743,7 @@ export default function PlayerApp() {
       partIndex: index,
       title: `${detail.title} · ${part.title}`,
       startMs: 0,
+      reportHistory: true,
     });
   }, [detail, openPlayer, options]);
 
@@ -755,6 +758,7 @@ export default function PlayerApp() {
         audioUrl: source.audioUrl || '',
         title: `${ep.title || ''} ${ep.long_title || ''}`.trim() || options.title,
         startMs: 0,
+        reportHistory: true,
       });
     } catch (error: any) { show(error.message, true); }
   }, [openPlayer, options, show]);
@@ -1010,7 +1014,7 @@ export default function PlayerApp() {
                       <div className="side-title">分P</div>
                       <div className="episode-grid">
                         {(options.parts || []).map((part: any, index: number) => (
-                          <button key={part.cid} className={`episode ${options.partIndex === index ? 'active' : ''}`} onClick={() => openPlayer({ ...options, cid: part.cid, partIndex: index, title: `${detail?.title || options.title} · ${part.title}`, startMs: 0 })}>P{index + 1}</button>
+                          <button key={part.cid} className={`episode ${options.partIndex === index ? 'active' : ''}`} onClick={() => openPlayer({ ...options, cid: part.cid, partIndex: index, title: `${detail?.title || options.title} · ${part.title}`, startMs: 0, reportHistory: true })}>P{index + 1}</button>
                         ))}
                       </div>
                     </>
@@ -1083,7 +1087,7 @@ export default function PlayerApp() {
                   {!historyDate ? <div style={{ color: '#8a8d92', fontSize: 11.5, marginTop: 4 }}>选择日期查看历史弹幕；「实时」是当前播放的列表。</div> : null}
                   <div className="side-title" style={{ marginTop: 16 }}>最近观看</div>
                   {history.slice(0, 5).map((item: any) => (
-                    <div key={item.kid} style={{ padding: '5px 0', cursor: 'pointer' }} onClick={() => openPlayer({ bvid: item.bvid, cid: item.cid || null, title: item.title, cover: item.cover, startMs: item.progress * 1000, url: null, audioUrl: null, epId: null })}>
+                    <div key={item.kid} style={{ padding: '5px 0', cursor: 'pointer' }} onClick={() => openPlayer({ bvid: item.bvid, cid: item.cid || null, title: item.title, cover: item.cover, startMs: item.progress * 1000, url: null, audioUrl: null, epId: null, reportHistory: true })}>
                       <div style={{ fontSize: 11, fontWeight: 600 }}>{item.title}</div>
                       <div style={{ fontSize: 10, color: '#8a8d92' }}>{item.author} · {formatTime(item.progress * 1000)}</div>
                     </div>
@@ -1175,7 +1179,7 @@ export default function PlayerApp() {
         <div className="controls">
           <button className="ctrl play" onClick={togglePlay} title="播放/暂停">{state.playing ? <IconPause size={18} /> : <IconPlay size={18} />}</button>
           <button className="ctrl" onClick={prevPlaylist} title="上一首"><IconPrev /></button>
-          <button className="ctrl" onClick={nextPlaylist} title="下一首"><IconNext /></button>
+          <button className="ctrl" onClick={() => nextPlaylist()} title="下一首"><IconNext /></button>
           <div className="time">{formatTime(position)} / {formatTime(duration)}</div>
           <div className="volume">
             <button className="ctrl" onClick={toggleMute}>{muted || volume === 0 ? <IconMute /> : <IconVolume />}</button>

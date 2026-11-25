@@ -754,6 +754,9 @@ struct Engine {
     cache_total: u64,
     // History heartbeat.
     aid: u64,
+    /// Whether the current source may report Bilibili history. Auto-play and
+    /// auto-next set this false; an explicitly opened video sets it true.
+    report_history: bool,
     heartbeat: Option<Heartbeat>,
     heartbeat_started: bool,
     heartbeat_accum: Duration,
@@ -1145,11 +1148,19 @@ impl Engine {
             player_keys.len(),
             player_keys_hint
         ));
-        let heartbeat = match (&session, &source.bvid, source.cid) {
-            (Some(session), Some(bvid), Some(cid)) => {
-                Some(Heartbeat::spawn(session.clone(), bvid.clone(), cid))
+        let report_history = config.report_history;
+        if !report_history {
+            log::line("heartbeat disabled reason=stream");
+        }
+        let heartbeat = if report_history {
+            match (&session, &source.bvid, source.cid) {
+                (Some(session), Some(bvid), Some(cid)) => {
+                    Some(Heartbeat::spawn(session.clone(), bvid.clone(), cid))
+                }
+                _ => None,
             }
-            _ => None,
+        } else {
+            None
         };
         let qa = parse_qa(duration_ms);
         let auto_exit = std::env::var("BILI_PLAYER_SECONDS")
@@ -1417,6 +1428,7 @@ impl Engine {
             cache_done: 0,
             cache_total: 0,
             aid: 0,
+            report_history,
             heartbeat,
             heartbeat_started: false,
             heartbeat_accum: Duration::ZERO,
@@ -3756,6 +3768,15 @@ impl Engine {
         self.heartbeat_anchor = None;
         self.heartbeat_accum = Duration::ZERO;
         self.last_heartbeat = Instant::now();
+        if !self.report_history {
+            self.heartbeat = None;
+            log::line(&format!(
+                "heartbeat paused reason=feed bvid={} cid={}",
+                self.source.bvid.as_deref().unwrap_or("-"),
+                self.source.cid.unwrap_or(0)
+            ));
+            return;
+        }
         self.heartbeat = match (&self.session, &self.source.bvid, self.source.cid) {
             (Some(session), Some(bvid), Some(cid)) => {
                 let worker = Heartbeat::spawn(session.clone(), bvid.clone(), cid);
@@ -7422,6 +7443,9 @@ impl Engine {
         let Some(bvid) = self.source.bvid.clone() else {
             return;
         };
+        // A page click in the player is an explicit open, even when the source
+        // being replaced came from feed auto-play.
+        self.report_history = true;
         // Leaving this part: keep its position before the old sessions stop.
         self.record_watch_progress();
         let cid = page.cid;
@@ -7765,6 +7789,7 @@ impl Engine {
         self.requested_start_ms = config.start_ms;
         self.session_started = Instant::now();
         self.is_live = config.is_live;
+        self.report_history = config.report_history;
         self.aid = 0;
         self.pages.clear();
         self.current_page = 0;

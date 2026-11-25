@@ -15,6 +15,9 @@ export interface LaunchOptions {
   partIndex?: number;
   seasonId?: number;
   epId?: number;
+  /// `false` for stream/auto-play so it never writes Bilibili history; direct
+  /// opens leave it unset (the native player defaults to reporting).
+  reportHistory?: boolean;
 }
 
 /// Left-click reuses the most recently focused player window (the shell

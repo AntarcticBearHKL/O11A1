@@ -444,7 +444,8 @@ export default function App({ initial }: { initial?: AppInitial }) {
     // The native shell owns the queue update: a left-click replaces the
     // focused window's row (delete old, insert new), a right-click enqueues a
     // new row. Doing it here too would fight that bookkeeping.
-    await launchPlayer(options, newWindow);
+    // Every card/row click here is an explicit open, so it syncs history.
+    await launchPlayer({ ...options, reportHistory: true }, newWindow);
   }, []);
 
   const triggerRefresh = useCallback(() => {

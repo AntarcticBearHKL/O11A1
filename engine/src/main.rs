@@ -1907,6 +1907,11 @@ fn config_from_params(
             .map(|value| value as usize),
         host,
         is_live: params.get("live").and_then(Value::as_bool).unwrap_or(false),
+        // Explicit opens report history. Auto-play/next sources pass false.
+        report_history: params
+            .get("reportHistory")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
     }
 }
 

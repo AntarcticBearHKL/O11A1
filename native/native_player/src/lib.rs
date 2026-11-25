@@ -120,6 +120,11 @@ pub struct PlayerConfig {
     /// Live stream: interpolation and enhancement are disabled and the player
     /// shows a live-specific settings list.
     pub is_live: bool,
+    /// Report Bilibili history heartbeats for this source. Directly opened
+    /// videos keep this on; feed auto-play / auto-next sources turn it off so
+    /// browsing a stream never writes to the account's history. Local resume
+    /// progress is still stored either way.
+    pub report_history: bool,
 }
 
 /// A running native player window.
@@ -190,6 +195,12 @@ impl Player {
         // for the first tick).
         crate::mediacache::start_janitor();
         let state = PlayerState::load();
+        log::line(&format!(
+            "open config report_history={} bvid={:?} cid={:?}",
+            config.report_history,
+            config.bvid,
+            config.cid
+        ));
         log::line(&format!(
             "player state file={} volume={} muted={} speed={:.2} aspect={} brightness={:.2} audio_only={} ontop={} danmaku={} qn={:?} codecid={:?} audio_index={:?}",
             state::state_path().display(),
