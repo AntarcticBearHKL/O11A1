@@ -514,6 +514,21 @@ function AgentStepRow({
   );
 }
 
+/// The exact prompt text, open by default. The owner wants every system
+/// instruction visible verbatim, not a preview or a folded card.
+function PromptBlock({ title, text }: { title: string; text: string }) {
+  if (!text.trim()) return null;
+  return (
+    <details className="agent-prompt" open>
+      <summary>
+        <span className="agent-prompt-title">{title}</span>
+        <span className="agent-prompt-meta">{text.length} 字符</span>
+      </summary>
+      <div className="agent-prompt-text">{text}</div>
+    </details>
+  );
+}
+
 function Chevron({ open }: { open: boolean }) {
   return (
     <span className={`agent-chevron ${open ? 'open' : ''}`}>
@@ -607,6 +622,12 @@ export function AgentTrace({
 
   return (
     <div className={`agent-chat ${full ? 'full' : ''}`}>
+      {agent?.system_prompt || agent?.user_prompt ? (
+        <div className="agent-prompts">
+          <PromptBlock title="系统提示词" text={agent?.system_prompt || ''} />
+          <PromptBlock title="起始消息" text={agent?.user_prompt || ''} />
+        </div>
+      ) : null}
       <div
         className="agent-thread"
         ref={threadRef}
