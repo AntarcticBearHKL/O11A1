@@ -784,6 +784,13 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             }
             rv(items)
         }
+        "feed.page" => {
+            let session = app.session().await?;
+            rv(session
+                .homepage_feed_page(unum(&params, "fresh").max(1))
+                .await
+                .map_err(e)?)
+        }
         "search.suggest" => {
             let session = app.session().await?;
             rv(session

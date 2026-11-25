@@ -235,6 +235,35 @@ function rememberPreview(key: string, url: string): void {
   previewCache.set(key, { url, at: Date.now() });
 }
 
+const previewWarming = new Set<string>();
+
+/// Resolve a few preview URLs for the block that was just appended below the
+/// viewport. The mobile feed does the same: by the time the next rows become
+/// visible, hovering a card starts its video immediately instead of waiting
+/// for a `video.preview` round-trip.
+export function prewarmFeedPreviews(
+  items: Array<{ bvid?: string; cid?: number }>,
+  limit = 4,
+): void {
+  let started = 0;
+  for (const item of items) {
+    if (started >= limit) break;
+    const bvid = String(item?.bvid || '').trim();
+    const cid = Number(item?.cid || 0);
+    if (!bvid || !cid) continue;
+    const key = `${bvid}:${cid}`;
+    if (cachedPreview(key) || previewWarming.has(key)) continue;
+    previewWarming.add(key);
+    started += 1;
+    call<{ url: string }>('video.preview', { bvid, cid })
+      .then((data) => {
+        if (data?.url) rememberPreview(key, data.url);
+      })
+      .catch(() => {})
+      .finally(() => previewWarming.delete(key));
+  }
+}
+
 function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigate }: {
   item: any;
   index: number;
@@ -340,6 +369,7 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
   return (
     <div
       className="video-card"
+      data-feed-key={item.bvid ? `${item.bvid}:${Number(item.cid || 0)}` : undefined}
       style={{ animationDelay: `${Math.min(index, 14) * 32}ms` }}
       role="button"
       tabIndex={0}

@@ -967,6 +967,57 @@ impl Session {
             .await
     }
 
+    /// Exactly one recommendation page plus the cursor for the next one. The
+    /// desktop feed's sliding window needs a precise page boundary: requesting
+    /// a card count can over-fetch and trim, which loses the next page cursor.
+    pub async fn homepage_feed_page(&self, fresh_idx: u64) -> Result<HomeFeedPage> {
+        let fresh = fresh_idx.max(1);
+        self.wbi_keys(false).await?;
+        let params = feed_params(fresh, fresh, 1, "");
+        let mut resp = self.feed_page(&params, false).await?;
+        if resp.code != 0 {
+            resp = self.feed_page(&params, true).await?;
+        }
+        if resp.code != 0 {
+            bail!("获取首页推荐失败（code={}）", resp.code);
+        }
+        let Some(data) = resp.data else {
+            return Ok(HomeFeedPage {
+                items: Vec::new(),
+                next: fresh + 1,
+                has_more: false,
+            });
+        };
+        let mut items = Vec::new();
+        for item in data.item {
+            if item.goto != "av" {
+                continue;
+            }
+            let (owner, owner_mid) = match item.owner {
+                Some(owner) => (owner.name, owner.mid),
+                None => (String::new(), 0),
+            };
+            items.push(FeedVideo {
+                bvid: item.bvid,
+                cid: item.cid,
+                aid: item.id,
+                title: item.title,
+                pic: item.pic,
+                owner,
+                owner_mid,
+                view: item.stat.map(|stat| stat.view).unwrap_or(0),
+                duration: item.duration,
+                pub_ts: item.pubdate,
+            });
+        }
+        let has_more = !items.is_empty();
+        Ok(HomeFeedPage {
+            items,
+            next: fresh + 1,
+            has_more,
+        })
+    }
+
     async fn homepage_feed_inner(
         &self,
         fresh_idx_start: u64,
@@ -2916,6 +2967,16 @@ pub struct FeedVideo {
     /// Publish time as a Unix timestamp in seconds; `0` when the payload has
     /// none. The feed, favourites, related and UP主 arc paths all fill it.
     pub pub_ts: i64,
+}
+
+/// One exact recommendation page: the desktop sliding window appends this
+/// block, then releases the oldest block after the viewport has moved past it.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HomeFeedPage {
+    pub items: Vec<FeedVideo>,
+    /// `fresh_idx` for the next page; monotonic even when a page is empty.
+    pub next: u64,
+    pub has_more: bool,
 }
 
 /// One discovery card (分区 / 排行 item).

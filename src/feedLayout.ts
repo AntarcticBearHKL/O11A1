@@ -1,6 +1,6 @@
-/// The home feed is a fixed seven-row batch. The card grid uses auto-fill
-/// columns, so the batch is sized from the viewport at load time: seven full
-/// rows at the current width, never an endless stream.
+/// The startup preloader and the 换一换 refresh buffer are sized as seven-row
+/// batches. The home feed itself is now an infinite sliding window; this batch
+/// only covers the first paint and each refresh.
 
 export const FEED_ROWS = 7;
 export const MAX_FEED_COLUMNS = 8;
