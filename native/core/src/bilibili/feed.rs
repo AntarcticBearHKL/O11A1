@@ -162,7 +162,18 @@ impl Session {
 impl Session {
     /// Full metadata for one video (WBI-signed, one retry).
     pub async fn video_view(&self, bvid: &str) -> Result<VideoDetail> {
-        let params = vec![("bvid".to_string(), bvid.to_string())];
+        self.video_view_params(vec![("bvid".to_string(), bvid.to_string())])
+            .await
+    }
+
+    /// The same view endpoint accepts the old numeric `aid`; used by the
+    /// clipboard share parser for `av` links.
+    pub async fn video_view_aid(&self, aid: u64) -> Result<VideoDetail> {
+        self.video_view_params(vec![("aid".to_string(), aid.to_string())])
+            .await
+    }
+
+    async fn video_view_params(&self, params: Vec<(String, String)>) -> Result<VideoDetail> {
         let mut resp: ViewResp = self.wbi_call(VIEW_URL, &params, false).await?.1;
         if resp.code != 0 {
             resp = self.wbi_call(VIEW_URL, &params, true).await?.1;

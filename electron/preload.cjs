@@ -38,6 +38,9 @@ contextBridge.exposeInMainWorld('o11a1', {
   dialog: {
     error: (title, message) => ipcRenderer.invoke('dialog:error', title, message),
   },
+  share: {
+    open: (text) => ipcRenderer.invoke('share:open', text),
+  },
   player: {
     launch: (options, newWindow) => ipcRenderer.invoke('player:launch', options, !!newWindow),
     options: () => ipcRenderer.invoke('player:options'),

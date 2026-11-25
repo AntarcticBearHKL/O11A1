@@ -470,6 +470,30 @@ export default function App({ initial }: { initial?: AppInitial }) {
     window.setTimeout(() => setDockRefresh(false), 650);
   }, [triggerRefresh]);
 
+  // Ctrl+V on the shell opens a Bilibili share directly. Inputs keep their
+  // normal paste behavior (search box, settings fields); a share text can use a
+  // full video URL, a b23.tv / bili2233.cn short link, or a bare BV/av id.
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      if (searchOpen) return;
+      const target = event.target as HTMLElement | null;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      const text = event.clipboardData?.getData('text') || '';
+      if (!text.trim()) return;
+      const hasVideo = /b23\.tv|bili2233\.cn|bilibili\.com\/video|BV[0-9A-Za-z]{10}/i.test(text)
+        || /^\s*av\d+\s*$/i.test(text)
+        || (/(?:bilibili|B站|哔哩)/i.test(text) && /\bav\d+\b/i.test(text));
+      if (!hasVideo) return;
+      event.preventDefault();
+      window.o11a1.share?.open(text).then((result: any) => {
+        if (result?.ok) show('已打开分享视频');
+        else show(result?.error || '没有识别到视频', true);
+      }).catch((error: any) => show(error?.message || '打开分享视频失败', true));
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [searchOpen, show]);
+
   // The top and bottom chrome keep their live backdrop blur while the page
   // scrolls; the glass samples the moving content every frame instead of
   // switching to an opaque surface.

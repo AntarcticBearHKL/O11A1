@@ -818,6 +818,13 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
                 .await
                 .map_err(e)?)
         }
+        "video.detail.aid" => {
+            let session = app.session().await?;
+            rv(session
+                .video_view_aid(unum(&params, "aid"))
+                .await
+                .map_err(e)?)
+        }
         "video.related" => {
             let session = app.session().await?;
             rv(session.related(&text(&params, "bvid")).await.map_err(e)?)

@@ -1185,6 +1185,133 @@ ipcMain.handle('dialog:error', (_event, title, message) => {
   dialog.showMessageBox({ type: 'error', title, message });
 });
 
+// ---- clipboard share links ------------------------------------------------
+// Bilibili share text arrives in several shapes: a full video URL, a b23.tv /
+// bili2233.cn short link (sometimes without https://), a bare BV/av id, or any
+// of those wrapped in 【title】 text. The parser accepts all of them and opens
+// the resolved video in the player.
+const SHARE_VIDEO_RE = /(?:https?:\/\/)?(?:www\.|m\.)?bilibili\.com\/video\/(BV[0-9A-Za-z]{10}|av(\d+))([^\s【】]*)/i;
+const SHARE_SHORT_RE = /(?:https?:\/\/)?(b23\.tv|bili2233\.cn)\/([A-Za-z0-9]+)(\?[^\s【】]*)?/i;
+const SHARE_BVID_QUERY_RE = /[?&]bvid=(BV[0-9A-Za-z]{10})/i;
+const SHARE_BV_RE = /\bBV[0-9A-Za-z]{10}\b/;
+const SHARE_AV_RE = /\bav(\d+)\b/i;
+const SHARE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+
+function shareQueryNumber(text, key) {
+  const match = String(text || '').match(new RegExp(`[?&]${key}=(\\d+)`, 'i'));
+  return match ? Number(match[1]) : 0;
+}
+
+function shareTimeMs(text) {
+  const match = String(text || '').match(/[?&](?:t|start)=([^&#\s]+)/i);
+  if (!match) return 0;
+  const raw = decodeURIComponent(match[1]);
+  if (/^\d+$/.test(raw)) return Number(raw) * 1000;
+  let total = 0;
+  for (const part of raw.matchAll(/(\d+)(h|m|s)/gi)) {
+    const amount = Number(part[1]);
+    const unit = part[2].toLowerCase();
+    total += unit === 'h' ? amount * 3600 : unit === 'm' ? amount * 60 : amount;
+  }
+  return total * 1000;
+}
+
+function directShareTarget(text) {
+  const match = String(text || '').match(SHARE_VIDEO_RE);
+  if (!match) return null;
+  const id = match[1] || '';
+  const tail = match[3] || '';
+  const part = shareQueryNumber(tail, 'p') || 1;
+  const startMs = shareTimeMs(tail);
+  if (/^BV/i.test(id)) return { bvid: id, part, startMs };
+  const aid = Number(match[2] || id.replace(/^av/i, ''));
+  return aid > 0 ? { aid, part, startMs } : null;
+}
+
+async function fetchShare(url, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: { 'User-Agent': SHARE_UA, Referer: 'https://www.bilibili.com/' },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveShortShare(host, path, query) {
+  const part = shareQueryNumber(query, 'p') || 1;
+  const startMs = shareTimeMs(query);
+  if (/^BV[0-9A-Za-z]{10}$/i.test(path)) return { bvid: path, part, startMs };
+  if (/^av\d+$/i.test(path)) return { aid: Number(path.replace(/^av/i, '')), part, startMs };
+  const response = await fetchShare(`https://${host}/${path}${query || ''}`);
+  const finalUrl = String(response.url || '');
+  const direct = directShareTarget(finalUrl);
+  if (direct) return direct;
+  // A few short links answer with an HTML jump page instead of a 302.
+  const html = await response.text();
+  const inline = html.match(/https?:\/\/[^"'<>\\\s]*bilibili\.com\/video\/(?:BV[0-9A-Za-z]{10}|av\d+)[^"'<>\\\s]*/i);
+  return inline ? directShareTarget(inline[0]) : null;
+}
+
+async function resolveShareTarget(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const direct = directShareTarget(raw);
+  if (direct) return direct;
+  const short = raw.match(SHARE_SHORT_RE);
+  if (short) {
+    const target = await resolveShortShare(short[1], short[2], short[3] || '');
+    if (target) return target;
+  }
+  const queryBv = raw.match(SHARE_BVID_QUERY_RE);
+  if (queryBv) {
+    return {
+      bvid: queryBv[1],
+      part: shareQueryNumber(raw, 'p') || 1,
+      startMs: shareTimeMs(raw),
+    };
+  }
+  const bv = raw.match(SHARE_BV_RE);
+  if (bv) return { bvid: bv[0], part: 1, startMs: 0 };
+  const av = raw.match(SHARE_AV_RE);
+  if (av) return { aid: Number(av[1]), part: 1, startMs: 0 };
+  return null;
+}
+
+async function openShareText(text) {
+  const target = await resolveShareTarget(text);
+  if (!target) return { ok: false, error: '没有识别到 B 站视频链接' };
+  let bvid = target.bvid || '';
+  if (!bvid && target.aid) {
+    const detail = await engineCall('video.detail.aid', { aid: target.aid }, 15000).catch(() => null);
+    bvid = detail?.bvid || '';
+  }
+  if (!bvid) return { ok: false, error: '没有解析出视频 BV 号' };
+  let cid = null;
+  if ((target.part || 1) > 1) {
+    const detail = await engineCall('video.detail', { bvid }, 15000).catch(() => null);
+    const page = Array.isArray(detail?.pages) ? detail.pages[(target.part || 1) - 1] : null;
+    cid = page?.cid || null;
+  }
+  const options = { bvid, cid, startMs: target.startMs || 0, reportHistory: true };
+  const existing = mostRecentNativePlayer();
+  if (existing) await replaceNativePlayback(existing, options);
+  else await launchNativePlayer(options);
+  return { ok: true, bvid, part: target.part || 1 };
+}
+
+ipcMain.handle('share:open', async (_event, text) => {
+  try {
+    return await openShareText(text);
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+});
+
 ipcMain.handle('player:launch', async (_event, options, newWindow) => {
   // Left-click: take over the most recently focused player window, keeping
   // its rectangle and chrome. Right-click asks for a new window explicitly.
