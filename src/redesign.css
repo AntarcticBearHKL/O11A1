@@ -1744,15 +1744,20 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .settings-nav {
   position: sticky;
   top: 20px;
+  align-self: start;
+  height: fit-content;
   padding: 16px 10px;
-  display: flex;
-  flex-direction: column;
+  /* Grid, not flex: a taller settings panel must never stretch the nav and
+     leave the last item floating below the rest. */
+  display: grid;
+  grid-auto-rows: 48px;
   gap: 3px;
 }
 .settings-nav button {
   width: 100%;
   height: 48px;
-  min-height: 48px;
+  min-height: 0;
+  flex: none;
   padding: 0 14px;
   border-radius: 10px;
   color: var(--text-dim);
@@ -4130,8 +4135,8 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   .page-actions { justify-content: flex-start; flex-wrap: wrap; }
   .settings-layout, .favorites-layout, .fish-grid, .tool-grid { grid-template-columns: 1fr; }
   .settings-nav, .folder-rail { position: static; }
-  .settings-nav { flex-direction: row; flex-wrap: wrap; padding: 10px; }
-  .settings-nav button { width: auto; height: auto; min-height: 34px; flex-direction: row; align-items: center; padding: 7px 12px; }
+  .settings-nav { display: flex; flex-direction: row; flex-wrap: wrap; padding: 10px; height: auto; }
+  .settings-nav button { width: auto; height: auto; min-height: 34px; flex: 0 0 auto; flex-direction: row; align-items: center; padding: 7px 12px; }
   .settings-nav button small { display: none; }
 }
 
