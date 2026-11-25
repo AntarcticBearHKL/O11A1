@@ -6,7 +6,7 @@ import { useApp } from '../context';
 import type { FishAgent, FishState, FishToolSpec } from '../types';
 import { ErrorBox, PageHead, Spinner, Tabs, Toggle } from '../components/Common';
 
-const TABS = ['看片', '试验台', '设置'];
+const TABS = ['Agent', '试验台', '设置'];
 
 /// 语音识别固定使用 tiny 模型：设置里只提供下载，其余参数保持默认值。
 const ASR_MODEL = 'tiny';
@@ -74,14 +74,6 @@ export default function Fish() {
   const snapshot = state?.snapshot;
   const snapshotState = snapshot?.state;
 
-  const action = async (method: string, params: Record<string, any> = {}) => {
-    try {
-      await call(method, params);
-      await load(true);
-      toast('操作成功');
-    } catch (reason: any) { toast(reason.message, true); }
-  };
-
   const nextAgentStep = async () => {
     try {
       await call('fish.agent.step');
@@ -129,56 +121,36 @@ export default function Fish() {
   const agentWaiting = Boolean(snapshot?.agent_waiting);
   const agentState = agent?.state || '';
   const errorText = stateError || (agentState === 'error' ? agent?.note || '' : '');
-  const stepLabel = agentWaiting
-    ? '等待下一步'
-    : isLive
-      ? '运行中'
-      : errorText
-        ? '出错 · 点下一步重试'
-        : agentState === 'done' || agentState === 'cancelled'
-          ? '本轮结束 · 点下一步继续'
-          : '点击「下一步」开始';
 
   return (
     <>
-      <PageHead eyebrow="实验" title="养鱼" sub="AI 看片 · 固定观看流程">
+      <PageHead eyebrow="实验" title="Agent" sub="AI 看片 · 单步工具流" className="fish-page-head">
         <Tabs tabs={TABS} active={tab} onChange={setTab} />
+        <button
+          className="btn sm primary fish-next"
+          disabled={isLive && !agentWaiting}
+          onClick={nextAgentStep}
+        >
+          下一步
+        </button>
       </PageHead>
 
-      {loading && !state ? <Spinner label="读取养鱼引擎…" /> : error ? <ErrorBox error={error} onRetry={() => load()} /> : state ? (
+      {loading && !state ? <Spinner label="读取 Agent…" /> : error ? <ErrorBox error={error} onRetry={() => load()} /> : state ? (
         <>
           {tab === 0 ? (
             <div className="agent-page">
-              <section className="fish-top fish-step-top">
-                <div className="fish-stepbar">
+              {errorText ? (
+                <div className="fish-error-strip" role="alert">
+                  <b>运行出错</b>
+                  <span>{errorText}</span>
                   <button
-                    className="btn sm primary"
-                    disabled={isLive && !agentWaiting}
-                    onClick={nextAgentStep}
+                    className="btn sm"
+                    onClick={() => navigator.clipboard.writeText(errorText).then(() => toast('错误已复制')).catch(() => toast('复制失败', true))}
                   >
-                    下一步
+                    复制错误
                   </button>
-                  <span className={`fish-debug-state ${agentWaiting ? 'waiting' : isLive ? 'running' : errorText ? 'error' : agentState === 'done' ? 'done' : 'idle'}`}>
-                    {stepLabel}
-                  </span>
-                  {isLive ? <button className="btn sm danger" onClick={() => action('fish.stop')}>停止</button> : null}
-                  {errorText ? (
-                    <button
-                      className="btn sm"
-                      onClick={() => navigator.clipboard.writeText(errorText).then(() => toast('错误已复制')).catch(() => toast('复制失败', true))}
-                    >
-                      复制错误
-                    </button>
-                  ) : null}
-                  <span className="fish-step-hint">每轮 DeepSeek 调用和工具执行结束后停住</span>
                 </div>
-                {errorText ? (
-                  <div className="fish-error-strip" role="alert">
-                    <b>运行出错</b>
-                    <span>{errorText}</span>
-                  </div>
-                ) : null}
-              </section>
+              ) : null}
 
               <AgentTrace key={`full-${agent?.bvid || 'empty'}`} agent={agent} full parked={agentWaiting} />
             </div>
@@ -215,7 +187,7 @@ export default function Fish() {
                 <div className="field"><label>间隔（毫秒）</label><input className="input" type="number" min={200} max={10000} value={settings.fish_interval_ms} onChange={(event) => saveFish({ fish_interval_ms: Number(event.target.value) })} /></div>
                 <div className="field"><label>候选来源</label><div className="fish-muted" style={{ paddingTop: 9 }}>固定首页视频流</div></div>
               </div>
-              <div className="settings-row"><div className="label"><div className="name">启用养鱼</div><div className="desc">允许后台定时喂食</div></div><Toggle on={settings.fish_enabled} onChange={(value) => saveFish({ fish_enabled: value })} /></div>
+              <div className="settings-row"><div className="label"><div className="name">启用 Agent</div><div className="desc">允许后台定时喂食</div></div><Toggle on={settings.fish_enabled} onChange={(value) => saveFish({ fish_enabled: value })} /></div>
               <div className="settings-row"><div className="label"><div className="name">自动喂食</div><div className="desc">{settings.fish_feed_time || '20:00'} 开始</div></div><Toggle on={settings.fish_auto_feed} onChange={(value) => saveFish({ fish_auto_feed: value })} /></div>
               <div className="settings-row"><div className="label"><div className="name">画面实验室抽帧间隔</div><div className="desc">仅手动画面实验室/旧流程使用；Agent 会自己选 1/5/10/20/30/60 秒</div></div>
                 <div className="control">

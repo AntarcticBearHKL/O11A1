@@ -41,15 +41,16 @@ export function ErrorBox({ error, onRetry }: { error: string; onRetry?: () => vo
  * subtitles are deliberately not rendered: content leads, tabs/filters stay.
  * Callers may still pass title/sub for context, but they are ignored.
  */
-export function PageHead({ children }: {
+export function PageHead({ children, className }: {
   title?: string;
   sub?: string;
   eyebrow?: string;
   children?: React.ReactNode;
+  className?: string;
 }) {
   if (!children) return null;
   return (
-    <header className="page-head">
+    <header className={`page-head${className ? ` ${className}` : ''}`}>
       <div className="page-actions">{children}</div>
     </header>
   );

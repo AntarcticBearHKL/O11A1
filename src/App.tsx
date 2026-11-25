@@ -53,7 +53,7 @@ const NAV = [
   { key: 'regions', label: '分区', icon: IconCompass, hint: '分区' },
   { key: 'pgc', label: '番剧', icon: IconTv, hint: '番剧' },
   { key: 'live', label: '直播', icon: IconRadio, hint: '直播' },
-  { key: 'fish', label: '养鱼', icon: IconFish, hint: '大肥鱼' },
+  { key: 'fish', label: 'Agent', icon: IconFish, hint: 'Agent' },
   { key: 'dynamic', label: '动态', icon: IconActivity, hint: '动态' },
   { key: 'messages', label: '消息', icon: IconBell, hint: '私信' },
 ] as const;

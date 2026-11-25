@@ -2562,9 +2562,9 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
    panels and no per-row background boxes. */
 .fish-flat { display: flex; flex-direction: column; max-width: 1120px; }
 .fish-top { padding: 0 2px 14px; }
-.fish-step-top { padding-bottom: 10px; }
-.fish-stepbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 4px 2px 12px; border-bottom: 1px solid var(--line); }
-.fish-step-hint { flex: 1; min-width: 180px; font-size: 10.5px; color: var(--text-faint); }
+/* The Agent page keeps one control: 下一步 at the right edge of the tab row. */
+.fish-page-head .page-actions { width: 100%; justify-content: flex-start; gap: 12px; }
+.fish-next { flex: none; margin-left: auto; }
 .fish-status-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .fish-state { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--text-dim); }
 .fish-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
@@ -3545,14 +3545,10 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 .fish-debug { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 2px 2px; border-top: 1px solid var(--line); }
 .fish-debug-label { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-dim); }
 .fish-debug-hint { flex: 1; min-width: 180px; font-size: 10.5px; color: var(--text-faint); }
-.fish-debug-state { display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border-radius: 999px; background: var(--surface-2); font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em; color: var(--text-faint); white-space: nowrap; }
-.fish-debug-state.waiting { background: var(--accent-soft); color: var(--accent); }
-.fish-debug-state.running { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); }
-.fish-debug-state.done { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); }
-.fish-debug-state.error { background: color-mix(in srgb, var(--danger) 13%, transparent); color: var(--danger); }
-.fish-error-strip { display: flex; align-items: flex-start; gap: 10px; margin-top: 9px; padding: 8px 11px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 6%, transparent); font-size: 12px; line-height: 1.65; color: var(--text-dim); }
+.fish-error-strip { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 10px; padding: 8px 11px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 6%, transparent); font-size: 12px; line-height: 1.65; color: var(--text-dim); }
 .fish-error-strip b { flex: none; color: var(--danger); font-weight: 700; }
 .fish-error-strip span { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; user-select: text; cursor: text; }
+.fish-error-strip .btn { flex: none; align-self: center; margin-left: auto; }
 .fish-debug.on .fish-debug-label { color: var(--accent); }
 .agent-thinking-body { position: relative; margin: 0 16px 10px 33px; padding: 2px 0 2px 13px; border-left: 2px solid var(--line); }
 .agent-thinking-body.clamped { max-height: 8.1em; overflow: hidden; }
