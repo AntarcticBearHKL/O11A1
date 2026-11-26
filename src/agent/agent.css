@@ -81,6 +81,11 @@
   -webkit-app-region: no-drag;
 }
 
+.agent-dev-body .agent-page {
+  height: 100%;
+  min-height: 0;
+}
+
 .agent-dev-body .agent-thread {
   max-height: none;
   min-height: 0;

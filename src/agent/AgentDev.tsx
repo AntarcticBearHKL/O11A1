@@ -44,6 +44,8 @@ export default function AgentDev() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [maximized, setMaximized] = useState(false);
+  const [chatText, setChatText] = useState('');
+  const [sending, setSending] = useState(false);
   const themeApplied = useRef(false);
 
   const load = useCallback(async (quiet = false) => {
@@ -132,7 +134,42 @@ export default function AgentDev() {
   const workerAlive = Boolean(snapshot?.worker_alive);
   const isLive = workerAlive && (name === 'Running' || name === 'Waiting');
   const agentWaiting = Boolean(snapshot?.agent_waiting);
+  const agentBusy = Boolean(snapshot?.chat_busy || agent?.state === 'running');
   const errorText = stateError(snapshot?.state) || (agent?.state === 'error' ? agent?.note || '' : '');
+
+  const sendChat = async () => {
+    const text = chatText.trim();
+    if (!text || sending) return;
+    setSending(true);
+    try {
+      await call('fish.agent.chat', { text });
+      setChatText('');
+      await load(true);
+    } catch (reason: any) {
+      show(reason?.message || String(reason), true);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const resetChat = async () => {
+    try {
+      await call('fish.agent.reset');
+      setChatText('');
+      await load(true);
+    } catch (reason: any) {
+      show(reason?.message || String(reason), true);
+    }
+  };
+
+  const cancelChat = async () => {
+    try {
+      await call('fish.agent.cancel');
+      await load(true);
+    } catch (reason: any) {
+      show(reason?.message || String(reason), true);
+    }
+  };
 
   const next = async () => {
     try {
@@ -175,6 +212,9 @@ export default function AgentDev() {
               <IconRefresh size={13} />
               刷新
             </button>
+            <button className="btn sm" disabled={agentBusy || !agent?.steps?.length} onClick={resetChat}>
+              新对话
+            </button>
             <button
               className="btn sm primary"
               disabled={demoMode || (isLive && !agentWaiting)}
@@ -194,7 +234,28 @@ export default function AgentDev() {
                 errorText={errorText}
                 parked={agentWaiting}
                 onCopyError={() => navigator.clipboard.writeText(errorText).then(() => show('错误已复制')).catch(() => show('复制失败', true))}
-              />
+              >
+                <div className="agent-composer">
+                  <textarea
+                    className="agent-composer-input"
+                    value={chatText}
+                    rows={2}
+                    placeholder={agentBusy ? 'Agent 正在回复…' : '跟 Agent 说你想看什么…（Enter 发送，Shift+Enter 换行）'}
+                    onChange={(event) => setChatText(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'Enter' || event.shiftKey) return;
+                      if (event.nativeEvent.isComposing) return;
+                      event.preventDefault();
+                      if (!agentBusy) void sendChat();
+                    }}
+                  />
+                  {agentBusy ? (
+                    <button className="btn sm" onClick={cancelChat}>停止</button>
+                  ) : (
+                    <button className="btn sm primary" disabled={!chatText.trim() || sending} onClick={sendChat}>发送</button>
+                  )}
+                </div>
+              </AgentPanel>
             ) : (
               <div className="agent-dev-empty">未连接到引擎，请稍后重试。</div>
             )}
