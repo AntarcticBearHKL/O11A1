@@ -2014,6 +2014,103 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   margin: 0 0 16px;
 }
 .user-load-sentinel { height: 1px; }
+
+/* UP page skeleton: profile card + order tabs + flat video cards, not the
+   home-feed card grid. The generic shimmer is too close to the page paper,
+   so the dedicated page uses one stronger neutral mix. */
+.up-skeleton-hero,
+.up-skeleton-tabs,
+.up-skeleton-grid { pointer-events: none; }
+.up-skeleton-hero .skeleton,
+.up-skeleton-tabs .skeleton,
+.up-skeleton-grid .skeleton {
+  background: linear-gradient(
+    100deg,
+    color-mix(in srgb, var(--text) 7%, var(--surface-3)) 20%,
+    color-mix(in srgb, var(--text) 13%, var(--surface-2)) 38%,
+    color-mix(in srgb, var(--text) 7%, var(--surface-3)) 56%
+  );
+  background-size: 300% 100%;
+}
+.up-skeleton-avatar {
+  width: 86px;
+  height: 86px;
+  border-radius: 50%;
+}
+.up-skeleton-name {
+  width: min(260px, 46%);
+  height: 30px;
+  margin-top: 4px;
+  border-radius: 9px;
+}
+.up-skeleton-sign {
+  width: min(360px, 62%);
+  height: 12px;
+  margin-top: 12px;
+  border-radius: 6px;
+}
+.up-skeleton-stats {
+  display: flex;
+  gap: 24px;
+  margin-top: 16px;
+}
+.up-skeleton-stat {
+  width: 68px;
+  height: 14px;
+  border-radius: 6px;
+}
+.up-skeleton-stat:nth-child(2) { width: 58px; }
+.up-skeleton-stat:nth-child(3) { width: 76px; }
+.up-skeleton-follow {
+  width: 92px;
+  height: 38px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+}
+.up-skeleton-tabs { gap: 6px; }
+.up-skeleton-tab {
+  width: 72px;
+  height: 32px;
+  border-radius: 999px;
+}
+.up-skeleton-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.up-skeleton-cover {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 20px;
+}
+.up-skeleton-title {
+  width: 92%;
+  height: 12px;
+  margin: 12px 2px 0;
+  border-radius: 6px;
+}
+.up-skeleton-title.short {
+  width: 58%;
+  margin-top: 7px;
+}
+.up-skeleton-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 2px 0;
+}
+.up-skeleton-meta-line {
+  width: 52%;
+  height: 10px;
+  border-radius: 5px;
+}
+.up-skeleton-meta-pill {
+  width: 46px;
+  height: 16px;
+  flex: none;
+  border-radius: 999px;
+}
 .member-hero { margin-bottom: 18px; }
 
 /* --------------------------------------------------------------- regions */
@@ -4272,7 +4369,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   .bottom-disc .vinyl-disc { width: 62px; height: 62px; flex-basis: 62px; }
   .bottom-disc .vinyl-art { inset: 8px; width: 46px; height: 46px; }
   .profile-hero { flex-direction: column; align-items: flex-start; padding: 22px; }
-  .profile-follow { align-self: stretch; }
+  .profile-follow, .up-skeleton-follow { align-self: stretch; width: 100%; }
 }
 
 /* Reduce motion without losing the state changes themselves. */

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { call, cover, formatCount } from '../api';
 import { useApp } from '../context';
 import type { FeedVideo, SpaceVideoPage, UpInfo } from '../types';
-import { ErrorBox, SkeletonGrid, Tabs, VideoGrid } from '../components/Common';
+import { ErrorBox, Tabs, VideoGrid } from '../components/Common';
 
 type VideoOrder = 'newest' | 'plays';
 
@@ -10,6 +10,54 @@ const ORDER_TABS: Array<{ key: VideoOrder; label: string }> = [
   { key: 'newest', label: '最新发布' },
   { key: 'plays', label: '播放最多' },
 ];
+
+/// The UP page has its own shape: a wide profile card, one order-tab row, then
+/// flat video cards. The generic SkeletonGrid looked like the home feed, so
+/// this mirrors the real page instead and keeps the first paint from jumping.
+function UpPageSkeleton() {
+  return (
+    <>
+      <section className="profile-hero up-skeleton-hero" aria-hidden="true">
+        <div className="profile-avatar-wrap">
+          <div className="skeleton up-skeleton-avatar" />
+        </div>
+        <div className="profile-copy">
+          <div className="skeleton up-skeleton-name" />
+          <div className="skeleton up-skeleton-sign" />
+          <div className="up-skeleton-stats">
+            <div className="skeleton up-skeleton-stat" />
+            <div className="skeleton up-skeleton-stat" />
+            <div className="skeleton up-skeleton-stat" />
+          </div>
+        </div>
+        <div className="skeleton up-skeleton-follow" />
+      </section>
+      <div className="user-video-tabs up-skeleton-tabs" aria-hidden="true">
+        <div className="skeleton up-skeleton-tab" />
+        <div className="skeleton up-skeleton-tab" />
+      </div>
+      <UpVideoSkeleton count={10} />
+    </>
+  );
+}
+
+function UpVideoSkeleton({ count = 10 }: { count?: number }) {
+  return (
+    <div className="video-grid up-skeleton-grid" aria-hidden="true">
+      {Array.from({ length: count }).map((_, index) => (
+        <div className="up-skeleton-card" key={index}>
+          <div className="skeleton up-skeleton-cover" />
+          <div className="skeleton up-skeleton-title" />
+          <div className="skeleton up-skeleton-title short" />
+          <div className="up-skeleton-meta">
+            <span className="skeleton up-skeleton-meta-line" />
+            <span className="skeleton up-skeleton-meta-pill" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function User({ mid }: { mid: number }) {
   const { launch, toast } = useApp();
@@ -118,7 +166,7 @@ export default function User({ mid }: { mid: number }) {
     }
   };
 
-  if (loading && !info) return <SkeletonGrid count={8} />;
+  if (loading && !info) return <UpPageSkeleton />;
   if (!info) return <ErrorBox error={error || '没有找到 UP 主'} onRetry={load} />;
 
   const items = videos.map((item) => ({
@@ -160,7 +208,7 @@ export default function User({ mid }: { mid: number }) {
       {error ? <div className="banner">{error}</div> : null}
 
       {loading && !videos.length ? (
-        <SkeletonGrid count={8} />
+        <UpVideoSkeleton count={10} />
       ) : videos.length ? (
         <>
           <VideoGrid
