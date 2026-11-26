@@ -9566,7 +9566,11 @@ impl Engine {
     }
 
     fn draw_danmaku(&mut self) {
-        if self.interacting
+        // A window move freezes the chrome layout, not the danmaku layer: the
+        // full-monitor layer simply moves with the window. Keep the comments
+        // animating so dragging the player never looks like playback paused.
+        // Resizes still skip, because the layer is being scaled live.
+        if (self.interacting && self.interaction_resizing)
             || !self.danmaku_visible
             || self.danmaku.is_empty()
             || self.danmaku.settings().opacity <= 0.0

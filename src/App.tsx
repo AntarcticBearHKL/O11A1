@@ -115,6 +115,27 @@ export default function App({ initial }: { initial?: AppInitial }) {
   const [bottomPill, setBottomPill] = useState({ left: 0, top: 8, size: 42, ready: false });
   const { toast, show } = useToast();
 
+  // While a page is actively scrolling, drop the bar backdrop blur so the
+  // compositor does not re-blur the moving feed every frame; it returns as soon
+  // as the gesture settles. The class is toggled directly on the shell to avoid
+  // a React render on every scroll event.
+  useEffect(() => {
+    const app = appRef.current;
+    if (!app) return;
+    let timer = 0;
+    const onScroll = () => {
+      app.classList.add('scrolling');
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => app.classList.remove('scrolling'), 160);
+    };
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      window.clearTimeout(timer);
+      app.classList.remove('scrolling');
+    };
+  }, [settings]);
+
   // Windowed mode keeps the 22px transparent rim for the paper shadow. The
   // maximized window must drop it and fill the work area.
   useEffect(() => {
