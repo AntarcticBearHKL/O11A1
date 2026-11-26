@@ -44,9 +44,13 @@ const playerWindows = new Map();
 const nativePlayers = new Map();
 let engineProcess = null;
 let engineSocket = null;
+let enginePort = 0;
 let engineBuffer = '';
 let engineReady = false;
 let engineWaiters = [];
+/** A drag owns its own engine connection so a busy feed/preload call cannot
+ *  queue the move gesture behind it. */
+let dragInFlight = false;
 let engineSeq = 1;
 let enginePending = new Map();
 let engineStarting = false;
@@ -164,6 +168,8 @@ function startEngine() {
     engineProcess = null;
     engineReady = false;
     engineStarting = false;
+    enginePort = 0;
+    dragInFlight = false;
     if (engineSocket) engineSocket.destroy();
     engineSocket = null;
     for (const [, pending] of enginePending) pending.reject(new Error(`引擎已退出（${code}）`));
@@ -176,6 +182,7 @@ function startEngine() {
 }
 
 function connectEngine(port) {
+  enginePort = port;
   const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
     engineSocket = socket;
     engineReady = true;
@@ -589,6 +596,85 @@ function engineCall(method, params = {}, timeout = 60000) {
     enginePending.set(id, { resolve, reject, timer });
     engineSocket.write(JSON.stringify({ id, method, params }) + '\n');
   });
+}
+
+/// Resolve as soon as the engine's control socket is up. The startup boot
+/// screen can be interactive a few hundred ms before that; a drag requested
+/// there starts as soon as the socket exists if the button is still down.
+function waitForEngine(timeout = 5000) {
+  if (engineReady && enginePort) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      engineWaiters = engineWaiters.filter((item) => item !== waiter);
+      reject(new Error('engine not ready'));
+    }, timeout);
+    const waiter = {
+      resolve: () => {
+        clearTimeout(timer);
+        resolve();
+      },
+    };
+    engineWaiters.push(waiter);
+  });
+}
+
+/// Move a BrowserWindow through the engine's native cursor-follow loop on a
+/// private connection. The main `engineSocket` is intentionally serial: a
+/// feed/preload request in flight there would otherwise delay the drag until
+/// it finishes, which is exactly what made the first home-feed moments feel
+/// undraggable. Keep at most one drag gesture alive at a time.
+function beginNativeDrag(hwnd) {
+  if (dragInFlight) return false;
+  dragInFlight = true;
+  let socket = null;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    dragInFlight = false;
+    if (socket) socket.destroy();
+  };
+  waitForEngine()
+    .then(() => {
+      if (!engineReady || !enginePort) {
+        finish();
+        return;
+      }
+      socket = net.createConnection({ host: '127.0.0.1', port: enginePort }, () => {
+        socket.write(JSON.stringify({
+          id: 0,
+          method: 'window.drag',
+          params: { hwnd },
+        }) + '\n');
+      });
+      socket.setEncoding('utf8');
+      // Every engine connection also receives broadcast events, so do not
+      // release the gesture slot on the first line. The move loop ends with
+      // the reply carrying our id; a close/error also releases it.
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += chunk;
+        let index;
+        while ((index = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, index).trim();
+          buffer = buffer.slice(index + 1);
+          if (!line) continue;
+          try {
+            const message = JSON.parse(line);
+            if (message.id === 0) {
+              finish();
+              return;
+            }
+          } catch {
+            /* ignore non-JSON lines */
+          }
+        }
+      });
+      socket.on('error', finish);
+      socket.on('close', finish);
+    })
+    .catch(finish);
+  return true;
 }
 
 function physicalRect(win, rect) {
@@ -1182,11 +1268,11 @@ ipcMain.handle('window:end-resize', () => {
   return true;
 });
 
-ipcMain.handle('window:start-drag', async (event) => {
+ipcMain.handle('window:start-drag', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win || win.isDestroyed()) return false;
   const hwnd = Number(win.getNativeWindowHandle().readBigUInt64LE(0).toString());
-  await engineCall('window.drag', { hwnd }).catch(() => {});
+  beginNativeDrag(hwnd);
   return true;
 });
 ipcMain.handle('app:navigate-main', (_event, route) => {

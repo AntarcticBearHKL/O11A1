@@ -4797,9 +4797,15 @@ html, body, #root {
   translate: 0 -3px;
   background: color-mix(in srgb, var(--card-solid) 94%, transparent);
 }
-/* Entrance animation only belongs to the first screenful; new infinite-feed
-   blocks should paint immediately while the user is scrolling into them. */
-.feed-block:not(:first-child) .video-card { animation: none; }
+/* Entrance animation only belongs to the initial screenful; new infinite-feed
+   blocks should paint immediately while the user is scrolling into them. Key
+   this to the original block id rather than :first-child: when trimFront
+   releases the oldest block, the next block becomes :first-child and would
+   otherwise replay the entrance animation over cards that were already on
+   screen. */
+.home-feed .video-card { animation: none; }
+.home-feed .feed-block-initial .video-card { animation: rd-card 0.5s var(--ease) both; }
+.home-feed .feed-block-initial .video-card:nth-child(n+15) { animation: none; }
 .home-feed .video-card:focus-visible {
   border-radius: 26px;
 }

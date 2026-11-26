@@ -178,8 +178,13 @@ export default function Home() {
   /// Re-split mounted cards after a column change so every block still ends
   /// on a complete grid row.
   const reflowBlocks = useCallback((columns: number) => {
+    // Keep the initial block id across the first column measurement. The
+    // preloaded feed starts as one block and is re-split into full rows here;
+    // if the id changed, `feed-block-initial` would be lost and the entrance
+    // animation would either vanish or move to whichever block becomes first.
+    const hasInitial = blocksRef.current[0]?.id === 0;
     const all = [...blocksRef.current.flatMap((block) => block.items), ...pendingRef.current];
-    const split = splitFullRows(all, columns, nextBlockId.current);
+    const split = splitFullRows(all, columns, hasInitial ? 0 : nextBlockId.current);
     nextBlockId.current = split.nextId;
     pendingRef.current = split.pending;
     blocksRef.current = split.blocks;
@@ -483,7 +488,10 @@ export default function Home() {
       {blocks.length ? (
         <div ref={feedRef} className="home-feed">
           {blocks.map((block) => (
-            <div className="feed-block" key={block.id}>
+            <div
+              className={`feed-block${block.id === 0 ? ' feed-block-initial' : ''}`}
+              key={block.id}
+            >
               <VideoGrid items={block.items} onPlay={play} />
             </div>
           ))}
