@@ -153,7 +153,7 @@ pub struct DanmakuSettings {
 }
 
 impl DanmakuSettings {
-    pub fn load(window_height: u32) -> Self {
+    pub fn load() -> Self {
         let stored = o11a1::settings::load();
         let keywords: Vec<String> = stored
             .blocked_keywords
@@ -176,7 +176,7 @@ impl DanmakuSettings {
         let font_scale =
             o11a1::settings::normalise_danmaku_font(stored.danmaku_font) as f32 / 100.0;
         let area_percent = o11a1::settings::clamp_area(stored.danmaku_area);
-        let font_sizes = font_sizes(window_height, font_scale);
+        let font_sizes = font_sizes(font_scale);
         let settings = Self {
             opacity: stored.danmaku_opacity.min(100) as f32 / 100.0,
             font_scale,
@@ -238,8 +238,9 @@ impl DanmakuSettings {
     }
 }
 
-/// 18/25/36 API hints → three buckets. The exact pixels are computed from the
-/// window height: ~22/27/32 px at 1080p, times the persisted font scale.
+/// 18/25/36 API hints → three buckets. The pixel sizes are absolute: 22/27/32
+/// reference pixels times the persisted font scale. They must not follow the
+/// window height, otherwise entering fullscreen silently enlarges the text.
 fn bucket_for_hint(hint: u32) -> usize {
     match hint {
         0..=18 => 0,
@@ -248,12 +249,11 @@ fn bucket_for_hint(hint: u32) -> usize {
     }
 }
 
-fn font_sizes(window_height: u32, font_scale: f32) -> [f32; 3] {
-    let scale = (window_height.max(240) as f32 / 1080.0) * font_scale;
+fn font_sizes(font_scale: f32) -> [f32; 3] {
     [
-        (22.0 * scale).max(12.0),
-        (27.0 * scale).max(13.0),
-        (32.0 * scale).max(14.0),
+        (22.0 * font_scale).max(12.0),
+        (27.0 * font_scale).max(13.0),
+        (32.0 * font_scale).max(14.0),
     ]
 }
 
@@ -429,7 +429,7 @@ impl DanmakuModel {
     fn reflow(&mut self, band: Band, position: u64) {
         let old_scroll = self.scroll_ms.max(1.0);
         self.band = band;
-        self.settings.font_sizes = font_sizes(band.window_height, self.settings.font_scale);
+        self.settings.font_sizes = font_sizes(self.settings.font_scale);
         self.row_height = self.settings.font_sizes[2] * 1.32 + 2.0;
         let area_height = (band.height * self.settings.area_percent as f32 / 100.0).max(1.0);
         self.rows = ((area_height / self.row_height).floor() as usize).clamp(1, 64);
@@ -1132,12 +1132,13 @@ mod tests {
     }
 
     #[test]
-    fn font_mapping_uses_window_height_and_scale() {
-        let sizes = font_sizes(1080, 1.0);
+    fn font_mapping_is_absolute_and_follows_user_scale() {
+        let sizes = font_sizes(1.0);
         assert!((sizes[0] - 22.0).abs() < 0.1);
         assert!((sizes[1] - 27.0).abs() < 0.1);
         assert!((sizes[2] - 32.0).abs() < 0.1);
-        let small = font_sizes(1080, 0.85);
+        // The user's percentage still scales the absolute face.
+        let small = font_sizes(0.85);
         assert!((small[1] - 22.95).abs() < 0.1);
         assert_eq!(bucket_for_hint(18), 0);
         assert_eq!(bucket_for_hint(25), 1);
@@ -1157,7 +1158,7 @@ mod tests {
             blocked_senders: vec!["sender".into()],
             keywords: vec!["spoiler".into()],
             regexes: vec![Regex::new("^!!!").unwrap()],
-            font_sizes: font_sizes(1080, 1.0),
+            font_sizes: font_sizes(1.0),
         };
         assert!(settings.blocked(&item(0, "a SPOILER here")));
         assert!(settings.blocked(&item(0, "!!!boom")));
@@ -1181,7 +1182,7 @@ mod tests {
                 blocked_senders: Vec::new(),
                 keywords: Vec::new(),
                 regexes: Vec::new(),
-                font_sizes: font_sizes(1080, 1.0),
+                font_sizes: font_sizes(1.0),
             },
             band(),
         );
@@ -1212,7 +1213,7 @@ mod tests {
                 blocked_senders: Vec::new(),
                 keywords: Vec::new(),
                 regexes: Vec::new(),
-                font_sizes: font_sizes(1080, 1.0),
+                font_sizes: font_sizes(1.0),
             },
             band(),
         );
@@ -1244,7 +1245,7 @@ mod tests {
                 blocked_senders: Vec::new(),
                 keywords: Vec::new(),
                 regexes: Vec::new(),
-                font_sizes: font_sizes(720, 1.0),
+                font_sizes: font_sizes(1.0),
             },
             band(),
         );
@@ -1286,7 +1287,7 @@ mod tests {
                 blocked_senders: Vec::new(),
                 keywords: Vec::new(),
                 regexes: Vec::new(),
-                font_sizes: font_sizes(1080, 1.0),
+                font_sizes: font_sizes(1.0),
             },
             band(),
         );
@@ -1314,7 +1315,7 @@ mod tests {
                 blocked_senders: Vec::new(),
                 keywords: Vec::new(),
                 regexes: Vec::new(),
-                font_sizes: font_sizes(1080, 1.0),
+                font_sizes: font_sizes(1.0),
             },
             band(),
         );
@@ -1353,7 +1354,7 @@ mod tests {
                 blocked_senders: Vec::new(),
                 keywords: Vec::new(),
                 regexes: Vec::new(),
-                font_sizes: font_sizes(1080, 1.0),
+                font_sizes: font_sizes(1.0),
             },
             band(),
         );

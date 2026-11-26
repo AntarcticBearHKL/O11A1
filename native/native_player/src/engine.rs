@@ -1117,7 +1117,7 @@ impl Engine {
         if external {
             overlay.clear().context("clear hosted overlay")?;
         }
-        let danmaku_settings = DanmakuSettings::load(client.1);
+        let danmaku_settings = DanmakuSettings::load();
         let danmaku_fonts = danmaku_settings.font_sizes;
         let danmaku_opacity = danmaku_settings.opacity;
         let mut danmaku_layer =
