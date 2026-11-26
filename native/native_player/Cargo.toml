@@ -17,7 +17,7 @@ regex = "1"
 # Disk-backed media prefetch uses blocking range requests and a loopback
 # server; the rest of the player keeps its std-thread design.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows = { version = "0.62", features = [

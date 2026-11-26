@@ -476,13 +476,6 @@ pub struct Layout {
     /// Right-click precision seek panel: heatmap, A/B loop and frame wheel.
     pub precision: Rect,
     pub precision_track: Rect,
-    pub precision_a: Rect,
-    pub precision_b: Rect,
-    pub precision_clear: Rect,
-    /// Frame-step select field and its upward dropdown.
-    pub precision_step: Rect,
-    pub precision_step_menu: Rect,
-    pub precision_step_rows: [Rect; 4],
     pub precision_wheel: Rect,
     /// Speed panel: one full-width speed ruler, same form as the precision
     /// frame wheel.
@@ -821,10 +814,10 @@ impl Layout {
         };
         // Precision panel: the toolbar grows upward from one fixed bottom
         // anchor. It keeps its own 626px width, independent of the compact
-        // toolbar, and morphs out of the pill on the same centre line. Compact
-        // vertical rhythm: 30px header, 30px heatmap, 32px A/B row and a 38px
-        // wheel + frame-step band; 20px side padding, 180px tall.
-        let precision_h = 180.0 * s;
+        // toolbar, and morphs out of the pill on the same centre line. Two
+        // rows only: a full-width energy/progress bar, then a full-width time
+        // ruler. No header, A/B row or frame-step field.
+        let precision_h = 122.0 * s;
         let precision_w = (626.0 * s).min((ui_w - 8.0 * s).max(320.0 * s));
         let precision_cx = (toolbar.left + toolbar.right) * 0.5;
         let precision_left = (precision_cx - precision_w * 0.5)
@@ -835,89 +828,22 @@ impl Layout {
             right: precision_left + precision_w,
             bottom: toolbar.bottom,
         };
-        let p = 20.0 * s;
+        let p = 18.0 * s;
         let content_left = precision.left + p;
         let content_right = precision.right - p;
-        let content_w = (content_right - content_left).max(1.0);
         let precision_track = Rect {
             left: content_left,
-            top: precision.top + 48.0 * s,
+            top: precision.top + 16.0 * s,
             right: content_right,
-            bottom: precision.top + 78.0 * s,
+            bottom: precision.top + 46.0 * s,
         };
-        let ab_top = precision.top + 88.0 * s;
-        let ab_h = 32.0 * s;
-        let ab_gap = 8.0 * s;
-        let step_w = 92.0 * s;
-        // The A/B row mirrors the band below it column for column: A's left
-        // edge is the ruler's left edge, B's right edge is the ruler's right
-        // edge, and 清空 occupies exactly the 1帧 selector's column. The old
-        // 13%-of-row width made 清空 longer than the unit field and left B
-        // ending at a different x than the ruler.
-        let clear_w = step_w;
-        let wheel_w = (content_w - clear_w - 12.0 * s).max(2.0 * 40.0 * s + ab_gap);
-        let ab_w = ((wheel_w - ab_gap) * 0.5).max(40.0 * s);
-        let precision_a = Rect {
-            left: content_left,
-            top: ab_top,
-            right: content_left + ab_w,
-            bottom: ab_top + ab_h,
-        };
-        let precision_b = Rect {
-            left: precision_a.right + ab_gap,
-            top: ab_top,
-            right: precision_a.right + ab_gap + ab_w,
-            bottom: ab_top + ab_h,
-        };
-        let precision_clear = Rect {
-            left: content_right - clear_w,
-            top: ab_top,
-            right: content_right,
-            bottom: ab_top + ab_h,
-        };
-        let wheel_top = precision.top + 130.0 * s;
-        let wheel_h = 38.0 * s;
-        // The frame-step select is the same height as the ruler, so the two
-        // controls share one clean horizontal band.
-        let precision_step = Rect {
-            left: content_right - step_w,
-            top: wheel_top,
-            right: content_right,
-            bottom: wheel_top + wheel_h,
-        };
+        let wheel_top = precision.top + 58.0 * s;
         let precision_wheel = Rect {
             left: content_left,
             top: wheel_top,
-            right: precision_step.left - 12.0 * s,
-            bottom: wheel_top + wheel_h,
+            right: content_right,
+            bottom: wheel_top + 48.0 * s,
         };
-        let step_row_h = 30.0 * s;
-        let step_menu_h = step_row_h * 4.0 + 8.0 * s;
-        // The select opens as a compact popover to the right of the panel so
-        // it never covers the frame pill or the A/B row. In a narrow window it
-        // flips to the left instead of clipping at the edge.
-        let menu_right = width - 8.0 * s - step_w;
-        let menu_left = if precision_step.right + 8.0 * s + step_w <= width - 8.0 * s {
-            precision_step.right + 8.0 * s
-        } else {
-            (precision_step.left - 8.0 * s - step_w).max(8.0 * s)
-        };
-        let precision_step_menu = Rect {
-            left: menu_left.min(menu_right.max(8.0 * s)),
-            top: precision_step.bottom - step_menu_h,
-            right: menu_left.min(menu_right.max(8.0 * s)) + step_w,
-            bottom: precision_step.bottom,
-        };
-        let mut precision_step_rows = [Rect::default(); 4];
-        for (index, rect) in precision_step_rows.iter_mut().enumerate() {
-            let top = precision_step_menu.top + 4.0 * s + index as f32 * step_row_h;
-            *rect = Rect {
-                left: precision_step_menu.left,
-                top,
-                right: precision_step_menu.right,
-                bottom: top + step_row_h,
-            };
-        }
 
         // Speed panel: the toolbar itself becomes one flat horizontal picker
         // wheel. One surface, no inset chip and no second border.
@@ -971,12 +897,6 @@ impl Layout {
             undo_button,
             precision,
             precision_track,
-            precision_a,
-            precision_b,
-            precision_clear,
-            precision_step,
-            precision_step_menu,
-            precision_step_rows,
             precision_wheel,
             speed_panel,
             speed_wheel,
@@ -1215,9 +1135,6 @@ pub struct UiModel {
     pub precision_step_open: bool,
     /// Eased toolbar→precision morph, 0..1.
     pub precision_mix: f32,
-    pub ab_a: Option<u64>,
-    pub ab_b: Option<u64>,
-    pub frame_step: u64,
     pub heatmap: [u8; HEAT_BUCKETS],
     pub tuner_offset: f32,
     pub danmaku_visible: bool,
@@ -1366,10 +1283,6 @@ pub struct Overlay {
     /// Info tab's description body, with a more generous line box.
     info_body_format: IDWriteTextFormat,
     hint_format: IDWriteTextFormat,
-    precision_clock_format: IDWriteTextFormat,
-    precision_frame_format: IDWriteTextFormat,
-    /// Centred 12.5px face for the frame-step value.
-    precision_step_format: IDWriteTextFormat,
     tab_format: IDWriteTextFormat,
     tab_active_format: IDWriteTextFormat,
     /// Comment list typography: a larger body than the old 12.5px rows, with
@@ -1543,17 +1456,6 @@ impl Overlay {
                 13.5 * s * 1.55,
                 13.5 * s * 1.1,
             )?;
-            // The precision header is a typographic pair, not two identical
-            // pills: a large clock face for the current time, and a slightly
-            // smaller semibold face for the millisecond tail and the frame
-            // counter. Supporting text uses the standard small face.
-            let precision_clock_format =
-                text_format(&dwrite, 16.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-            let precision_frame_format =
-                text_format(&dwrite, 13.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-            let precision_step_format =
-                text_format(&dwrite, 12.5 * s, DWRITE_FONT_WEIGHT_NORMAL)?;
-            precision_step_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             let hint_format = text_format(&dwrite, 11.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?;
             hint_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             let tab_format = text_format(&dwrite, 12.5 * s, DWRITE_FONT_WEIGHT_NORMAL)?;
@@ -1675,9 +1577,6 @@ impl Overlay {
                 (&info_label_format, 10.5 * s, 600),
                 (&info_id_format, 11.5 * s, 600),
                 (&info_body_format, 13.5 * s, 400),
-                (&precision_clock_format, 16.0 * s, 600),
-                (&precision_frame_format, 13.0 * s, 600),
-                (&precision_step_format, 12.5 * s, 400),
                 (&hint_format, 11.0 * s, 400),
                 (&tab_format, 12.5 * s, 400),
                 // The active tab is semibold, but it must stay on the same GDI
@@ -1743,9 +1642,6 @@ impl Overlay {
                 info_id_format,
                 info_body_format,
                 hint_format,
-                precision_clock_format,
-                precision_frame_format,
-                precision_step_format,
                 tab_format,
                 tab_active_format,
                 comment_author_format,
@@ -4599,42 +4495,6 @@ impl Overlay {
         }
     }
 
-    unsafe fn precision_chip(&self, rect: Rect, label: &str, active: bool, s: f32) {
-        let rounded = D2D1_ROUNDED_RECT {
-            rect: to_d2d(rect),
-            radiusX: 8.0 * s,
-            radiusY: 8.0 * s,
-        };
-        self.d2d.FillRoundedRectangle(
-            &rounded,
-            if active {
-                &self.accent_blue
-            } else {
-                &self.chip
-            },
-        );
-        self.d2d
-            .DrawRoundedRectangle(&rounded, &self.panel_border, 1.0 * s, None);
-        self.text_centered(
-            label,
-            rect,
-            &self.comment_body_format,
-            if active { &self.accent_fg } else { &self.text },
-        );
-    }
-
-    unsafe fn precision_clear_chip(&self, rect: Rect, label: &str, s: f32) {
-        let rounded = D2D1_ROUNDED_RECT {
-            rect: to_d2d(rect),
-            radiusX: 8.0 * s,
-            radiusY: 8.0 * s,
-        };
-        self.d2d.FillRoundedRectangle(&rounded, &self.danger_fill);
-        self.d2d
-            .DrawRoundedRectangle(&rounded, &self.danger_line, 1.0 * s, None);
-        self.text_centered(label, rect, &self.comment_name_format, &self.danger_soft);
-    }
-
     /// One paper card that morphs between the toolbar and a bottom panel
     /// (precision seek or playback speed). The toolbar content fades out over
     /// the first part of the morph, the panel content fades in over the
@@ -4928,144 +4788,14 @@ impl Overlay {
         self.d2d.FillRoundedRectangle(&aim_round, &self.aim_line);
     }
 
-    /// Precision seek: a two-sided timecode / frame readout, a full-width
-    /// heatmap, A/B/clear, and a gliding frame wheel. This is the content of
-    /// the card that the toolbar morphs into; it deliberately has no title,
-    /// no close button and no transport (spacebar and the picture own
-    /// play/pause).
+    /// Precision seek: one full-width energy/progress bar above one full-width
+    /// time ruler. This is the content of the card that the toolbar morphs
+    /// into; it deliberately has no title, no close button, no A/B row and no
+    /// frame-step field (spacebar and the picture own play/pause).
     unsafe fn draw_precision(&mut self, model: &UiModel, layout: &Layout) {
         let s = layout.scale;
-        let panel = layout.precision;
-
         let position = model.drag_preview.unwrap_or(model.position_ms);
         let duration = model.duration_ms;
-        let fps = if model.source_fps > 1.0 {
-            model.source_fps
-        } else {
-            30.0
-        };
-        let frame_ms = (1000.0 / fps).max(0.01);
-        let total_frames = if duration > 0 {
-            (duration as f64 / frame_ms as f64).round() as u64
-        } else {
-            0
-        };
-        let current_frame = if total_frames > 0 {
-            ((position as f64 / frame_ms as f64).round() as u64).min(total_frames)
-        } else {
-            0
-        };
-
-        // One typographic header with matching labels on both sides:
-        // 时间 03:21.461 / 14:16           帧 6044 / 25680
-        // The clock value is the large face, its millisecond tail and the two
-        // totals are secondary, and the labels / slashes are the quietest.
-        // Every piece shares one baseline; there is no pill or transport.
-        let content_left = panel.left + 20.0 * s;
-        let content_right = panel.right - 20.0 * s;
-        let baseline = panel.top + 29.0 * s;
-
-        let time_label = "时间";
-        let time_label_w = self.text_width(time_label, &self.small_format);
-        self.text_on_baseline(
-            time_label,
-            content_left,
-            baseline,
-            time_label_w + 2.0 * s,
-            &self.small_format,
-            &self.text_faint,
-        );
-
-        let time_left = content_left + time_label_w + 9.0 * s;
-        let clock_base = crate::format::format_time(position);
-        let clock_ms = format!(".{:03}", position % 1000);
-        let clock_base_w = self.text_width(&clock_base, &self.precision_clock_format);
-        self.text_on_baseline(
-            &clock_base,
-            time_left,
-            baseline,
-            clock_base_w + 2.0 * s,
-            &self.precision_clock_format,
-            &self.text,
-        );
-        let clock_ms_left = time_left + clock_base_w + 1.0 * s;
-        let clock_ms_w = self.text_width(&clock_ms, &self.precision_frame_format);
-        self.text_on_baseline(
-            &clock_ms,
-            clock_ms_left,
-            baseline,
-            clock_ms_w + 2.0 * s,
-            &self.precision_frame_format,
-            &self.text_dim,
-        );
-
-        let slash_left = clock_ms_left + clock_ms_w + 10.0 * s;
-        let slash_w = self.text_width("/", &self.small_format);
-        self.text_on_baseline(
-            "/",
-            slash_left,
-            baseline,
-            slash_w + 2.0 * s,
-            &self.small_format,
-            &self.text_faint,
-        );
-        let total = crate::format::format_time(duration);
-        let total_left = slash_left + slash_w + 9.0 * s;
-        let total_w = self.text_width(&total, &self.small_format);
-        self.text_on_baseline(
-            &total,
-            total_left,
-            baseline,
-            total_w + 2.0 * s,
-            &self.small_format,
-            &self.text_dim,
-        );
-
-        let frames_total = total_frames.to_string();
-        let frames_total_w = self.text_width(&frames_total, &self.small_format);
-        let frames_total_left = content_right - frames_total_w;
-        self.text_on_baseline(
-            &frames_total,
-            frames_total_left,
-            baseline,
-            frames_total_w + 2.0 * s,
-            &self.small_format,
-            &self.text_dim,
-        );
-        let frames_slash_right = frames_total_left - 6.0 * s;
-        let frames_slash_w = self.text_width("/", &self.small_format);
-        self.text_on_baseline(
-            "/",
-            frames_slash_right - frames_slash_w,
-            baseline,
-            frames_slash_w + 2.0 * s,
-            &self.small_format,
-            &self.text_faint,
-        );
-        let frame_value = current_frame.to_string();
-        let frame_value_w = self.text_width(&frame_value, &self.precision_frame_format);
-        let frame_value_left = frames_slash_right - frames_slash_w - 8.0 * s - frame_value_w;
-        self.text_on_baseline(
-            &frame_value,
-            frame_value_left,
-            baseline,
-            frame_value_w + 2.0 * s,
-            &self.precision_frame_format,
-            &self.text,
-        );
-        let frame_label = "帧";
-        let frame_label_w = self.text_width(frame_label, &self.small_format);
-        let frame_label_left = frame_value_left - 8.0 * s - frame_label_w;
-        self.text_on_baseline(
-            frame_label,
-            frame_label_left,
-            baseline,
-            frame_label_w + 2.0 * s,
-            &self.small_format,
-            &self.text_faint,
-        );
-
-
         // Full-width heatmap track.
         let track = layout.precision_track;
         let track_round = D2D1_ROUNDED_RECT {
@@ -5081,29 +4811,21 @@ impl Overlay {
         } else {
             0.0
         };
-        let fraction_at = |time: u64| {
-            if duration > 0 {
-                (time as f32 / duration as f32).clamp(0.0, 1.0)
-            } else {
-                0.0
-            }
-        };
-        let range = match (model.ab_a, model.ab_b) {
-            (Some(a), Some(b)) if b > a => Some((a, b)),
-            _ => None,
-        };
-        if let Some((a, b)) = range {
-            let xa = track.left + fraction_at(a) * track.width();
-            let xb = track.left + fraction_at(b) * track.width();
-            self.fill(
-                Rect {
-                    left: xa,
-                    top: track.top + 2.0 * s,
-                    right: xb,
-                    bottom: track.bottom - 2.0 * s,
-                },
-                &self.loop_fill,
-            );
+        let play_x = track.left + fraction * track.width();
+        if fraction > 0.002 {
+            // The played portion is a quiet blue wash, so the row still reads
+            // as a progress bar even when the danmaku heatmap is empty.
+            let played = D2D1_ROUNDED_RECT {
+                rect: to_d2d(Rect {
+                    left: track.left + 1.0 * s,
+                    top: track.top + 1.0 * s,
+                    right: play_x.max(track.left + 2.0 * s),
+                    bottom: track.bottom - 1.0 * s,
+                }),
+                radiusX: 8.0 * s,
+                radiusY: 8.0 * s,
+            };
+            self.d2d.FillRoundedRectangle(&played, &self.loop_fill);
         }
         let count = model.heatmap.len().max(1);
         let gap = 1.0 * s;
@@ -5129,7 +4851,6 @@ impl Overlay {
                 },
             );
         }
-        let play_x = track.left + fraction * track.width();
         self.line(
             track.left,
             track.bottom - 2.0 * s,
@@ -5146,36 +4867,12 @@ impl Overlay {
             1.5 * s,
             &self.accent_blue,
         );
-        for time in [model.ab_a, model.ab_b].into_iter().flatten() {
-            let x = (track.left + fraction_at(time) * track.width())
-                .clamp(track.left + 6.0 * s, track.right - 6.0 * s);
-            self.line(
-                x,
-                track.top + 3.0 * s,
-                x,
-                track.bottom - 3.0 * s,
-                2.0 * s,
-                &self.accent_blue,
-            );
-        }
-
-        // A / B / 清空: A and B share the row; 清空 is the visible tail action.
-        let a_label = model
-            .ab_a
-            .map(|time| format!("A {}", crate::format::format_time_ms(time)))
-            .unwrap_or_else(|| "A 起点".to_string());
-        let b_label = model
-            .ab_b
-            .map(|time| format!("B {}", crate::format::format_time_ms(time)))
-            .unwrap_or_else(|| "B 终点".to_string());
-        self.precision_chip(layout.precision_a, &a_label, model.ab_a.is_some(), s);
-        self.precision_chip(layout.precision_b, &b_label, model.ab_b.is_some(), s);
-        self.precision_clear_chip(layout.precision_clear, "清空", s);
-
-        // Full-width,endless frame ruler. The strip travels with the pointer
+        // Full-width, endless time ruler. The strip travels with the pointer
         // for the whole drag; tick indices are derived from the unbounded
-        // offset so the scale never runs out of marks. Every fourth blue tick
-        // carries a top graduation cap and its frame offset.
+        // offset so the scale never runs out of marks. Every fifth blue tick
+        // carries a time label, not a frame offset.
+
+
         let wheel = layout.precision_wheel;
         let wheel_round = D2D1_ROUNDED_RECT {
             rect: to_d2d(wheel),
@@ -5219,8 +4916,7 @@ impl Overlay {
             if x < wheel.left - 24.0 * s || x > wheel.right + 24.0 * s {
                 continue;
             }
-            let major = index.rem_euclid(4) == 0;
-            let medium = index.rem_euclid(2) == 0;
+            let major = index.rem_euclid(5) == 0;
             // The red aim needle owns the exact centre. Leave the scale's own
             // graduation out there, otherwise its blue cap peeks out from
             // behind the needle as a second, slightly offset "T".
@@ -5228,10 +4924,8 @@ impl Overlay {
             if !at_aim {
                 let (top, width, brush): (f32, f32, &ID2D1SolidColorBrush) = if major {
                     (tick_top, 1.6 * s, &self.accent_blue)
-                } else if medium {
-                    (tick_top + 5.0 * s, 1.0 * s, &self.text_dim)
                 } else {
-                    (tick_top + 9.0 * s, 1.0 * s, &self.text_faint)
+                    (tick_top + 7.0 * s, 1.0 * s, &self.text_faint)
                 };
                 self.line(x, top, x, tick_bottom, width, brush);
                 if major {
@@ -5246,24 +4940,26 @@ impl Overlay {
                     );
                 }
             }
-            if major && x >= wheel.left + 26.0 * s && x <= wheel.right - 26.0 * s {
-                let frames = index as i64 * model.frame_step as i64;
-                let label = if frames > 0 {
-                    format!("+{frames}")
-                } else {
-                    format!("{frames}")
-                };
-                self.text_centered(
-                    &label,
-                    Rect {
-                        left: x - 24.0 * s,
-                        top: label_top,
-                        right: x + 24.0 * s,
-                        bottom: label_bottom,
-                    },
-                    &self.hud_format,
-                    &self.text_dim,
-                );
+            if major && x >= wheel.left + 30.0 * s && x <= wheel.right - 30.0 * s {
+                // Tick labels are absolute video timestamps. The wheel scrolls
+                // under the needle, so the time at a tick is the preview time
+                // plus the tick's distance from the centre in one-second steps.
+                let tick_time = position as f64
+                    + ((x - centre) as f64 / ridge_gap as f64) * 1000.0;
+                if tick_time >= 0.0 && tick_time <= duration as f64 {
+                    let label = crate::format::format_time(tick_time.round() as u64);
+                    self.text_centered(
+                        &label,
+                        Rect {
+                            left: x - 30.0 * s,
+                            top: label_top,
+                            right: x + 30.0 * s,
+                            bottom: label_bottom,
+                        },
+                        &self.hud_format,
+                        &self.text_dim,
+                    );
+                }
             }
         }
         self.d2d.PopAxisAlignedClip();
@@ -5280,29 +4976,6 @@ impl Overlay {
             &self.aim_line,
         );
 
-        // Frame-step cycle button: one click advances 1 → 2 → 5 → 10 → 1.
-        // There is no dropdown; the value in the chip is the mode.
-        let field = layout.precision_step;
-        let field_round = D2D1_ROUNDED_RECT {
-            rect: to_d2d(field),
-            radiusX: 10.0 * s,
-            radiusY: 10.0 * s,
-        };
-        self.d2d.FillRoundedRectangle(&field_round, &self.chip);
-        self.d2d.DrawRoundedRectangle(
-            &field_round,
-            &self.panel_border,
-            1.0 * s,
-            None,
-        );
-        let label = format!("{} 帧", model.frame_step);
-        self.text_box(
-            &label,
-            field,
-            &self.precision_step_format,
-            &self.text,
-            1,
-        );
     }
 
     /// The toolbar is the same home-page paper as the sidebar lane: an opaque
@@ -8144,31 +7817,32 @@ mod tests {
     }
 
     #[test]
-    fn precision_clear_reserves_a_visible_tail() {
+    fn precision_is_one_bar_and_one_full_width_wheel() {
         for width in [640.0, 800.0, 1200.0, 1600.0] {
             let layout = Layout::new(width, 700.0, 1.0, false, false);
+            let panel = layout.precision;
             assert!(
-                layout.precision_clear.width() >= 72.0,
-                "clear chip too narrow at {width}: {:?}",
-                layout.precision_clear
+                (panel.height() - 122.0).abs() < 0.01,
+                "precision panel should have only two rows at {width}: {panel:?}"
             );
             assert!(
-                layout.precision_clear.left >= layout.precision_b.right,
-                "clear chip overlaps B at {width}"
+                layout.precision_track.left >= panel.left
+                    && layout.precision_track.right <= panel.right,
+                "progress bar leaves the panel at {width}"
             );
             assert!(
-                layout.precision_clear.right <= layout.precision.right,
-                "clear chip leaves the panel at {width}"
+                (layout.precision_track.left - layout.precision_wheel.left).abs() < 0.01
+                    && (layout.precision_track.right - layout.precision_wheel.right).abs() < 0.01,
+                "wheel must span the same full width as the progress bar at {width}"
             );
             assert!(
-                (layout.precision_clear.left - layout.precision_step.left).abs() < 0.01
-                    && (layout.precision_clear.right - layout.precision_step.right).abs() < 0.01,
-                "clear chip must share the unit field column at {width}"
+                layout.precision_wheel.top > layout.precision_track.bottom
+                    && layout.precision_wheel.bottom <= panel.bottom,
+                "wheel is not the second row at {width}"
             );
             assert!(
-                (layout.precision_a.left - layout.precision_wheel.left).abs() < 0.01
-                    && (layout.precision_b.right - layout.precision_wheel.right).abs() < 0.01,
-                "A/B row must span the ruler at {width}"
+                layout.precision_wheel.width() > 0.0,
+                "wheel has no width at {width}"
             );
         }
     }

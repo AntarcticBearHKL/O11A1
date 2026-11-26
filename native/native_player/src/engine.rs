@@ -2691,18 +2691,11 @@ impl Engine {
         log::line("ab cleared");
     }
 
-    /// Quantize a frame nudge against the source frame rate. The preview is
+    /// Move the time preview by a fixed number of milliseconds. The preview is
     /// shown immediately; the caller decides when to issue the decoder seek.
-    fn nudge_frames(&mut self, frames: i64) -> Option<u64> {
-        let fps = if self.source.fps > 1.0 {
-            self.source.fps
-        } else {
-            30.0
-        };
-        let frame_ms = 1000.0 / fps;
-        // While a previous detent's seek is still in flight, keep stacking
-        // against its target. Reading the old clock for every fast wheel notch
-        // would make most of them land on the same position.
+    /// While a previous detent's seek is still in flight, keep stacking against
+    /// its target so fast wheel notches do not all land on the same position.
+    fn nudge_time(&mut self, delta_ms: i64) -> Option<u64> {
         let current = self.drag_preview.unwrap_or_else(|| {
             if self.seek_in_flight {
                 self.seek_target
@@ -2710,8 +2703,11 @@ impl Engine {
                 self.position_now()
             }
         });
-        let index = (current as f64 / frame_ms).round() + frames as f64;
-        let target = self.clamp_position((index.max(0.0) * frame_ms).round() as u64);
+        let target = self.clamp_position(
+            (current as i64)
+                .saturating_add(delta_ms)
+                .max(0) as u64,
+        );
         self.drag_preview = Some(target);
         self.ui_dirty = true;
         Some(target)
@@ -2964,22 +2960,6 @@ impl Engine {
 
     fn handle_precision_click(&mut self, px: f32, py: f32) -> bool {
         let layout = self.overlay.layout;
-        if layout.precision_step.contains(px, py) {
-            self.cycle_frame_step();
-            return true;
-        }
-        if layout.precision_a.contains(px, py) {
-            self.set_ab_a();
-            return true;
-        }
-        if layout.precision_b.contains(px, py) {
-            self.set_ab_b();
-            return true;
-        }
-        if layout.precision_clear.contains(px, py) {
-            self.clear_ab();
-            return true;
-        }
         if layout.precision_wheel.contains(px, py) {
             let start = self.drag_preview.unwrap_or_else(|| self.position_now());
             self.tuner_drag = Some((px, start));
@@ -6781,19 +6761,15 @@ impl Engine {
                     let notch = 12.0 * self.scale;
                     // Continuous drag: the ruler follows the finger for the
                     // whole gesture, but the playback position only changes on
-                    // release. Trunc keeps a small wobble inside a notch from
-                    // stepping a frame.
+                    // release. One notch is one second, not a frame; the ruler
+                    // labels are absolute video timestamps.
                     let delta = x as f32 - start_x;
                     let steps = tuner_steps(delta, notch);
-                    let fps = if self.source.fps > 1.0 {
-                        self.source.fps
-                    } else {
-                        30.0
-                    };
-                    let frame_ms = 1000.0 / fps;
-                    let start_frame = (start_ms as f64 / frame_ms).round();
-                    let target_frame = start_frame + (steps * self.frame_step as i64) as f64;
-                    let target = self.clamp_position((target_frame.max(0.0) * frame_ms).round() as u64);
+                    let target = self.clamp_position(
+                        (start_ms as i64)
+                            .saturating_add(steps.saturating_mul(1000))
+                            .max(0) as u64,
+                    );
                     self.drag_preview = Some(target);
                     // The ruler is endless: keep the full drag distance so the
                     // scale can keep moving as far as the pointer travels. The
@@ -6923,7 +6899,7 @@ impl Engine {
                             self.tuner_offset = 0.0;
                             self.tuner_pulse = 0.001;
                             self.tuner_pulse_dir = if step > 0 { -1.0 } else { 1.0 };
-                            if let Some(target) = self.nudge_frames(step * self.frame_step as i64) {
+                            if let Some(target) = self.nudge_time(step.saturating_mul(1000)) {
                                 self.pending_wheel_seek = Some((target, Instant::now()));
                             }
                             self.ui_dirty = true;
@@ -9759,9 +9735,6 @@ impl Engine {
             precision_dragging: self.precision_dragging,
             precision_step_open: false,
             precision_mix: self.precision_anim,
-            ab_a: self.ab_a,
-            ab_b: self.ab_b,
-            frame_step: self.frame_step,
             heatmap: self.heatmap,
             tuner_offset: self.tuner_offset,
             danmaku_visible: self.danmaku_visible,
