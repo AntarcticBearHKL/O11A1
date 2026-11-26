@@ -1,7 +1,7 @@
 //!  首页与视频：信息流、分区、排行、视频详情、播放地址(playurl)、画质档位与 CDN 选路。
 
 use super::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Upper bound for `BILI_FEED_PAGES` (each page is one signed request).
 const MAX_FEED_PAGES: usize = 8;
@@ -3418,6 +3418,18 @@ impl PlayInfo {
     }
 }
 
+/// Bilibili sometimes serialises a list field as explicit `null` for unusual
+/// uploads (interactive / vertical / archived sources). `#[serde(default)]`
+/// only covers a missing key, so accept null as the same empty list instead of
+/// rejecting the whole playurl body.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct PlayUrlResp {
     #[serde(default)]
@@ -3439,13 +3451,13 @@ struct PlayUrlData {
     /// Every tier the video advertises (`120` 4K, `116` 1080P60, …), in the
     /// API's own order. The signed-in account may not be able to play all of
     /// them; `dash.video[]` is the authoritative list of what it may play.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     accept_quality: Vec<i64>,
     /// Labels parallel to `accept_quality` (`4K 超清`, `1080P 高码率`, …).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     accept_description: Vec<String>,
     /// The same tiers with their marketing copy and codec list.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     support_formats: Vec<SupportFormat>,
 }
 
@@ -3468,9 +3480,9 @@ struct SupportFormat {
 struct Dash {
     #[serde(default)]
     duration: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     video: Vec<DashTrack>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     audio: Vec<DashTrack>,
     #[serde(default)]
     flac: Option<FlacObject>,
@@ -3537,9 +3549,9 @@ struct DashTrack {
     base_url: String,
     #[serde(default, rename = "base_url")]
     base_url_snake: String,
-    #[serde(default, rename = "backupUrl")]
+    #[serde(default, rename = "backupUrl", deserialize_with = "null_as_default")]
     backup_url: Vec<String>,
-    #[serde(default, rename = "backup_url")]
+    #[serde(default, rename = "backup_url", deserialize_with = "null_as_default")]
     backup_url_snake: Vec<String>,
 }
 
@@ -3908,6 +3920,43 @@ mod track_tests {
         assert_eq!(info.video_tracks.first().map(|t| t.id), Some(0));
         assert_eq!(info.default_qn, 0);
         assert_eq!(info.duration, 125);
+        assert!(info.audio_tracks.is_empty());
+    }
+
+    /// BV1rpyazXExZ returns explicit `null` for `dash.audio` and the tier
+    /// lists. The old `Vec` fields rejected the whole body; they must parse as
+    /// empty lists and leave the video streams usable.
+    #[test]
+    fn response_with_explicit_null_lists_still_plays_video() {
+        let json = r#"{
+            "code": 0,
+            "data": {
+                "accept_quality": null,
+                "accept_description": null,
+                "support_formats": null,
+                "dash": {
+                    "duration": 681,
+                    "video": [
+                        {"id": 120, "codecid": 7, "width": 2560, "height": 1600, "bandwidth": 1319233, "baseUrl": "https://x/4k.m4s"}
+                    ],
+                    "audio": null,
+                    "flac": {"audio": null}
+                }
+            }
+        }"#;
+        let resp: super::PlayUrlResp = match serde_json::from_str(json) {
+            Ok(resp) => resp,
+            Err(err) => return assert!(false, "explicit null lists must parse: {err}"),
+        };
+        let Some(data) = resp.data else {
+            return assert!(false, "playurl data missing");
+        };
+        let info = match super::build_play_info(data) {
+            Some(info) => info,
+            None => return assert!(false, "video stream must survive null lists"),
+        };
+        assert_eq!(info.video_tracks.len(), 1);
+        assert_eq!(info.video_tracks[0].id, 120);
         assert!(info.audio_tracks.is_empty());
     }
 }
