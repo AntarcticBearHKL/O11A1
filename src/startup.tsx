@@ -63,7 +63,18 @@ function LoginScreen({ closeAction, children }: { closeAction: number; children:
   const maximized = useWindowMaximized();
   return (
     <>
-      <div className={`login-gate${maximized ? ' maximized' : ''}`}>
+      <div
+        className={`login-gate${maximized ? ' maximized' : ''}`}
+        onPointerDownCapture={(event) => {
+          if (event.button !== 0) return;
+          const target = event.target as Element | null;
+          if (target?.closest(
+            'button, a, input, textarea, select, option, label, [role="button"], [role="tab"], .login-panel, .login-window-controls, .no-drag',
+          )) return;
+          window.o11a1.window.startDrag?.().catch?.(() => {});
+        }}
+      >
+        <div className="login-drag" aria-hidden="true" />
         <WindowControls closeAction={closeAction} />
         <section className="login-panel">{children}</section>
       </div>

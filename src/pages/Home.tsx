@@ -151,6 +151,7 @@ export default function Home() {
   const anchorRef = useRef<{ key: string; top: number } | null>(null);
   const idleTimer = useRef(0);
   const prefetchAt = useRef(0);
+  const warmedScroll = useRef(false);
 
   const applyCover = useCallback((items: FeedVideo[]) => {
     if (items[0]?.pic) rememberCover(items[0].pic);
@@ -415,6 +416,23 @@ export default function Home() {
       idleTimer.current = 0;
     };
   }, [onScroll, blocks.length > 0]);
+
+  // The first scroll of a freshly mounted feed can pay a one-frame
+  // layerisation/decode cost. Warm the scroll container while the user is still
+  // reading the first row; skip if they already scrolled themselves.
+  useEffect(() => {
+    if (warmedScroll.current || !blocks.length) return;
+    warmedScroll.current = true;
+    const timer = window.setTimeout(() => {
+      const scroll = feedRef.current?.closest('.page') as HTMLElement | null;
+      if (!scroll || scroll.scrollTop !== 0) return;
+      scroll.scrollTop = 1;
+      window.requestAnimationFrame(() => {
+        if (scroll.scrollTop === 1) scroll.scrollTop = 0;
+      });
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [blocks.length]);
 
   useEffect(() => {
     const onRefresh = () => refresh();

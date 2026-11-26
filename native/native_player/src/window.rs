@@ -29,7 +29,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus,
+    GetAsyncKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus,
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_LBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
@@ -1855,11 +1855,64 @@ pub fn drag_window(hwnd: HWND) {
     unsafe {
         // Only a real left-button press may start a drag. `handle_click` runs
         // on LeftDown, but keeping the guard makes a stray release harmless.
-        if GetKeyState(VK_LBUTTON.0 as i32) >= 0 {
+        // `GetAsyncKeyState`, not `GetKeyState`: this may run on a thread with
+        // no input queue of its own.
+        if GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0 {
             return;
         }
         let events = events_for(hwnd);
         let _ = start_drag(hwnd, events, DragMode::Move);
+    }
+}
+
+/// Move an Electron BrowserWindow. It has no native-player `WindowEvents`, so
+/// hand the gesture to its own WndProc and let Windows run the standard move
+/// loop. The call blocks until the move ends; the shell has no video decoder on
+/// this thread.
+pub fn drag_window_native(hwnd: HWND) {
+    unsafe {
+        if GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0 {
+            return;
+        }
+        if IsZoomed(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let mut start = POINT::default();
+        let mut rect = RECT::default();
+        if GetCursorPos(&mut start).is_err() || GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        crate::log::line(&format!(
+            "native drag start hwnd={:?} rect={:?}",
+            hwnd.0, rect
+        ));
+        let origin = (rect.left, rect.top);
+        let mut moves = 0u32;
+        // Native cursor-follow loop. Unlike the old Node timer this runs in the
+        // engine process with no renderer/IPC per frame, and it ends on the
+        // physical button state instead of a pointerup callback that can be
+        // lost when the gesture crosses a window boundary.
+        loop {
+            if GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0 {
+                break;
+            }
+            let mut cursor = POINT::default();
+            if GetCursorPos(&mut cursor).is_err() {
+                break;
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                origin.0 + cursor.x - start.x,
+                origin.1 + cursor.y - start.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            moves = moves.saturating_add(1);
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        crate::log::line(&format!("native drag end moves={moves}"));
     }
 }
 

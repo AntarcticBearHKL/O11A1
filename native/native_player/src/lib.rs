@@ -80,7 +80,7 @@ use anyhow::{anyhow, Context, Result};
 
 /// Start the native window-move loop for a host window (Electron player).
 pub fn drag_window(hwnd: isize) {
-    window::drag_window(windows::Win32::Foundation::HWND(hwnd as *mut _));
+    window::drag_window_native(windows::Win32::Foundation::HWND(hwnd as *mut _));
 }
 
 /// Put this process's windows in the Electron shell's taskbar group. Called by

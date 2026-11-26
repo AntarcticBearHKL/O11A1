@@ -545,12 +545,13 @@ em { font-style: normal; }
   gap: 10px;
   padding: 0 18px;
   z-index: 26;
-  background: color-mix(in srgb, var(--card-solid) 68%, transparent);
+  background: color-mix(in srgb, var(--card-solid) 90%, transparent);
   border-bottom: 1px solid var(--card-border);
   box-shadow:
     0 18px 44px -34px rgba(20, 18, 14, 0.42),
     inset 0 1px 0 rgba(255, 255, 255, 0.32);
-  backdrop-filter: blur(26px) saturate(1.35);
+  /* No backdrop blur: the feed scrolls under this bar, and re-blurring the
+     moving cards every frame was a major source of scroll jank. */
 }
 [data-theme='dark'] .topbar {
   box-shadow:
@@ -970,7 +971,7 @@ em { font-style: normal; }
   flex-direction: column;
   gap: 24px;
 }
-.feed-block { min-width: 0; }
+.feed-block { min-width: 0; contain: layout; }
 .feed-tail {
   display: flex;
   align-items: center;
@@ -3878,12 +3879,13 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   height: 72px;
   padding: 8px 14px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--card-solid) 68%, transparent);
+  background: color-mix(in srgb, var(--card-solid) 90%, transparent);
   border: 1px solid var(--card-border);
   box-shadow:
     0 22px 54px -22px rgba(20, 18, 14, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.45);
-  backdrop-filter: blur(26px) saturate(1.35);
+  /* The dock floats over the scrolling feed; keep it opaque instead of
+     re-blurring everything that passes underneath. */
   animation: rd-dock 0.45s var(--spring) both;
 }
 [data-theme='dark'] .bottom-bar {
@@ -4292,27 +4294,16 @@ img, a {
 
 /* ------------------------------------------------------- window dragging */
 
-/* Only the topbar is a native drag surface. Keeping the rest of the shell out
-   of the app region is what lets real mouse hover/click events reach the feed,
-   cards and scrollbars; a whole-window drag region swallowed them even though
-   the page itself was marked no-drag. */
-.app {
-  -webkit-app-region: no-drag;
-}
+/* No element is a native app-region. A whole-window (or whole-topbar) drag
+   region swallowed real mouse hover/click events on the feed. The shell
+   pointerdown handler calls the main process instead, which hands the gesture
+   to Windows' own move loop. */
+.app,
 .topbar,
-.login-gate {
-  -webkit-app-region: drag;
-}
-/* The login card scrolls and holds the inputs, so it must stay out of the
-   window-drag strip. The gate background around it still drags. */
+.login-gate,
 .page,
-.login-panel {
-  -webkit-app-region: no-drag;
-}
-/* A child of a native drag strip must opt out explicitly; without this the
-   search/account/window controls can start a window drag instead of a click. */
-.topbar > *,
 .login-panel,
+.topbar > *,
 .login-panel * {
   -webkit-app-region: no-drag;
 }
@@ -4768,10 +4759,10 @@ html, body, #root {
 .fish-agent-line .agent-tool-strip { margin-top: 0; }
 
 /* ------------------------------------------------ home feed: glass cards */
-/* Full-card frosted shell for the home feed only. Search/history/favorites
-   keep the airy transparent card so a dense list does not turn into a wall of
-   blurred panels. The shell is weaker than the floating toolbar (14px vs
-   26px blur) and only the shell is translucent; the cover stays opaque. */
+/* A dense feed cannot afford one backdrop-filter layer per card: 60 blurred
+   cards made scrolling and window dragging compete with the compositor. The
+   shell keeps its soft translucent paper with a near-opaque tint and a
+   hairline instead; the cover stays opaque. */
 .home-feed .video-grid {
   grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
   gap: 24px;
@@ -4780,10 +4771,10 @@ html, body, #root {
   padding: 0;
   overflow: hidden;
   border-radius: 24px;
-  background: color-mix(in srgb, var(--card-solid) 56%, transparent);
-  border: 0;
-  backdrop-filter: blur(14px) saturate(1.12);
-  -webkit-backdrop-filter: blur(14px) saturate(1.12);
+  background: color-mix(in srgb, var(--card-solid) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 58%, transparent);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   transition:
     translate 0.26s var(--ease),
     background 0.22s var(--ease);
@@ -4791,8 +4782,11 @@ html, body, #root {
 .home-feed .video-card:hover {
   transform: none;
   translate: 0 -3px;
-  background: color-mix(in srgb, var(--card-solid) 63%, transparent);
+  background: color-mix(in srgb, var(--card-solid) 94%, transparent);
 }
+/* Entrance animation only belongs to the first screenful; new infinite-feed
+   blocks should paint immediately while the user is scrolling into them. */
+.feed-block:not(:first-child) .video-card { animation: none; }
 .home-feed .video-card:focus-visible {
   border-radius: 26px;
 }
@@ -4813,10 +4807,10 @@ html, body, #root {
   margin-top: 6px;
 }
 [data-theme='dark'] .home-feed .video-card {
-  background: color-mix(in srgb, var(--card-solid) 60%, transparent);
+  background: color-mix(in srgb, var(--card-solid) 90%, transparent);
 }
 [data-theme='dark'] .home-feed .video-card:hover {
-  background: color-mix(in srgb, var(--card-solid) 68%, transparent);
+  background: color-mix(in srgb, var(--card-solid) 95%, transparent);
 }
 /* Pressed feedback is driven by a React class, not :active, because a click
    on the cover image does not always activate the card div. */

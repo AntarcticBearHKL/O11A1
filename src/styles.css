@@ -136,7 +136,7 @@ img { display: block; }
   left: 0;
   right: 0;
   height: 54px;
-  -webkit-app-region: drag;
+  -webkit-app-region: no-drag;
   z-index: 2;
 }
 .login-window-controls {

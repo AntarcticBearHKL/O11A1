@@ -29,6 +29,21 @@ import { clearPreloadedData } from './preload';
 
 type HotSearchItem = { keyword: string; show_name: string };
 
+/// Areas that own their pointer gestures. Everything else in the shell can be
+/// used as a window-drag handle; the handler below hands the press to Windows'
+/// native move loop instead of a JS timer, so a lost pointerup cannot leave the
+/// window following the cursor.
+const SHELL_GESTURE_TARGETS = [
+  'button', 'a', 'input', 'textarea', 'select', 'option', 'label',
+  '[role="button"]', '[role="tab"]', '[role="slider"]', '[contenteditable="true"]',
+  '.video-card', '.pgc-card', '.msg-row', '.queue-row', '.folder-item', '.row',
+  '.search-hit-card', '.dynamic-card .head', '.dynamic-archive', '.search-dock',
+  '.tabs', '.chips', '.settings-row .control', '.account-menu', '.playlist-popover',
+  '.queue-foot', '.folder-actions', '.window-controls', '.login-window-controls',
+  '.image-viewer', '.card-tip', '.agent-composer', '.agent-thread', '.agent-fold',
+  '.agent-card', '.agent-chat-msg', '.no-drag',
+].join(',');
+
 function parseRoute(): Route {
   const raw = window.location.hash.replace(/^#\/?/, '');
   const [path, queryText = ''] = raw.split('?');
@@ -433,6 +448,23 @@ export default function App({ initial }: { initial?: AppInitial }) {
     await launchPlayer({ ...options, reportHistory: true }, newWindow);
   }, []);
 
+  /// Drag the shell from any non-interactive surface. Native app regions are
+  /// deliberately absent: they swallowed real hover/click events on the feed.
+  /// The main process hands this press to Windows' move loop, which ends with
+  /// the OS gesture instead of a JS timer that can get stuck.
+  const shellPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target as Element | null;
+    if (!target || target.closest(SHELL_GESTURE_TARGETS)) return;
+    const page = target.closest('.page') as HTMLElement | null;
+    if (page) {
+      const rect = page.getBoundingClientRect();
+      // Do not steal the page scrollbar thumb.
+      if (event.clientX >= rect.left + page.clientWidth - 1) return;
+    }
+    window.o11a1.window.startDrag?.().catch?.(() => {});
+  }, []);
+
   const dockGo = useCallback((key: string) => {
     setSearchOpen(false);
     setPlaylistOpen(false);
@@ -674,7 +706,11 @@ export default function App({ initial }: { initial?: AppInitial }) {
 
   return (
     <AppContext.Provider value={{ settings, account, saveSettings, reloadSettings, navigate, route, toast: show, launch, refreshAccount, openSearch: openSearchMorph }}>
-      <div className={`app${maximized ? ' maximized' : ''}`} ref={appRef}>
+      <div
+        className={`app${maximized ? ' maximized' : ''}`}
+        ref={appRef}
+        onPointerDownCapture={shellPointerDown}
+      >
 
         <div className="workspace">
           <header className="topbar">

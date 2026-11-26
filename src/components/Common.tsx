@@ -264,6 +264,14 @@ export function prewarmFeedPreviews(
   }
 }
 
+/// Hover previews are a network + decoder job. Suppress them for a short
+/// moment after any scroll so a pointer resting over a moving feed does not
+/// start a preview for every card that passes underneath.
+let lastScrollAt = 0;
+if (typeof window !== 'undefined') {
+  window.addEventListener('scroll', () => { lastScrollAt = performance.now(); }, { capture: true, passive: true });
+}
+
 function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigate }: {
   item: any;
   index: number;
@@ -304,6 +312,7 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
   }, []);
 
   const beginPreview = useCallback(() => {
+    if (performance.now() - lastScrollAt < 240) return;
     const bvid = String(item?.bvid || '').trim();
     const cid = Number(item?.cid || 0);
     if (!bvid || !cid) return;
@@ -316,6 +325,9 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
     const token = ++previewToken.current;
     clearTimeout(previewTimer.current);
     previewTimer.current = setTimeout(async () => {
+      // The pointer may have started moving the feed while this timer was
+      // pending; never begin a preview in the middle of a scroll.
+      if (performance.now() - lastScrollAt < 240) return;
       try {
         const data = await call<{ url: string }>('video.preview', { bvid, cid });
         if (token !== previewToken.current || !data?.url) return;
