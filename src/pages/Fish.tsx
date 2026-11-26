@@ -21,7 +21,8 @@ export default function Fish() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [key, setKey] = useState('');
-  const [instruction, setInstruction] = useState(settings.fish_instruction || '');
+  const [chatText, setChatText] = useState('');
+  const [sending, setSending] = useState(false);
   const [tools, setTools] = useState<FishToolSpec[]>([]);
 
   const load = useCallback(async (quiet = false) => {
@@ -42,12 +43,16 @@ export default function Fish() {
 
   useEffect(() => {
     load();
-    // A live Agent transcript should feel live: poll every second while the
-    // worker runs, then back off to 3 s once it is idle.
-    const running = state?.snapshot?.state === 'Running' || state?.snapshot?.state === 'Waiting';
+    // A live Agent transcript should feel live: poll every second while a
+    // chat turn runs, then back off to 3 s once it is idle.
+    const agentState = state?.snapshot?.agent?.state;
+    const running = state?.snapshot?.chat_busy
+      || agentState === 'running'
+      || state?.snapshot?.state === 'Running'
+      || state?.snapshot?.state === 'Waiting';
     const timer = setInterval(() => load(true), running ? 1000 : 3000);
     return () => clearInterval(timer);
-  }, [load, state?.snapshot?.state]);
+  }, [load, state?.snapshot?.chat_busy, state?.snapshot?.agent?.state, state?.snapshot?.state]);
 
   useEffect(() => {
     const onRefresh = () => load();
@@ -74,11 +79,34 @@ export default function Fish() {
   const snapshot = state?.snapshot;
   const snapshotState = snapshot?.state;
 
-  const nextAgentStep = async () => {
+  const sendChat = async () => {
+    const text = chatText.trim();
+    if (!text || sending) return;
+    setSending(true);
     try {
-      await call('fish.agent.step');
+      await call('fish.agent.chat', { text });
+      setChatText('');
       await load(true);
-    } catch (reason: any) { toast(reason.message, true); }
+    } catch (reason: any) {
+      toast(reason.message || String(reason), true);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const resetChat = async () => {
+    try {
+      await call('fish.agent.reset');
+      setChatText('');
+      await load(true);
+    } catch (reason: any) { toast(reason.message || String(reason), true); }
+  };
+
+  const cancelChat = async () => {
+    try {
+      await call('fish.agent.cancel');
+      await load(true);
+    } catch (reason: any) { toast(reason.message || String(reason), true); }
   };
 
   const saveFish = async (patch: Record<string, any>) => {
@@ -108,31 +136,26 @@ export default function Fish() {
     } catch (reason: any) { toast(reason.message, true); }
   };
 
-  const stateName = typeof snapshotState === 'string'
-    ? snapshotState
-    : snapshotState && typeof snapshotState === 'object'
-      ? Object.keys(snapshotState)[0] || ''
-      : '';
   const stateError = snapshotState && typeof snapshotState === 'object'
     ? String((snapshotState as any).Error || '')
     : '';
-  const workerAlive = Boolean(snapshot?.worker_alive);
-  const isLive = workerAlive && (stateName === 'Running' || stateName === 'Waiting');
-  const agentWaiting = Boolean(snapshot?.agent_waiting);
   const agentState = agent?.state || '';
+  const agentBusy = Boolean(snapshot?.chat_busy || agentState === 'running');
   const errorText = stateError || (agentState === 'error' ? agent?.note || '' : '');
 
   return (
     <>
-      <PageHead eyebrow="实验" title="Agent" sub="AI 看片 · 单步工具流" className="fish-page-head">
+      <PageHead eyebrow="实验" title="Agent" sub="AI 看片 · 对话" className="fish-page-head">
         <Tabs tabs={TABS} active={tab} onChange={setTab} />
-        <button
-          className="btn sm primary fish-next"
-          disabled={isLive && !agentWaiting}
-          onClick={nextAgentStep}
-        >
-          下一步
-        </button>
+        {tab === 0 ? (
+          <button
+            className="btn sm fish-new"
+            disabled={agentBusy || !agent?.steps?.length}
+            onClick={resetChat}
+          >
+            新对话
+          </button>
+        ) : null}
       </PageHead>
 
       {loading && !state ? <Spinner label="读取 Agent…" /> : error ? <ErrorBox error={error} onRetry={() => load()} /> : state ? (
@@ -141,9 +164,32 @@ export default function Fish() {
             <AgentPanel
               agent={agent}
               errorText={errorText}
-              parked={agentWaiting}
+              parked={false}
               onCopyError={() => navigator.clipboard.writeText(errorText).then(() => toast('错误已复制')).catch(() => toast('复制失败', true))}
-            />
+            >
+              <div className="agent-composer">
+                <textarea
+                  className="agent-composer-input"
+                  value={chatText}
+                  rows={2}
+                  placeholder={agentBusy ? 'Agent 正在回复…' : '跟 Agent 说你想看什么…（Enter 发送，Shift+Enter 换行）'}
+                  onChange={(event) => setChatText(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'Enter' || event.shiftKey) return;
+                    // Enter while an IME is composing commits the Chinese
+                    // candidate, it must not also send the message.
+                    if (event.nativeEvent.isComposing) return;
+                    event.preventDefault();
+                    if (!agentBusy) void sendChat();
+                  }}
+                />
+                {agentBusy ? (
+                  <button className="btn sm" onClick={cancelChat}>停止</button>
+                ) : (
+                  <button className="btn sm primary" disabled={!chatText.trim() || sending} onClick={sendChat}>发送</button>
+                )}
+              </div>
+            </AgentPanel>
           ) : null}
 
           {tab === 1 ? <TestLab tools={tools} seedBvid={toolSeed} /> : null}
@@ -157,28 +203,15 @@ export default function Fish() {
                   <button className="btn sm primary" disabled={!key.trim()} onClick={async () => { await saveFish({ deepseek_key: key.trim() }); setKey(''); toast('Key 已保存'); load(true); }}>保存</button>
                 </div>
               </div>
-              <div className="field">
-                <label>观看指令</label>
-                <textarea className="textarea" value={instruction} onChange={(event) => setInstruction(event.target.value)} />
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <button className="btn sm" onClick={async () => { await saveFish({ fish_instruction: instruction }); toast('已保存'); }}>保存指令</button>
-                  {(state.presets || []).map((preset: any) => (
-                    <button key={preset.id} className="chip small" title={preset.tagline} onClick={async () => { setInstruction(preset.body); await saveFish({ fish_instruction: preset.body }); toast(`已切换到 ${preset.name}`); }}>{preset.name}</button>
-                  ))}
-                </div>
+              <div className="field"><label>模型</label>
+                <select className="select" value={settings.fish_model} onChange={(event) => saveFish({ fish_model: event.target.value })}>
+                  <option value="deepseek-flash">deepseek-flash</option>
+                  <option value="deepseek-reasoner">deepseek-reasoner</option>
+                </select>
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-                <div className="field"><label>模型</label>
-                  <select className="select" value={settings.fish_model} onChange={(event) => saveFish({ fish_model: event.target.value })}>
-                    <option value="deepseek-flash">deepseek-flash</option>
-                    <option value="deepseek-reasoner">deepseek-reasoner</option>
-                  </select>
-                </div>
-                <div className="field"><label>间隔（毫秒）</label><input className="input" type="number" min={200} max={10000} value={settings.fish_interval_ms} onChange={(event) => saveFish({ fish_interval_ms: Number(event.target.value) })} /></div>
-                <div className="field"><label>候选来源</label><div className="fish-muted" style={{ paddingTop: 9 }}>固定首页视频流</div></div>
+              <div className="settings-row">
+                <div className="label"><div className="name">Agent 模式</div><div className="desc">只在对话里工作；不会自动刷首页或自动看片</div></div>
               </div>
-              <div className="settings-row"><div className="label"><div className="name">启用 Agent</div><div className="desc">允许后台定时喂食</div></div><Toggle on={settings.fish_enabled} onChange={(value) => saveFish({ fish_enabled: value })} /></div>
-              <div className="settings-row"><div className="label"><div className="name">自动喂食</div><div className="desc">{settings.fish_feed_time || '20:00'} 开始</div></div><Toggle on={settings.fish_auto_feed} onChange={(value) => saveFish({ fish_auto_feed: value })} /></div>
               <div className="settings-row"><div className="label"><div className="name">画面实验室抽帧间隔</div><div className="desc">仅手动画面实验室/旧流程使用；Agent 会自己选 1/5/10/20/30/60 秒</div></div>
                 <div className="control">
                   <select className="select" value={(settings as any).fish_frame_interval_s ?? 0} onChange={(event) => saveFish({ fish_frame_interval_s: Number(event.target.value) })}>

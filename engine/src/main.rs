@@ -389,17 +389,9 @@ async fn main() -> Result<()> {
         });
     }
 
-    {
-        let app = app.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(20)).await;
-                if let Err(error) = auto_feed_tick(&app).await {
-                    o11a1::debug_log(&format!("auto feed skipped: {error:#}"));
-                }
-            }
-        });
-    }
+    // The Agent is conversational now: it never wakes up on its own or feeds
+    // itself a homepage batch. `auto_feed_tick` is kept for a future explicit
+    // schedule but is deliberately not started.
 
     {
         let app = app.clone();
@@ -1438,6 +1430,30 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
             let approved = engine.approve_agent_step();
             Ok(json!({ "approved": approved, "snapshot": engine.snapshot() }))
         }
+        "fish.agent.chat" => {
+            let engine = fish_engine(app).await?;
+            let text = text(&params, "text");
+            if text.trim().is_empty() {
+                return Err("消息不能为空".to_string());
+            }
+            engine.set_agent_debug(false);
+            engine
+                .chat(app.session().await?, text)
+                .map_err(|error| error.to_string())?;
+            Ok(json!({ "snapshot": engine.snapshot() }))
+        }
+        "fish.agent.cancel" => {
+            let engine = fish_engine(app).await?;
+            engine.cancel_chat();
+            Ok(json!({ "snapshot": engine.snapshot() }))
+        }
+        "fish.agent.reset" => {
+            let engine = fish_engine(app).await?;
+            engine
+                .reset_chat()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({ "snapshot": engine.snapshot() }))
+        }
         "fish.agent.continue" => {
             let engine = fish_engine(app).await?;
             engine.set_agent_debug(false);
@@ -1864,9 +1880,9 @@ fn engine_presets() -> Value {
     )
 }
 
-/// Once-a-day scheduled feed. It is opt-in (`fish_auto_feed`), only fires in
-/// the configured local minute, and records the local day so a restart after
-/// the minute cannot feed twice.
+/// Once-a-day scheduled feed. Kept for a future explicit schedule; the
+/// conversational Agent does not start this loop.
+#[allow(dead_code)]
 async fn auto_feed_tick(app: &Arc<App>) -> Result<()> {
     let settings = app.settings.lock().await.clone();
     if !settings.fish_enabled || !settings.fish_auto_feed {

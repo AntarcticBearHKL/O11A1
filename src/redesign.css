@@ -3706,9 +3706,88 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 
 /* Full Agent tab: the compact overview preview keeps its own height, the
    dedicated tab gets the room the whole transcript needs. */
-.agent-page { display: flex; flex-direction: column; }
-.agent-chat.full { margin-bottom: 14px; }
-.agent-chat.full .agent-thread { max-height: min(760px, calc(100vh - 390px)); min-height: 260px; }
+.agent-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 300px);
+  min-height: 420px;
+}
+.agent-chat.full {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  margin-bottom: 8px;
+}
+
+/* Conversational Agent: user and assistant bubbles sit in the same scroll
+   thread as the tool rows, so the transcript reads as one conversation. */
+.agent-chat-msg { display: flex; padding: 7px 2px; }
+.agent-chat-msg.user { justify-content: flex-end; }
+.agent-chat-msg.assistant { justify-content: flex-start; }
+.agent-chat-bubble {
+  max-width: 84%;
+  padding: 9px 12px;
+  border-radius: 14px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.agent-chat-msg.user .agent-chat-bubble {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-bottom-right-radius: 5px;
+}
+.agent-chat-msg.assistant .agent-chat-bubble {
+  border-bottom-left-radius: 5px;
+}
+.agent-chat-msg.assistant .agent-chat-bubble .agent-rich {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.agent-chat-empty {
+  padding: 30px 14px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  text-align: center;
+}
+.agent-composer {
+  display: flex;
+  flex: none;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 2px 2px;
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+.agent-composer-input {
+  flex: 1;
+  min-height: 42px;
+  max-height: 120px;
+  resize: none;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  outline: none;
+  transition: border-color 0.16s var(--ease);
+}
+.agent-composer-input:focus { border-color: var(--accent-line); }
+.agent-composer .btn { height: 42px; }
+.fish-new { flex: none; margin-left: auto; }
+.agent-chat.full .agent-thread {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
 
 /* Compact tool inventory on the Agent tab. Full descriptions and the manual
    test panels live in the 工具 tab. */

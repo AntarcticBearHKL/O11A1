@@ -1,6 +1,6 @@
 {
   "name": "o11a1-electron",
-  "version": "0.9.52",
+  "version": "0.9.53",
   "private": true,
   "description": "O11A1 Electron UI + Rust video engine",
   "author": "O11A1",

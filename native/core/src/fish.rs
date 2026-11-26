@@ -314,6 +314,8 @@ pub struct FishSnapshot {
     pub agent_debug: bool,
     /// True while the worker is stopped at a single-step approval gate.
     pub agent_waiting: bool,
+    /// True while a conversational Agent turn is in flight.
+    pub chat_busy: bool,
     /// True while a `fish-worker` thread exists.
     pub worker_alive: bool,
     /// The newest successful verdict.
@@ -918,6 +920,17 @@ struct AgentRunState {
     total_out: u64,
     rate: Option<ParsedVerdict>,
     no_candidates: bool,
+    /// True for a conversational turn; avoids mutating the old queue table.
+    chat: bool,
+}
+
+/// One conversational Agent session. The API messages and the tool state are
+/// kept across user turns, so "open that video" then "watch the first minute"
+/// works without repeating the context.
+struct ChatSession {
+    messages: Vec<serde_json::Value>,
+    tools: AgentRunState,
+    work_dir: PathBuf,
 }
 
 /// What one tool call produced for the transcript and the model.
@@ -952,6 +965,10 @@ pub struct FishEngine {
     /// Work directory of the transcript currently on screen. Kept until the
     /// next video starts so its contact sheets stay loadable.
     agent_work_dir: Mutex<Option<PathBuf>>,
+    /// Conversational Agent state (API messages + the open video/clips).
+    chat: Mutex<Option<ChatSession>>,
+    /// True while one `fish-chat` turn is talking to DeepSeek or running tools.
+    chat_busy: AtomicBool,
     /// Last time `progress` was pushed to the snapshot hook (throttle).
     last_progress_publish: Mutex<Option<Instant>>,
     signals: Mutex<Option<Signals>>,
@@ -1044,6 +1061,8 @@ impl FishEngine {
             agent_images: Mutex::new(HashMap::new()),
             agent_image_seq: AtomicU64::new(1),
             agent_work_dir: Mutex::new(None),
+            chat: Mutex::new(None),
+            chat_busy: AtomicBool::new(false),
             last_progress_publish: Mutex::new(None),
             signals: Mutex::new(None),
             hook: Mutex::new(None),
@@ -1171,6 +1190,7 @@ impl FishEngine {
             agent,
             agent_debug: self.debug_steps.load(Ordering::SeqCst),
             agent_waiting,
+            chat_busy: self.chat_busy.load(Ordering::SeqCst),
             worker_alive: self.worker.load(Ordering::SeqCst),
             ..FishSnapshot::default()
         };
@@ -1748,6 +1768,191 @@ impl FishEngine {
     /// hook in `core`.
     pub fn shutdown(&self) {
         self.stop();
+    }
+
+    /// Send one user message to the conversational Agent. A second message
+    /// while the previous answer is still running is rejected; the UI disables
+    /// the composer until the snapshot says the turn has finished.
+    pub fn chat(&self, session: Arc<Session>, text: String) -> Result<()> {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            bail!("消息不能为空");
+        }
+        if self.chat_busy.swap(true, Ordering::SeqCst) {
+            bail!("Agent 正在回复，等它说完");
+        }
+        let config = match self.config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.chat_busy.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let mut guard = match self.chat.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.chat_busy.store(false, Ordering::SeqCst);
+                bail!("Agent 会话状态不可用");
+            }
+        };
+        if guard.is_none() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let work_dir = std::env::temp_dir()
+                .join("o11a1-fish-chat")
+                .join(format!("chat-{stamp}"));
+            if let Err(error) = std::fs::create_dir_all(&work_dir) {
+                self.chat_busy.store(false, Ordering::SeqCst);
+                bail!("创建 Agent 工作目录失败：{error}");
+            }
+            let system = agent_tools::CHAT_SYSTEM_PROMPT.to_string();
+            self.clear_agent_images();
+            if let Ok(mut slot) = self.agent.lock() {
+                let mut view = AgentView::begin_chat(&config.model);
+                view.system_prompt = system.clone();
+                *slot = Some(view);
+            }
+            if let Ok(mut slot) = self.agent_work_dir.lock() {
+                *slot = Some(work_dir.clone());
+            }
+            *guard = Some(ChatSession {
+                messages: vec![serde_json::json!({ "role": "system", "content": system })],
+                tools: AgentRunState {
+                    opened: None,
+                    movie: None,
+                    work_dir: work_dir.clone(),
+                    clip_count: 0,
+                    clips: Vec::new(),
+                    network_bytes: 0,
+                    system_prompt: system.clone(),
+                    user_prompt: String::new(),
+                    total_in: 0,
+                    total_out: 0,
+                    rate: None,
+                    no_candidates: false,
+                    chat: true,
+                },
+                work_dir,
+            });
+        }
+        let Some(mut chat) = guard.take() else {
+            self.chat_busy.store(false, Ordering::SeqCst);
+            bail!("Agent 会话状态不可用");
+        };
+        drop(guard);
+
+        chat.messages.push(serde_json::json!({
+            "role": "user",
+            "content": text.clone(),
+        }));
+        self.agent_push(AgentStepView {
+            id: self.agent_next_id("msg"),
+            kind: "user".to_string(),
+            title: "你".to_string(),
+            state: "ok".to_string(),
+            detail: clip(&collapse_ws(&text), 180),
+            thinking: text,
+            tool: "user".to_string(),
+            ..AgentStepView::default()
+        });
+        self.agent_with(|agent| {
+            agent.state = "running".to_string();
+            agent.note = "正在回复…".to_string();
+        });
+        self.set_state(FishState::Running);
+        self.publish();
+
+        let Some(engine) = self.self_ref.lock().ok().and_then(|slot| slot.upgrade()) else {
+            self.chat_busy.store(false, Ordering::SeqCst);
+            bail!("引擎未初始化");
+        };
+        let spawned = std::thread::Builder::new()
+            .name("fish-chat".into())
+            .spawn(move || {
+                let generation = engine.generation.load(Ordering::SeqCst);
+                let (chat, result) = engine.run_chat_turn(&config, generation, chat, session);
+                if let Ok(mut slot) = engine.chat.lock() {
+                    *slot = Some(chat);
+                }
+                engine.cancel_current.store(false, Ordering::SeqCst);
+                match result {
+                    Ok(()) => {
+                        engine.agent_with(|agent| {
+                            agent.state = "idle".to_string();
+                            agent.note = "等你说话。".to_string();
+                        });
+                        engine.set_state(FishState::Idle);
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if message.contains("已取消") {
+                            engine.agent_with(|agent| {
+                                agent.state = "idle".to_string();
+                                agent.note = "已停止。".to_string();
+                            });
+                            engine.set_state(FishState::Idle);
+                        } else {
+                            engine.agent_push(AgentStepView {
+                                id: engine.agent_next_id("error"),
+                                kind: "error".to_string(),
+                                title: "运行出错".to_string(),
+                                state: "failed".to_string(),
+                                detail: clip(&message, 240),
+                                thinking: message.clone(),
+                                tool: "deepseek".to_string(),
+                                ..AgentStepView::default()
+                            });
+                            engine.agent_with(|agent| {
+                                agent.state = "error".to_string();
+                                agent.note = message.clone();
+                            });
+                            engine.set_state(FishState::Error(message));
+                        }
+                    }
+                }
+                engine.chat_busy.store(false, Ordering::SeqCst);
+                engine.publish();
+            });
+        if spawned.is_err() {
+            self.chat_busy.store(false, Ordering::SeqCst);
+            self.set_state(FishState::Error("无法启动 Agent 线程".to_string()));
+            bail!("无法启动 Agent 线程");
+        }
+        Ok(())
+    }
+
+    /// Stop the current chat turn. The thread keeps the conversation; the next
+    /// message can continue from the same context.
+    pub fn cancel_chat(&self) {
+        self.cancel_current.store(true, Ordering::SeqCst);
+        self.agent_with(|agent| {
+            agent.note = "正在停止…".to_string();
+        });
+        self.publish();
+    }
+
+    /// Start a fresh conversation and release the old contact sheets.
+    pub fn reset_chat(&self) -> Result<()> {
+        if self.chat_busy.load(Ordering::SeqCst) {
+            bail!("Agent 正在回复，等它说完");
+        }
+        let previous = self.chat.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(session) = previous {
+            let _ = std::fs::remove_dir_all(&session.work_dir);
+        }
+        self.clear_agent_images();
+        if let Ok(mut slot) = self.agent_work_dir.lock() {
+            *slot = None;
+        }
+        let model = self.config().map(|config| config.model).unwrap_or_default();
+        if let Ok(mut slot) = self.agent.lock() {
+            *slot = Some(AgentView::begin_chat(&model));
+        }
+        self.set_state(FishState::Idle);
+        self.publish();
+        Ok(())
     }
 
     /// True while a `fish-worker` thread exists (it may be paused).
@@ -2424,6 +2629,7 @@ impl FishEngine {
             total_out: 0,
             rate: None,
             no_candidates: false,
+            chat: false,
         };
         self.agent_with(|agent| {
             agent.system_prompt = system.clone();
@@ -2682,6 +2888,226 @@ impl FishEngine {
         Ok(Some(verdict))
     }
 
+    fn run_chat_turn(
+        &self,
+        config: &EngineConfig,
+        generation: u64,
+        mut chat: ChatSession,
+        session: Arc<Session>,
+    ) -> (ChatSession, Result<()>) {
+        let result = self.chat_loop(config, generation, &mut chat, &session);
+        (chat, result)
+    }
+
+    /// One user message, one model turn at a time until the model answers
+    /// without asking for a tool. No mandatory `rate_video`, no automatic next
+    /// video: the thread returns to the owner after each answer.
+    fn chat_loop(
+        &self,
+        config: &EngineConfig,
+        generation: u64,
+        chat: &mut ChatSession,
+        session: &Arc<Session>,
+    ) -> Result<()> {
+        let tools = agent_tools::chat_tool_definitions();
+        let max_turns = 12usize;
+        for turn in 0..max_turns {
+            if self.stale_or_cancelled(generation) {
+                bail!("已取消");
+            }
+            self.progress_note(format!("Agent 第 {} 轮思考…", turn + 1));
+            self.agent_with(|agent| {
+                agent.note = format!("第 {} 轮 · 正在思考…", turn + 1);
+            });
+
+            let ask_started = Instant::now();
+            let asked = runtime().block_on(async {
+                let ask = self.ask_agent(config, &chat.messages, &tools);
+                let cancel = wait_cancel(self.cancel_current.clone());
+                tokio::pin!(ask);
+                tokio::pin!(cancel);
+                match futures::future::select(ask, cancel).await {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right((_, _)) => Err(anyhow!("已取消")),
+                }
+            })?;
+            if self.stale_or_cancelled(generation) {
+                bail!("已取消");
+            }
+            let ask_ms = ask_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            chat.tools.total_in = chat.tools.total_in.saturating_add(asked.tokens_in);
+            chat.tools.total_out = chat.tools.total_out.saturating_add(asked.tokens_out);
+            self.agent_add_usage(asked.tokens_in, asked.tokens_out);
+
+            if !asked.reasoning.trim().is_empty() {
+                self.agent_push(AgentStepView {
+                    id: self.agent_next_id("think"),
+                    kind: "thinking".to_string(),
+                    title: "思考".to_string(),
+                    meta: config.model.clone(),
+                    state: "ok".to_string(),
+                    detail: clip(&collapse_ws(&asked.reasoning), 180),
+                    thinking: clip(&asked.reasoning, 12_000),
+                    tool: "deepseek".to_string(),
+                    ms: ask_ms,
+                    tokens: asked.tokens_in.saturating_add(asked.tokens_out),
+                    ..AgentStepView::default()
+                });
+            }
+
+            let mut assistant = serde_json::json!({
+                "role": "assistant",
+                "content": asked.content,
+            });
+            if !asked.tool_calls.is_empty() {
+                assistant["tool_calls"] = serde_json::Value::Array(
+                    asked
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments,
+                                }
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            chat.messages.push(assistant);
+            // Contact sheets are large data URLs. The model has already seen
+            // them in this turn; keep a short marker in history so a long
+            // conversation does not resend every image on every message.
+            compact_image_messages(&mut chat.messages);
+
+            if !asked.content.trim().is_empty() {
+                self.agent_push(AgentStepView {
+                    id: self.agent_next_id("reply"),
+                    kind: "assistant".to_string(),
+                    title: "Agent".to_string(),
+                    state: "ok".to_string(),
+                    detail: clip(&collapse_ws(&asked.content), 180),
+                    thinking: clip(&asked.content, 12_000),
+                    tool: "assistant".to_string(),
+                    ms: ask_ms,
+                    ..AgentStepView::default()
+                });
+            }
+
+            if asked.tool_calls.is_empty() {
+                return Ok(());
+            }
+
+            for call in &asked.tool_calls {
+                if self.stale_or_cancelled(generation) {
+                    bail!("已取消");
+                }
+                let tool_step_id = self.agent_next_id("tool");
+                let label = agent_tools::tool_label(&call.name);
+                let args_pretty = clip(
+                    &pretty_json(
+                        &serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": call.arguments })),
+                    ),
+                    12_000,
+                );
+                self.agent_push(AgentStepView {
+                    id: tool_step_id.clone(),
+                    kind: "tool".to_string(),
+                    title: label.to_string(),
+                    meta: call.name.clone(),
+                    state: "running".to_string(),
+                    detail: format!("调用 {}", call.name),
+                    arguments: args_pretty.clone(),
+                    tool: call.name.clone(),
+                    ..AgentStepView::default()
+                });
+                let tool_started = Instant::now();
+                let outcome = self.execute_agent_tool(
+                    config,
+                    session,
+                    &mut chat.tools,
+                    call,
+                    &tool_step_id,
+                );
+                let tool_ms = tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                match outcome {
+                    Ok(out) => {
+                        chat.tools.network_bytes = chat.tools.network_bytes.saturating_add(out.bytes);
+                        chat.messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": clip(&out.content, 20_000),
+                        }));
+                        if !out.images.is_empty() {
+                            let mut parts = vec![serde_json::json!({
+                                "type": "text",
+                                "text": format!(
+                                    "{} 的画面拼图（{} 张，按时间顺序，左上角是时间戳）。",
+                                    label,
+                                    out.images.len()
+                                ),
+                            })];
+                            for image in &out.images {
+                                if let Ok(data) = self.agent_image_data_url(&image.key) {
+                                    parts.push(serde_json::json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": data, "detail": "high" }
+                                    }));
+                                }
+                            }
+                            chat.messages.push(serde_json::json!({ "role": "user", "content": parts }));
+                        }
+                        self.agent_update(AgentStepView {
+                            id: tool_step_id,
+                            kind: "tool".to_string(),
+                            title: label.to_string(),
+                            meta: call.name.clone(),
+                            state: "ok".to_string(),
+                            detail: out.summary.clone(),
+                            arguments: args_pretty,
+                            output: clip(&out.output, 20_000),
+                            tool: call.name.clone(),
+                            images: out.images.clone(),
+                            ms: tool_ms,
+                            bytes: out.bytes,
+                            ..AgentStepView::default()
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let error_json = pretty_json(&serde_json::json!({ "error": message }));
+                        self.agent_update(AgentStepView {
+                            id: tool_step_id,
+                            kind: "tool".to_string(),
+                            title: label.to_string(),
+                            meta: call.name.clone(),
+                            state: "failed".to_string(),
+                            detail: clip(&message, 240),
+                            arguments: args_pretty,
+                            output: clip(&error_json, 8_000),
+                            tool: call.name.clone(),
+                            ms: tool_ms,
+                            ..AgentStepView::default()
+                        });
+                        chat.messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": error_json,
+                        }));
+                    }
+                }
+            }
+        }
+        self.agent_with(|agent| {
+            agent.note = "这一轮工具调用太多，先停在这里。".to_string();
+        });
+        Ok(())
+    }
+
     fn execute_agent_tool(
         &self,
         config: &EngineConfig,
@@ -2731,8 +3157,10 @@ impl FishEngine {
                     .filter(|video| !self.is_watched(&video.bvid).unwrap_or(false))
                     .take(limit)
                     .collect();
-                if let Err(err) = self.enqueue_candidates(&list) {
-                    note = format!("候选写入失败：{err:#}");
+                if !state.chat {
+                    if let Err(err) = self.enqueue_candidates(&list) {
+                        note = format!("候选写入失败：{err:#}");
+                    }
                 }
             }
             Err(err) => {
@@ -2805,11 +3233,13 @@ impl FishEngine {
                     rate: None,
                 });
             }
-            bail!(
-                "本轮已经打开了 {}（{}），请先 rate_video 再换视频",
-                opened.title,
-                opened.bvid
-            );
+            // Chat mode may switch videos freely. Drop the per-video cache so
+            // clips and scores from the previous video never leak into this one.
+            state.opened = None;
+            state.movie = None;
+            state.clip_count = 0;
+            state.clips.clear();
+            state.rate = None;
         }
         self.progress_note(format!("打开视频 {bvid} · 读取评论与字幕…"));
         let opened = runtime().block_on(agent_tools::open_video(
@@ -2820,7 +3250,9 @@ impl FishEngine {
         ))?;
         self.agent_set_video(&opened);
         self.set_current(Some((opened.bvid.clone(), opened.title.clone())));
-        self.mark_queue_running(&opened.bvid);
+        if !state.chat {
+            self.mark_queue_running(&opened.bvid);
+        }
         let opened_bytes = opened.bytes;
         let output = open_video_json(&opened);
         let summary = format!(
@@ -2865,9 +3297,6 @@ impl FishEngine {
             .to_string();
         if !bvid.is_empty() && bvid != opened_bvid {
             bail!("watch_clip 只能看当前打开的 {opened_bvid}，不能看 {bvid}");
-        }
-        if state.clip_count >= 4 {
-            bail!("这个视频已经看了 4 段，请调用 rate_video 下结论");
         }
         let mut start_s = args
             .get("start_s")
@@ -3117,7 +3546,7 @@ impl FishEngine {
             "score": rate.score,
             "verdict": rate.verdict,
             "one_line": rate.one_line,
-            "note": "评分已接受，系统将保存并进入下一个视频。",
+            "note": "评分卡已生成。",
         });
         let summary = format!("{} · {:.1} 分 · {}", rate.verdict, rate.score, rate.one_line);
         state.rate = Some(rate.clone());
@@ -4344,6 +4773,24 @@ fn messages_for_display(messages: &[serde_json::Value]) -> Vec<serde_json::Value
         redact_image_data(message);
     }
     copy
+}
+
+/// Drop image-bearing user messages from the API history after the model has
+/// seen them. The UI keeps the actual contact sheets on the tool row.
+fn compact_image_messages(messages: &mut [serde_json::Value]) {
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(|role| role.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        if content.is_array() {
+            *content = serde_json::Value::String(
+                "[之前看过的画面拼图已从上下文移除；需要时重新调用 watch_clip。]".to_string(),
+            );
+        }
+    }
 }
 
 fn redact_image_data(value: &mut serde_json::Value) {

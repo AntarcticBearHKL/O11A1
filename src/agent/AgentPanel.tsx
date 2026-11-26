@@ -10,12 +10,15 @@ export function AgentPanel({
   errorText,
   parked,
   onCopyError,
+  children,
 }: {
   agent: FishAgent | null;
   errorText: string;
   parked: boolean;
   onCopyError?: () => void;
+  children?: React.ReactNode;
 }) {
+  const empty = !agent?.steps?.length;
   return (
     <div className="agent-page">
       {errorText ? (
@@ -37,7 +40,13 @@ export function AgentPanel({
         </div>
       ) : null}
 
+      {empty && children && !errorText ? (
+        <div className="agent-chat-empty">
+          直接说你想看什么，或者让我看看首页推荐。
+        </div>
+      ) : null}
       <AgentTrace key={`full-${agent?.bvid || 'empty'}`} agent={agent} full parked={parked} />
+      {children}
     </div>
   );
 }

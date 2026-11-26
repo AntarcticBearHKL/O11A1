@@ -123,6 +123,21 @@ impl AgentView {
         }
     }
 
+    /// Start a conversational transcript. Unlike [`AgentView::begin`], this
+    /// does not assume a video is being watched: the thread stays idle until
+    /// the owner sends a message.
+    pub fn begin_chat(model: &str) -> Self {
+        let at = unix_now();
+        AgentView {
+            model: model.to_string(),
+            state: "idle".to_string(),
+            note: "直接说你想看什么。".to_string(),
+            started_at: at,
+            updated_at: at,
+            ..AgentView::default()
+        }
+    }
+
     /// Fill in the video card after `open_video` returns.
     pub fn set_video(
         &mut self,

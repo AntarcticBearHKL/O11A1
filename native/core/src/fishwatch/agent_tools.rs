@@ -189,6 +189,62 @@ pub fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// The tool schemas used by the conversational Agent. The legacy one-shot
+/// watch loop keeps [`tool_definitions`]; chat tools only change the wording so
+/// the model does not treat `rate_video` as a mandatory end-of-run step.
+pub fn chat_tool_definitions() -> serde_json::Value {
+    let mut tools = tool_definitions();
+    if let Some(items) = tools.as_array_mut() {
+        for tool in items {
+            let Some(function) = tool.get_mut("function").and_then(|value| value.as_object_mut()) else {
+                continue;
+            };
+            let name = function
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let description = match name.as_str() {
+                "list_videos" => "读取一批首页推荐视频。用户也可以直接给 BV 号，不一定要用这个。",
+                "open_video" => "打开一个视频，读取标题、UP、时长、简介、评论、字幕和弹幕。可以随时换视频。",
+                "watch_clip" => "看一个视频的某一段：返回这一段的字幕、弹幕和按间隔抽取的画面拼图，一次 5-120 秒。",
+                "rate_video" => "可选：给当前打开的视频生成一张评分卡。不会结束对话或自动切换视频。",
+                _ => continue,
+            };
+            function.insert(
+                "description".to_string(),
+                serde_json::Value::String(description.to_string()),
+            );
+            if name == "rate_video" {
+                if let Some(properties) = function
+                    .get_mut("parameters")
+                    .and_then(|value| value.get_mut("properties"))
+                    .and_then(|value| value.as_object_mut())
+                {
+                    for key in ["reasons", "tags"] {
+                        if let Some(slot) = properties.get_mut(key).and_then(|value| value.as_object_mut()) {
+                            slot.remove("maxItems");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tools
+}
+
+/// The conversational Agent prompt. Short on purpose: the owner speaks to the
+/// model directly, so the prompt explains the tools and the truthfulness rule
+/// and leaves the workflow to the user.
+pub const CHAT_SYSTEM_PROMPT: &str = "你是 O11A1 的视频助手，和用户直接聊天。\n\n\
+用户让你看什么、查什么，你就用工具去做；用户没让你做的事不要主动做。\n\n\
+工具：\n\
+- list_videos：看首页推荐，拿一批候选视频。\n\
+- open_video：打开一个视频（BV 号），读标题、简介、评论、字幕和弹幕。\n\
+- watch_clip：看某一段的画面、字幕和弹幕，一次 5-120 秒，可以分多次看。\n\
+- rate_video：可选；用户要评分时，给一张评分卡。\n\n\
+回答简短、直接，像聊天。只依据工具返回的材料；不确定就说不确定，不要编造。";
+
 /// The stable system prompt. The owner's instruction is appended by `fish.rs`,
 /// so the transcript can show exactly what was sent.
 pub const SYSTEM_PROMPT: &str = "你是 O11A1「养鱼」栏目里的看片 agent。鱼主人让你替他刷视频，最后只回答一件事：这个视频值不值得花时间看。\n\n\

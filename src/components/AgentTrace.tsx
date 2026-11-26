@@ -475,6 +475,23 @@ function AgentArgs({ step }: { step: FishAgentStep }) {
   );
 }
 
+/// One conversational bubble. User text stays plain; the Agent's answer keeps
+/// the same lightweight Markdown renderer used by thinking rows.
+function ChatMessage({ step, index }: { step: FishAgentStep; index: number }) {
+  const user = step.kind === 'user';
+  const text = String(step.thinking || step.detail || '').trim();
+  return (
+    <div
+      className={`agent-chat-msg ${user ? 'user' : 'assistant'}`}
+      data-step-index={index}
+    >
+      <div className="agent-chat-bubble">
+        {user ? text : <RichText text={text || '（空回复）'} />}
+      </div>
+    </div>
+  );
+}
+
 /// One thinking or tool row. Thinking is painted as prose; a tool shows its
 /// parsed result. Raw request/response JSON is never rendered.
 function AgentStepRow({ step, index }: { step: FishAgentStep; index: number }) {
@@ -576,7 +593,6 @@ function PromptBlock({ title, text }: { title: string; text: string }) {
     <AgentFold
       title={title}
       meta={`${text.length} 字符`}
-      defaultOpen
       className="agent-prompt-fold"
     >
       <div className="agent-prompt-text">{text}</div>
@@ -688,7 +704,9 @@ export function AgentTrace({
         }}
       >
         {steps.map((step, index) => (
-          <AgentStepRow key={step.id} step={step} index={index} />
+          step.kind === 'user' || step.kind === 'assistant'
+            ? <ChatMessage key={step.id} step={step} index={index} />
+            : <AgentStepRow key={step.id} step={step} index={index} />
         ))}
         {waiting ? (
           <div className="agent-waiting">
