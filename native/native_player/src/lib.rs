@@ -54,6 +54,23 @@ pub fn prewarm_hwdecode() {
     hwdecode::prewarm([7, 12, 13, 14]);
 }
 
+/// Create one D3D11 device at engine startup and keep it alive for the life of
+/// the process. The first player otherwise pays DXGI/driver initialization
+/// (~280 ms) before its window can be shown; later windows reuse the warmed
+/// driver path (~20 ms).
+pub fn prewarm_gpu() {
+    let _ = std::thread::Builder::new()
+        .name("gpu-prewarm".into())
+        .spawn(|| match gpu::Gpu::new() {
+            Ok(device) => {
+                log::line("gpu prewarm ready");
+                std::thread::sleep(std::time::Duration::from_secs(24 * 60 * 60));
+                drop(device);
+            }
+            Err(error) => log::line(&format!("gpu prewarm failed: {error:#}")),
+        });
+}
+
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;

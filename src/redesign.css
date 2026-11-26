@@ -4292,14 +4292,28 @@ img, a {
 
 /* ------------------------------------------------------- window dragging */
 
+/* Only the topbar is a native drag surface. Keeping the rest of the shell out
+   of the app region is what lets real mouse hover/click events reach the feed,
+   cards and scrollbars; a whole-window drag region swallowed them even though
+   the page itself was marked no-drag. */
 .app {
+  -webkit-app-region: no-drag;
+}
+.topbar,
+.login-gate {
   -webkit-app-region: drag;
 }
-/* The scroll container owns wheel/scrollbar/card input; only the topbar and
-   the shell rim drag the window. Native app regions end the gesture with the
-   OS, so a lost pointerup can never leave the window following the cursor. */
+/* The login card scrolls and holds the inputs, so it must stay out of the
+   window-drag strip. The gate background around it still drags. */
 .page,
-.login-gate {
+.login-panel {
+  -webkit-app-region: no-drag;
+}
+/* A child of a native drag strip must opt out explicitly; without this the
+   search/account/window controls can start a window drag instead of a click. */
+.topbar > *,
+.login-panel,
+.login-panel * {
   -webkit-app-region: no-drag;
 }
 .app button, .app a, .app input, .app textarea, .app select, .app option,
@@ -4803,6 +4817,20 @@ html, body, #root {
 }
 [data-theme='dark'] .home-feed .video-card:hover {
   background: color-mix(in srgb, var(--card-solid) 68%, transparent);
+}
+/* Pressed feedback is driven by a React class, not :active, because a click
+   on the cover image does not always activate the card div. */
+.video-card.pressed,
+.home-feed .video-card.pressed {
+  /* `transform` is owned by the entrance animation on the first cards, so the
+     press uses the independent `scale`/`translate` properties. */
+  scale: 0.972;
+  translate: 0 0;
+}
+.video-card.pressed .cover { filter: brightness(0.94); }
+.pgc-card:active,
+.dynamic-archive:active {
+  scale: 0.98;
 }
 @media (max-width: 1260px) {
   .home-feed .video-grid {

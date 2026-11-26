@@ -1086,6 +1086,7 @@ impl Engine {
                 window::create(&title, client_w, client_h)?
             }
         };
+        log::line("player init window created");
         // Shift-resize needs the source aspect inside the window proc.
         events.set_video_aspect(source.source_width, source.source_height);
         // Apply 置顶 before the composition tree is built; the state is also
@@ -1106,10 +1107,13 @@ impl Engine {
         let monitor = window::monitor_size(hwnd);
         let surface = (monitor.0.max(client.0), monitor.1.max(client.1));
         let gpu = Gpu::new().context("create D3D11 device")?;
+        log::line("player init gpu ready");
         let video = VideoSurface::new(&gpu, source.width, source.height)
             .context("create video swapchain")?;
+        log::line("player init video ready");
         let mut overlay = Overlay::new(&gpu, client.0, client.1, surface.0, surface.1, scale)
             .context("create overlay swapchain")?;
+        log::line("player init overlay ready");
         if external {
             overlay.clear().context("clear hosted overlay")?;
         }
@@ -1119,9 +1123,11 @@ impl Engine {
         let mut danmaku_layer =
             DanmakuOverlay::new(&gpu, surface.0, surface.1, danmaku_fonts, danmaku_opacity)
                 .context("create danmaku swapchain")?;
+        log::line("player init danmaku ready");
         let composition =
             Composition::new(hwnd, &gpu, &video.swap, &danmaku_layer.swap, &overlay.swap)
                 .context("create DirectComposition tree")?;
+        log::line("player init composition ready");
         composition.set_root_clip(client.0, client.1)?;
         let (x, y, picture_w, picture_h) =
             overlay
@@ -1148,6 +1154,7 @@ impl Engine {
                     None
                 }
             };
+        log::line("player init enhance ready");
 
         let duration_ms = source.duration_ms;
         let start_ms = clamp_seek(requested_start_ms, duration_ms);

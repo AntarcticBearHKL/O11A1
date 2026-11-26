@@ -337,6 +337,9 @@ async fn main() -> Result<()> {
             std::thread::sleep(Duration::from_millis(1_500));
             native_player::prewarm_hwdecode();
         });
+    // Warm the D3D11/DXGI device path now, so the first click is not the one
+    // paying the driver initialization before the loading window appears.
+    native_player::prewarm_gpu();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind control port")?;

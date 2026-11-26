@@ -283,6 +283,7 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
   // short delay. It is only a look-ahead, never history or local progress.
   const [preview, setPreview] = useState<{ url: string; key: string } | null>(null);
   const [previewOn, setPreviewOn] = useState(false);
+  const [pressed, setPressed] = useState(false);
   const previewTimer = useRef<any>(null);
   const previewToken = useRef(0);
   const previewStart = useRef(0);
@@ -368,15 +369,21 @@ function VideoCardItem({ item, index, onPlay, getProgress, renderAction, navigat
 
   return (
     <div
-      className="video-card"
+      className={`video-card${pressed ? ' pressed' : ''}`}
       data-feed-key={item.bvid ? `${item.bvid}:${Number(item.cid || 0)}` : undefined}
       style={{ animationDelay: `${Math.min(index, 14) * 32}ms` }}
       role="button"
       tabIndex={0}
       onMouseEnter={beginPreview}
-      onMouseLeave={stopPreview}
-      onPointerDown={stopPreview}
+      onMouseLeave={() => { setPressed(false); stopPreview(); }}
+      onPointerDown={(event) => {
+        if (event.button === 0) setPressed(true);
+        stopPreview();
+      }}
+      onPointerUp={() => setPressed(false)}
+      onPointerCancel={() => setPressed(false)}
       onClick={() => {
+        setPressed(false);
         setTip(null);
         stopPreview();
         onPlay(item);
