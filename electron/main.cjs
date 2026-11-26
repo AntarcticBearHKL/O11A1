@@ -220,6 +220,16 @@ function entryByPlayerId(playerId) {
   return entry && entry.window && !entry.window.isDestroyed() ? entry : null;
 }
 
+/// User-initiated reveal (tray, taskbar, second launch): restore a minimized
+/// window before showing it. Closing a player deliberately does NOT call this;
+/// the shell keeps whatever minimized/hidden state the owner left it in.
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
 function entryForWindow(win) {
   if (!win) return null;
   return playerEntries().find((entry) => entry.window === win) || null;
@@ -292,7 +302,17 @@ async function replaceNativePlayback(record, options) {
       console.error('native queue replace failed', error);
     });
   } catch (error) {
+    // The native window can disappear between the map update and the replace
+    // (closed by its own titlebar, by the OS, or by a player.closeAll). Drop
+    // the dead record and open a fresh window instead of swallowing the click.
     console.error('native replace failed', error);
+    nativePlayers.delete(record.playerId);
+    try {
+      await launchNativePlayer(options || {});
+    } catch (fallback) {
+      console.error('native relaunch after failed replace', fallback);
+      throw fallback;
+    }
   } finally {
     record.replacing = false;
   }
@@ -697,14 +717,14 @@ function createTray() {
   if (!fs.existsSync(ICON)) return;
   tray = new Tray(ICON);
   const menu = Menu.buildFromTemplate([
-    { label: '打开 O11A1', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
+    { label: '打开 O11A1', click: () => showMainWindow() },
     { label: '检查更新', click: () => checkUpdate().then((result) => broadcast('update:result', result)).catch((error) => broadcast('update:result', { error: error.message })) },
     { type: 'separator' },
     { label: '退出', click: () => { quitting = true; app.quit(); } },
   ]);
   tray.setToolTip('O11A1');
   tray.setContextMenu(menu);
-  tray.on('double-click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
+  tray.on('double-click', () => showMainWindow());
 }
 
 function versionParts(value) {
@@ -948,7 +968,7 @@ app.whenReady().then(() => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
-    else if (mainWindow) mainWindow.show();
+    else showMainWindow();
   });
 });
 
@@ -970,10 +990,7 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      mainWindow.show();
-      mainWindow.focus();
-    }
+    showMainWindow();
   });
 }
 
@@ -1023,8 +1040,7 @@ ipcMain.handle('window:hide', (event) => {
   BrowserWindow.fromWebContents(event.sender)?.hide();
 });
 ipcMain.handle('window:show', () => {
-  mainWindow?.show();
-  mainWindow?.focus();
+  showMainWindow();
 });
 function stopWindowDrag() {
   if (!windowDrag) return;
@@ -1117,8 +1133,7 @@ ipcMain.handle('window:start-drag', async (event) => {
 });
 ipcMain.handle('app:navigate-main', (_event, route) => {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
-  mainWindow.show();
-  mainWindow.focus();
+  showMainWindow();
   mainWindow.webContents.send('app:navigate', String(route || ''));
   return true;
 });

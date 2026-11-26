@@ -3,7 +3,6 @@ import { createRoot } from 'react-dom/client';
 import Startup from './startup';
 import './styles.css';
 import './redesign.css';
-import { installWindowDrag } from './windowDrag';
 
 // No native selection box and no Chromium context menu anywhere in the app.
 // Text selection is still available inside real text fields via CSS.
@@ -15,7 +14,6 @@ document.addEventListener('dragstart', (event) => event.preventDefault());
 window.addEventListener('mousedown', (event) => {
   if (event.button === 2) event.preventDefault();
 }, true);
-installWindowDrag();
 
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

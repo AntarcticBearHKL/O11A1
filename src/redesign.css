@@ -3968,7 +3968,12 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
 }
 .bottom-disc .vinyl-ring { inset: 16px; }
 .bottom-disc .vinyl-hole { width: 10px; height: 10px; }
-.bottom-disc.playing .vinyl-disc { animation: rd-disc 12s linear infinite; }
+/* A permanently spinning 72px disc inside the frosted dock forced the whole
+   window to recomposite at the display refresh rate (about half a GPU core on
+   a 120 Hz screen). Spin only while the queue is open or the pointer is on the
+   disc, where the motion is actually being watched. */
+.bottom-disc:hover .vinyl-disc,
+.bottom-disc.open .vinyl-disc { animation: rd-disc 12s linear infinite; }
 .vinyl-record {
   position: relative;
   top: auto;
@@ -4208,8 +4213,15 @@ img, a {
 
 /* ------------------------------------------------------- window dragging */
 
-.app, .login-gate {
+.app {
   -webkit-app-region: drag;
+}
+/* The scroll container owns wheel/scrollbar/card input; only the topbar and
+   the shell rim drag the window. Native app regions end the gesture with the
+   OS, so a lost pointerup can never leave the window following the cursor. */
+.page,
+.login-gate {
+  -webkit-app-region: no-drag;
 }
 .app button, .app a, .app input, .app textarea, .app select, .app option,
 .app [role='button'], .app [role='tab'], .app [role='slider'],
@@ -4279,13 +4291,6 @@ html, body, #root {
   box-shadow:
     var(--window-shadow),
     inset 0 0 0 1px rgba(255, 255, 255, 0.03);
-}
-
-
-/* Custom cursor-follow drag replaces native app regions so right-click stays
-   available for the card action instead of starting a native window drag. */
-.app, .login-gate, .drag, .login-drag {
-  -webkit-app-region: no-drag;
 }
 
 

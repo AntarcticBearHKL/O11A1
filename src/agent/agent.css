@@ -2,7 +2,7 @@
    src/agent/main.tsx, so none of it ships in the normal renderer bundle. */
 
 .agent-dev-app {
-  -webkit-app-region: no-drag;
+  -webkit-app-region: drag;
   color: var(--text);
 }
 
@@ -41,6 +41,7 @@
   overflow-y: auto;
   padding: 4px 4px 28px;
   overscroll-behavior: contain;
+  -webkit-app-region: no-drag;
 }
 
 .agent-dev-body .agent-thread {
