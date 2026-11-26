@@ -3,6 +3,7 @@ import { call } from '../api';
 import { AgentPanel } from './AgentPanel';
 import { ErrorBox, Spinner } from '../components/Common';
 import { IconClose, IconMax, IconMin, IconRefresh } from '../components/Icons';
+import { WindowResizeGrip } from '../components/WindowResizeGrip';
 import { useToast } from '../hooks';
 import { createDemoState } from './demo';
 import type { FishAgent, FishState } from '../types';
@@ -28,7 +29,7 @@ function stateError(value: any): string {
   return String(value.Error || '');
 }
 
-/// Standalone credential-free Agent view used by `agent.html`.
+/// Standalone Agent view used by `agent.html` and the `O11A1 Agent` shortcut.
 ///
 /// This is the same AgentPanel and AgentTrace the main Fish page renders. It
 /// talks to the running sidecar through the normal preload bridge, so a Vite
@@ -42,6 +43,7 @@ export default function AgentDev() {
   const [state, setState] = useState<FishState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [maximized, setMaximized] = useState(false);
   const themeApplied = useRef(false);
 
   const load = useCallback(async (quiet = false) => {
@@ -70,8 +72,53 @@ export default function AgentDev() {
   }, []);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    let alive = true;
+    const sync = () => {
+      window.o11a1?.window
+        ?.isMaximized?.()
+        .then((value: boolean) => {
+          if (alive) setMaximized(!!value);
+        })
+        .catch(() => {});
+    };
+    sync();
+    window.addEventListener('resize', sync);
+    return () => {
+      alive = false;
+      window.removeEventListener('resize', sync);
+    };
+  }, []);
+
+  // The Agent shortcut can be the first thing that starts the app. The engine
+  // is spawned in parallel, so wait for its socket instead of flashing the
+  // connection error for the first second.
+  useEffect(() => {
+    if (demoMode) {
+      load();
+      return;
+    }
+    let alive = true;
+    let timer = 0;
+    const boot = async () => {
+      if (!alive) return;
+      try {
+        const status = await window.o11a1?.engineStatus?.();
+        if (!alive) return;
+        if (status && !status.ready) {
+          timer = window.setTimeout(boot, 400);
+          return;
+        }
+      } catch {
+        /* No preload bridge (plain browser preview); fall through to load. */
+      }
+      if (alive) load();
+    };
+    boot();
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [demoMode, load]);
 
   useEffect(() => {
     const running = state?.snapshot?.state === 'Running' || state?.snapshot?.state === 'Waiting';
@@ -98,53 +145,65 @@ export default function AgentDev() {
   };
 
   return (
-    <div className="app agent-dev-app">
-      <div className="agent-dev-shell">
-        <div className="agent-dev-actions no-drag">
-          <button className="btn sm" onClick={() => load()} disabled={loading}>
-            <IconRefresh size={13} />
-            刷新
-          </button>
-          <button
-            className="btn sm primary"
-            disabled={demoMode || (isLive && !agentWaiting)}
-            onClick={next}
-            title={demoMode ? '演示数据不连接引擎' : isLive && !agentWaiting ? '当前这一轮还在运行' : '执行下一次 DeepSeek 请求'}
-          >
-            下一步
-          </button>
-          <div className="window-controls">
-            <button className="icon-btn" title="最小化" onClick={() => (window as any).o11a1?.window?.minimize?.()}>
-              <IconMin />
+    <>
+      <div className={`app agent-dev-app${maximized ? ' maximized' : ''}`}>
+        <div className="agent-dev-shell">
+          <header className="agent-dev-titlebar">
+            <span className="agent-dev-brand">
+              <span className="agent-dev-dot" aria-hidden="true" />
+              O11A1 <span className="agent-dev-brand-suffix">Agent</span>
+            </span>
+            <div className="window-controls no-drag">
+              <button className="icon-btn" title="最小化" onClick={() => window.o11a1.window.minimize()}>
+                <IconMin />
+              </button>
+              <button
+                className="icon-btn"
+                title={maximized ? '还原' : '最大化'}
+                onClick={async () => setMaximized(await window.o11a1.window.maximize())}
+              >
+                <IconMax />
+              </button>
+              <button className="icon-btn close" title="关闭" onClick={() => window.o11a1.window.close()}>
+                <IconClose />
+              </button>
+            </div>
+          </header>
+
+          <div className="agent-dev-actions no-drag">
+            <button className="btn sm" onClick={() => load()} disabled={loading}>
+              <IconRefresh size={13} />
+              刷新
             </button>
-            <button className="icon-btn" title="最大化" onClick={() => (window as any).o11a1?.window?.maximize?.()}>
-              <IconMax />
+            <button
+              className="btn sm primary"
+              disabled={demoMode || (isLive && !agentWaiting)}
+              onClick={next}
+              title={demoMode ? '演示数据不连接引擎' : isLive && !agentWaiting ? '当前这一轮还在运行' : '执行下一次 DeepSeek 请求'}
+            >
+              下一步
             </button>
-            <button className="icon-btn close" title="退出调试" onClick={() => (window as any).o11a1?.window?.quit?.()}>
-              <IconClose />
-            </button>
+          </div>
+
+          <div className="agent-dev-body">
+            {loading && !state ? <Spinner label="读取 Agent…" /> : error ? (
+              <ErrorBox error={error} onRetry={() => load()} />
+            ) : state ? (
+              <AgentPanel
+                agent={agent}
+                errorText={errorText}
+                parked={agentWaiting}
+                onCopyError={() => navigator.clipboard.writeText(errorText).then(() => show('错误已复制')).catch(() => show('复制失败', true))}
+              />
+            ) : (
+              <div className="agent-dev-empty">未连接到引擎，请稍后重试。</div>
+            )}
           </div>
         </div>
 
-        <div className="agent-dev-body">
-          {loading && !state ? <Spinner label="读取 Agent…" /> : error ? (
-            <ErrorBox error={error} onRetry={() => load()} />
-          ) : state ? (
-            <AgentPanel
-              agent={agent}
-              errorText={errorText}
-              parked={agentWaiting}
-              onCopyError={() => navigator.clipboard.writeText(errorText).then(() => show('错误已复制')).catch(() => show('复制失败', true))}
-            />
-          ) : (
-            <div className="agent-dev-empty">
-              未连接到引擎。请用 <code>npm run agent:dev</code> 启动 Electron 调试窗口。
-            </div>
-          )}
-        </div>
+        {toast ? <div className={`toast ${toast.error ? 'error' : ''}`}>{toast.text}</div> : null}
       </div>
-
-      {toast ? <div className={`toast ${toast.error ? 'error' : ''}`}>{toast.text}</div> : null}
-    </div>
+      <WindowResizeGrip hidden={maximized} />
+    </>
   );
 }

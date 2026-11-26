@@ -16,6 +16,43 @@
   padding: 12px 24px 0;
 }
 
+.agent-dev-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  height: 42px;
+  padding: 0 0 0 4px;
+}
+
+.agent-dev-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.agent-dev-brand-suffix {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.agent-dev-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.agent-dev-titlebar .window-controls {
+  margin-left: auto;
+  -webkit-app-region: no-drag;
+}
+
 .agent-dev-actions {
   display: flex;
   align-items: center;

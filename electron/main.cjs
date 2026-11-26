@@ -17,6 +17,10 @@ const https = require('https');
 const updater = require('./updater.cjs');
 
 const IS_DEV = !!process.env.O11A1_DEV_URL;
+/// Desktop shortcut for the standalone Agent window launches the same app with
+/// `--agent`; the shell is created hidden so the Agent window is the only one
+/// the owner sees (the tray/desktop shortcut can still reveal the main shell).
+const START_AGENT = process.argv.includes('--agent');
 const ROOT = path.join(__dirname, '..');
 const ICON = path.join(ROOT, 'assets', 'o11a1.ico');
 const RELEASE_API =
@@ -31,6 +35,7 @@ if (process.env.O11A1_USER_DATA) {
 }
 
 let mainWindow = null;
+let agentWindow = null;
 let tray = null;
 let playerSeq = 0;
 /** playerId -> { window, playerId, options, cssRect, opened, lastFocused } */
@@ -611,7 +616,7 @@ function showPlayerPopup(entry, visible) {
   engineCall('player.visible', { playerId: entry.playerId, visible }).catch(() => {});
 }
 
-function createWindow() {
+function createWindow(showOnReady = true) {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -630,7 +635,9 @@ function createWindow() {
       spellcheck: false,
     },
   });
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => {
+    if (showOnReady) mainWindow.show();
+  });
   mainWindow.on('closed', stopWindowDrag);
   mainWindow.on('close', (event) => {
     if (!quitting) {
@@ -659,6 +666,49 @@ function loadRenderer(win, hash) {
   } else {
     win.loadFile(path.join(ROOT, 'dist', 'index.html'), hash ? { hash: `/${hash}` } : {});
   }
+}
+
+function loadAgentRenderer(win) {
+  if (IS_DEV) {
+    win.loadURL(new URL('agent.html', process.env.O11A1_DEV_URL).toString());
+  } else {
+    win.loadFile(path.join(ROOT, 'dist', 'agent.html'));
+  }
+}
+
+/// A second, independent shell window that opens `agent.html` directly. It
+/// shares the preload bridge, engine and account with the main shell but has no
+/// titlebar/tab chrome of its own.
+function createAgentWindow() {
+  if (agentWindow && !agentWindow.isDestroyed()) {
+    agentWindow.show();
+    agentWindow.focus();
+    return agentWindow;
+  }
+  agentWindow = new BrowserWindow({
+    width: 980,
+    height: 820,
+    minWidth: 720,
+    minHeight: 560,
+    frame: false,
+    show: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    icon: fs.existsSync(ICON) ? ICON : undefined,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      spellcheck: false,
+    },
+  });
+  agentWindow.once('ready-to-show', () => agentWindow.show());
+  agentWindow.on('closed', () => {
+    agentWindow = null;
+  });
+  loadAgentRenderer(agentWindow);
+  return agentWindow;
 }
 
 function createPlayerWindow(options) {
@@ -718,6 +768,7 @@ function createTray() {
   tray = new Tray(ICON);
   const menu = Menu.buildFromTemplate([
     { label: '打开 O11A1', click: () => showMainWindow() },
+    { label: '打开 Agent', click: () => createAgentWindow() },
     { label: '检查更新', click: () => checkUpdate().then((result) => broadcast('update:result', result)).catch((error) => broadcast('update:result', { error: error.message })) },
     { type: 'separator' },
     { label: '退出', click: () => { quitting = true; app.quit(); } },
@@ -957,8 +1008,12 @@ app.whenReady().then(() => {
     },
   );
   startEngine();
-  createWindow();
+  // `--agent` is the desktop Agent shortcut: keep the main shell hidden in the
+  // tray so the Agent window is the only surface on launch, but reuse the same
+  // process, engine and account.
+  createWindow(!START_AGENT);
   createTray();
+  if (START_AGENT) createAgentWindow();
   try {
     const saved = JSON.parse(fs.readFileSync(path.join(dataRoot(), 'settings.json'), 'utf8'));
     app.setLoginItemSettings({ openAtLogin: !!saved.autostart, path: process.execPath, args: IS_DEV ? [path.join(ROOT, 'electron', 'main.cjs')] : [] });
@@ -989,8 +1044,11 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    showMainWindow();
+  app.on('second-instance', (_event, commandLine) => {
+    // A second click on the Agent shortcut opens/focuses that window; the
+    // normal shortcut keeps its old behaviour and raises the main shell.
+    if (commandLine.includes('--agent')) createAgentWindow();
+    else showMainWindow();
   });
 }
 
