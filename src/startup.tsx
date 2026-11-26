@@ -74,7 +74,6 @@ function LoginScreen({ closeAction, children }: { closeAction: number; children:
           window.o11a1.window.startDrag?.().catch?.(() => {});
         }}
       >
-        <div className="login-drag" aria-hidden="true" />
         <WindowControls closeAction={closeAction} />
         <section className="login-panel">{children}</section>
       </div>
