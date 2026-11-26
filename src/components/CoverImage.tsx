@@ -18,7 +18,7 @@ function retryUrl(url: string): string {
 /// @480w variant, transient CDN error, empty payload), so walk:
 /// 480px thumbnail → original URL → one cache-busted retry → neutral fallback.
 /// A failed image never leaves a broken icon or an empty box behind.
-export function CoverImage({ src, eager, className, alt = '', ...rest }: Props) {
+export function CoverImage({ src, eager, className, alt = '', onLoad, ...rest }: Props) {
   const full = cover(src || '');
   const thumb = cardCover(src || '');
   const candidates = useMemo(() => {
@@ -64,6 +64,12 @@ export function CoverImage({ src, eager, className, alt = '', ...rest }: Props) 
       decoding="async"
       referrerPolicy="no-referrer"
       draggable={false}
+      onLoad={(event) => {
+        // Decode while the card is still offscreen; otherwise the first
+        // scroll into a row pays the image decode on the presentation frame.
+        event.currentTarget.decode?.().catch(() => {});
+        onLoad?.(event);
+      }}
       onError={() => setAttempt({ key: full, index: index + 1 })}
     />
   );

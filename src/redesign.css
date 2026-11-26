@@ -3888,14 +3888,7 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   -webkit-backdrop-filter: blur(22px) saturate(1.3);
   animation: rd-dock 0.45s var(--spring) both;
 }
-/* Live blur is only affordable while the page is still. During a scroll the
-   bars switch to an opaque paper surface, then the frosted glass returns. */
-.app.scrolling .topbar,
-.app.scrolling .bottom-bar {
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  background: color-mix(in srgb, var(--card-solid) 90%, transparent);
-}
+
 [data-theme='dark'] .bottom-bar {
   box-shadow:
     0 24px 60px -22px rgba(0, 0, 0, 0.8),

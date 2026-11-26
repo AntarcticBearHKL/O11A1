@@ -418,20 +418,26 @@ export default function Home() {
   }, [onScroll, blocks.length > 0]);
 
   // The first scroll of a freshly mounted feed can pay a one-frame
-  // layerisation/decode cost. Warm the scroll container while the user is still
-  // reading the first row; skip if they already scrolled themselves.
+  // layerisation/backdrop-filter cost. Set a small offset and reset it in the
+  // same task: no frame is painted between the two writes, but the compositor
+  // builds the scroll/backdrop surfaces before the user touches the wheel.
   useEffect(() => {
     if (warmedScroll.current || !blocks.length) return;
     warmedScroll.current = true;
-    const timer = window.setTimeout(() => {
+    const warm = (offset: number) => {
       const scroll = feedRef.current?.closest('.page') as HTMLElement | null;
       if (!scroll || scroll.scrollTop !== 0) return;
-      scroll.scrollTop = 1;
-      window.requestAnimationFrame(() => {
-        if (scroll.scrollTop === 1) scroll.scrollTop = 0;
-      });
-    }, 450);
-    return () => window.clearTimeout(timer);
+      scroll.scrollTop = offset;
+      scroll.scrollTop = 0;
+    };
+    const first = window.setTimeout(() => warm(60), 450);
+    // A second pass after covers have decoded warms the next row's backdrop
+    // surface without painting an intermediate frame.
+    const second = window.setTimeout(() => warm(180), 1200);
+    return () => {
+      window.clearTimeout(first);
+      window.clearTimeout(second);
+    };
   }, [blocks.length]);
 
   useEffect(() => {
