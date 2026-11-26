@@ -69,11 +69,12 @@ function LoginScreen({ closeAction, children }: { closeAction: number; children:
           if (event.button !== 0) return;
           const target = event.target as Element | null;
           if (target?.closest(
-            'button, a, input, textarea, select, option, label, [role="button"], [role="tab"], .login-panel, .login-window-controls, .no-drag',
+            'button, a, input, textarea, select, option, label, [role="button"], [role="tab"], .login-surface, .login-window-controls, .no-drag',
           )) return;
           window.o11a1.window.startDrag?.().catch?.(() => {});
         }}
       >
+        <div className="login-drag" aria-hidden="true" />
         <WindowControls closeAction={closeAction} />
         <section className="login-panel">{children}</section>
       </div>

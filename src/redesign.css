@@ -4441,6 +4441,18 @@ html, body, #root {
   background-image: radial-gradient(rgba(255, 255, 255, 0.18) 0.45px, transparent 0.45px);
 }
 .login-gate > * { position: relative; z-index: 1; }
+/* The drag strip is a fixed overlay, not a flow block. A `.login-gate > *`
+   position rule previously made this 54px element push the centered panel
+   down; the extra specificity keeps it out of layout. */
+.login-gate > .login-drag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 54px;
+  z-index: 2;
+  -webkit-app-region: no-drag;
+}
 .login-gate > .login-window-controls {
   position: absolute;
   top: 14px;
