@@ -2006,6 +2006,14 @@ input[type='number'] { font-variant-numeric: tabular-nums; }
   color: var(--accent);
 }
 .section-meta { color: var(--text-faint); font-size: 11px; }
+/* UP page: the profile card is the first control, then only the order tabs
+   and the video grid. The infinite-scroll marker is a 1px invisible row. */
+.user-video-tabs {
+  display: flex;
+  align-items: center;
+  margin: 0 0 16px;
+}
+.user-load-sentinel { height: 1px; }
 .member-hero { margin-bottom: 18px; }
 
 /* --------------------------------------------------------------- regions */

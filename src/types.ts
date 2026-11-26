@@ -272,7 +272,7 @@ export interface SpaceVideo {
 export interface SpaceVideoPage {
   page: number;
   has_more: boolean;
-  items: SpaceVideo[];
+  items: FeedVideo[];
 }
 
 export interface LiveRoom {

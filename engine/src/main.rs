@@ -79,6 +79,15 @@ fn flag(params: &Value, key: &str) -> bool {
     params.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// The UP page's two video orders. `plays` matches B站's 播放最多, everything
+/// else keeps the historical 最新发布 order.
+fn up_order(params: &Value) -> bili::UpOrder {
+    match text(params, "order").trim().to_ascii_lowercase().as_str() {
+        "plays" | "play" | "click" | "views" => bili::UpOrder::Plays,
+        _ => bili::UpOrder::Newest,
+    }
+}
+
 fn player_id(params: &Value) -> String {
     let id = text(params, "playerId");
     if id.is_empty() {
@@ -1028,23 +1037,36 @@ async fn dispatch(app: &Arc<App>, method: &str, params: Value) -> Rpc<Value> {
         "user.space" => {
             let session = app.session().await?;
             let mid = num(&params, "mid");
+            let order = up_order(&params);
             let (info, videos, relation) = tokio::join!(
                 session.space_info(mid),
-                session.space_videos(mid, 1, 24),
+                session.up_videos(mid, order, 1),
                 session.relation(mid)
             );
+            let (items, has_more) = videos.map_err(e)?;
             Ok(json!({
                 "info": info.map_err(e)?,
-                "videos": videos.map_err(e)?,
+                "videos": {
+                    "page": 1,
+                    "has_more": has_more,
+                    "items": items,
+                },
                 "relation": relation.map_err(e)?,
             }))
         }
         "user.videos" => {
             let session = app.session().await?;
-            rv(session
-                .space_videos(num(&params, "mid"), num(&params, "page").max(1), 24)
+            let mid = num(&params, "mid");
+            let page = num(&params, "page").max(1).min(u32::MAX as i64) as u32;
+            let (items, has_more) = session
+                .up_videos(mid, up_order(&params), page)
                 .await
-                .map_err(e)?)
+                .map_err(e)?;
+            Ok(json!({
+                "page": page,
+                "has_more": has_more,
+                "items": items,
+            }))
         }
         "user.follow" => {
             let session = app.session().await?;
